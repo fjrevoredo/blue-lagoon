@@ -1,0 +1,15 @@
+[app]
+name = "blue-lagoon"
+log_filter = "info"
+
+[database]
+minimum_supported_schema_version = 1
+
+[harness]
+allow_synthetic_smoke = true
+default_wall_clock_budget_ms = 30000
+
+[worker]
+timeout_ms = 10000
+command = ""
+args = []

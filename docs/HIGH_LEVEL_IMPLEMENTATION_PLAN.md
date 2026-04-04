@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-05
-Status: Initial draft for iteration
+Status: Phase 1 completed, Phase 2 planning baseline
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -101,7 +101,21 @@ The plan should be interpreted with the following testing rules:
 
 The implementation should proceed through six major phases.
 
+## Current status
+
+- Phase 1 status: `COMPLETE`
+- Phase 2 status: `NEXT`
+- Implementation evidence for Phase 1 lives in
+  `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
+- The current repository state includes a runnable Rust workspace under
+  `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
+  gating, worker subprocess execution, and a verified synthetic trigger path
+
 ### Phase 1: Runtime foundation and authority boundaries
+
+#### Phase 1 implementation status
+
+Phase 1 is complete.
 
 #### Phase 1 goal
 
@@ -110,7 +124,7 @@ boundaries, and startup safety rules that every later phase depends on.
 
 #### Phase 1 primary outcomes
 
-- Create the initial Rust workspace and the first-class boundaries for `app`,
+- Create the initial Rust workspace and the first-class boundaries for `runtime`,
   `harness`, `contracts`, and `workers`.
 - Establish local development runtime shape with PostgreSQL and reviewed SQL
   migrations.
@@ -138,6 +152,17 @@ boundaries, and startup safety rules that every later phase depends on.
   automated test baseline.
 - Phase 1 behavior is covered by required unit and component tests rather than
   manual verification alone.
+
+#### Phase 1 completion note
+
+Phase 1 has been implemented and verified. The completed foundation includes:
+
+- a Rust workspace with `runtime`, `harness`, `contracts`, and `workers`
+- reviewed SQL migrations and migration command wiring
+- startup schema compatibility checks that fail closed on incompatible history
+- durable audit-event and execution-record persistence
+- isolated worker subprocess execution with timeout termination behavior
+- unit, component, integration, and smoke-style verification coverage
 
 ### Phase 2: Minimal foreground vertical slice
 
@@ -345,9 +370,8 @@ core single-user v1 runtime enough to justify the added complexity now.
 This document should be used as the agreement point for implementation order and
 milestone definition.
 
-Once the phase sequence, scope boundaries, and exit criteria are accepted, the
-next planning step should be a detailed implementation plan that breaks each phase
-into:
+With Phase 1 complete, the next planning step should be the detailed
+implementation plan for Phase 2. That document should break the next phase into:
 
 - concrete subsystems
 - major schema work

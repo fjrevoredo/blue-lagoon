@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: blue_lagoon
+      POSTGRES_USER: blue_lagoon
+      POSTGRES_PASSWORD: blue_lagoon
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blue_lagoon -d blue_lagoon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  runtime:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@postgres:5432/blue_lagoon
+      BLUE_LAGOON_CONFIG: /workspace/config/default.toml
+      BLUE_LAGOON_LOG: info
+    command: ["cargo", "run", "-p", "runtime", "--", "harness", "--once", "--idle"]
+    volumes:
+      - ./:/workspace
+
+volumes:
+  postgres-data:

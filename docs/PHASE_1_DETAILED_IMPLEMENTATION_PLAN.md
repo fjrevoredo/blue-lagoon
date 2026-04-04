@@ -121,13 +121,13 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `NOT STARTED`
+- Current milestone: `DONE`
 - Current active task: `none`
-- Completed tasks: `0/21`
-- Milestone A status: `TODO`
-- Milestone B status: `TODO`
-- Milestone C status: `TODO`
-- Milestone D status: `TODO`
+- Completed tasks: `21/21`
+- Milestone A status: `DONE`
+- Milestone B status: `DONE`
+- Milestone C status: `DONE`
+- Milestone D status: `DONE`
 
 ## Expected Phase 1 verification commands
 
@@ -139,10 +139,10 @@ become available only after earlier tasks are complete.
 - `cargo test --workspace`
 - `docker compose config`
 - `docker compose up -d postgres`
-- `cargo run -p app -- migrate`
-- `cargo run -p app -- --help`
-- `cargo run -p app -- harness --once --idle`
-- `cargo run -p app -- harness --once --synthetic-trigger smoke`
+- `cargo run -p runtime -- migrate`
+- `cargo run -p runtime -- --help`
+- `cargo run -p runtime -- harness --once --idle`
+- `cargo run -p runtime -- harness --once --synthetic-trigger smoke`
 
 ## Phase 1 milestones
 
@@ -194,36 +194,39 @@ Milestone D is green only if:
 
 ### Task P1-01: Create root Rust workspace
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
   - root `Cargo.toml` workspace manifest
-  - root crate membership for `app`, `harness`, `contracts`, and `workers`
+  - root crate membership for `runtime`, `harness`, `contracts`, and `workers`
   - initial directory structure for those crates
 - Verification:
   - `cargo metadata --format-version 1 >/dev/null`
 - Evidence:
-  - pending
+  - `Cargo.toml`; crate roots at `app/`, `harness/`, `contracts/`, and
+    `workers/`; verified with `cmd.exe /c cargo metadata --format-version 1`
 
 ### Task P1-02: Scaffold crate entrypoints and compile baseline
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-01`
 - Parallel-safe: no
 - Deliverables:
-  - `app` crate with thin executable entrypoint
+  - `runtime` crate with thin executable entrypoint
   - `harness` crate with public bootstrap surface
   - `contracts` crate for shared cross-process types
   - `workers` crate with worker executable entrypoint
 - Verification:
   - `cargo check --workspace`
 - Evidence:
-  - pending
+  - `crates/runtime/src/main.rs`, `crates/harness/src/lib.rs`,
+    `crates/contracts/src/lib.rs`, and `crates/workers/src/main.rs`; verified
+    with `cmd.exe /c cargo check --workspace`
 
 ### Task P1-03: Add repository runtime files for local development
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-02`
 - Parallel-safe: no
 - Deliverables:
@@ -236,11 +239,12 @@ Milestone D is green only if:
 - Verification:
   - `docker compose config`
 - Evidence:
-  - pending
+  - `compose.yaml`, `config/default.toml`, `.env.example`, and `.gitignore`;
+    verified with `cmd.exe /c docker compose config`
 
 ### Task P1-04: Document initial Phase 1 command surface
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-03`
 - Parallel-safe: yes
 - Deliverables:
@@ -249,11 +253,12 @@ Milestone D is green only if:
 - Verification:
   - manual review that the documented commands match the scaffolded files
 - Evidence:
-  - pending
+  - `README.md` updated with Phase 1 boot, migrate, smoke, and verification
+    commands
 
 ### Task P1-05: Add reviewed SQL migration layout
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-03`
 - Parallel-safe: no
 - Deliverables:
@@ -266,11 +271,13 @@ Milestone D is green only if:
   - migration files exist with the agreed naming convention
   - migration runner can discover them
 - Evidence:
-  - pending
+  - `migrations/0001__phase_1_foundation.sql` and
+    `crates/harness/src/migration.rs`; discovery covered by
+    `migration::tests::load_migrations_discovers_phase_1_files`
 
 ### Task P1-06: Create Phase 1 canonical database tables
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-05`
 - Parallel-safe: no
 - Deliverables:
@@ -282,11 +289,15 @@ Milestone D is green only if:
   - migrations apply cleanly to disposable PostgreSQL
   - tables are visible after migration
 - Evidence:
-  - pending
+  - `schema_migrations` support in `crates/harness/src/migration.rs`;
+    `audit_events`
+    and `execution_records` created in
+    `migrations/0001__phase_1_foundation.sql`; verified by
+    `migration_application_creates_phase_1_tables`
 
 ### Task P1-07: Implement config loading and startup inputs
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-03`
 - Parallel-safe: no
 - Deliverables:
@@ -298,11 +309,14 @@ Milestone D is green only if:
   - unit tests for config parsing and validation
   - failed startup on missing required settings
 - Evidence:
-  - pending
+  - `crates/harness/src/config.rs` plus `config/default.toml`; validation
+    covered by
+    `config::tests::*`; missing `BLUE_LAGOON_DATABASE_URL` now fails closed at
+    startup
 
 ### Task P1-08: Implement schema-version compatibility gating
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-06`, `P1-07`
 - Parallel-safe: no
 - Deliverables:
@@ -316,11 +330,14 @@ Milestone D is green only if:
   - component test against disposable PostgreSQL for supported and unsupported
     schema states
 - Evidence:
-  - pending
+  - `crates/harness/src/schema.rs` and `crates/harness/src/runtime.rs`;
+    verified by
+    `schema::tests::*` and
+    `startup_compatibility_reports_supported_and_unsupported_states`
 
 ### Task P1-09: Add tracing bootstrap and trace correlation primitives
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-02`, `P1-07`
 - Parallel-safe: yes
 - Deliverables:
@@ -331,11 +348,13 @@ Milestone D is green only if:
   - startup emits structured logs
   - unit tests for trace-context helpers where applicable
 - Evidence:
-  - pending
+  - `crates/harness/src/trace.rs`; structured JSON logs observed during
+    `cargo run -p runtime -- migrate` and `cargo run -p runtime -- harness ...`;
+    unit coverage in `trace::tests::root_trace_context_uses_non_nil_uuid`
 
 ### Task P1-10: Add durable audit-event write path
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-06`, `P1-09`
 - Parallel-safe: no
 - Deliverables:
@@ -345,11 +364,12 @@ Milestone D is green only if:
 - Verification:
   - component test writes and reads an audit event from real PostgreSQL
 - Evidence:
-  - pending
+  - `crates/harness/src/audit.rs`; verified by
+    `audit_event_write_path_persists_rows`
 
 ### Task P1-11: Add minimal execution-record persistence
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-06`, `P1-07`
 - Parallel-safe: yes
 - Deliverables:
@@ -359,11 +379,12 @@ Milestone D is green only if:
 - Verification:
   - component test writes and reads a synthetic execution record
 - Evidence:
-  - pending
+  - `crates/harness/src/execution.rs`; verified by
+    `execution_record_write_path_persists_rows`
 
 ### Task P1-12: Add minimal policy and budget scaffolding
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-02`, `P1-07`
 - Parallel-safe: yes
 - Deliverables:
@@ -373,11 +394,11 @@ Milestone D is green only if:
 - Verification:
   - unit tests for policy and budget decisions
 - Evidence:
-  - pending
+  - `crates/harness/src/policy.rs`; verified by `policy::tests::*`
 
 ### Task P1-13: Define initial cross-process worker contract
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-02`
 - Parallel-safe: yes
 - Deliverables:
@@ -389,11 +410,11 @@ Milestone D is green only if:
 - Verification:
   - unit tests for contract serialization and validation
 - Evidence:
-  - pending
+  - `crates/contracts/src/lib.rs`; verified by `contracts::tests::*`
 
 ### Task P1-14: Implement isolated worker subprocess launcher
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-11`, `P1-12`, `P1-13`
 - Parallel-safe: no
 - Deliverables:
@@ -404,11 +425,12 @@ Milestone D is green only if:
 - Verification:
   - component or integration test proving a subprocess is spawned and handled
 - Evidence:
-  - pending
+  - `crates/harness/src/worker.rs`; subprocess path verified by
+    `synthetic_trigger_runs_end_to_end_and_persists_outputs`
 
 ### Task P1-15: Implement stub worker runtime
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-13`
 - Parallel-safe: yes
 - Deliverables:
@@ -420,11 +442,13 @@ Milestone D is green only if:
 - Verification:
   - direct worker test for request in and structured response out
 - Evidence:
-  - pending
+  - `crates/workers/src/main.rs` and
+    `crates/workers/tests/smoke_worker_cli.rs`; verified by worker unit and CLI
+    tests
 
 ### Task P1-16A: Implement no-trigger harness boot and idle path
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-08`, `P1-12`
 - Parallel-safe: no
 - Deliverables:
@@ -434,13 +458,15 @@ Milestone D is green only if:
   - explicit separation between migration command execution and normal harness
     boot
 - Verification:
-  - `cargo run -p app -- harness --once --idle`
+  - `cargo run -p runtime -- harness --once --idle`
 - Evidence:
-  - pending
+  - `crates/harness/src/runtime.rs` idle path plus
+    `crates/runtime/src/main.rs`; verified with
+    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --idle"`
 
 ### Task P1-16: Implement synthetic trigger end-to-end harness flow
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-10`, `P1-11`, `P1-12`, `P1-14`, `P1-15`, `P1-16A`
 - Parallel-safe: no
 - Deliverables:
@@ -451,14 +477,16 @@ Milestone D is green only if:
   - audit-event emission for the flow
   - idle or completion return path
 - Verification:
-  - `cargo run -p app -- harness --once --synthetic-trigger smoke`
+  - `cargo run -p runtime -- harness --once --synthetic-trigger smoke`
   - integration test for trigger to worker to persisted outputs
 - Evidence:
-  - pending
+  - end-to-end flow in `crates/harness/src/runtime.rs`; verified with
+    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --synthetic-trigger smoke"`
+    and `synthetic_trigger_runs_end_to_end_and_persists_outputs`
 
 ### Task P1-17: Add Phase 1 unit-test baseline
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-07`, `P1-08`, `P1-12`, `P1-13`
 - Parallel-safe: yes
 - Deliverables:
@@ -469,11 +497,14 @@ Milestone D is green only if:
 - Verification:
   - `cargo test --workspace`
 - Evidence:
-  - pending
+  - config, schema, policy, trace, migration-discovery, and contract tests now
+    live under `crates/contracts/src/lib.rs` and `crates/harness/src/*`;
+    verified with
+    `cmd.exe /c cargo test --workspace`
 
 ### Task P1-18: Add Phase 1 real-PostgreSQL component tests
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-06`, `P1-08`, `P1-10`, `P1-11`
 - Parallel-safe: no
 - Deliverables:
@@ -484,11 +515,13 @@ Milestone D is green only if:
 - Verification:
   - component-test command against disposable PostgreSQL
 - Evidence:
-  - pending
+  - `crates/harness/tests/phase1_component.rs` with disposable Postgres
+    bootstrapped through `docker compose up -d postgres`; verified via
+    `cmd.exe /c cargo test --workspace`
 
 ### Task P1-19: Add Phase 1 smoke and regression gate
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-16`, `P1-17`, `P1-18`
 - Parallel-safe: no
 - Deliverables:
@@ -498,11 +531,20 @@ Milestone D is green only if:
 - Verification:
   - all recurring Phase 1 verification commands pass
 - Evidence:
-  - pending
+  - Passed: `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`,
+    `cmd.exe /c cargo test --workspace`,
+    `cmd.exe /c docker compose config`,
+    `cmd.exe /c docker compose up -d postgres`,
+    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- migrate"`,
+    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --idle"`,
+    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --synthetic-trigger smoke"`;
+    fail-closed regression covered by
+    `startup_compatibility_reports_supported_and_unsupported_states`
 
 ### Task P1-20: Update Phase 1 completion notes and progress ledger
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P1-19`
 - Parallel-safe: no
 - Deliverables:
@@ -512,7 +554,8 @@ Milestone D is green only if:
 - Verification:
   - manual review that all completed tasks contain evidence
 - Evidence:
-  - pending
+  - this document updated to `21/21` complete; README command surface refreshed
+    for Phase 1 runtime usage and verification
 
 ## Recommended execution order
 
