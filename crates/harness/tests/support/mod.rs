@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, process::Command, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result};
 use harness::{config::RuntimeConfig, db};
@@ -6,6 +6,8 @@ use sqlx::{Executor, PgPool};
 
 const LOCAL_TEST_DATABASE_URL: &str =
     "postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon";
+#[allow(dead_code)]
+static WORKERS_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -13,6 +15,15 @@ pub fn workspace_root() -> PathBuf {
         .and_then(|path| path.parent())
         .expect("workspace root should exist")
         .to_path_buf()
+}
+
+#[allow(dead_code)]
+pub fn workers_binary() -> Result<PathBuf> {
+    match WORKERS_BINARY.get_or_init(|| resolve_workers_binary().map_err(|error| error.to_string()))
+    {
+        Ok(path) => Ok(path.clone()),
+        Err(message) => Err(anyhow::anyhow!(message.clone())),
+    }
 }
 
 pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
@@ -91,6 +102,44 @@ fn ensure_postgres_running() -> Result<()> {
         anyhow::bail!("docker compose up -d postgres failed");
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+fn resolve_workers_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_workers") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let binary_name = if cfg!(windows) {
+        "workers.exe"
+    } else {
+        "workers"
+    };
+    let binary_path = workspace_root()
+        .join("target")
+        .join("debug")
+        .join(binary_name);
+    if binary_path.exists() {
+        return Ok(binary_path);
+    }
+
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("workers")
+        .current_dir(workspace_root())
+        .status()
+        .context("failed to run cargo build -p workers")?;
+    if !status.success() {
+        anyhow::bail!("cargo build -p workers failed");
+    }
+    if !binary_path.exists() {
+        anyhow::bail!(
+            "workers binary was not produced at expected path {}",
+            binary_path.display()
+        );
+    }
+    Ok(binary_path)
 }
 
 pub async fn reset_database(pool: &PgPool) -> Result<()> {

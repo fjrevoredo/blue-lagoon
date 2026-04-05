@@ -614,7 +614,7 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
 #[tokio::test]
 async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result<()> {
     let (mut config, _pool) = support::prepare_database().await?;
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
 
@@ -675,7 +675,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             .join("config")
             .join("self_model_seed.toml"),
     });
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
@@ -782,7 +782,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
 async fn foreground_orchestration_marks_execution_failed_when_context_assembly_fails() -> Result<()>
 {
     let (mut config, pool) = support::prepare_database().await?;
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
@@ -873,7 +873,7 @@ async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<
             .join("config")
             .join("self_model_seed.toml"),
     });
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;

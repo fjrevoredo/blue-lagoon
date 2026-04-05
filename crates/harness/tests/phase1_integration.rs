@@ -82,7 +82,7 @@ async fn timed_out_worker_is_terminated() -> Result<()> {
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
 
     let pid_file = std::env::temp_dir().join(format!("blue-lagoon-worker-{}.pid", Uuid::now_v7()));
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec![
         "stall-worker".to_string(),
@@ -119,7 +119,7 @@ async fn timed_out_foreground_run_is_marked_failed_and_audited() -> Result<()> {
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
 
     let pid_file = std::env::temp_dir().join(format!("blue-lagoon-worker-{}.pid", Uuid::now_v7()));
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec![
         "stall-worker".to_string(),

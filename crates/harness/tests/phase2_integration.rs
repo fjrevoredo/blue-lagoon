@@ -23,7 +23,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
             .join("config")
             .join("self_model_seed.toml"),
     });
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
@@ -128,7 +128,7 @@ async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() 
             .join("config")
             .join("self_model_seed.toml"),
     });
-    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    let worker_binary = support::workers_binary()?;
     config.worker.command = worker_binary.to_string_lossy().into_owned();
     config.worker.args = vec!["conscious-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
