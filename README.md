@@ -103,6 +103,8 @@ Important runtime inputs include:
 - `BLUE_LAGOON_WORKER_COMMAND`: explicit worker executable path when a sibling
   `workers` binary is not used
 - `BLUE_LAGOON_WORKER_ARGS`: worker arguments as a JSON array of strings
+- `BLUE_LAGOON_WORKER_TIMEOUT_MS`: generic worker timeout override for smoke and
+  non-foreground worker launches
 - `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`: Telegram bot token
 - `BLUE_LAGOON_FOREGROUND_ROUTE`: optional foreground route override in
   `<provider>/<exact-model>` form
@@ -123,6 +125,15 @@ The Telegram foreground path also requires:
 - a configured single allowed Telegram user and private chat binding
 - a valid self-model seed file
 - a configured foreground model route
+
+Live Telegram foreground timeout behavior is derived from the harness budget:
+
+- foreground budget uses `harness.default_wall_clock_budget_ms`
+- model-call timeout is `min(model_gateway.foreground.timeout_ms, harness.default_wall_clock_budget_ms)`
+- conscious worker timeout is derived from the same harness budget plus a fixed
+  grace window
+- `worker.timeout_ms` and `BLUE_LAGOON_WORKER_TIMEOUT_MS` do not shorten or
+  extend that live Telegram foreground worker timeout
 
 Provider-specific foreground settings live under `model_gateway.<provider>`.
 For Z.ai, the stable config is `[model_gateway.z_ai]` with:
@@ -147,6 +158,8 @@ Automated DB tests follow one repository-wide rule:
 - DB-using tests must not target existing operator databases
 - live manual Telegram E2E uses the normal local app config and database, not a
   dedicated test profile
+- use `with_clean_database(...)` when a test needs an unmigrated DB
+- use `with_migrated_database(...)` when a test needs the latest reviewed schema
 
 ## Verification
 

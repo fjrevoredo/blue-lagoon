@@ -942,35 +942,8 @@ pub async fn intake_telegram_foreground_trigger(
         find_ingress_event_by_channel_event(pool, ingress.channel_kind, &ingress.external_event_id)
             .await?
     {
-        audit::insert(
-            pool,
-            &NewAuditEvent {
-                loop_kind: "conscious".to_string(),
-                subsystem: "foreground_trigger".to_string(),
-                event_kind: "foreground_trigger_duplicate".to_string(),
-                severity: "info".to_string(),
-                trace_id: existing.trace_id,
-                execution_id: existing.execution_id,
-                worker_pid: None,
-                payload: json!({
-                    "ingress_id": existing.ingress_id,
-                    "channel_kind": channel_kind_as_str(ingress.channel_kind),
-                    "external_event_id": ingress.external_event_id,
-                    "deduplication_key": deduplication_key,
-                    "existing_status": existing.status,
-                }),
-            },
-        )
-        .await?;
-
-        return Ok(ForegroundTriggerIntakeOutcome::Duplicate(
-            DuplicateForegroundTrigger {
-                ingress_id: existing.ingress_id,
-                trace_id: existing.trace_id,
-                execution_id: existing.execution_id,
-                status: existing.status,
-            },
-        ));
+        return duplicate_foreground_trigger_outcome(pool, &ingress, &deduplication_key, existing)
+            .await;
     }
 
     match policy::evaluate_telegram_foreground_trigger(telegram_config, &ingress) {
@@ -1071,7 +1044,7 @@ pub async fn intake_telegram_foreground_trigger(
     .await?;
 
     let conversation_binding = reconcile_conversation_binding_in_tx(&mut tx, &binding).await?;
-    insert_ingress_event(
+    if let Err(error) = insert_ingress_event(
         &mut *tx,
         &NewIngressEvent {
             ingress: ingress.clone(),
@@ -1082,7 +1055,28 @@ pub async fn intake_telegram_foreground_trigger(
             rejection_reason: None,
         },
     )
-    .await?;
+    .await
+    {
+        if is_unique_violation(&error) {
+            drop(tx);
+            if let Some(existing) = find_ingress_event_by_channel_event(
+                pool,
+                ingress.channel_kind,
+                &ingress.external_event_id,
+            )
+            .await?
+            {
+                return duplicate_foreground_trigger_outcome(
+                    pool,
+                    &ingress,
+                    &deduplication_key,
+                    existing,
+                )
+                .await;
+            }
+        }
+        return Err(error);
+    }
 
     audit::insert(
         &mut *tx,
@@ -1118,6 +1112,43 @@ pub async fn intake_telegram_foreground_trigger(
     Ok(ForegroundTriggerIntakeOutcome::Accepted(Box::new(trigger)))
 }
 
+async fn duplicate_foreground_trigger_outcome(
+    pool: &PgPool,
+    ingress: &NormalizedIngress,
+    deduplication_key: &str,
+    existing: IngressEventRecord,
+) -> Result<ForegroundTriggerIntakeOutcome> {
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "foreground_trigger".to_string(),
+            event_kind: "foreground_trigger_duplicate".to_string(),
+            severity: "info".to_string(),
+            trace_id: existing.trace_id,
+            execution_id: existing.execution_id,
+            worker_pid: None,
+            payload: json!({
+                "ingress_id": existing.ingress_id,
+                "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                "external_event_id": ingress.external_event_id,
+                "deduplication_key": deduplication_key,
+                "existing_status": existing.status,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(ForegroundTriggerIntakeOutcome::Duplicate(
+        DuplicateForegroundTrigger {
+            ingress_id: existing.ingress_id,
+            trace_id: existing.trace_id,
+            execution_id: existing.execution_id,
+            status: existing.status,
+        },
+    ))
+}
+
 fn channel_kind_as_str(channel_kind: ChannelKind) -> &'static str {
     match channel_kind {
         ChannelKind::Telegram => "telegram",
@@ -1146,6 +1177,19 @@ fn foreground_deduplication_key(ingress: &NormalizedIngress) -> String {
         channel_kind_as_str(ingress.channel_kind),
         ingress.external_event_id
     )
+}
+
+fn is_unique_violation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(|sqlx_error| {
+            matches!(
+                sqlx_error,
+                sqlx::Error::Database(database_error)
+                    if database_error.code().as_deref() == Some("23505")
+            )
+        })
 }
 
 async fn find_ingress_event_by_channel_event(

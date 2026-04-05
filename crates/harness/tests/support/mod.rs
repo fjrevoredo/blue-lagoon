@@ -1,6 +1,13 @@
-use std::{future::Future, path::PathBuf, process::Command, sync::OnceLock, time::Duration};
+use std::{
+    future::Future,
+    path::PathBuf,
+    process::Command,
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use harness::{config::RuntimeConfig, db, migration};
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use url::Url;
@@ -8,6 +15,8 @@ use uuid::Uuid;
 
 const DEFAULT_TEST_POSTGRES_ADMIN_URL: &str =
     "postgres://blue_lagoon:blue_lagoon@localhost:55432/postgres";
+const TEST_DATABASE_PREFIX: &str = "blue_lagoon_test_";
+const STALE_TEST_DATABASE_MIN_AGE_SECS: u64 = 6 * 60 * 60;
 #[allow(dead_code)]
 static WORKERS_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -62,7 +71,10 @@ where
     if should_bootstrap_local_postgres() {
         ensure_postgres_running()?;
     }
+    sweep_stale_test_databases(&admin_database_url).await?;
 
+    // Disposable test databases never reuse names. That keeps concurrent runs isolated
+    // and makes any leaked databases safe to identify by prefix and embedded timestamp.
     let database_name = disposable_database_name();
     let database_url = disposable_database_url(&admin_database_url, &database_name)?;
     create_database(&admin_database_url, &database_name).await?;
@@ -73,21 +85,33 @@ where
         migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
     }
 
-    let result = test_fn(TestDatabaseContext {
-        config: config.clone(),
-        pool: pool.clone(),
+    let fixture = TestDatabaseFixture {
+        admin_database_url,
         database_name: database_name.clone(),
-    })
+        pool: Some(pool.clone()),
+    };
+
+    let result = std::panic::AssertUnwindSafe(test_fn(TestDatabaseContext {
+        config: config.clone(),
+        pool,
+        database_name,
+    }))
+    .catch_unwind()
     .await;
 
-    let cleanup_result = drop_database(&admin_database_url, pool, &database_name).await;
+    let cleanup_result = fixture.cleanup().await;
     match (result, cleanup_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(test_error), Ok(())) => Err(test_error),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(test_error), Err(cleanup_error)) => Err(test_error.context(format!(
+        (Ok(Ok(value)), Ok(())) => Ok(value),
+        (Ok(Err(test_error)), Ok(())) => Err(test_error),
+        (Ok(Ok(_)), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(Err(test_error)), Err(cleanup_error)) => Err(test_error.context(format!(
             "test database cleanup also failed: {cleanup_error}"
         ))),
+        (Err(panic_payload), Ok(())) => std::panic::resume_unwind(panic_payload),
+        (Err(panic_payload), Err(cleanup_error)) => {
+            eprintln!("test database cleanup failed after panic: {cleanup_error}");
+            std::panic::resume_unwind(panic_payload)
+        }
     }
 }
 
@@ -128,7 +152,11 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
 }
 
 fn disposable_database_name() -> String {
-    format!("blue_lagoon_test_{}", Uuid::now_v7().simple())
+    format!(
+        "{TEST_DATABASE_PREFIX}{}_{}",
+        current_unix_timestamp_secs(),
+        Uuid::now_v7().simple()
+    )
 }
 
 fn disposable_database_url(admin_database_url: &str, database_name: &str) -> Result<String> {
@@ -152,6 +180,34 @@ async fn connect_with_retry(config: &RuntimeConfig) -> Result<PgPool> {
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("postgres never became reachable")))
+}
+
+async fn sweep_stale_test_databases(admin_database_url: &str) -> Result<()> {
+    let mut connection = PgConnection::connect(admin_database_url)
+        .await
+        .context("failed to connect to test postgres admin database for stale sweep")?;
+    let database_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT datname
+        FROM pg_database
+        WHERE datname LIKE 'blue_lagoon_test_%'
+        "#,
+    )
+    .fetch_all(&mut connection)
+    .await
+    .context("failed to enumerate disposable test databases")?;
+
+    for database_name in database_names {
+        if !is_stale_test_database_name(&database_name) {
+            continue;
+        }
+        if has_active_sessions(&mut connection, &database_name).await? {
+            continue;
+        }
+        drop_database_with_connection(&mut connection, &database_name).await?;
+    }
+
+    Ok(())
 }
 
 fn ensure_postgres_running() -> Result<()> {
@@ -186,6 +242,31 @@ async fn drop_database(admin_database_url: &str, pool: PgPool, database_name: &s
     let mut connection = PgConnection::connect(admin_database_url)
         .await
         .context("failed to reconnect to test postgres admin database for cleanup")?;
+    drop_database_with_connection(&mut connection, database_name).await?;
+    Ok(())
+}
+
+async fn has_active_sessions(connection: &mut PgConnection, database_name: &str) -> Result<bool> {
+    let session_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM pg_stat_activity
+        WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#,
+    )
+    .bind(database_name)
+    .fetch_one(&mut *connection)
+    .await
+    .with_context(|| {
+        format!("failed to inspect active sessions for disposable test database '{database_name}'")
+    })?;
+    Ok(session_count > 0)
+}
+
+async fn drop_database_with_connection(
+    connection: &mut PgConnection,
+    database_name: &str,
+) -> Result<()> {
     sqlx::query(
         r#"
         SELECT pg_terminate_backend(pid)
@@ -194,7 +275,7 @@ async fn drop_database(admin_database_url: &str, pool: PgPool, database_name: &s
         "#,
     )
     .bind(database_name)
-    .execute(&mut connection)
+    .execute(&mut *connection)
     .await
     .with_context(|| {
         format!(
@@ -206,6 +287,46 @@ async fn drop_database(admin_database_url: &str, pool: PgPool, database_name: &s
         .await
         .with_context(|| format!("failed to drop disposable test database '{database_name}'"))?;
     Ok(())
+}
+
+fn is_stale_test_database_name(database_name: &str) -> bool {
+    let Some((timestamp, _suffix)) = parse_test_database_name(database_name) else {
+        return false;
+    };
+    current_unix_timestamp_secs().saturating_sub(timestamp) >= STALE_TEST_DATABASE_MIN_AGE_SECS
+}
+
+fn parse_test_database_name(database_name: &str) -> Option<(u64, &str)> {
+    let suffix = database_name.strip_prefix(TEST_DATABASE_PREFIX)?;
+    let (timestamp, uuid_suffix) = suffix.split_once('_')?;
+    let timestamp = timestamp.parse::<u64>().ok()?;
+    if uuid_suffix.is_empty() {
+        return None;
+    }
+    Some((timestamp, uuid_suffix))
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_secs()
+}
+
+struct TestDatabaseFixture {
+    admin_database_url: String,
+    database_name: String,
+    pool: Option<PgPool>,
+}
+
+impl TestDatabaseFixture {
+    async fn cleanup(mut self) -> Result<()> {
+        let pool = self
+            .pool
+            .take()
+            .expect("test database fixture pool should exist during cleanup");
+        drop_database(&self.admin_database_url, pool, &self.database_name).await
+    }
 }
 
 #[allow(dead_code)]

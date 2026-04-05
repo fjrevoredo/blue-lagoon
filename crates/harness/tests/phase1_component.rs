@@ -2,9 +2,11 @@ mod support;
 
 use anyhow::Result;
 use chrono::Utc;
+use futures_util::FutureExt;
 use serde_json::json;
 use serial_test::serial;
-use sqlx::Row;
+use sqlx::{Connection, PgConnection, Row};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use harness::{
@@ -216,4 +218,85 @@ async fn execution_record_write_path_persists_rows() -> Result<()> {
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+#[serial]
+async fn disposable_database_fixture_cleans_up_after_panic() -> Result<()> {
+    let observed_database_name = Arc::new(Mutex::new(None::<String>));
+    let observed_database_name_for_task = observed_database_name.clone();
+
+    std::panic::AssertUnwindSafe(support::with_clean_database(move |ctx| {
+        let observed_database_name = observed_database_name_for_task.clone();
+        async move {
+            *observed_database_name
+                .lock()
+                .expect("observed database mutex should not be poisoned") =
+                Some(ctx.database_name.clone());
+            panic!("intentional fixture panic");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        }
+    }))
+    .catch_unwind()
+    .await
+    .expect_err("panic should propagate after cleanup");
+
+    let database_name = observed_database_name
+        .lock()
+        .expect("observed database mutex should not be poisoned")
+        .clone()
+        .expect("test should record disposable database name before panicking");
+    assert!(!database_exists(&resolved_test_postgres_admin_url(), &database_name).await?);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn disposable_database_fixture_sweeps_stale_test_databases() -> Result<()> {
+    let admin_database_url = resolved_test_postgres_admin_url();
+    let stale_database_name = format!("blue_lagoon_test_1_{}", Uuid::now_v7().simple());
+    let stale_database_name_for_fixture = stale_database_name.clone();
+    create_database(&admin_database_url, &stale_database_name).await?;
+    assert!(database_exists(&admin_database_url, &stale_database_name).await?);
+
+    support::with_clean_database(move |ctx| async move {
+        assert_ne!(ctx.database_name, stale_database_name_for_fixture);
+        Ok(())
+    })
+    .await?;
+
+    assert!(!database_exists(&admin_database_url, &stale_database_name).await?);
+    Ok(())
+}
+
+fn resolved_test_postgres_admin_url() -> String {
+    std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL").unwrap_or_else(|_| {
+        "postgres://blue_lagoon:blue_lagoon@localhost:55432/postgres".to_string()
+    })
+}
+
+async fn database_exists(admin_database_url: &str, database_name: &str) -> Result<bool> {
+    let mut connection = PgConnection::connect(admin_database_url).await?;
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_database
+            WHERE datname = $1
+        )
+        "#,
+    )
+    .bind(database_name)
+    .fetch_one(&mut connection)
+    .await?;
+    Ok(exists)
+}
+
+async fn create_database(admin_database_url: &str, database_name: &str) -> Result<()> {
+    let mut connection = PgConnection::connect(admin_database_url).await?;
+    sqlx::query(format!(r#"CREATE DATABASE "{database_name}""#).as_str())
+        .execute(&mut connection)
+        .await?;
+    Ok(())
 }

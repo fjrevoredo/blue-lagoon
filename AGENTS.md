@@ -98,6 +98,8 @@ Database-using automated tests must follow the repository fixture pattern:
   from automated tests
 - reserve the regular local app config and database for manual runtime and
   Telegram E2E validation
+- use `with_clean_database(...)` for unmigrated DB scenarios
+- use `with_migrated_database(...)` for normal migrated persistence tests
 
 When modifying code, prefer to run the lowest effective layer first, then rerun
 the relevant broader suite:

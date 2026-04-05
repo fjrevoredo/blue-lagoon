@@ -16,8 +16,9 @@ use harness::{
     telegram, worker,
 };
 use serial_test::serial;
-use sqlx::Row;
+use sqlx::{Connection, PgConnection, Row};
 use std::ffi::OsString;
+use tokio::time::{Duration as TokioDuration, sleep};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -615,6 +616,143 @@ async fn duplicate_foreground_trigger_is_idempotent_and_audited() -> Result<()> 
         assert_eq!(audit_events.len(), 2);
         assert_eq!(audit_events[0].event_kind, "foreground_trigger_accepted");
         assert_eq!(audit_events[1].event_kind, "foreground_trigger_duplicate");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_duplicate_foreground_trigger_is_recovered_from_db_conflict() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let _binding = foreground::reconcile_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: ingress.external_user_id.clone(),
+                external_conversation_id: ingress.external_conversation_id.clone(),
+                internal_principal_ref: ingress.internal_principal_ref.clone(),
+                internal_conversation_ref: ingress.internal_conversation_ref.clone(),
+            },
+        )
+        .await?;
+
+        let mut lock_connection = PgConnection::connect(&ctx.config.database.database_url).await?;
+        sqlx::query("BEGIN").execute(&mut lock_connection).await?;
+        sqlx::query(
+            r#"
+            SELECT conversation_binding_id
+            FROM conversation_bindings
+            WHERE internal_conversation_ref = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(&ingress.internal_conversation_ref)
+        .fetch_one(&mut lock_connection)
+        .await?;
+
+        let pool = ctx.pool.clone();
+        let config = ctx.config.clone();
+        let duplicate_candidate = ingress.clone();
+        let intake_task = tokio::spawn(async move {
+            foreground::intake_telegram_foreground_trigger(
+                &pool,
+                &config,
+                &sample_telegram_config(),
+                duplicate_candidate,
+            )
+            .await
+        });
+
+        wait_for_binding_reconcile_lock(&ctx.config.database.database_url).await?;
+
+        let canonical_execution_id = Uuid::now_v7();
+        let canonical_trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id: canonical_execution_id,
+                trace_id: canonical_trace_id,
+                trigger_kind: "telegram_user_ingress".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({
+                    "kind": "duplicate_race_fixture"
+                }),
+            },
+        )
+        .await?;
+        foreground::insert_ingress_event(
+            &ctx.pool,
+            &foreground::NewIngressEvent {
+                ingress: ingress.clone(),
+                conversation_binding_id: None,
+                trace_id: canonical_trace_id,
+                execution_id: Some(canonical_execution_id),
+                status: "accepted".to_string(),
+                rejection_reason: None,
+            },
+        )
+        .await?;
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock_connection)
+            .await
+            .expect("lock transaction should roll back cleanly");
+
+        let outcome = intake_task
+            .await
+            .expect("intake task should join cleanly")?;
+        let duplicate = match outcome {
+            foreground::ForegroundTriggerIntakeOutcome::Duplicate(duplicate) => duplicate,
+            other => panic!("expected duplicate outcome after DB conflict, got {other:?}"),
+        };
+
+        assert_eq!(duplicate.ingress_id, ingress.ingress_id);
+        assert_eq!(duplicate.execution_id, Some(canonical_execution_id));
+        assert_eq!(duplicate.trace_id, canonical_trace_id);
+
+        let ingress_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_events
+            WHERE channel_kind = 'telegram' AND external_event_id = $1
+            "#,
+        )
+        .bind(&ingress.external_event_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(ingress_count, 1);
+
+        let execution_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM execution_records
+            WHERE trigger_kind = 'telegram_user_ingress'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(execution_count, 1);
+
+        let audit_events = audit::list_for_execution(&ctx.pool, canonical_execution_id).await?;
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events[0].event_kind, "foreground_trigger_duplicate");
         Ok(())
     })
     .await
@@ -1498,4 +1636,28 @@ async fn insert_completed_episode(
 
     foreground::mark_episode_completed(pool, episode_id, "completed", "context test").await?;
     Ok(())
+}
+
+async fn wait_for_binding_reconcile_lock(database_url: &str) -> Result<()> {
+    for _ in 0..50 {
+        let mut connection = PgConnection::connect(database_url).await?;
+        let waiting_sessions: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM pg_stat_activity
+            WHERE state = 'active'
+              AND wait_event_type = 'Lock'
+              AND query LIKE '%FROM conversation_bindings%'
+              AND query LIKE '%FOR UPDATE%'
+            "#,
+        )
+        .fetch_one(&mut connection)
+        .await?;
+        if waiting_sessions > 0 {
+            return Ok(());
+        }
+        sleep(TokioDuration::from_millis(20)).await;
+    }
+
+    anyhow::bail!("foreground intake never blocked on the expected binding lock")
 }

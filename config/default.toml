@@ -17,6 +17,10 @@ timeout_ms = 10000
 # - a packaged sibling `workers` binary next to the runtime binary, or
 # - an explicit worker command supplied here or through BLUE_LAGOON_WORKER_COMMAND.
 # BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
+# worker.timeout_ms remains the generic worker timeout. Live Telegram foreground
+# derives its conscious worker timeout from harness.default_wall_clock_budget_ms
+# plus a fixed grace window so the foreground path cannot be shorter than the
+# configured foreground budget.
 command = ""
 args = []
 

@@ -904,6 +904,12 @@ Manual Telegram E2E remains an operator workflow against the regular local app
 configuration. Test isolation is a test-support responsibility, not a reason to
 split the local runtime into a separate E2E config profile.
 
+Live Telegram foreground timeout remains a harness-derived policy, not a
+separate operator-tuned worker timeout. The foreground wall-clock budget is
+owned by harness policy, the foreground model timeout is clamped to that budget,
+and the conscious worker timeout is derived from the same budget plus a bounded
+grace window.
+
 Mock-only testing is not acceptable for persistence, migration, recovery, or permission-boundary safety.
 
 ### Fault injection

@@ -51,6 +51,13 @@ cargo build -p runtime
 cargo run -p runtime -- migrate
 ```
 
+Timeout note:
+
+- tune live foreground duration through `harness.default_wall_clock_budget_ms`
+  and `model_gateway.foreground.timeout_ms`
+- `worker.timeout_ms` and `BLUE_LAGOON_WORKER_TIMEOUT_MS` are not the live
+  Telegram foreground timeout control
+
 ## 6. Sanity-check the harness boot
 
 ```bash
