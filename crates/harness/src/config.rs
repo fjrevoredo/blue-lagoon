@@ -79,12 +79,9 @@ impl RuntimeConfig {
 
         let worker_args = env::var("BLUE_LAGOON_WORKER_ARGS")
             .ok()
-            .map(|value| {
-                value
-                    .split_whitespace()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
+            .as_deref()
+            .map(parse_worker_args_override)
+            .transpose()?
             .unwrap_or_else(|| file_config.worker.args.clone());
 
         let config = Self {
@@ -136,6 +133,10 @@ impl RuntimeConfig {
     }
 }
 
+fn parse_worker_args_override(raw: &str) -> Result<Vec<String>> {
+    serde_json::from_str(raw).context("BLUE_LAGOON_WORKER_ARGS must be a JSON array of strings")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +186,19 @@ mod tests {
                 .to_string()
                 .contains("minimum_supported_schema_version")
         );
+    }
+
+    #[test]
+    fn parse_worker_args_override_accepts_json_array() {
+        let args = parse_worker_args_override(r#"["--flag","value with spaces"]"#)
+            .expect("worker args should parse");
+        assert_eq!(args, vec!["--flag", "value with spaces"]);
+    }
+
+    #[test]
+    fn parse_worker_args_override_rejects_shell_style_string() {
+        let error = parse_worker_args_override("--flag value")
+            .expect_err("shell-style strings should be rejected");
+        assert!(error.to_string().contains("JSON array"));
     }
 }

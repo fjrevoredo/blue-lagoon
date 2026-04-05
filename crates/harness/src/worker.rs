@@ -105,17 +105,9 @@ fn resolve_command(config: &RuntimeConfig) -> Result<CommandSpec> {
         });
     }
 
-    Ok(CommandSpec {
-        command: OsString::from("cargo"),
-        args: vec![
-            OsString::from("run"),
-            OsString::from("--quiet"),
-            OsString::from("-p"),
-            OsString::from("workers"),
-            OsString::from("--"),
-            OsString::from("smoke-worker"),
-        ],
-    })
+    bail!(
+        "worker command is not configured and no sibling workers binary was found; set worker.command or BLUE_LAGOON_WORKER_COMMAND explicitly"
+    )
 }
 
 fn sibling_worker_binary() -> Option<PathBuf> {

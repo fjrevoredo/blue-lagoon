@@ -26,6 +26,16 @@ Verify the harness can boot safely and return to idle:
 cargo run -p runtime -- harness --once --idle
 ```
 
+Before running the synthetic smoke trigger, make sure the harness can locate a
+worker executable. The intended v1 posture is an explicit worker binary rather
+than an implicit `cargo run` fallback. For local development, either:
+
+- build the worker binary first with `cargo build -p workers`, or
+- set `BLUE_LAGOON_WORKER_COMMAND` explicitly to the worker executable path
+
+If `BLUE_LAGOON_WORKER_ARGS` is needed, provide it as a JSON array of strings
+rather than as shell-split text.
+
 Run the Phase 1 synthetic smoke trigger:
 
 ```bash

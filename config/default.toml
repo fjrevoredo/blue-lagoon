@@ -11,5 +11,9 @@ default_wall_clock_budget_ms = 30000
 
 [worker]
 timeout_ms = 10000
+# The harness now requires either:
+# - a packaged sibling `workers` binary next to the runtime binary, or
+# - an explicit worker command supplied here or through BLUE_LAGOON_WORKER_COMMAND.
+# BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
 command = ""
 args = []

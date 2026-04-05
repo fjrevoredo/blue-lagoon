@@ -131,13 +131,29 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
     )
     .await?;
 
-    let response = worker::launch_smoke_worker(config, &request).await?;
+    let response = match worker::launch_smoke_worker(config, &request).await {
+        Ok(response) => response,
+        Err(error) => {
+            record_smoke_failure(pool, trace.trace_id, execution_id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
+    let response_payload = match serde_json::to_value(&response)
+        .context("failed to serialize worker response payload")
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            record_smoke_failure(pool, trace.trace_id, execution_id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
+
     execution::mark_succeeded(
         pool,
         execution_id,
         "smoke",
         response.worker_pid as i32,
-        &serde_json::to_value(&response).context("failed to serialize worker response payload")?,
+        &response_payload,
     )
     .await?;
 
@@ -169,4 +185,36 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
         execution_id,
         trace_id: trace.trace_id,
     })
+}
+
+async fn record_smoke_failure(
+    pool: &PgPool,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    error_message: &str,
+) -> Result<()> {
+    let failure_payload = json!({
+        "kind": "worker_failure",
+        "message": error_message,
+    });
+
+    execution::mark_failed(pool, execution_id, &failure_payload).await?;
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "harness".to_string(),
+            event_kind: "synthetic_trigger_failed".to_string(),
+            severity: "error".to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "synthetic_trigger": SyntheticTrigger::Smoke.as_str(),
+                "error": error_message,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
 }

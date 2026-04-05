@@ -98,6 +98,30 @@ pub async fn mark_succeeded(
     Ok(())
 }
 
+pub async fn mark_failed(
+    pool: &PgPool,
+    execution_id: Uuid,
+    response_payload: &Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE execution_records
+        SET
+            status = 'failed',
+            response_payload = $2,
+            updated_at = NOW(),
+            completed_at = NOW()
+        WHERE execution_id = $1
+        "#,
+    )
+    .bind(execution_id)
+    .bind(response_payload)
+    .execute(pool)
+    .await
+    .context("failed to mark execution record as failed")?;
+    Ok(())
+}
+
 pub async fn get(pool: &PgPool, execution_id: Uuid) -> Result<ExecutionRecord> {
     let row = sqlx::query(
         r#"
