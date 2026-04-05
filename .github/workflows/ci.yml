@@ -49,6 +49,9 @@ jobs:
       - name: cargo check --workspace
         run: cargo check --workspace
 
+      - name: cargo build -p workers
+        run: cargo build -p workers
+
       - name: cargo test -p harness --test phase2_component -- --nocapture
         run: cargo test -p harness --test phase2_component -- --nocapture
 
