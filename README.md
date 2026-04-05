@@ -12,8 +12,14 @@ specification lives in:
 - `docs/LOOP_ARCHITECTURE.md`
 - `docs/IMPLEMENTATION_DESIGN.md`
 
-Implementation plans and phase ledgers under `docs/PHASE_*` are useful project
-history, but they are not the stable description of repository behavior.
+Implementation plans and detailed planning ledgers under `docs/` are useful
+project history, but they are not the stable description of repository
+behavior.
+
+Planning labels belong only in planning documents. Deliverable artifacts such
+as code, tests, migrations, config, workflow steps, and canonical behavior
+docs should be named by capability or domain, not by sequencing labels from a
+project plan.
 
 ## Workspace Layout
 
@@ -172,6 +178,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 docker compose config
 ```
+
+Matched pre-commit helper scripts are available for the same validation set:
+
+- bash/WSL: `./scripts/pre-commit.sh`
+- PowerShell: `./scripts/pre-commit.ps1`
+
+If `markdownlint` is installed locally, the scripts run it in warning-only mode
+by default because the repository-wide Markdown baseline is not yet fully
+clean. Set `BLUE_LAGOON_STRICT_MARKDOWNLINT=1` to make Markdown lint failures
+blocking.
 
 Useful command-surface checks:
 

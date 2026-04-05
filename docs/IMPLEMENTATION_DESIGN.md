@@ -9,9 +9,18 @@ Audience: Implementation planning and implementation work
 
 This document defines the validated implementation design for Blue Lagoon.
 
-It consolidates the settled architectural decisions, implementation-direction choices, operational constraints, and validation guidance gathered during the design phase into one canonical baseline for implementation planning and implementation work.
+It consolidates the settled architectural decisions, implementation-direction choices, operational constraints, and validation guidance gathered during design work into one canonical baseline for implementation planning and implementation work.
 
 This document is intended to stand on its own as the current implementation-design source of truth.
+
+## Artifact naming discipline
+
+Planning labels are allowed inside planning documents, but they must not become
+the names of runtime-facing or repository-facing deliverables.
+
+Code, tests, migrations, config, workflow steps, and canonical behavior docs
+must be named by domain or capability so repository artifacts describe what
+they are, not where they happened to appear in an implementation sequence.
 
 ## Current product definition
 

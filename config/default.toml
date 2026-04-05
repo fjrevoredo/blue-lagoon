@@ -8,7 +8,7 @@ minimum_supported_schema_version = 1
 [harness]
 allow_synthetic_smoke = true
 default_foreground_iteration_budget = 1
-default_wall_clock_budget_ms = 30000
+default_wall_clock_budget_ms = 60000
 default_foreground_token_budget = 4000
 
 [worker]
@@ -37,7 +37,7 @@ poll_limit = 10
 provider = "z_ai"
 model = "z-ai-foreground"
 api_key_env = "BLUE_LAGOON_FOREGROUND_API_KEY"
-timeout_ms = 30000
+timeout_ms = 60000
 
 [model_gateway.z_ai]
 api_surface = "coding"

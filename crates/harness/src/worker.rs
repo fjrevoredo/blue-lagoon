@@ -184,7 +184,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         let response = match final_message {
             ConsciousWorkerOutboundMessage::ModelCallRequest(_) => {
                 bail!(
-                    "conscious worker emitted more than one model-call request; Phase 2 supports only one"
+                    "conscious worker emitted more than one model-call request; foreground execution supports only one"
                 )
             }
             ConsciousWorkerOutboundMessage::FinalResponse(response) => response,

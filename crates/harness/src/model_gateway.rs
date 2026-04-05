@@ -191,12 +191,12 @@ fn validate_foreground_request(
 ) -> std::result::Result<(), ModelGatewayError> {
     if request.loop_kind != LoopKind::Conscious {
         return Err(ModelGatewayError::Validation(
-            "Phase 2 model gateway supports only conscious-loop requests".to_string(),
+            "foreground model gateway supports only conscious-loop requests".to_string(),
         ));
     }
     if request.purpose != ModelCallPurpose::ForegroundResponse {
         return Err(ModelGatewayError::Validation(
-            "Phase 2 model gateway supports only foreground-response requests".to_string(),
+            "foreground model gateway supports only foreground-response requests".to_string(),
         ));
     }
     if request.budget.max_input_tokens == 0 {

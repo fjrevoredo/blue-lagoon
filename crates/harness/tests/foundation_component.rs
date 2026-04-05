@@ -23,7 +23,7 @@ async fn migration_application_creates_foundation_and_foreground_tables() -> Res
         let summary =
             migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
 
-        assert_eq!(summary.discovered_versions, vec![1, 2]);
+        assert_eq!(summary.discovered_versions, vec![1, 2, 3]);
         let tables = sqlx::query(
             r#"
             SELECT table_name
@@ -60,11 +60,11 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 2,
+                expected_version: 3,
             },
         )
         .await?;
-        assert_eq!(supported, 2);
+        assert_eq!(supported, 3);
         Ok(())
     })
     .await?;
@@ -76,7 +76,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             INSERT INTO schema_migrations
                 (version, name, checksum, applied_at, app_version, applied_by, execution_ms)
             VALUES
-                (2, 'phase_2_only', 'gap', NOW(), 'test', 'test', 1)
+                (2, 'foreground_only', 'gap', NOW(), 'test', 'test', 1)
             "#,
         )
         .execute(&ctx.pool)
@@ -86,7 +86,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 2,
+                expected_version: 3,
             },
         )
         .await
@@ -102,7 +102,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             INSERT INTO schema_migrations
                 (version, name, checksum, applied_at, app_version, applied_by, execution_ms)
             VALUES
-                (3, 'future_schema', 'future', NOW(), 'test', 'test', 1)
+                (4, 'future_schema', 'future', NOW(), 'test', 'test', 1)
             "#,
         )
         .execute(&ctx.pool)
@@ -112,7 +112,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 2,
+                expected_version: 3,
             },
         )
         .await
@@ -137,12 +137,61 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 2,
+                expected_version: 3,
             },
         )
         .await
         .expect_err("tampered migration history should fail closed");
         assert!(tampered_error.to_string().contains("checksum"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn migrate_normalizes_schema_migration_names_to_capability_labels() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        sqlx::query(
+            r#"
+            UPDATE schema_migrations
+            SET name = CASE version
+                WHEN 1 THEN 'legacy_foundation'
+                WHEN 2 THEN 'legacy_foreground'
+                ELSE name
+            END
+            WHERE version IN (1, 2)
+            "#,
+        )
+        .execute(&ctx.pool)
+        .await?;
+
+        let summary =
+            migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
+        assert!(summary.applied_versions.is_empty());
+
+        let rows = sqlx::query(
+            r#"
+            SELECT version, name
+            FROM schema_migrations
+            ORDER BY version
+            "#,
+        )
+        .fetch_all(&ctx.pool)
+        .await?;
+
+        let names = rows
+            .into_iter()
+            .map(|row| (row.get::<i64, _>("version"), row.get::<String, _>("name")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                (1, "runtime_foundation".to_string()),
+                (2, "foreground_loop".to_string()),
+                (3, "migration_metadata_normalization".to_string()),
+            ]
+        );
         Ok(())
     })
     .await

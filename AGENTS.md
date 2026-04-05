@@ -12,7 +12,7 @@ Planning material also lives under `docs/`, but it should be treated according
 to purpose:
 
 - `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`: repository roadmap and sequencing
-- `docs/PHASE_*_DETAILED_IMPLEMENTATION_PLAN.md`: implementation ledgers and
+- detailed implementation plans under `docs/`: implementation ledgers and
   historical execution records, not canonical runtime behavior
 
 Runtime code lives under `crates/`:
@@ -32,6 +32,10 @@ Use `docs/sources/` for research inputs and external references. Historical
 handover documents live in `docs/archive/` and should be treated as archived
 context rather than current canonical guidance.
 
+Planning labels belong in planning documents only. Code, tests, migrations,
+config, workflow steps, and canonical behavior docs must use domain or
+capability names rather than project-sequencing labels.
+
 ## Build, Test, and Development Commands
 
 Typical implementation workflow is:
@@ -42,6 +46,14 @@ Typical implementation workflow is:
 - `cargo clippy --workspace --all-targets -- -D warnings` to keep linting clean.
 - `cargo test --workspace` to run unit, component, and integration tests.
 - `docker compose config` to verify the local runtime topology.
+- `./scripts/pre-commit.sh` to run the standard pre-commit verification bundle
+  from bash/WSL.
+- `./scripts/pre-commit.ps1` to run the same pre-commit verification bundle
+  from PowerShell.
+- `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.sh` or
+  `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.ps1` to make the
+  optional Markdown lint step blocking once the repository Markdown baseline is
+  ready for it.
 - `docker compose up -d postgres` to start local PostgreSQL.
 - `cargo run -p runtime -- migrate` to apply reviewed migrations.
 - `cargo run -p runtime -- --help` to inspect the stable CLI surface.
@@ -112,8 +124,8 @@ Documentation testing remains manual. Verify that section hierarchy is
 consistent, terminology matches `PHILOSOPHY.md`, `docs/REQUIREMENTS.md`,
 `docs/LOOP_ARCHITECTURE.md`, and `docs/IMPLEMENTATION_DESIGN.md`, and
 cross-document claims do not conflict. `README.md` and `AGENTS.md` should stay
-repository-oriented and stable rather than being written as phase handoff notes
-or temporary execution status reports. Re-read modified files in rendered
+repository-oriented and stable rather than being written as handoff notes or
+temporary execution status reports. Re-read modified files in rendered
 Markdown when possible. Treat broken links, contradictory definitions, and
 unclear scope boundaries as defects that must be fixed before merge.
 

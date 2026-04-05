@@ -1,4 +1,4 @@
-# Blue Lagoon Phase 2 Telegram E2E Checklist
+# Blue Lagoon Telegram E2E Checklist
 
 Use this sequence.
 
@@ -118,8 +118,8 @@ than replying twice.
 Useful extra checks:
 
 ```bash
-cargo test -p harness --test phase2_component -- --nocapture
-cargo test -p harness --test phase2_integration -- --nocapture
+cargo test -p harness --test foreground_component -- --nocapture
+cargo test -p harness --test foreground_integration -- --nocapture
 ```
 
 If needed, prepare a minimal known-good local config in `config/default.toml`

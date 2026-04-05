@@ -33,7 +33,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from phase2 integration" },
+                    "message": { "content": "assistant reply from foreground integration" },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -60,7 +60,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "assistant reply from phase2 integration"
+            "assistant reply from foreground integration"
         );
 
         let execution_row = sqlx::query(
@@ -96,7 +96,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
         assert_eq!(messages[1].message_role, "assistant");
         assert_eq!(
             messages[1].text_body.as_deref(),
-            Some("assistant reply from phase2 integration")
+            Some("assistant reply from foreground integration")
         );
 
         let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;

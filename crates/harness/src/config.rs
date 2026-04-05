@@ -257,14 +257,14 @@ impl RuntimeConfig {
         let telegram = self
             .telegram
             .as_ref()
-            .context("missing Phase 2 Telegram configuration")?;
+            .context("missing Telegram foreground configuration")?;
         telegram.validate()?;
 
         Ok(ResolvedTelegramConfig {
             api_base_url: telegram.api_base_url.clone(),
             bot_token: require_secret_env(
                 &telegram.bot_token_env,
-                "Phase 2 Telegram bot token environment variable",
+                "Telegram bot token environment variable",
             )?,
             allowed_user_id: telegram.allowed_user_id,
             allowed_chat_id: telegram.allowed_chat_id,
@@ -278,7 +278,7 @@ impl RuntimeConfig {
         let model_gateway = self
             .model_gateway
             .as_ref()
-            .context("missing Phase 2 model gateway configuration")?;
+            .context("missing foreground model gateway configuration")?;
         model_gateway.validate()?;
 
         Ok(ResolvedModelGatewayConfig {
@@ -296,19 +296,19 @@ impl RuntimeConfig {
         let self_model = self
             .self_model
             .as_ref()
-            .context("missing Phase 2 self-model seed configuration")?;
+            .context("missing foreground self-model seed configuration")?;
         self_model.validate()?;
 
         let seed_path = resolve_relative_to_config(&self_model.seed_path);
         let metadata = fs::metadata(&seed_path).with_context(|| {
             format!(
-                "failed to access Phase 2 self-model seed artifact at {}",
+                "failed to access foreground self-model seed artifact at {}",
                 seed_path.display()
             )
         })?;
         if !metadata.is_file() {
             bail!(
-                "Phase 2 self-model seed artifact path is not a file: {}",
+                "foreground self-model seed artifact path is not a file: {}",
                 seed_path.display()
             );
         }
@@ -440,7 +440,7 @@ fn require_foreground_api_key(configured_env_name: &str) -> Result<String> {
 
     require_secret_env(
         configured_env_name,
-        "Phase 2 model gateway API key environment variable",
+        "foreground model gateway API key environment variable",
     )
 }
 
@@ -615,10 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_phase_1_only_configuration() {
+    fn validate_accepts_minimal_configuration_without_foreground_sections() {
         sample_config()
             .validate()
-            .expect("phase 1 configuration should remain valid");
+            .expect("minimal configuration should remain valid");
     }
 
     #[test]
@@ -653,7 +653,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("missing Phase 2 Telegram configuration")
+                .contains("missing Telegram foreground configuration")
         );
     }
 
@@ -677,7 +677,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("missing required Phase 2 Telegram bot token")
+                .contains("missing required Telegram bot token")
         );
     }
 
@@ -702,7 +702,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("missing required Phase 2 model gateway API key")
+                .contains("missing required foreground model gateway API key")
         );
     }
 

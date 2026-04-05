@@ -105,7 +105,7 @@ pub fn evaluate_telegram_foreground_trigger(
         IngressEventKind::MessageCreated | IngressEventKind::CommandIssued => {}
         IngressEventKind::ApprovalCallback => {
             return PolicyDecision::Denied {
-                reason: "approval callbacks are not yet supported as Phase 2 foreground triggers"
+                reason: "approval callbacks are not yet supported as foreground Telegram triggers"
                     .to_string(),
             };
         }

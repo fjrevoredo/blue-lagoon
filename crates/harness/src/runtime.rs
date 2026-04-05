@@ -81,7 +81,7 @@ pub async fn run_harness_once(
     options: HarnessOptions,
 ) -> Result<HarnessOutcome> {
     if !options.once {
-        bail!("Phase 1 only supports one-shot harness execution");
+        bail!("current harness mode supports one-shot execution only");
     }
     if options.idle == options.synthetic_trigger.is_some() {
         bail!("choose exactly one of --idle or --synthetic-trigger");

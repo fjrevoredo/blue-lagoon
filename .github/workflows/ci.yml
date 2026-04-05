@@ -52,11 +52,11 @@ jobs:
       - name: cargo build -p workers
         run: cargo build -p workers
 
-      - name: cargo test -p harness --test phase2_component -- --nocapture
-        run: cargo test -p harness --test phase2_component -- --nocapture
+      - name: cargo test -p harness --test foreground_component -- --nocapture
+        run: cargo test -p harness --test foreground_component -- --nocapture
 
-      - name: cargo test -p harness --test phase2_integration -- --nocapture
-        run: cargo test -p harness --test phase2_integration -- --nocapture
+      - name: cargo test -p harness --test foreground_integration -- --nocapture
+        run: cargo test -p harness --test foreground_integration -- --nocapture
 
       - name: cargo test --workspace
         run: cargo test --workspace

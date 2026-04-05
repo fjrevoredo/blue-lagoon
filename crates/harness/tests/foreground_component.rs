@@ -266,7 +266,7 @@ async fn foreground_persistence_reads_recent_episode_history() -> Result<()> {
                 synthetic_trigger: None,
                 status: "started".to_string(),
                 request_payload: serde_json::json!({
-                    "kind": "phase2_component"
+                    "kind": "foreground_component"
                 }),
             },
         )
@@ -1132,7 +1132,7 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
         assert!(
             error
                 .to_string()
-                .contains("missing Phase 2 self-model seed configuration")
+                .contains("missing foreground self-model seed configuration")
         );
 
         let execution_row = sqlx::query(
@@ -1333,7 +1333,7 @@ async fn runtime_poll_once_fails_closed_when_telegram_config_is_absent() -> Resu
         assert!(
             error
                 .to_string()
-                .contains("missing Phase 2 Telegram configuration")
+                .contains("missing Telegram foreground configuration")
         );
         Ok(())
     })
@@ -1576,7 +1576,7 @@ async fn insert_completed_episode(
         &execution::NewExecutionRecord {
             execution_id,
             trace_id,
-            trigger_kind: format!("phase2-context-{suffix}"),
+            trigger_kind: format!("foreground-context-{suffix}"),
             synthetic_trigger: None,
             status: "started".to_string(),
             request_payload: serde_json::json!({ "kind": "context_assembly_test", "suffix": suffix }),
