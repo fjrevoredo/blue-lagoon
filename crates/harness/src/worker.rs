@@ -1,20 +1,26 @@
 use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use contracts::{WorkerRequest, WorkerResponse, WorkerResult};
+use contracts::{
+    ConsciousWorkerInboundMessage, ConsciousWorkerOutboundMessage, WorkerRequest, WorkerResponse,
+    WorkerResult,
+};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     time::timeout,
 };
 
-use crate::config::RuntimeConfig;
+use crate::{
+    config::{ResolvedModelGatewayConfig, RuntimeConfig},
+    model_gateway::{self, ModelProviderTransport},
+};
 
 pub async fn launch_smoke_worker(
     config: &RuntimeConfig,
     request: &WorkerRequest,
 ) -> Result<WorkerResponse> {
-    let command_spec = resolve_command(config)?;
+    let command_spec = resolve_command(config, "smoke-worker")?;
     let mut command = Command::new(&command_spec.command);
     command
         .args(&command_spec.args)
@@ -84,13 +90,133 @@ pub async fn launch_smoke_worker(
     Ok(response)
 }
 
+pub async fn launch_conscious_worker<T: ModelProviderTransport>(
+    config: &RuntimeConfig,
+    gateway: &ResolvedModelGatewayConfig,
+    request: &WorkerRequest,
+    transport: &T,
+) -> Result<WorkerResponse> {
+    let command_spec = resolve_command(config, "conscious-worker")?;
+    let mut command = Command::new(&command_spec.command);
+    command
+        .args(&command_spec.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn conscious worker subprocess")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to take conscious worker stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to take conscious worker stdout")?;
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let mut stderr = stderr;
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        })
+    });
+    let mut stdout_lines = BufReader::new(stdout).lines();
+
+    let operation = async {
+        write_json_line(&mut stdin, request).await?;
+
+        let first_line = stdout_lines
+            .next_line()
+            .await
+            .context("failed to read conscious worker model-request line")?
+            .context("conscious worker exited before sending a protocol message")?;
+        let first_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&first_line)
+            .context("failed to decode first worker protocol message")?;
+
+        let model_request = match first_message {
+            ConsciousWorkerOutboundMessage::ModelCallRequest(model_request) => model_request,
+            ConsciousWorkerOutboundMessage::FinalResponse(response) => {
+                let status = child
+                    .wait()
+                    .await
+                    .context("conscious worker failed while waiting for exit status")?;
+                return Ok((response, status));
+            }
+        };
+
+        let model_response =
+            model_gateway::execute_foreground_model_call(gateway, &model_request, transport)
+                .await
+                .context("conscious worker model-call execution failed in the harness")?;
+        write_json_line(
+            &mut stdin,
+            &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),
+        )
+        .await?;
+        drop(stdin);
+
+        let final_line = stdout_lines
+            .next_line()
+            .await
+            .context("failed to read conscious worker final-response line")?
+            .context("conscious worker exited before sending a final response")?;
+        let final_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&final_line)
+            .context("failed to decode final worker protocol message")?;
+        let response = match final_message {
+            ConsciousWorkerOutboundMessage::ModelCallRequest(_) => {
+                bail!(
+                    "conscious worker emitted more than one model-call request; Phase 2 supports only one"
+                )
+            }
+            ConsciousWorkerOutboundMessage::FinalResponse(response) => response,
+        };
+
+        let status = child
+            .wait()
+            .await
+            .context("conscious worker failed while waiting for exit status")?;
+        Ok((response, status))
+    };
+
+    let (response, status) =
+        match timeout(Duration::from_millis(config.worker.timeout_ms), operation).await {
+            Ok(result) => result?,
+            Err(_) => {
+                child
+                    .start_kill()
+                    .context("failed to terminate timed-out conscious worker subprocess")?;
+                let _ = child.wait().await;
+                let _ = read_child_stream(stderr_task, "stderr").await;
+                bail!(
+                    "conscious worker subprocess timed out after {} ms and was terminated",
+                    config.worker.timeout_ms
+                );
+            }
+        };
+
+    let stderr = read_child_stream(stderr_task, "stderr").await?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        bail!("conscious worker subprocess failed: {stderr}");
+    }
+    if let WorkerResult::Error(error) = &response.result {
+        bail!(
+            "conscious worker returned an error response: {}",
+            error.message
+        );
+    }
+    Ok(response)
+}
+
 #[derive(Debug, Clone)]
 struct CommandSpec {
     command: OsString,
     args: Vec<OsString>,
 }
 
-fn resolve_command(config: &RuntimeConfig) -> Result<CommandSpec> {
+fn resolve_command(config: &RuntimeConfig, default_subcommand: &str) -> Result<CommandSpec> {
     if !config.worker.command.trim().is_empty() {
         return Ok(CommandSpec {
             command: OsString::from(&config.worker.command),
@@ -101,7 +227,7 @@ fn resolve_command(config: &RuntimeConfig) -> Result<CommandSpec> {
     if let Some(path) = sibling_worker_binary() {
         return Ok(CommandSpec {
             command: path.into_os_string(),
-            args: vec![OsString::from("smoke-worker")],
+            args: vec![OsString::from(default_subcommand)],
         });
     }
 
@@ -133,4 +259,24 @@ async fn read_child_stream(
             .with_context(|| format!("failed to read worker {stream_name}")),
         None => Ok(Vec::new()),
     }
+}
+
+async fn write_json_line<T: serde::Serialize>(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    value: &T,
+) -> Result<()> {
+    let json = serde_json::to_string(value).context("failed to encode worker protocol message")?;
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .context("failed to write worker protocol line")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("failed to terminate worker protocol line")?;
+    writer
+        .flush()
+        .await
+        .context("failed to flush worker stdin")?;
+    Ok(())
 }

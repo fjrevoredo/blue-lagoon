@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use chrono::Utc;
 use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundTrigger};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
@@ -37,7 +38,7 @@ pub struct ContextAssemblyOptions {
     pub active_conditions: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextAssemblyMetadata {
     pub source_ingress_id: Uuid,
     pub self_model_seed_path: String,

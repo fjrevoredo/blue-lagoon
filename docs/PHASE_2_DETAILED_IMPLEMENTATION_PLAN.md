@@ -212,22 +212,25 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `MILESTONE C`
-- Current active task: `P2-12`
-- Completed tasks: `11/18`
+- Current milestone: `COMPLETE`
+- Current active task: `none`
+- Completed tasks: `18/18`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
-- Milestone C status: `IN PROGRESS`
-- Milestone D status: `TODO`
+- Milestone C status: `DONE`
+- Milestone D status: `DONE`
 
 Latest verification state:
 
-- Phase 2 state has been self-checked after `P2-06` and `P2-11`
+- Phase 2 state has been self-checked after `P2-06`, `P2-11`, `P2-12`,
+  `P2-13`, `P2-14`, `P2-15`, `P2-16`, `P2-17`, and `P2-18`
   implementation.
 - `cmd.exe /c cargo fmt --all --check` is green.
 - `cmd.exe /c cargo check --workspace` is green.
 - `cmd.exe /c cargo test -p contracts -- --nocapture` is green.
 - `cmd.exe /c cargo test -p harness -- --nocapture` is green.
+- `cmd.exe /c cargo test -p harness --test phase2_integration -- --nocapture`
+  is green.
 - `cmd.exe /c cargo test -p workers -- --nocapture` is green.
 - `cmd.exe /c cargo test --workspace` is green.
 
@@ -667,7 +670,7 @@ Milestone D is green only if:
 
 ### Task P2-12: Implement the harness-owned model gateway and one provider adapter
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-02`, `P2-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -679,11 +682,27 @@ Milestone D is green only if:
   - unit tests for routing, validation, and provider-error handling
   - component tests using the fake provider
 - Evidence:
-  - pending
+  - Added a harness-owned provider-agnostic gateway in
+    `crates/harness/src/model_gateway.rs` with request validation, foreground
+    route resolution, provider-hint compatibility checks, fake-provider
+    transport support, and one concrete `z.ai` adapter that emits an
+    OpenAI-compatible chat-completions request and normalizes the provider
+    response back into the canonical `ModelCallResponse` contract. Added the
+    required HTTP client dependency in `Cargo.toml` and
+    `crates/harness/Cargo.toml`, exported the new module in
+    `crates/harness/src/lib.rs`, and kept provider logic entirely inside the
+    harness boundary rather than the worker runtime. Expanded
+    `crates/harness/tests/phase2_component.rs` with a fake-provider component
+    test and added unit coverage in `crates/harness/src/model_gateway.rs` for
+    routing, validation, and provider-error handling. Verified with
+    `cmd.exe /c cargo test -p harness -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-13: Implement the conscious worker path for one harness-mediated model cycle
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-05`, `P2-06`, `P2-11`, `P2-12`
 - Parallel-safe: no
 - Deliverables:
@@ -697,11 +716,25 @@ Milestone D is green only if:
   - worker unit tests
   - component tests with fake provider and fake transport
 - Evidence:
-  - pending
+  - Added the harness-side conscious worker launcher in
+    `crates/harness/src/worker.rs`, extending the worker subprocess boundary to
+    support one line-oriented `ModelCallRequest` / `ModelCallResponse` exchange
+    followed by a final structured worker response, while preserving the Phase 1
+    smoke-worker path. The harness now executes the worker-emitted model call
+    through the harness-owned gateway rather than exposing provider logic inside
+    the worker. Added a PostgreSQL-backed Phase 2 component test in
+    `crates/harness/tests/phase2_component.rs` proving the conscious worker can
+    consume bounded context, request one harness-mediated model call through the
+    fake provider, and return structured assistant output plus episode metadata
+    without canonical-write authority. Verified with
+    `cmd.exe /c cargo test -p harness -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-14: Implement end-to-end foreground orchestration from ingress to response
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-04`, `P2-07`, `P2-09`, `P2-13`
 - Parallel-safe: no
 - Deliverables:
@@ -714,11 +747,24 @@ Milestone D is green only if:
   - component tests for foreground orchestration with real PostgreSQL and fake
     provider or Telegram transport boundaries
 - Evidence:
-  - pending
+  - Added `crates/harness/src/foreground_orchestration.rs` to drive the
+    accepted Phase 2 Telegram foreground path from ingress intake through
+    episode creation, bounded context assembly, conscious worker launch,
+    harness-owned model-call mediation, Telegram reply delivery, execution or
+    episode completion, and trace-linked success or failure audit emission.
+  - Added and validated the PostgreSQL-backed end-to-end component test
+    `foreground_orchestration_runs_from_ingress_to_delivery` in
+    `crates/harness/tests/phase2_component.rs`, proving a normalized Telegram
+    private-message fixture can become a persisted foreground episode and a
+    delivered Telegram reply through fake provider and Telegram boundaries.
+  - Verified with `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`,
+    `cmd.exe /c cargo test -p harness -- --nocapture`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-15: Add thin runtime entrypoints for fixture-driven and poll-once Telegram execution
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-07`, `P2-14`
 - Parallel-safe: no
 - Deliverables:
@@ -732,11 +778,27 @@ Milestone D is green only if:
   - local manual check of the implemented poll-once path with safe fail-closed
     behavior when Telegram configuration is absent
 - Evidence:
-  - pending
+  - Added a new `runtime telegram` command surface in `crates/runtime/src/main.rs`
+    with `--fixture <path>` and `--poll-once` one-shot modes while keeping the
+    runtime crate thin.
+  - Added harness-owned Telegram runtime wiring in `crates/harness/src/runtime.rs`
+    for fixture processing, live poll-once execution, and per-run outcome
+    summaries while preserving orchestration logic inside `crates/harness`.
+  - Added live Telegram HTTP boundaries in `crates/harness/src/telegram.rs` for
+    one-shot `getUpdates` polling and `sendMessage` delivery, plus unit tests
+    against a local single-use HTTP server proving request or response shape.
+  - Added PostgreSQL-backed Phase 2 component tests in
+    `crates/harness/tests/phase2_component.rs` covering the fixture-driven
+    runtime path and fail-closed runtime rejection when Telegram configuration
+    is absent for `--poll-once`.
+  - Verified with `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`,
+    `cmd.exe /c cargo test -p harness -- --nocapture`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-16: Add unit and component coverage for the Phase 2 foreground subsystems
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-04`, `P2-07`, `P2-09`, `P2-10`, `P2-11`, `P2-12`, `P2-13`
 - Parallel-safe: yes
 - Deliverables:
@@ -748,11 +810,29 @@ Milestone D is green only if:
 - Verification:
   - `cargo test --workspace`
 - Evidence:
-  - pending
+  - Unit coverage now exists in `crates/harness/src/config.rs`,
+    `crates/harness/src/ingress.rs`, `crates/harness/src/policy.rs`,
+    `crates/harness/src/self_model.rs`, `crates/harness/src/context.rs`,
+    `crates/harness/src/model_gateway.rs`, and
+    `crates/harness/src/telegram.rs` for normalization, validation, budgeting,
+    self-model seeding, internal-state snapshots, provider routing, and
+    Telegram transport boundaries.
+  - PostgreSQL-backed component coverage now exists in
+    `crates/harness/tests/phase2_component.rs` for persistence, trigger
+    acceptance or rejection, deduplication, bounded context assembly, model
+    gateway execution, conscious worker mediation, end-to-end foreground
+    orchestration, fixture-driven runtime execution, and fail-closed runtime
+    behavior when Telegram configuration is absent.
+  - Regression coverage now includes fail-closed invalid Telegram timestamps,
+    unsupported chat modes, unauthorized actors, empty foreground text,
+    approval callbacks, duplicate ingress, provider mismatch, provider error
+    responses, invalid model-call request shapes, and missing Telegram runtime
+    configuration.
+  - Verified with `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-17: Add architecture-critical foreground integration tests
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-14`, `P2-15`, `P2-16`
 - Parallel-safe: no
 - Deliverables:
@@ -766,11 +846,20 @@ Milestone D is green only if:
   - targeted integration-test execution
   - `cargo test --workspace`
 - Evidence:
-  - pending
+  - Added `crates/harness/tests/phase2_integration.rs` with a runtime-facing
+    foreground integration test proving a normalized Telegram fixture can flow
+    through fixture-driven runtime execution into persisted execution, episode,
+    assistant response, and trace-linked audit records.
+  - Added a second runtime-facing foreground integration test in
+    `crates/harness/tests/phase2_integration.rs` proving duplicate Telegram
+    ingress is idempotent, does not trigger an extra provider call or delivery,
+    and emits duplicate-path audit evidence.
+  - Verified with `cmd.exe /c cargo test -p harness --test phase2_integration -- --nocapture`
+    and `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-18: Extend repository CI and canonical docs for the Phase 2 foreground gate
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-15`, `P2-16`, `P2-17`
 - Parallel-safe: no
 - Deliverables:
@@ -785,4 +874,16 @@ Milestone D is green only if:
   - review of at least one successful repository-hosted run if the environment
     can record it, otherwise explicit blocker documentation
 - Evidence:
-  - pending
+  - Updated `.github/workflows/ci.yml` so the stable
+    `workspace-verification` job now runs explicit Phase 2 foreground component
+    and integration suites in addition to the workspace-wide checks, without
+    renaming the baseline gate.
+  - Updated `README.md` with the Phase 2 `runtime telegram --fixture` and
+    `runtime telegram --poll-once` command surface, operator prerequisites, and
+    explicit documentation that live Telegram or provider checks remain
+    intentionally outside repository-hosted CI.
+  - Updated this document to reflect final Phase 2 task status, progress, and
+    verification evidence.
+  - Repository-hosted live-network run evidence could not be recorded from the
+    current implementation environment, so the blocker is documented explicitly
+    in `README.md` rather than being left implicit.

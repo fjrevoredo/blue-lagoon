@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use contracts::{WorkerRequest, WorkerResult};
 use serde_json::json;
@@ -10,9 +12,13 @@ use crate::{
     config::RuntimeConfig,
     db,
     execution::{self, NewExecutionRecord},
+    foreground_orchestration::{self, TelegramForegroundOrchestrationOutcome},
+    ingress::{self, TelegramNormalizationOutcome},
     migration,
+    model_gateway::{self, ModelProviderTransport},
     policy::{self, PolicyDecision},
     schema::{self, SchemaPolicy},
+    telegram::{self, TelegramDelivery, TelegramUpdate},
     trace::TraceContext,
     worker,
 };
@@ -43,6 +49,28 @@ pub enum HarnessOutcome {
     SyntheticCompleted { execution_id: Uuid, trace_id: Uuid },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramOptions {
+    pub fixture_path: Option<PathBuf>,
+    pub poll_once: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelegramOutcome {
+    FixtureProcessed(TelegramProcessingSummary),
+    PollProcessed(TelegramProcessingSummary),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TelegramProcessingSummary {
+    pub fetched_updates: usize,
+    pub completed_count: usize,
+    pub duplicate_count: usize,
+    pub trigger_rejected_count: usize,
+    pub normalization_rejected_count: usize,
+    pub ignored_count: usize,
+}
+
 pub async fn run_migrate(config: &RuntimeConfig) -> Result<migration::MigrationSummary> {
     let pool = db::connect(config).await?;
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await
@@ -71,6 +99,79 @@ pub async fn run_harness_once(
         Some(SyntheticTrigger::Smoke) => run_smoke_trigger(&pool, config).await,
         None => bail!("missing harness mode"),
     }
+}
+
+pub async fn run_telegram_once(
+    config: &RuntimeConfig,
+    options: TelegramOptions,
+) -> Result<TelegramOutcome> {
+    if options.fixture_path.is_some() == options.poll_once {
+        bail!("choose exactly one of --fixture or --poll-once");
+    }
+
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let telegram_config = config.require_telegram_config()?;
+    let model_gateway_config = config.require_model_gateway_config()?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+
+    if let Some(fixture_path) = options.fixture_path {
+        let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
+        let summary = run_telegram_fixture_with(
+            &pool,
+            config,
+            &telegram_config,
+            &model_gateway_config,
+            &fixture_path,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+        return Ok(TelegramOutcome::FixtureProcessed(summary));
+    }
+
+    let updates = telegram::fetch_updates_once(telegram_config.clone())?;
+    let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
+    let summary = process_telegram_updates(
+        &pool,
+        config,
+        &telegram_config,
+        &model_gateway_config,
+        updates,
+        Some("telegram:getUpdates".to_string()),
+        &transport,
+        &mut delivery,
+    )
+    .await?;
+    Ok(TelegramOutcome::PollProcessed(summary))
+}
+
+pub async fn run_telegram_fixture_with<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    telegram_config: &crate::config::ResolvedTelegramConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    fixture_path: &Path,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<TelegramProcessingSummary>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let updates = telegram::load_fixture_updates(fixture_path)?;
+    process_telegram_updates(
+        pool,
+        config,
+        telegram_config,
+        model_gateway_config,
+        updates,
+        Some(fixture_path.display().to_string()),
+        transport,
+        delivery,
+    )
+    .await
 }
 
 async fn verify_schema(pool: &PgPool, config: &RuntimeConfig) -> Result<i64> {
@@ -186,6 +287,74 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
         execution_id,
         trace_id: trace.trace_id,
     })
+}
+
+async fn process_telegram_updates<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    telegram_config: &crate::config::ResolvedTelegramConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    updates: Vec<TelegramUpdate>,
+    raw_payload_ref: Option<String>,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<TelegramProcessingSummary>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let mut summary = TelegramProcessingSummary {
+        fetched_updates: updates.len(),
+        ..TelegramProcessingSummary::default()
+    };
+
+    for update in updates {
+        let normalization =
+            ingress::normalize_telegram_update(telegram_config, &update, raw_payload_ref.clone())?;
+
+        match normalization {
+            TelegramNormalizationOutcome::Accepted(ingress) => {
+                match foreground_orchestration::orchestrate_telegram_foreground_ingress(
+                    pool,
+                    config,
+                    telegram_config,
+                    model_gateway_config,
+                    ingress,
+                    transport,
+                    delivery,
+                )
+                .await?
+                {
+                    TelegramForegroundOrchestrationOutcome::Completed(_) => {
+                        summary.completed_count += 1;
+                    }
+                    TelegramForegroundOrchestrationOutcome::Duplicate(_) => {
+                        summary.duplicate_count += 1;
+                    }
+                    TelegramForegroundOrchestrationOutcome::Rejected(_) => {
+                        summary.trigger_rejected_count += 1;
+                    }
+                }
+            }
+            TelegramNormalizationOutcome::Rejected(rejected) => {
+                summary.normalization_rejected_count += 1;
+                info!(
+                    external_event_id = rejected.external_event_id,
+                    detail = rejected.detail,
+                    "telegram update rejected during normalization",
+                );
+            }
+            TelegramNormalizationOutcome::Ignored(ignored) => {
+                summary.ignored_count += 1;
+                info!(
+                    external_event_id = ignored.external_event_id,
+                    "telegram update ignored during normalization",
+                );
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 async fn record_smoke_failure(

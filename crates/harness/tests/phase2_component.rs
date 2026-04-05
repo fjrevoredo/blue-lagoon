@@ -2,11 +2,18 @@ mod support;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use contracts::ChannelKind;
+use contracts::{
+    ChannelKind, LoopKind, ModelCallPurpose, ModelCallRequest, ModelInput, ModelInputMessage,
+    ModelMessageRole, ModelOutputMode, ToolPolicy,
+};
 use harness::{
     audit,
-    config::{ResolvedTelegramConfig, SelfModelConfig},
-    context, execution, foreground, ingress, migration, telegram,
+    config::{
+        ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, ResolvedTelegramConfig,
+        SelfModelConfig,
+    },
+    context, execution, foreground, foreground_orchestration, ingress, migration, model_gateway,
+    runtime, telegram, worker,
 };
 use serial_test::serial;
 use sqlx::Row;
@@ -562,6 +569,295 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn model_gateway_executes_foreground_request_with_fake_provider() -> Result<()> {
+    let gateway = sample_model_gateway_config();
+    let request = sample_model_call_request();
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+        status: 200,
+        body: serde_json::json!({
+            "choices": [{
+                "message": { "content": "hello from fake provider" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 4
+            }
+        }),
+    }));
+
+    let response = model_gateway::execute_foreground_model_call(&gateway, &request, &transport)
+        .await
+        .expect("gateway call should succeed");
+
+    assert_eq!(response.request_id, request.request_id);
+    assert_eq!(response.provider, contracts::ModelProviderKind::ZAi);
+    assert_eq!(response.model, "z-ai-foreground");
+    assert_eq!(response.output.text, "hello from fake provider");
+
+    let seen = transport.seen_requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].url, "https://api.z.ai/api/paas/v4/chat/completions");
+    assert_eq!(
+        seen[0]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(3)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result<()> {
+    let (mut config, _pool) = support::prepare_database().await?;
+    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    config.worker.command = worker_binary.to_string_lossy().into_owned();
+    config.worker.args = vec!["conscious-worker".to_string()];
+
+    let gateway = sample_model_gateway_config();
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+        status: 200,
+        body: serde_json::json!({
+            "choices": [{
+                "message": { "content": "assistant reply from fake provider" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 13,
+                "completion_tokens": 6
+            }
+        }),
+    }));
+
+    let request = contracts::WorkerRequest::conscious(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        sample_conscious_context(),
+    );
+
+    let response = worker::launch_conscious_worker(&config, &gateway, &request, &transport).await?;
+    match response.result {
+        contracts::WorkerResult::Conscious(result) => {
+            assert_eq!(result.status, contracts::ConsciousWorkerStatus::Completed);
+            assert_eq!(
+                result.assistant_output.text,
+                "assistant reply from fake provider"
+            );
+            assert_eq!(
+                result.assistant_output.internal_conversation_ref,
+                "telegram-primary"
+            );
+            assert_eq!(result.episode_summary.outcome, "completed");
+        }
+        contracts::WorkerResult::Smoke(_) => panic!("expected conscious worker result"),
+        contracts::WorkerResult::Error(error) => {
+            panic!("unexpected worker error: {}", error.message)
+        }
+    }
+
+    let seen = transport.seen_requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].url, "https://api.z.ai/api/paas/v4/chat/completions");
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> {
+    let (mut config, pool) = support::prepare_database().await?;
+    config.self_model = Some(SelfModelConfig {
+        seed_path: support::workspace_root()
+            .join("config")
+            .join("self_model_seed.toml"),
+    });
+    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    config.worker.command = worker_binary.to_string_lossy().into_owned();
+    config.worker.args = vec!["conscious-worker".to_string()];
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/private_text_message.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+    };
+
+    let gateway = sample_model_gateway_config();
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+        status: 200,
+        body: serde_json::json!({
+            "choices": [{
+                "message": { "content": "assistant reply from fake provider" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 13,
+                "completion_tokens": 6
+            }
+        }),
+    }));
+    let mut delivery = telegram::FakeTelegramDelivery::default();
+
+    let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        &gateway,
+        ingress,
+        &transport,
+        &mut delivery,
+    )
+    .await?;
+
+    let completed = match outcome {
+        foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(completed) => {
+            completed
+        }
+        other => panic!("expected completed orchestration, got {other:?}"),
+    };
+
+    let execution = execution::get(&pool, completed.execution_id).await?;
+    assert_eq!(execution.status, "completed");
+    assert_eq!(execution.trace_id, completed.trace_id);
+
+    let episode = foreground::get_episode(&pool, completed.episode_id).await?;
+    assert_eq!(episode.status, "completed");
+    assert_eq!(episode.execution_id, completed.execution_id);
+    assert_eq!(episode.outcome.as_deref(), Some("completed"));
+
+    let messages = foreground::list_episode_messages(&pool, completed.episode_id).await?;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].message_role, "user");
+    assert_eq!(messages[1].message_role, "assistant");
+    assert_eq!(
+        messages[1].text_body.as_deref(),
+        Some("assistant reply from fake provider")
+    );
+    assert_eq!(
+        messages[1].external_message_id.as_deref(),
+        Some(completed.outbound_message_id.to_string().as_str())
+    );
+
+    assert_eq!(delivery.sent_messages().len(), 1);
+    assert_eq!(delivery.sent_messages()[0].chat_id, 42);
+    assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(42));
+    assert_eq!(
+        delivery.sent_messages()[0].text,
+        "assistant reply from fake provider"
+    );
+
+    let audit_events = audit::list_for_execution(&pool, completed.execution_id).await?;
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_trigger_accepted")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_context_assembled")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_execution_completed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<()> {
+    let (mut config, pool) = support::prepare_database().await?;
+    config.self_model = Some(SelfModelConfig {
+        seed_path: support::workspace_root()
+            .join("config")
+            .join("self_model_seed.toml"),
+    });
+    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    config.worker.command = worker_binary.to_string_lossy().into_owned();
+    config.worker.args = vec!["conscious-worker".to_string()];
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+        status: 200,
+        body: serde_json::json!({
+            "choices": [{
+                "message": { "content": "assistant reply from fixture runtime path" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7
+            }
+        }),
+    }));
+    let mut delivery = telegram::FakeTelegramDelivery::default();
+
+    let summary = runtime::run_telegram_fixture_with(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        &sample_model_gateway_config(),
+        &telegram_fixture("private_text_message.json"),
+        &transport,
+        &mut delivery,
+    )
+    .await?;
+
+    assert_eq!(summary.fetched_updates, 1);
+    assert_eq!(summary.completed_count, 1);
+    assert_eq!(summary.duplicate_count, 0);
+    assert_eq!(summary.trigger_rejected_count, 0);
+    assert_eq!(summary.normalization_rejected_count, 0);
+    assert_eq!(summary.ignored_count, 0);
+
+    assert_eq!(delivery.sent_messages().len(), 1);
+    assert_eq!(
+        delivery.sent_messages()[0].text,
+        "assistant reply from fixture runtime path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn runtime_poll_once_fails_closed_when_telegram_config_is_absent() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+    drop(pool);
+
+    let error = runtime::run_telegram_once(
+        &config,
+        runtime::TelegramOptions {
+            fixture_path: None,
+            poll_once: true,
+        },
+    )
+    .await
+    .expect_err("missing telegram config should fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing Phase 2 Telegram configuration")
+    );
+    Ok(())
+}
+
 fn sample_telegram_config() -> ResolvedTelegramConfig {
     ResolvedTelegramConfig {
         api_base_url: "https://api.telegram.org".to_string(),
@@ -580,6 +876,117 @@ fn telegram_fixture(name: &str) -> std::path::PathBuf {
         .join("fixtures")
         .join("telegram")
         .join(name)
+}
+
+fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
+    ResolvedModelGatewayConfig {
+        foreground: ResolvedForegroundModelRouteConfig {
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "secret".to_string(),
+            timeout_ms: 20_000,
+        },
+    }
+}
+
+fn sample_model_call_request() -> ModelCallRequest {
+    ModelCallRequest {
+        request_id: Uuid::now_v7(),
+        trace_id: Uuid::now_v7(),
+        execution_id: Uuid::now_v7(),
+        loop_kind: LoopKind::Conscious,
+        purpose: ModelCallPurpose::ForegroundResponse,
+        task_class: "telegram_foreground_reply".to_string(),
+        budget: contracts::ModelBudget {
+            max_input_tokens: 2_000,
+            max_output_tokens: 500,
+            timeout_ms: 30_000,
+        },
+        input: ModelInput {
+            system_prompt: "You are Blue Lagoon.".to_string(),
+            messages: vec![
+                ModelInputMessage {
+                    role: ModelMessageRole::Developer,
+                    content: "Stay concise.".to_string(),
+                },
+                ModelInputMessage {
+                    role: ModelMessageRole::User,
+                    content: "hello".to_string(),
+                },
+            ],
+        },
+        output_mode: ModelOutputMode::PlainText,
+        schema_name: None,
+        schema_json: None,
+        tool_policy: ToolPolicy::NoTools,
+        provider_hint: None,
+    }
+}
+
+fn sample_conscious_context() -> contracts::ConsciousContext {
+    contracts::ConsciousContext {
+        context_id: Uuid::now_v7(),
+        assembled_at: Utc::now(),
+        trigger: contracts::ForegroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            trigger_kind: contracts::ForegroundTriggerKind::UserIngress,
+            ingress: contracts::NormalizedIngress {
+                ingress_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                external_event_id: "update-42".to_string(),
+                external_message_id: Some("message-42".to_string()),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                event_kind: contracts::IngressEventKind::MessageCreated,
+                occurred_at: Utc::now(),
+                text_body: Some("hello from trigger".to_string()),
+                reply_to: None,
+                attachments: Vec::new(),
+                command_hint: None,
+                approval_payload: None,
+                raw_payload_ref: None,
+            },
+            received_at: Utc::now(),
+            deduplication_key: "telegram:update-42".to_string(),
+            budget: contracts::ForegroundBudget {
+                iteration_budget: 1,
+                wall_clock_budget_ms: 30_000,
+                token_budget: 4_000,
+            },
+        },
+        self_model: contracts::SelfModelSnapshot {
+            stable_identity: "blue-lagoon".to_string(),
+            role: "personal_assistant".to_string(),
+            communication_style: "direct".to_string(),
+            capabilities: vec!["conversation".to_string()],
+            constraints: vec!["respect_harness_policy".to_string()],
+            preferences: vec!["concise".to_string()],
+            current_goals: vec!["support_the_user".to_string()],
+            current_subgoals: vec!["reply_to_current_message".to_string()],
+        },
+        internal_state: contracts::InternalStateSnapshot {
+            load_pct: 15,
+            health_pct: 100,
+            reliability_pct: 100,
+            resource_pressure_pct: 10,
+            confidence_pct: 80,
+            connection_quality_pct: 95,
+            active_conditions: Vec::new(),
+        },
+        recent_history: vec![contracts::EpisodeExcerpt {
+            episode_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            started_at: Utc::now(),
+            user_message: Some("older user".to_string()),
+            assistant_message: Some("older assistant".to_string()),
+            outcome: "completed".to_string(),
+        }],
+    }
 }
 
 async fn insert_completed_episode(

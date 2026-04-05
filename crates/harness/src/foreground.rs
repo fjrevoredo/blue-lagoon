@@ -462,6 +462,32 @@ pub async fn mark_episode_completed(
     Ok(())
 }
 
+pub async fn mark_episode_failed(
+    pool: &PgPool,
+    episode_id: Uuid,
+    outcome: &str,
+    summary: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE episodes
+        SET
+            status = 'failed',
+            completed_at = NOW(),
+            outcome = $2,
+            summary = $3
+        WHERE episode_id = $1
+        "#,
+    )
+    .bind(episode_id)
+    .bind(outcome)
+    .bind(summary)
+    .execute(pool)
+    .await
+    .context("failed to mark episode failed")?;
+    Ok(())
+}
+
 pub async fn get_episode(pool: &PgPool, episode_id: Uuid) -> Result<EpisodeRecord> {
     let row = sqlx::query(
         r#"
@@ -574,6 +600,26 @@ pub async fn list_episode_messages(
             external_message_id: row.get("external_message_id"),
         })
         .collect())
+}
+
+pub async fn update_episode_message_external_message_id(
+    pool: &PgPool,
+    episode_message_id: Uuid,
+    external_message_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE episode_messages
+        SET external_message_id = $2
+        WHERE episode_message_id = $1
+        "#,
+    )
+    .bind(episode_message_id)
+    .bind(external_message_id)
+    .execute(pool)
+    .await
+    .context("failed to update episode message external message id")?;
+    Ok(())
 }
 
 pub async fn list_recent_episode_excerpts(
