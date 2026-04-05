@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use futures_util::FutureExt;
 use harness::{config::RuntimeConfig, db, migration};
 use sqlx::{Connection, Executor, PgConnection, PgPool};
+use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ const TEST_DATABASE_PREFIX: &str = "blue_lagoon_test_";
 const STALE_TEST_DATABASE_MIN_AGE_SECS: u64 = 6 * 60 * 60;
 #[allow(dead_code)]
 static WORKERS_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static POSTGRES_BOOTSTRAP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct TestDatabaseContext {
@@ -69,7 +71,7 @@ where
 {
     let admin_database_url = resolved_test_postgres_admin_url();
     if should_bootstrap_local_postgres() {
-        ensure_postgres_running()?;
+        ensure_local_postgres_ready(&admin_database_url).await?;
     }
     sweep_stale_test_databases(&admin_database_url).await?;
 
@@ -183,9 +185,7 @@ async fn connect_with_retry(config: &RuntimeConfig) -> Result<PgPool> {
 }
 
 async fn sweep_stale_test_databases(admin_database_url: &str) -> Result<()> {
-    let mut connection = PgConnection::connect(admin_database_url)
-        .await
-        .context("failed to connect to test postgres admin database for stale sweep")?;
+    let mut connection = connect_admin_with_retry(admin_database_url, "stale sweep").await?;
     let database_names: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT datname
@@ -210,6 +210,17 @@ async fn sweep_stale_test_databases(admin_database_url: &str) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_local_postgres_ready(admin_database_url: &str) -> Result<()> {
+    let _guard = POSTGRES_BOOTSTRAP_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    ensure_postgres_running()?;
+    let connection = connect_admin_with_retry(admin_database_url, "local postgres bootstrap").await;
+    drop(_guard);
+    connection.map(drop)
+}
+
 fn ensure_postgres_running() -> Result<()> {
     let status = Command::new("docker")
         .arg("compose")
@@ -226,9 +237,8 @@ fn ensure_postgres_running() -> Result<()> {
 }
 
 async fn create_database(admin_database_url: &str, database_name: &str) -> Result<()> {
-    let mut connection = PgConnection::connect(admin_database_url)
-        .await
-        .context("failed to connect to test postgres admin database")?;
+    let mut connection =
+        connect_admin_with_retry(admin_database_url, "test database creation").await?;
     connection
         .execute(format!(r#"CREATE DATABASE "{database_name}""#).as_str())
         .await
@@ -239,11 +249,33 @@ async fn create_database(admin_database_url: &str, database_name: &str) -> Resul
 async fn drop_database(admin_database_url: &str, pool: PgPool, database_name: &str) -> Result<()> {
     pool.close().await;
 
-    let mut connection = PgConnection::connect(admin_database_url)
-        .await
-        .context("failed to reconnect to test postgres admin database for cleanup")?;
+    let mut connection =
+        connect_admin_with_retry(admin_database_url, "test database cleanup").await?;
     drop_database_with_connection(&mut connection, database_name).await?;
     Ok(())
+}
+
+async fn connect_admin_with_retry(
+    admin_database_url: &str,
+    operation: &str,
+) -> Result<PgConnection> {
+    let mut last_error = None;
+    for _ in 0..30 {
+        match PgConnection::connect(admin_database_url).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    let error = last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("postgres admin database never became reachable"));
+    Err(error).with_context(|| {
+        format!("failed to connect to test postgres admin database for {operation}")
+    })
 }
 
 async fn has_active_sessions(connection: &mut PgConnection, database_name: &str) -> Result<bool> {
