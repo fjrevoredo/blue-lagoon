@@ -17,7 +17,10 @@ use harness::{
 #[tokio::test]
 #[serial]
 async fn synthetic_trigger_runs_end_to_end_and_persists_outputs() -> Result<()> {
-    let (config, pool) = support::prepare_database().await?;
+    let (mut config, pool) = support::prepare_database().await?;
+    let worker_binary = support::workers_binary()?;
+    config.worker.command = worker_binary.to_string_lossy().into_owned();
+    config.worker.args = vec!["smoke-worker".to_string()];
     migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
 
     let outcome = runtime::run_harness_once(
