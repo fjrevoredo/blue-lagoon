@@ -20,6 +20,7 @@ fn smoke_worker_cli_reads_json_and_writes_json() {
             assert_eq!(result.status, "completed");
             assert!(result.summary.contains("smoke"));
         }
+        WorkerResult::Conscious(_) => panic!("unexpected conscious worker result"),
         WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
     }
 }

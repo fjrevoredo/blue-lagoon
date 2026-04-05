@@ -17,3 +17,22 @@ timeout_ms = 10000
 # BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
 command = ""
 args = []
+
+[telegram]
+api_base_url = "https://api.telegram.org"
+bot_token_env = "BLUE_LAGOON_TELEGRAM_BOT_TOKEN"
+allowed_user_id = 1
+allowed_chat_id = 1
+internal_principal_ref = "primary-user"
+internal_conversation_ref = "telegram-primary"
+poll_limit = 10
+
+[model_gateway.foreground]
+provider = "z_ai"
+model = "z-ai-foreground"
+api_base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "BLUE_LAGOON_ZAI_API_KEY"
+timeout_ms = 30000
+
+[self_model]
+seed_path = "self_model_seed.toml"

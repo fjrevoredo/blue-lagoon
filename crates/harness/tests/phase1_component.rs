@@ -16,11 +16,11 @@ use harness::{
 
 #[tokio::test]
 #[serial]
-async fn migration_application_creates_phase_1_tables() -> Result<()> {
+async fn migration_application_creates_foundation_and_foreground_tables() -> Result<()> {
     let (config, pool) = support::prepare_database().await?;
     let summary = migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
 
-    assert_eq!(summary.discovered_versions, vec![1]);
+    assert_eq!(summary.discovered_versions, vec![1, 2]);
     let tables = sqlx::query(
         r#"
         SELECT table_name
@@ -39,6 +39,10 @@ async fn migration_application_creates_phase_1_tables() -> Result<()> {
     assert!(names.contains(&"schema_migrations".to_string()));
     assert!(names.contains(&"audit_events".to_string()));
     assert!(names.contains(&"execution_records".to_string()));
+    assert!(names.contains(&"conversation_bindings".to_string()));
+    assert!(names.contains(&"ingress_events".to_string()));
+    assert!(names.contains(&"episodes".to_string()));
+    assert!(names.contains(&"episode_messages".to_string()));
     assert_eq!(config.database.minimum_supported_schema_version, 1);
     Ok(())
 }
@@ -53,18 +57,18 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
         &pool,
         SchemaPolicy {
             minimum_supported_version: 1,
-            expected_version: 1,
+            expected_version: 2,
         },
     )
     .await?;
-    assert_eq!(supported, 1);
+    assert_eq!(supported, 2);
 
     sqlx::query(
         r#"
         INSERT INTO schema_migrations
             (version, name, checksum, applied_at, app_version, applied_by, execution_ms)
         VALUES
-            (2, 'future_schema', 'future', NOW(), 'test', 'test', 1)
+            (3, 'future_schema', 'future', NOW(), 'test', 'test', 1)
         "#,
     )
     .execute(&pool)
@@ -74,7 +78,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
         &pool,
         SchemaPolicy {
             minimum_supported_version: 1,
-            expected_version: 1,
+            expected_version: 2,
         },
     )
     .await
@@ -98,7 +102,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
         &pool,
         SchemaPolicy {
             minimum_supported_version: 1,
-            expected_version: 1,
+            expected_version: 2,
         },
     )
     .await
@@ -121,7 +125,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
         &pool,
         SchemaPolicy {
             minimum_supported_version: 1,
-            expected_version: 1,
+            expected_version: 2,
         },
     )
     .await

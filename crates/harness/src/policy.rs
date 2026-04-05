@@ -60,6 +60,9 @@ mod tests {
                 command: String::new(),
                 args: Vec::new(),
             },
+            telegram: None,
+            model_gateway: None,
+            self_model: None,
         }
     }
 

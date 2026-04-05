@@ -87,6 +87,11 @@ fn handle_request(request: WorkerRequest) -> WorkerResponse {
                 ),
             }),
         },
+        WorkerPayload::Conscious(_) => request_error_response(
+            &request,
+            WorkerErrorCode::UnsupportedWorker,
+            "conscious worker protocol is not implemented yet".to_string(),
+        ),
     }
 }
 
@@ -95,6 +100,21 @@ fn error_response(code: WorkerErrorCode, message: String) -> WorkerResponse {
         request_id: uuid::Uuid::nil(),
         trace_id: uuid::Uuid::nil(),
         execution_id: uuid::Uuid::nil(),
+        finished_at: chrono::Utc::now(),
+        worker_pid: std::process::id(),
+        result: WorkerResult::Error(WorkerFailure { code, message }),
+    }
+}
+
+fn request_error_response(
+    request: &WorkerRequest,
+    code: WorkerErrorCode,
+    message: String,
+) -> WorkerResponse {
+    WorkerResponse {
+        request_id: request.request_id,
+        trace_id: request.trace_id,
+        execution_id: request.execution_id,
         finished_at: chrono::Utc::now(),
         worker_pid: std::process::id(),
         result: WorkerResult::Error(WorkerFailure { code, message }),
@@ -116,6 +136,9 @@ mod tests {
             WorkerResult::Smoke(result) => {
                 assert_eq!(result.status, "completed");
                 assert!(result.summary.contains("smoke"));
+            }
+            WorkerResult::Conscious(_) => {
+                panic!("smoke worker should not return a conscious result")
             }
             WorkerResult::Error(_) => panic!("smoke worker should not return an error"),
         }

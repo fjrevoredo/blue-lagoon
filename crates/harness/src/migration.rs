@@ -278,13 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn load_migrations_discovers_phase_1_files() {
+    fn load_migrations_discovers_reviewed_files_in_order() {
         let versions = load_migrations()
             .expect("migrations should load")
             .into_iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1]);
+        assert_eq!(versions, vec![1, 2]);
     }
 
     #[test]

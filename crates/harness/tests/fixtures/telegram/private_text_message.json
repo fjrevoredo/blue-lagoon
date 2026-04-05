@@ -1,0 +1,33 @@
+{
+  "update_id": 1001,
+  "message": {
+    "message_id": 42,
+    "date": 1712300000,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "text": "hello from telegram",
+    "reply_to_message": {
+      "message_id": 41,
+      "date": 1712299990,
+      "from": {
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Francisco",
+        "username": "fjr"
+      },
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "previous message"
+    }
+  }
+}

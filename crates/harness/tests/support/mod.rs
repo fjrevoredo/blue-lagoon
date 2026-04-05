@@ -41,6 +41,9 @@ pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
             command: String::new(),
             args: Vec::new(),
         },
+        telegram: None,
+        model_gateway: None,
+        self_model: None,
     };
 
     let pool = connect_with_retry(&config).await?;
@@ -89,6 +92,18 @@ fn ensure_postgres_running() -> Result<()> {
 }
 
 pub async fn reset_database(pool: &PgPool) -> Result<()> {
+    pool.execute("DROP TABLE IF EXISTS episode_messages CASCADE")
+        .await
+        .context("failed to drop episode_messages")?;
+    pool.execute("DROP TABLE IF EXISTS episodes CASCADE")
+        .await
+        .context("failed to drop episodes")?;
+    pool.execute("DROP TABLE IF EXISTS ingress_events CASCADE")
+        .await
+        .context("failed to drop ingress_events")?;
+    pool.execute("DROP TABLE IF EXISTS conversation_bindings CASCADE")
+        .await
+        .context("failed to drop conversation_bindings")?;
     pool.execute("DROP TABLE IF EXISTS audit_events CASCADE")
         .await
         .context("failed to drop audit_events")?;

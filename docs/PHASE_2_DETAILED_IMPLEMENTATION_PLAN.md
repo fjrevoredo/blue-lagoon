@@ -95,6 +95,9 @@ documents intentionally change them:
 - The model gateway remains harness-owned from the first real foreground path.
   Workers must not own provider-specific logic, direct provider network access,
   or routing authority.
+- The first concrete provider adapter implemented for Phase 2 will target
+  `z.ai`, but it must sit behind provider-agnostic harness-owned model-gateway
+  contracts so later provider additions do not require architectural rework.
 - The minimal conscious execution path may use a single model-request cycle per
   foreground episode. Multi-step tool-mediated execution remains later work.
 - Phase 2 episode persistence is a foreground continuity baseline, not the full
@@ -108,6 +111,60 @@ documents intentionally change them:
 - Phase 2 CI expansion should extend the stable Phase 1.1 baseline or add
   adjacent stable gates without renaming or replacing the existing
   `workspace-verification` identity.
+
+## Phase 2 scope boundary
+
+### In scope for Phase 2
+
+- one reactive foreground path only
+- private 1:1 Telegram text ingress and plain-text Telegram egress
+- single configured principal and conversation binding for the initial user
+- normalized ingress, trigger validation, deduplication, policy checks, and
+  foreground budget initialization
+- compact self-model seeding plus internal-state snapshot injection into
+  conscious context
+- bounded recent foreground episode retrieval for context assembly v0
+- one conscious worker cycle that can request one harness-mediated model call
+- one harness-owned provider-agnostic model gateway with one concrete `z.ai`
+  adapter
+- persistence for conversation bindings, ingress events, episodes, episode
+  messages, execution linkage, and trace-linked audit events
+- fakeable Telegram and provider boundaries for required automated tests
+
+### Explicitly out of scope for Phase 2
+
+- canonical long-term memory artifacts, retrieval artifacts, merge workflows, or
+  self-model artifact persistence beyond the initial runtime seed path
+- background jobs, wake-signal conversion, scheduled foreground tasks, or other
+  proactive behavior beyond what is already documented as deferred
+- approval objects, approval rendering, approval-resolution execution, or any
+  user-authorized side-effect flow
+- tool execution, tool-call approval, or tool-result observation beyond model
+  output generation
+- group chats, Telegram channels, multi-party semantics, or multi-user identity
+  management
+- rich attachment processing beyond normalized attachment references with basic
+  metadata fields
+- multi-step conscious orchestration, multi-turn tool mediation, or autonomous
+  replanning loops beyond the single foreground model cycle
+
+### Deferred by later phases
+
+- Phase 3: canonical memory artifacts, retrieval structures, self-model
+  artifacts, and proposal-and-merge flows
+- Phase 4: bounded background jobs, maintenance triggers, consolidation, and
+  wake-signal production or handling
+- Phase 5: approval flows, risk-tiered tool execution, and richer policy-driven
+  external actions
+
+### Execution posture confirmed for Phase 2
+
+- reactive only
+- single-user first
+- Telegram-first
+- harness-sovereign
+- provider-agnostic internally even though `z.ai` is first
+- fakeable at transport and provider boundaries
 
 ## LLM execution rules
 
@@ -155,13 +212,30 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `QUEUED`
-- Current active task: `none`
-- Completed tasks: `0/18`
-- Milestone A status: `TODO`
+- Current milestone: `MILESTONE A`
+- Current active task: `P2-09`
+- Completed tasks: `8/18`
+- Milestone A status: `IN PROGRESS`
 - Milestone B status: `TODO`
 - Milestone C status: `TODO`
 - Milestone D status: `TODO`
+
+Latest verification state:
+
+- Phase 2 state has been self-checked after implementation and review fixes.
+- `cmd.exe /c cargo fmt --all --check` is green.
+- `cmd.exe /c cargo check --workspace` is green.
+- `cmd.exe /c cargo test --workspace` is green.
+
+Latest review corrections already applied:
+
+- invalid Telegram timestamps now fail closed rather than being rewritten
+- normalized ingress persistence now retains attachment metadata, command args,
+  and approval callback payloads
+- conscious worker requests now reuse one consistent request ID and timestamp
+  across wrapper and payload
+- task status and evidence in this document have been reconciled with the code
+  state
 
 Repository sequencing note:
 
@@ -249,7 +323,7 @@ Milestone D is green only if:
 
 ### Task P2-01: Lock the Phase 2 foreground slice boundary
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
@@ -262,11 +336,17 @@ Milestone D is green only if:
   - manual review against `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`,
     `docs/IMPLEMENTATION_DESIGN.md`, and `docs/REQUIREMENTS.md`
 - Evidence:
-  - pending
+  - `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md` now includes an explicit
+    `Phase 2 scope boundary` section covering in-scope behavior, out-of-scope
+    behavior, and deferrals to Phases 3, 4, and 5; settled clarifications now
+    record `z.ai` as the first concrete provider behind a provider-agnostic
+    harness-owned model gateway. Manual review completed against
+    `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`,
+    `docs/IMPLEMENTATION_DESIGN.md`, and `docs/REQUIREMENTS.md`.
 
 ### Task P2-02: Extend runtime config and secret-loading surface for foreground execution
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-01`
 - Parallel-safe: no
 - Deliverables:
@@ -278,11 +358,19 @@ Milestone D is green only if:
   - unit tests for config parsing and validation
   - failed startup on missing critical Phase 2 settings
 - Evidence:
-  - pending
+  - Added typed optional Phase 2 config sections and fail-closed foreground
+    accessors in [crates/harness/src/config.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/config.rs)
+    for Telegram transport settings, `z.ai` model-gateway routing settings, and
+    self-model seed artifact resolution; added versioned non-secret config
+    surface in [config/default.toml](/mnt/d/Repos/blue-lagoon/config/default.toml)
+    and initial seed artifact in [config/self_model_seed.toml](/mnt/d/Repos/blue-lagoon/config/self_model_seed.toml).
+    Verified with `cmd.exe /c cargo test -p harness config -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`.
 
 ### Task P2-03: Add reviewed SQL migration for Phase 2 foreground persistence tables
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-01`
 - Parallel-safe: no
 - Deliverables:
@@ -300,11 +388,25 @@ Milestone D is green only if:
   - migration discovery and ordering behave correctly
   - migration applies cleanly to disposable PostgreSQL
 - Evidence:
-  - pending
+  - Added reviewed foreground migration
+    `migrations/0002__phase_2_foreground.sql` with `conversation_bindings`,
+    `ingress_events`, `episodes`, and `episode_messages` plus unique
+    constraints and indexes for external identifiers, execution linkage, and
+    per-episode ordering. The reviewed Phase 2 ingress schema now retains
+    normalized attachment metadata, command args, and approval callback payload
+    fields in addition to the baseline identifier, status, and text fields.
+    Updated migration expectations in
+    `crates/harness/src/migration.rs`, reset support in
+    `crates/harness/tests/support/mod.rs`, and PostgreSQL-backed migration
+    verification in `crates/harness/tests/phase1_component.rs`. Verified with
+    `cmd.exe /c cargo test -p harness migration -- --nocapture`,
+    `cmd.exe /c cargo test -p harness phase1_component -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`.
 
 ### Task P2-04: Implement harness persistence services for the new foreground tables
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-03`
 - Parallel-safe: no
 - Deliverables:
@@ -315,11 +417,22 @@ Milestone D is green only if:
 - Verification:
   - component tests against disposable PostgreSQL
 - Evidence:
-  - pending
+  - Added foreground persistence services in
+    `crates/harness/src/foreground.rs` for conversation-binding upsert,
+    ingress-event persistence and retrieval, episode and episode-message
+    persistence, and bounded recent-history reads for context assembly.
+    PostgreSQL-backed coverage lives in
+    `crates/harness/tests/phase2_component.rs`, including retention of
+    normalized attachment metadata, command args, and approval callback
+    payloads. Verified with
+    `cmd.exe /c cargo test -p harness --test phase2_component -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`; broader regression confirmed with
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-05: Define canonical Phase 2 foreground contracts
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-01`
 - Parallel-safe: yes
 - Deliverables:
@@ -340,7 +453,23 @@ Milestone D is green only if:
   - manual review that Telegram-specific business semantics do not leak into the
     normalized ingress contract
 - Evidence:
-  - pending
+  - Added canonical Phase 2 foreground contracts in
+    `crates/contracts/src/lib.rs` for normalized ingress, foreground triggers,
+    conscious context, model calls, and conscious-worker request or result
+    shapes; evolved worker contracts compatibly to add a conscious-worker kind
+    while preserving the Phase 1 smoke path. Updated
+    `crates/workers/src/main.rs`, `crates/workers/tests/smoke_worker_cli.rs`,
+    `crates/harness/src/runtime.rs`, and `crates/harness/src/config.rs` to
+    compile against the expanded shared contract surface. Post-review contract
+    correction: conscious worker requests now use one consistent request ID and
+    timestamp across the outer worker request and inner conscious payload.
+    Verified with
+    `cmd.exe /c cargo test -p contracts -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`; later confirmed by
+    `cmd.exe /c cargo test --workspace`. Manual review completed to confirm the
+    normalized ingress contract remains transport-level rather than
+    Telegram-business-specific.
 
 ### Task P2-06: Extend worker kinds and subprocess protocol for conscious execution
 
@@ -363,7 +492,7 @@ Milestone D is green only if:
 
 ### Task P2-07: Implement the Telegram adapter boundary and fake transport fixtures
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-02`, `P2-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -376,11 +505,21 @@ Milestone D is green only if:
 - Verification:
   - unit tests using fake Telegram payloads and fake delivery transport
 - Evidence:
-  - pending
+  - Added transport-only Telegram boundary in
+    `crates/harness/src/telegram.rs` with raw update parsing, fixture loading,
+    one-shot polling abstraction, and outbound delivery abstraction plus fake
+    implementations for tests; added canonical Telegram fixtures under
+    `crates/harness/tests/fixtures/telegram/`, including private text,
+    rejected group, private batch, private command-with-document, and approval
+    callback fixtures. Verified with
+    `cmd.exe /c cargo test -p harness telegram -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`; later confirmed by
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-08: Implement inbound Telegram normalization and identifier mapping
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-04`, `P2-05`, `P2-07`
 - Parallel-safe: no
 - Deliverables:
@@ -397,7 +536,21 @@ Milestone D is green only if:
   - unit tests for accepted and rejected normalization cases
   - component tests that persisted ingress records retain the normalized fields
 - Evidence:
-  - pending
+  - Added harness-owned Telegram normalization and identifier mapping in
+    `crates/harness/src/ingress.rs`, including fail-closed private-chat and
+    configured-actor checks, reply-link normalization, attachment-reference
+    normalization, command-hint extraction, callback-payload support, and
+    graceful ignore handling for unsupported raw update shapes. Post-review
+    correction: invalid Telegram timestamps now fail closed instead of being
+    rewritten to runtime-local time. Expanded
+    ingress persistence reads in `crates/harness/src/foreground.rs` and updated
+    `crates/harness/tests/phase2_component.rs` to verify persisted normalized
+    fields. Verified with
+    `cmd.exe /c cargo test -p harness ingress -- --nocapture`,
+    `cmd.exe /c cargo test -p harness --test phase2_component -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`; later confirmed by
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-09: Implement foreground trigger validation, deduplication, and budget initialization
 
@@ -420,7 +573,7 @@ Milestone D is green only if:
 
 ### Task P2-10: Implement the compact self-model seed and internal-state snapshot path
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-02`
 - Parallel-safe: yes
 - Deliverables:
@@ -434,7 +587,14 @@ Milestone D is green only if:
 - Verification:
   - unit tests for seed loading, validation, and snapshot derivation
 - Evidence:
-  - pending
+  - Added self-model seed loading, validation, internal-state snapshot
+    building, and compact serialization helpers in
+    `crates/harness/src/self_model.rs` using the repo-local seed artifact from
+    `config/self_model_seed.toml`. Verified with
+    `cmd.exe /c cargo test -p harness self_model -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`, and
+    `cmd.exe /c cargo check --workspace`; later confirmed by
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-11: Implement context assembly v0 for conscious foreground episodes
 
