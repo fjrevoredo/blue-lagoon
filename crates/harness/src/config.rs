@@ -69,15 +69,33 @@ pub struct ResolvedTelegramConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModelGatewayConfig {
     pub foreground: ForegroundModelRouteConfig,
+    #[serde(default)]
+    pub z_ai: Option<ZAiProviderConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ForegroundModelRouteConfig {
     pub provider: ModelProviderKind,
     pub model: String,
-    pub api_base_url: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
     pub api_key_env: String,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ZAiProviderConfig {
+    #[serde(default)]
+    pub api_surface: Option<ZAiApiSurface>,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZAiApiSurface {
+    General,
+    Coding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +285,7 @@ impl RuntimeConfig {
             foreground: ResolvedForegroundModelRouteConfig {
                 provider: model_gateway.foreground.provider,
                 model: model_gateway.foreground.model.clone(),
-                api_base_url: model_gateway.foreground.api_base_url.clone(),
+                api_base_url: require_foreground_api_base_url(model_gateway)?,
                 api_key: require_foreground_api_key(&model_gateway.foreground.api_key_env)?,
                 timeout_ms: model_gateway.foreground.timeout_ms,
             },
@@ -357,14 +375,37 @@ impl ModelGatewayConfig {
         if self.foreground.model.trim().is_empty() {
             bail!("model_gateway.foreground.model must not be empty");
         }
-        if self.foreground.api_base_url.trim().is_empty() {
-            bail!("model_gateway.foreground.api_base_url must not be empty");
+        if self.foreground.provider == ModelProviderKind::ZAi
+            && self
+                .foreground
+                .api_base_url
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self.z_ai.as_ref().is_none_or(|config| {
+                config
+                    .api_base_url
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    && config.api_surface.is_none()
+            })
+        {
+            bail!(
+                "model_gateway.foreground.api_base_url must not be empty unless model_gateway.z_ai config defines api_surface or api_base_url"
+            );
         }
         if self.foreground.api_key_env.trim().is_empty() {
             bail!("model_gateway.foreground.api_key_env must not be empty");
         }
         if self.foreground.timeout_ms == 0 {
             bail!("model_gateway.foreground.timeout_ms must be greater than zero");
+        }
+        if let Some(z_ai) = &self.z_ai
+            && z_ai
+                .api_base_url
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("model_gateway.z_ai.api_base_url must not be empty");
         }
         Ok(())
     }
@@ -403,6 +444,38 @@ fn require_foreground_api_key(configured_env_name: &str) -> Result<String> {
     )
 }
 
+fn require_foreground_api_base_url(config: &ModelGatewayConfig) -> Result<String> {
+    if let Ok(value) = env::var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") {
+        if value.trim().is_empty() {
+            bail!("BLUE_LAGOON_FOREGROUND_API_BASE_URL must not be empty");
+        }
+        return Ok(value);
+    }
+
+    match config.foreground.provider {
+        ModelProviderKind::ZAi => {
+            if let Some(z_ai) = &config.z_ai {
+                if let Some(api_base_url) = z_ai.api_base_url.as_deref()
+                    && !api_base_url.trim().is_empty()
+                {
+                    return Ok(api_base_url.to_string());
+                }
+                if let Some(api_surface) = z_ai.api_surface {
+                    return Ok(match api_surface {
+                        ZAiApiSurface::General => "https://api.z.ai/api/paas/v4".to_string(),
+                        ZAiApiSurface::Coding => "https://api.z.ai/api/coding/paas/v4".to_string(),
+                    });
+                }
+            }
+            config
+                .foreground
+                .api_base_url
+                .clone()
+                .context("missing foreground api base url after provider-specific resolution")
+        }
+    }
+}
+
 fn resolve_relative_to_config(path: &PathBuf) -> PathBuf {
     if path.is_absolute() {
         return path.clone();
@@ -419,7 +492,16 @@ fn resolve_relative_to_config(path: &PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env test mutex should not be poisoned")
+    }
 
     fn sample_config() -> RuntimeConfig {
         RuntimeConfig {
@@ -577,6 +659,7 @@ mod tests {
 
     #[test]
     fn require_telegram_config_fails_when_secret_is_missing() {
+        let _env_lock = env_lock();
         let mut config = sample_config();
         config.telegram = Some(TelegramConfig {
             api_base_url: "https://api.telegram.org".to_string(),
@@ -600,15 +683,17 @@ mod tests {
 
     #[test]
     fn require_model_gateway_config_fails_when_secret_is_missing() {
+        let _env_lock = env_lock();
         let mut config = sample_config();
         config.model_gateway = Some(ModelGatewayConfig {
             foreground: ForegroundModelRouteConfig {
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
-                api_base_url: "https://api.z.ai".to_string(),
+                api_base_url: Some("https://api.z.ai".to_string()),
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
+            z_ai: None,
         });
 
         let error = config
@@ -623,6 +708,7 @@ mod tests {
 
     #[test]
     fn load_applies_foreground_route_env_override() {
+        let _env_lock = env_lock();
         let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp dir should be created");
         let config_path = temp_root.join("default.toml");
@@ -650,9 +736,11 @@ args = []
 [model_gateway.foreground]
 provider = "z_ai"
 model = "configured-model"
-api_base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
 timeout_ms = 30000
+
+[model_gateway.z_ai]
+api_surface = "coding"
 "#,
         )
         .expect("config file should be written");
@@ -691,16 +779,92 @@ timeout_ms = 30000
     }
 
     #[test]
+    fn load_accepts_provider_specific_zai_surface_without_legacy_foreground_api_base_url() {
+        let _env_lock = env_lock();
+        let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp dir should be created");
+        let config_path = temp_root.join("default.toml");
+        fs::write(
+            &config_path,
+            r#"
+[app]
+name = "blue-lagoon"
+log_filter = "info"
+
+[database]
+minimum_supported_schema_version = 1
+
+[harness]
+allow_synthetic_smoke = true
+default_foreground_iteration_budget = 1
+default_wall_clock_budget_ms = 30000
+default_foreground_token_budget = 4000
+
+[worker]
+timeout_ms = 10000
+command = ""
+args = []
+
+[model_gateway.foreground]
+provider = "z_ai"
+model = "configured-model"
+api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
+timeout_ms = 30000
+
+[model_gateway.z_ai]
+api_surface = "coding"
+"#,
+        )
+        .expect("config file should be written");
+
+        let original_config = env::var_os("BLUE_LAGOON_CONFIG");
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+
+        unsafe {
+            env::set_var("BLUE_LAGOON_CONFIG", &config_path);
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "provider-key");
+        }
+
+        let loaded =
+            RuntimeConfig::load().expect("config should load with provider-specific z_ai surface");
+        let resolved = loaded
+            .require_model_gateway_config()
+            .expect("provider-specific api surface should resolve without legacy base url");
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+
+        match original_config {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_CONFIG", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_CONFIG") },
+        }
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn require_model_gateway_config_prefers_direct_foreground_api_key_override() {
+        let _env_lock = env_lock();
         let mut config = sample_config();
         config.model_gateway = Some(ModelGatewayConfig {
             foreground: ForegroundModelRouteConfig {
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
-                api_base_url: "https://api.z.ai".to_string(),
+                api_base_url: Some("https://api.z.ai".to_string()),
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
+            z_ai: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -720,7 +884,137 @@ timeout_ms = 30000
     }
 
     #[test]
+    fn require_model_gateway_config_prefers_direct_foreground_api_base_url_override() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "zai-foreground".to_string(),
+                api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+                api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        let original_api_base_url = env::var_os("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "direct-override-key");
+            env::set_var(
+                "BLUE_LAGOON_FOREGROUND_API_BASE_URL",
+                "https://api.z.ai/api/coding/paas/v4",
+            );
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("direct foreground api base url override should resolve");
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        match original_api_base_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
+        }
+    }
+
+    #[test]
+    fn require_model_gateway_config_prefers_provider_specific_zai_api_base_url() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "zai-foreground".to_string(),
+                api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+                api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: Some(ZAiProviderConfig {
+                api_surface: None,
+                api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        let original_api_base_url = env::var_os("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "direct-override-key");
+            env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("provider-specific z_ai api base url should resolve");
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        match original_api_base_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
+        }
+    }
+
+    #[test]
+    fn require_model_gateway_config_resolves_provider_specific_zai_api_surface() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "zai-foreground".to_string(),
+                api_base_url: None,
+                api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: Some(ZAiProviderConfig {
+                api_surface: Some(ZAiApiSurface::Coding),
+                api_base_url: None,
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        let original_api_base_url = env::var_os("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "direct-override-key");
+            env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("provider-specific z_ai api surface should resolve");
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        match original_api_base_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
+        }
+    }
+
+    #[test]
     fn require_self_model_config_resolves_relative_seed_path() {
+        let _env_lock = env_lock();
         let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
         fs::create_dir_all(temp_root.join("config")).expect("temp config dir should be created");
         let seed_path = temp_root.join("config").join("self_model_seed.toml");

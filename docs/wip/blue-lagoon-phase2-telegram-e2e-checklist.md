@@ -11,11 +11,22 @@ docker compose up -d postgres
 ## 2. Export the required env vars
 
 ```bash
+export BLUE_LAGOON_CONFIG='config/default.toml'
 export BLUE_LAGOON_DATABASE_URL='postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon'
 export BLUE_LAGOON_TELEGRAM_BOT_TOKEN='...'
 export BLUE_LAGOON_FOREGROUND_ROUTE='zai/glm-5-turbo'
 export BLUE_LAGOON_FOREGROUND_API_KEY='...'
 ```
+
+If the regular local database does not exist yet:
+
+```bash
+docker compose exec -T postgres psql -U blue_lagoon -d postgres -c "CREATE DATABASE blue_lagoon OWNER blue_lagoon;"
+```
+
+Automated tests now provision disposable per-test databases through the harness
+test support fixtures, so manual Telegram E2E should run against the normal
+local app config rather than a dedicated E2E profile.
 
 ## 3. Configure the Telegram binding and self-model in `config/default.toml`
 
@@ -25,6 +36,7 @@ Set these correctly:
 - `telegram.allowed_chat_id`
 - `self_model.seed_path`
 - optionally `model_gateway.foreground.*` if you need a non-default route
+- use provider-specific config such as `[model_gateway.z_ai] api_surface = "coding"` when the provider exposes multiple API surfaces
 
 ## 4. Build the binaries once
 
@@ -73,6 +85,15 @@ Expected result:
 - the bot should send a reply in Telegram
 - the worker should have gone through the conscious path end to end
 
+Failure handling expectations:
+
+- if Telegram `getUpdates` fails, the run should fail closed and write a
+  durable `telegram_fetch_failed` audit event
+- if a foreground trigger is accepted, execution start, binding reconciliation,
+  ingress persistence, and acceptance audit should commit together
+- conversation rebinding keeps the canonical internal conversation binding and
+  rewires historical ingress rows before removing superseded duplicate bindings
+
 ## 10. Verify persistence if you want to inspect the run
 
 ```bash
@@ -94,5 +115,6 @@ cargo test -p harness --test phase2_component -- --nocapture
 cargo test -p harness --test phase2_integration -- --nocapture
 ```
 
-If needed, also prepare a minimal known-good local config in
-`config/default.toml`.
+If needed, prepare a minimal known-good local config in `config/default.toml`
+or another explicit local operator override, but do not rely on a dedicated
+test-only E2E profile.

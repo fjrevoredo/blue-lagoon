@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -24,7 +24,10 @@ pub struct AuditEvent {
     pub trace_id: Uuid,
 }
 
-pub async fn insert(pool: &PgPool, event: &NewAuditEvent) -> Result<Uuid> {
+pub async fn insert<'e, E>(executor: E, event: &NewAuditEvent) -> Result<Uuid>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let event_id = Uuid::now_v7();
     sqlx::query(
         r#"
@@ -68,7 +71,7 @@ pub async fn insert(pool: &PgPool, event: &NewAuditEvent) -> Result<Uuid> {
     .bind(event.execution_id)
     .bind(event.worker_pid)
     .bind(&event.payload)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to insert audit event")?;
     Ok(event_id)

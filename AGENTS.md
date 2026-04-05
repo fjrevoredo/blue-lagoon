@@ -42,7 +42,7 @@ Typical implementation workflow is:
 - `cargo clippy --workspace --all-targets -- -D warnings` to keep linting clean.
 - `cargo test --workspace` to run unit, component, and integration tests.
 - `docker compose config` to verify the local runtime topology.
-- `docker compose up -d postgres` to start disposable local PostgreSQL.
+- `docker compose up -d postgres` to start local PostgreSQL.
 - `cargo run -p runtime -- migrate` to apply reviewed migrations.
 - `cargo run -p runtime -- --help` to inspect the stable CLI surface.
 - `cargo run -p runtime -- harness --once --idle` to verify safe harness boot.
@@ -88,6 +88,16 @@ handovers under `docs/archive/` use descriptive lowercase kebab-case filenames.
 Automated testing is required for implementation work. Fast unit tests should
 cover local logic, while persistence-critical behavior must be verified against
 disposable real PostgreSQL through the harness component and integration tests.
+
+Database-using automated tests must follow the repository fixture pattern:
+
+- provision a disposable per-test PostgreSQL database
+- apply reviewed migrations inside test support, not by pointing at an existing
+  operator database
+- never target `BLUE_LAGOON_DATABASE_URL` or another shared operator database
+  from automated tests
+- reserve the regular local app config and database for manual runtime and
+  Telegram E2E validation
 
 When modifying code, prefer to run the lowest effective layer first, then rerun
 the relevant broader suite:

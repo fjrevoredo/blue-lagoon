@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -102,12 +102,14 @@ pub struct TelegramDeliveryReceipt {
     pub message_id: i64,
 }
 
+#[allow(async_fn_in_trait)]
 pub trait TelegramUpdateSource {
-    fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>>;
+    async fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>>;
 }
 
+#[allow(async_fn_in_trait)]
 pub trait TelegramDelivery {
-    fn send_message(
+    async fn send_message(
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt>;
@@ -132,21 +134,23 @@ where
         }
     }
 
-    pub fn poll_once(&mut self) -> Result<Vec<TelegramUpdate>> {
-        self.source.fetch_updates(self.config.poll_limit)
+    pub async fn poll_once(&mut self) -> Result<Vec<TelegramUpdate>> {
+        self.source.fetch_updates(self.config.poll_limit).await
     }
 
-    pub fn send_text(
+    pub async fn send_text(
         &mut self,
         chat_id: i64,
         text: impl Into<String>,
         reply_to_message_id: Option<i64>,
     ) -> Result<TelegramDeliveryReceipt> {
-        self.delivery.send_message(&TelegramOutboundMessage {
-            chat_id,
-            text: text.into(),
-            reply_to_message_id,
-        })
+        self.delivery
+            .send_message(&TelegramOutboundMessage {
+                chat_id,
+                text: text.into(),
+                reply_to_message_id,
+            })
+            .await
     }
 
     pub fn into_parts(self) -> (S, D, ResolvedTelegramConfig) {
@@ -172,7 +176,7 @@ impl FixtureTelegramSource {
 }
 
 impl TelegramUpdateSource for FixtureTelegramSource {
-    fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>> {
+    async fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>> {
         let take = usize::from(limit);
         let count = self.updates.len().min(take);
         Ok(self.updates.drain(0..count).collect())
@@ -192,7 +196,7 @@ impl FakeTelegramDelivery {
 }
 
 impl TelegramDelivery for FakeTelegramDelivery {
-    fn send_message(
+    async fn send_message(
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt> {
@@ -207,17 +211,15 @@ impl TelegramDelivery for FakeTelegramDelivery {
 
 #[derive(Debug, Clone)]
 pub struct ReqwestTelegramSource {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     config: ResolvedTelegramConfig,
 }
 
 impl ReqwestTelegramSource {
     pub fn new(config: ResolvedTelegramConfig) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_millis(
-                    DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS,
-                ))
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS))
                 .build()
                 .expect("Telegram reqwest client should build"),
             config,
@@ -226,7 +228,7 @@ impl ReqwestTelegramSource {
 }
 
 impl TelegramUpdateSource for ReqwestTelegramSource {
-    fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>> {
+    async fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>> {
         let response = self
             .client
             .post(telegram_api_url(&self.config, "getUpdates"))
@@ -236,6 +238,7 @@ impl TelegramUpdateSource for ReqwestTelegramSource {
                 "allowed_updates": ["message", "callback_query"],
             }))
             .send()
+            .await
             .context("failed to call Telegram getUpdates")?;
         let status = response.status();
         if !status.is_success() {
@@ -244,6 +247,7 @@ impl TelegramUpdateSource for ReqwestTelegramSource {
 
         let body: TelegramApiResponse<Vec<TelegramUpdate>> = response
             .json()
+            .await
             .context("failed to decode Telegram getUpdates response")?;
         if !body.ok {
             bail!("Telegram getUpdates response marked itself as not ok");
@@ -254,17 +258,15 @@ impl TelegramUpdateSource for ReqwestTelegramSource {
 
 #[derive(Debug, Clone)]
 pub struct ReqwestTelegramDelivery {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     config: ResolvedTelegramConfig,
 }
 
 impl ReqwestTelegramDelivery {
     pub fn new(config: ResolvedTelegramConfig) -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_millis(
-                    DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS,
-                ))
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS))
                 .build()
                 .expect("Telegram reqwest client should build"),
             config,
@@ -273,7 +275,7 @@ impl ReqwestTelegramDelivery {
 }
 
 impl TelegramDelivery for ReqwestTelegramDelivery {
-    fn send_message(
+    async fn send_message(
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt> {
@@ -286,6 +288,7 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
                 "reply_to_message_id": message.reply_to_message_id,
             }))
             .send()
+            .await
             .context("failed to call Telegram sendMessage")?;
         let status = response.status();
         if !status.is_success() {
@@ -294,6 +297,7 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
 
         let body: TelegramApiResponse<TelegramSendMessageResult> = response
             .json()
+            .await
             .context("failed to decode Telegram sendMessage response")?;
         if !body.ok {
             bail!("Telegram sendMessage response marked itself as not ok");
@@ -332,9 +336,11 @@ struct TelegramSendMessageResult {
     chat: TelegramChat,
 }
 
-pub fn fetch_updates_once(config: ResolvedTelegramConfig) -> Result<Vec<TelegramUpdate>> {
+pub async fn fetch_updates_once(config: ResolvedTelegramConfig) -> Result<Vec<TelegramUpdate>> {
     let limit = config.poll_limit;
-    ReqwestTelegramSource::new(config).fetch_updates(limit)
+    ReqwestTelegramSource::new(config)
+        .fetch_updates(limit)
+        .await
 }
 
 fn telegram_api_url(config: &ResolvedTelegramConfig, method: &str) -> String {
@@ -415,32 +421,38 @@ mod tests {
         assert_eq!(message.text.as_deref(), Some("hello from telegram"));
     }
 
-    #[test]
-    fn fixture_source_respects_one_shot_poll_limit() {
+    #[tokio::test]
+    async fn fixture_source_respects_one_shot_poll_limit() {
         let mut source = FixtureTelegramSource::from_fixture(&fixture_path("private_batch.json"))
             .expect("fixture source should load");
-        let first = source.fetch_updates(1).expect("first poll should succeed");
+        let first = source
+            .fetch_updates(1)
+            .await
+            .expect("first poll should succeed");
         let second = source
             .fetch_updates(10)
+            .await
             .expect("second poll should succeed");
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert!(
             source
                 .fetch_updates(10)
+                .await
                 .expect("third poll should succeed")
                 .is_empty()
         );
     }
 
-    #[test]
-    fn fake_delivery_captures_outbound_messages() {
+    #[tokio::test]
+    async fn fake_delivery_captures_outbound_messages() {
         let source = FixtureTelegramSource::from_updates(vec![]);
         let delivery = FakeTelegramDelivery::default();
         let mut adapter = TelegramAdapter::new(sample_config(), source, delivery);
 
         let receipt = adapter
             .send_text(42, "reply", Some(7))
+            .await
             .expect("delivery should succeed");
         assert_eq!(receipt.chat_id, 42);
         assert_eq!(receipt.message_id, 1);
@@ -451,8 +463,8 @@ mod tests {
         assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(7));
     }
 
-    #[test]
-    fn reqwest_source_fetches_updates_from_telegram_api() {
+    #[tokio::test]
+    async fn reqwest_source_fetches_updates_from_telegram_api() {
         let (api_base_url, receiver, handle) = spawn_single_use_http_server(serde_json::json!({
             "ok": true,
             "result": [{
@@ -483,7 +495,7 @@ mod tests {
             poll_limit: 10,
         });
 
-        let updates = source.fetch_updates(10).expect("poll should succeed");
+        let updates = source.fetch_updates(10).await.expect("poll should succeed");
 
         let request = receiver.recv().expect("request should be captured");
         handle.join().expect("server thread should join");
@@ -494,8 +506,8 @@ mod tests {
         assert_eq!(updates[0].update_id, 42);
     }
 
-    #[test]
-    fn reqwest_delivery_sends_messages_to_telegram_api() {
+    #[tokio::test]
+    async fn reqwest_delivery_sends_messages_to_telegram_api() {
         let (api_base_url, receiver, handle) = spawn_single_use_http_server(serde_json::json!({
             "ok": true,
             "result": {
@@ -522,6 +534,7 @@ mod tests {
                 text: "reply".to_string(),
                 reply_to_message_id: Some(7),
             })
+            .await
             .expect("send should succeed");
 
         let request = receiver.recv().expect("request should be captured");

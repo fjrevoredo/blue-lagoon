@@ -755,6 +755,14 @@ The interaction model is chat-like, but the first real production channel and lo
 - Message normalization, trigger creation, approvals, policy checks, identity handling, and rate control belong in the core harness-mediated system, not in Telegram-specific business logic.
 - Broader multi-channel rollout should be deferred until it clearly improves the single-user core assistant experience.
 
+### Telegram foreground control rules
+
+- Accepted Telegram foreground-trigger intake must be atomic: execution start, conversation-binding reconciliation, ingress persistence, and acceptance audit either commit together or do not commit.
+- Conversation rebinding is allowed, but the canonical internal conversation binding identity must be preserved across rebinds.
+- If duplicate binding rows must be merged, historical ingress rows must be rewired to the canonical binding before any superseded binding row is removed.
+- Live Telegram fetch failures must fail closed and emit durable audit events even when no foreground execution record is created.
+- Provider-specific API-surface differences belong in provider-scoped model-gateway configuration rather than Telegram-specific runtime logic.
+
 ### Proactive behavior and notifications
 
 Proactive behavior remains allowed in v1, but only in a narrow and policy-gated form.
@@ -886,10 +894,15 @@ Unit tests should use deterministic test doubles by default.
 The testing posture for dependencies is:
 
 - Storage-facing component and integration tests must use disposable real PostgreSQL where persistence semantics matter.
+- Storage-facing automated tests must provision disposable per-test databases from reviewed migrations and must not target existing operator databases.
 - Model providers should normally be stubbed or faked.
 - Telegram transport should normally be stubbed or faked.
 - External tools and services should normally be stubbed or faked unless a specific integration path requires stronger validation.
 - Real external networks or providers must not be required for the core required suites.
+
+Manual Telegram E2E remains an operator workflow against the regular local app
+configuration. Test isolation is a test-support responsibility, not a reason to
+split the local runtime into a separate E2E config profile.
 
 Mock-only testing is not acceptable for persistence, migration, recovery, or permission-boundary safety.
 

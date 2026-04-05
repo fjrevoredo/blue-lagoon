@@ -114,9 +114,9 @@ pub async fn run_telegram_once(
 
     let telegram_config = config.require_telegram_config()?;
     let model_gateway_config = config.require_model_gateway_config()?;
-    let transport = model_gateway::ReqwestModelProviderTransport::new();
 
     if let Some(fixture_path) = options.fixture_path {
+        let transport = model_gateway::ReqwestModelProviderTransport::new();
         let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
         let summary = run_telegram_fixture_with(
             &pool,
@@ -131,7 +131,20 @@ pub async fn run_telegram_once(
         return Ok(TelegramOutcome::FixtureProcessed(summary));
     }
 
-    let updates = telegram::fetch_updates_once(telegram_config.clone())?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let updates = match telegram::fetch_updates_once(telegram_config.clone()).await {
+        Ok(updates) => updates,
+        Err(error) => {
+            if let Err(record_error) =
+                record_telegram_fetch_failed(&pool, &error, Some("telegram:getUpdates")).await
+            {
+                return Err(error.context(format!(
+                    "failed to record telegram fetch failure: {record_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
     let summary = process_telegram_updates(
         TelegramProcessingContext {
@@ -433,6 +446,40 @@ async fn record_telegram_update_ignored(
     )
     .await?;
     Ok(())
+}
+
+async fn record_telegram_fetch_failed(
+    pool: &PgPool,
+    error: &anyhow::Error,
+    raw_payload_ref: Option<&str>,
+) -> Result<()> {
+    let trace = TraceContext::root();
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "telegram_ingress".to_string(),
+            event_kind: "telegram_fetch_failed".to_string(),
+            severity: "error".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "error": format_error_chain(error),
+                "raw_payload_ref": raw_payload_ref,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 async fn record_smoke_failure(

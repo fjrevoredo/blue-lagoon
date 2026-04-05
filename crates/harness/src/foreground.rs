@@ -5,7 +5,7 @@ use contracts::{
     IngressEventKind, NormalizedIngress,
 };
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -34,6 +34,31 @@ pub struct ConversationBindingRecord {
     pub external_conversation_id: String,
     pub internal_principal_ref: String,
     pub internal_conversation_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationBindingAction {
+    Created,
+    Updated,
+    Rebound,
+    Merged,
+}
+
+impl ConversationBindingAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Rebound => "rebound",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationBindingWriteResult {
+    pub record: ConversationBindingRecord,
+    pub action: ConversationBindingAction,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +171,88 @@ pub async fn upsert_conversation_binding(
     pool: &PgPool,
     binding: &NewConversationBinding,
 ) -> Result<ConversationBindingRecord> {
+    Ok(reconcile_conversation_binding(pool, binding).await?.record)
+}
+
+pub async fn reconcile_conversation_binding(
+    pool: &PgPool,
+    binding: &NewConversationBinding,
+) -> Result<ConversationBindingWriteResult> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start conversation binding transaction")?;
+
+    let result = reconcile_conversation_binding_in_tx(&mut tx, binding).await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit conversation binding transaction")?;
+
+    Ok(result)
+}
+
+async fn reconcile_conversation_binding_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    binding: &NewConversationBinding,
+) -> Result<ConversationBindingWriteResult> {
+    let external = find_locked_conversation_binding_by_external_tuple(tx, binding).await?;
+    let internal =
+        find_locked_conversation_binding_by_internal_ref(tx, &binding.internal_conversation_ref)
+            .await?;
+
+    let result = match (external, internal) {
+        (None, None) => {
+            // The first accepted ingress for a conversation creates the canonical binding row.
+            ConversationBindingWriteResult {
+                record: insert_conversation_binding(tx, binding).await?,
+                action: ConversationBindingAction::Created,
+            }
+        }
+        (Some(external), Some(internal))
+            if external.conversation_binding_id == internal.conversation_binding_id =>
+        {
+            ConversationBindingWriteResult {
+                record: update_conversation_binding(tx, internal.conversation_binding_id, binding)
+                    .await?,
+                action: ConversationBindingAction::Updated,
+            }
+        }
+        (None, Some(internal)) => ConversationBindingWriteResult {
+            record: update_conversation_binding(tx, internal.conversation_binding_id, binding)
+                .await?,
+            action: ConversationBindingAction::Rebound,
+        },
+        (Some(external), None) => ConversationBindingWriteResult {
+            record: update_conversation_binding(tx, external.conversation_binding_id, binding)
+                .await?,
+            action: ConversationBindingAction::Updated,
+        },
+        (Some(external), Some(internal)) => {
+            // Preserve the canonical internal conversation identity, rewrite any historical
+            // ingress rows that still reference the superseded external binding row, then
+            // remove the duplicate binding row.
+            reassign_ingress_event_bindings(
+                tx,
+                external.conversation_binding_id,
+                internal.conversation_binding_id,
+            )
+            .await?;
+            delete_conversation_binding(tx, external.conversation_binding_id).await?;
+            ConversationBindingWriteResult {
+                record: update_conversation_binding(tx, internal.conversation_binding_id, binding)
+                    .await?,
+                action: ConversationBindingAction::Merged,
+            }
+        }
+    };
+    Ok(result)
+}
+
+async fn insert_conversation_binding(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    binding: &NewConversationBinding,
+) -> Result<ConversationBindingRecord> {
     let row = sqlx::query(
         r#"
         INSERT INTO conversation_bindings (
@@ -167,11 +274,6 @@ pub async fn upsert_conversation_binding(
             NOW(),
             NOW()
         )
-        ON CONFLICT (channel_kind, external_user_id, external_conversation_id)
-        DO UPDATE SET
-            internal_principal_ref = EXCLUDED.internal_principal_ref,
-            internal_conversation_ref = EXCLUDED.internal_conversation_ref,
-            updated_at = NOW()
         RETURNING
             conversation_binding_id,
             channel_kind,
@@ -187,21 +289,159 @@ pub async fn upsert_conversation_binding(
     .bind(&binding.external_conversation_id)
     .bind(&binding.internal_principal_ref)
     .bind(&binding.internal_conversation_ref)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
-    .context("failed to upsert conversation binding")?;
+    .context("failed to insert conversation binding")?;
 
-    Ok(ConversationBindingRecord {
+    Ok(decode_conversation_binding_row(row))
+}
+
+async fn update_conversation_binding(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    conversation_binding_id: Uuid,
+    binding: &NewConversationBinding,
+) -> Result<ConversationBindingRecord> {
+    let row = sqlx::query(
+        r#"
+        UPDATE conversation_bindings
+        SET
+            channel_kind = $2,
+            external_user_id = $3,
+            external_conversation_id = $4,
+            internal_principal_ref = $5,
+            internal_conversation_ref = $6,
+            updated_at = NOW()
+        WHERE conversation_binding_id = $1
+        RETURNING
+            conversation_binding_id,
+            channel_kind,
+            external_user_id,
+            external_conversation_id,
+            internal_principal_ref,
+            internal_conversation_ref
+        "#,
+    )
+    .bind(conversation_binding_id)
+    .bind(channel_kind_as_str(binding.channel_kind))
+    .bind(&binding.external_user_id)
+    .bind(&binding.external_conversation_id)
+    .bind(&binding.internal_principal_ref)
+    .bind(&binding.internal_conversation_ref)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to update conversation binding")?;
+
+    Ok(decode_conversation_binding_row(row))
+}
+
+async fn delete_conversation_binding(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    conversation_binding_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM conversation_bindings
+        WHERE conversation_binding_id = $1
+        "#,
+    )
+    .bind(conversation_binding_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to delete superseded conversation binding")?;
+    Ok(())
+}
+
+async fn reassign_ingress_event_bindings(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    from_binding_id: Uuid,
+    to_binding_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE ingress_events
+        SET conversation_binding_id = $2
+        WHERE conversation_binding_id = $1
+        "#,
+    )
+    .bind(from_binding_id)
+    .bind(to_binding_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to reassign ingress events to canonical conversation binding")?;
+    Ok(())
+}
+
+fn decode_conversation_binding_row(row: sqlx::postgres::PgRow) -> ConversationBindingRecord {
+    ConversationBindingRecord {
         conversation_binding_id: row.get("conversation_binding_id"),
         channel_kind: row.get("channel_kind"),
         external_user_id: row.get("external_user_id"),
         external_conversation_id: row.get("external_conversation_id"),
         internal_principal_ref: row.get("internal_principal_ref"),
         internal_conversation_ref: row.get("internal_conversation_ref"),
-    })
+    }
 }
 
-pub async fn insert_ingress_event(pool: &PgPool, event: &NewIngressEvent) -> Result<()> {
+async fn find_locked_conversation_binding_by_external_tuple(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    binding: &NewConversationBinding,
+) -> Result<Option<ConversationBindingRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            conversation_binding_id,
+            channel_kind,
+            external_user_id,
+            external_conversation_id,
+            internal_principal_ref,
+            internal_conversation_ref
+        FROM conversation_bindings
+        WHERE channel_kind = $1
+          AND external_user_id = $2
+          AND external_conversation_id = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(channel_kind_as_str(binding.channel_kind))
+    .bind(&binding.external_user_id)
+    .bind(&binding.external_conversation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to look up conversation binding by external tuple")?;
+
+    Ok(row.map(decode_conversation_binding_row))
+}
+
+async fn find_locked_conversation_binding_by_internal_ref(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    internal_conversation_ref: &str,
+) -> Result<Option<ConversationBindingRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            conversation_binding_id,
+            channel_kind,
+            external_user_id,
+            external_conversation_id,
+            internal_principal_ref,
+            internal_conversation_ref
+        FROM conversation_bindings
+        WHERE internal_conversation_ref = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(internal_conversation_ref)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to look up conversation binding by internal conversation ref")?;
+
+    Ok(row.map(decode_conversation_binding_row))
+}
+
+pub async fn insert_ingress_event<'e, E>(executor: E, event: &NewIngressEvent) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         INSERT INTO ingress_events (
@@ -320,7 +560,7 @@ pub async fn insert_ingress_event(pool: &PgPool, event: &NewIngressEvent) -> Res
             .and_then(|payload| payload.callback_data.clone()),
     )
     .bind(&event.ingress.raw_payload_ref)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to insert ingress event")?;
     Ok(())
@@ -737,13 +977,15 @@ pub async fn intake_telegram_foreground_trigger(
         PolicyDecision::Allowed => {}
         PolicyDecision::Denied { reason } => {
             let trace = TraceContext::root();
-            let conversation_binding_id =
+            let conversation_binding =
                 maybe_upsert_matching_conversation_binding(pool, telegram_config, &ingress).await?;
             insert_ingress_event(
                 pool,
                 &NewIngressEvent {
                     ingress: ingress.clone(),
-                    conversation_binding_id,
+                    conversation_binding_id: conversation_binding
+                        .as_ref()
+                        .map(|binding| binding.record.conversation_binding_id),
                     trace_id: trace.trace_id,
                     execution_id: None,
                     status: "rejected".to_string(),
@@ -769,6 +1011,9 @@ pub async fn intake_telegram_foreground_trigger(
                         "event_kind": ingress_event_kind_as_str(ingress.event_kind),
                         "deduplication_key": deduplication_key,
                         "reason": reason,
+                        "conversation_binding_action": conversation_binding
+                            .as_ref()
+                            .map(|binding| binding.action.as_str()),
                     }),
                 },
             )
@@ -800,27 +1045,37 @@ pub async fn intake_telegram_foreground_trigger(
         budget,
     };
 
+    let request_payload = serde_json::to_value(&trigger)
+        .context("failed to serialize foreground trigger request payload")?;
+    let binding = matching_conversation_binding(telegram_config, &ingress)
+        .context("accepted Telegram ingress must match the configured conversation binding")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start accepted foreground trigger transaction")?;
+
+    // Accepted trigger creation is all-or-nothing. Execution start, binding reconciliation,
+    // ingress persistence, and acceptance audit commit together so failures cannot strand a
+    // foreground execution in `started` before orchestration begins.
     execution::insert(
-        pool,
+        &mut *tx,
         &NewExecutionRecord {
             execution_id,
             trace_id: trace.trace_id,
             trigger_kind: "telegram_user_ingress".to_string(),
             synthetic_trigger: None,
             status: "started".to_string(),
-            request_payload: serde_json::to_value(&trigger)
-                .context("failed to serialize foreground trigger request payload")?,
+            request_payload,
         },
     )
     .await?;
 
-    let conversation_binding_id =
-        upsert_matching_conversation_binding(pool, telegram_config, &ingress).await?;
+    let conversation_binding = reconcile_conversation_binding_in_tx(&mut tx, &binding).await?;
     insert_ingress_event(
-        pool,
+        &mut *tx,
         &NewIngressEvent {
             ingress: ingress.clone(),
-            conversation_binding_id: Some(conversation_binding_id),
+            conversation_binding_id: Some(conversation_binding.record.conversation_binding_id),
             trace_id: trace.trace_id,
             execution_id: Some(execution_id),
             status: "accepted".to_string(),
@@ -830,7 +1085,7 @@ pub async fn intake_telegram_foreground_trigger(
     .await?;
 
     audit::insert(
-        pool,
+        &mut *tx,
         &NewAuditEvent {
             loop_kind: "conscious".to_string(),
             subsystem: "foreground_trigger".to_string(),
@@ -850,10 +1105,15 @@ pub async fn intake_telegram_foreground_trigger(
                     "wall_clock_budget_ms": trigger.budget.wall_clock_budget_ms,
                     "token_budget": trigger.budget.token_budget,
                 },
+                "conversation_binding_action": conversation_binding.action.as_str(),
             }),
         },
     )
     .await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit accepted foreground trigger transaction")?;
 
     Ok(ForegroundTriggerIntakeOutcome::Accepted(Box::new(trigger)))
 }
@@ -933,24 +1193,12 @@ async fn maybe_upsert_matching_conversation_binding(
     pool: &PgPool,
     config: &ResolvedTelegramConfig,
     ingress: &NormalizedIngress,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<ConversationBindingWriteResult>> {
     let Some(binding) = matching_conversation_binding(config, ingress) else {
         return Ok(None);
     };
 
-    let record = upsert_conversation_binding(pool, &binding).await?;
-    Ok(Some(record.conversation_binding_id))
-}
-
-async fn upsert_matching_conversation_binding(
-    pool: &PgPool,
-    config: &ResolvedTelegramConfig,
-    ingress: &NormalizedIngress,
-) -> Result<Uuid> {
-    let binding = matching_conversation_binding(config, ingress)
-        .context("accepted Telegram ingress must match the configured conversation binding")?;
-    let record = upsert_conversation_binding(pool, &binding).await?;
-    Ok(record.conversation_binding_id)
+    Ok(Some(reconcile_conversation_binding(pool, &binding).await?))
 }
 
 fn matching_conversation_binding(

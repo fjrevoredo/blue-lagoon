@@ -83,9 +83,12 @@ Validate the compose topology:
 docker compose config
 ```
 
-If `BLUE_LAGOON_DATABASE_URL` is unset, the test support code starts local
-PostgreSQL through `docker compose up -d postgres`. In CI or other managed
-environments, set `BLUE_LAGOON_DATABASE_URL` explicitly instead.
+If `BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL` is unset, the test support code starts
+local PostgreSQL through `docker compose up -d postgres`. Automated tests do
+not run against `BLUE_LAGOON_DATABASE_URL`; they create disposable databases
+through the test support fixtures. In CI or other managed environments, set
+`BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL` to a PostgreSQL admin connection that can
+create and drop per-test databases.
 
 ## Configuration
 
@@ -103,7 +106,11 @@ Important runtime inputs include:
 - `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`: Telegram bot token
 - `BLUE_LAGOON_FOREGROUND_ROUTE`: optional foreground route override in
   `<provider>/<exact-model>` form
+- `BLUE_LAGOON_FOREGROUND_API_BASE_URL`: optional foreground provider API base
+  URL override for operator/debug use
 - `BLUE_LAGOON_FOREGROUND_API_KEY`: foreground model provider API key
+- `BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL`: optional automated-test-only PostgreSQL
+  admin connection used to create and drop disposable per-test databases
 
 The harness expects either:
 
@@ -116,6 +123,30 @@ The Telegram foreground path also requires:
 - a configured single allowed Telegram user and private chat binding
 - a valid self-model seed file
 - a configured foreground model route
+
+Provider-specific foreground settings live under `model_gateway.<provider>`.
+For Z.ai, the stable config is `[model_gateway.z_ai]` with:
+
+- `api_surface = "general" | "coding"`
+- optional `api_base_url` only when a nonstandard endpoint override is needed
+
+`model_gateway.foreground.api_base_url` remains a compatibility fallback, but
+provider-specific sections are the preferred repository-facing configuration.
+
+Foreground Telegram intake is treated as an atomic accepted-trigger write path:
+
+- execution start, binding reconciliation, ingress persistence, and acceptance
+  audit commit together or not at all
+- rebinding preserves the canonical internal conversation binding row and
+  rewires historical ingress references before removing superseded duplicates
+- live Telegram fetch failures are durably audited as ingress failures
+
+Automated DB tests follow one repository-wide rule:
+
+- DB-using tests must provision disposable databases from reviewed migrations
+- DB-using tests must not target existing operator databases
+- live manual Telegram E2E uses the normal local app config and database, not a
+  dedicated test profile
 
 ## Verification
 

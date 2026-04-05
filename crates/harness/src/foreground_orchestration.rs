@@ -8,6 +8,7 @@ use crate::{
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
     model_gateway::ModelProviderTransport,
+    policy,
     telegram::{TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
@@ -79,6 +80,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -107,6 +109,7 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
                 error,
             )
             .await;
@@ -128,6 +131,7 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::ContextAssemblyFailure,
                 error,
             )
             .await;
@@ -143,6 +147,7 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
                 error,
             )
             .await;
@@ -168,6 +173,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -178,23 +184,29 @@ where
         trigger.execution_id,
         assembly.context,
     );
-    let response =
-        match worker::launch_conscious_worker(config, model_gateway_config, &request, transport)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                record_foreground_failure(
-                    pool,
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    recorded_episode_id,
-                    &error.to_string(),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+    let response = match worker::launch_conscious_worker_with_timeout(
+        config,
+        model_gateway_config,
+        &request,
+        transport,
+        policy::effective_foreground_worker_timeout_ms(config),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_foreground_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                classify_conscious_worker_failure(&error),
+                &format_error_chain(&error),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
 
     let contracts::WorkerResult::Conscious(result) = &response.result else {
         let message = "conscious worker returned a non-conscious result".to_string();
@@ -203,6 +215,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::WorkerProtocolFailure,
             &message,
         )
         .await?;
@@ -231,6 +244,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -244,6 +258,7 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
                 error,
             )
             .await;
@@ -257,17 +272,21 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
                 error,
             )
             .await;
         }
     };
 
-    let delivery_receipt = match delivery.send_message(&TelegramOutboundMessage {
-        chat_id,
-        text: result.assistant_output.text.clone(),
-        reply_to_message_id,
-    }) {
+    let delivery_receipt = match delivery
+        .send_message(&TelegramOutboundMessage {
+            chat_id,
+            text: result.assistant_output.text.clone(),
+            reply_to_message_id,
+        })
+        .await
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             record_foreground_failure(
@@ -275,7 +294,8 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
-                &error.to_string(),
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                &format_error_chain(&error),
             )
             .await?;
             return Err(error);
@@ -293,6 +313,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -308,6 +329,7 @@ where
                 trigger.trace_id,
                 trigger.execution_id,
                 recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
                 error,
             )
             .await;
@@ -327,6 +349,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -344,6 +367,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -373,6 +397,7 @@ where
             trigger.trace_id,
             trigger.execution_id,
             recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
             error,
         )
         .await;
@@ -394,13 +419,14 @@ async fn record_foreground_failure(
     trace_id: Uuid,
     execution_id: Uuid,
     episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
     error_message: &str,
 ) -> Result<()> {
     execution::mark_failed(
         pool,
         execution_id,
         &json!({
-            "kind": "worker_failure",
+            "kind": failure_kind.as_str(),
             "message": error_message,
         }),
     )
@@ -420,6 +446,7 @@ async fn record_foreground_failure(
             worker_pid: None,
             payload: json!({
                 "episode_id": episode_id,
+                "failure_kind": failure_kind.as_str(),
                 "error": error_message,
             }),
         },
@@ -433,11 +460,19 @@ async fn record_and_return_failure<T>(
     trace_id: Uuid,
     execution_id: Uuid,
     episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
     error: Error,
 ) -> Result<T> {
-    if let Err(record_error) =
-        record_foreground_failure(pool, trace_id, execution_id, episode_id, &error.to_string())
-            .await
+    let error_message = format_error_chain(&error);
+    if let Err(record_error) = record_foreground_failure(
+        pool,
+        trace_id,
+        execution_id,
+        episode_id,
+        failure_kind,
+        &error_message,
+    )
+    .await
     {
         return Err(error.context(format!(
             "failed to record foreground execution failure: {record_error}"
@@ -445,6 +480,52 @@ async fn record_and_return_failure<T>(
     }
 
     Err(error)
+}
+
+fn format_error_chain(error: &Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundFailureKind {
+    ContextAssemblyFailure,
+    WorkerProtocolFailure,
+    ModelGatewayTransportFailure,
+    ProviderRejected,
+    TelegramDeliveryFailure,
+    PersistenceFailure,
+}
+
+impl ForegroundFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextAssemblyFailure => "context_assembly_failure",
+            Self::WorkerProtocolFailure => "worker_protocol_failure",
+            Self::ModelGatewayTransportFailure => "model_gateway_transport_failure",
+            Self::ProviderRejected => "provider_rejected",
+            Self::TelegramDeliveryFailure => "telegram_delivery_failure",
+            Self::PersistenceFailure => "persistence_failure",
+        }
+    }
+}
+
+fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
+    let message = format_error_chain(error);
+    if message.contains("provider returned status") {
+        return ForegroundFailureKind::ProviderRejected;
+    }
+    if message.contains("model gateway transport failed")
+        || message.contains("error sending request for url")
+        || message.contains("failed to decode provider HTTP response body")
+    {
+        return ForegroundFailureKind::ModelGatewayTransportFailure;
+    }
+
+    ForegroundFailureKind::WorkerProtocolFailure
 }
 
 fn parse_telegram_chat_id(ingress: &contracts::NormalizedIngress) -> Result<i64> {

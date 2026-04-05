@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use contracts::{ForegroundBudget, IngressEventKind, NormalizedIngress};
 
-use crate::config::{ResolvedTelegramConfig, RuntimeConfig};
+use crate::config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig};
+
+pub const FOREGROUND_WORKER_TIMEOUT_GRACE_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionBudget {
@@ -26,6 +28,23 @@ pub fn default_budget(config: &RuntimeConfig) -> ExecutionBudget {
     ExecutionBudget {
         wall_clock_budget_ms: config.harness.default_wall_clock_budget_ms,
     }
+}
+
+pub fn effective_foreground_model_timeout_ms(
+    config: &RuntimeConfig,
+    gateway: &ResolvedModelGatewayConfig,
+) -> u64 {
+    config
+        .harness
+        .default_wall_clock_budget_ms
+        .min(gateway.foreground.timeout_ms)
+}
+
+pub fn effective_foreground_worker_timeout_ms(config: &RuntimeConfig) -> u64 {
+    config
+        .harness
+        .default_wall_clock_budget_ms
+        .saturating_add(FOREGROUND_WORKER_TIMEOUT_GRACE_MS)
 }
 
 pub fn validate_budget(budget: ExecutionBudget) -> Result<()> {
@@ -207,6 +226,31 @@ mod tests {
         })
         .expect_err("zero token budget should be rejected");
         assert!(error.to_string().contains("token"));
+    }
+
+    #[test]
+    fn foreground_model_timeout_is_clamped_to_harness_budget() {
+        let timeout = effective_foreground_model_timeout_ms(
+            &config(true),
+            &crate::config::ResolvedModelGatewayConfig {
+                foreground: crate::config::ResolvedForegroundModelRouteConfig {
+                    provider: contracts::ModelProviderKind::ZAi,
+                    model: "glm".to_string(),
+                    api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+                    api_key: "secret".to_string(),
+                    timeout_ms: 45_000,
+                },
+            },
+        );
+        assert_eq!(timeout, 30_000);
+    }
+
+    #[test]
+    fn foreground_worker_timeout_derives_from_harness_budget() {
+        assert_eq!(
+            effective_foreground_worker_timeout_ms(&config(true)),
+            35_000
+        );
     }
 
     #[test]

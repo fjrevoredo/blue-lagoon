@@ -1,13 +1,23 @@
-use std::{path::PathBuf, process::Command, sync::OnceLock, time::Duration};
+use std::{future::Future, path::PathBuf, process::Command, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result};
-use harness::{config::RuntimeConfig, db};
-use sqlx::{Executor, PgPool};
+use harness::{config::RuntimeConfig, db, migration};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
+use url::Url;
+use uuid::Uuid;
 
-const LOCAL_TEST_DATABASE_URL: &str =
-    "postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon";
+const DEFAULT_TEST_POSTGRES_ADMIN_URL: &str =
+    "postgres://blue_lagoon:blue_lagoon@localhost:55432/postgres";
 #[allow(dead_code)]
 static WORKERS_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct TestDatabaseContext {
+    pub config: RuntimeConfig,
+    pub pool: PgPool,
+    #[allow(dead_code)]
+    pub database_name: String,
+}
 
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -26,15 +36,72 @@ pub fn workers_binary() -> Result<PathBuf> {
     }
 }
 
-pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
-    let database_url =
-        configured_database_url().unwrap_or_else(|| LOCAL_TEST_DATABASE_URL.to_string());
+#[allow(dead_code)]
+pub async fn with_clean_database<F, Fut, T>(test_fn: F) -> Result<T>
+where
+    F: FnOnce(TestDatabaseContext) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    with_database(TestDatabaseProvisioning::Clean, test_fn).await
+}
 
+pub async fn with_migrated_database<F, Fut, T>(test_fn: F) -> Result<T>
+where
+    F: FnOnce(TestDatabaseContext) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    with_database(TestDatabaseProvisioning::Migrated, test_fn).await
+}
+
+async fn with_database<F, Fut, T>(provisioning: TestDatabaseProvisioning, test_fn: F) -> Result<T>
+where
+    F: FnOnce(TestDatabaseContext) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let admin_database_url = resolved_test_postgres_admin_url();
     if should_bootstrap_local_postgres() {
         ensure_postgres_running()?;
     }
 
-    let config = RuntimeConfig {
+    let database_name = disposable_database_name();
+    let database_url = disposable_database_url(&admin_database_url, &database_name)?;
+    create_database(&admin_database_url, &database_name).await?;
+
+    let config = build_test_runtime_config(database_url);
+    let pool = connect_with_retry(&config).await?;
+    if provisioning == TestDatabaseProvisioning::Migrated {
+        migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+    }
+
+    let result = test_fn(TestDatabaseContext {
+        config: config.clone(),
+        pool: pool.clone(),
+        database_name: database_name.clone(),
+    })
+    .await;
+
+    let cleanup_result = drop_database(&admin_database_url, pool, &database_name).await;
+    match (result, cleanup_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(test_error), Ok(())) => Err(test_error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(test_error), Err(cleanup_error)) => Err(test_error.context(format!(
+            "test database cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
+fn resolved_test_postgres_admin_url() -> String {
+    std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL")
+        .unwrap_or_else(|_| DEFAULT_TEST_POSTGRES_ADMIN_URL.to_string())
+}
+
+fn should_bootstrap_local_postgres() -> bool {
+    std::env::var_os("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL").is_none()
+}
+
+fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
+    RuntimeConfig {
         app: harness::config::AppConfig {
             name: "blue-lagoon".to_string(),
             log_filter: "info".to_string(),
@@ -57,24 +124,22 @@ pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
         telegram: None,
         model_gateway: None,
         self_model: None,
-    };
-
-    let pool = connect_with_retry(&config).await?;
-    reset_database(&pool).await?;
-    Ok((config, pool))
+    }
 }
 
-fn configured_database_url() -> Option<String> {
-    std::env::var("BLUE_LAGOON_DATABASE_URL")
-        .ok()
-        .or_else(|| std::env::var("BLUE_LAGOON_TEST_DATABASE_URL").ok())
+fn disposable_database_name() -> String {
+    format!("blue_lagoon_test_{}", Uuid::now_v7().simple())
 }
 
-fn should_bootstrap_local_postgres() -> bool {
-    configured_database_url().is_none()
+fn disposable_database_url(admin_database_url: &str, database_name: &str) -> Result<String> {
+    let mut url = Url::parse(admin_database_url).with_context(|| {
+        format!("failed to parse test postgres admin url '{admin_database_url}'")
+    })?;
+    url.set_path(&format!("/{database_name}"));
+    Ok(url.into())
 }
 
-pub async fn connect_with_retry(config: &RuntimeConfig) -> Result<PgPool> {
+async fn connect_with_retry(config: &RuntimeConfig) -> Result<PgPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match db::connect(config).await {
@@ -101,6 +166,45 @@ fn ensure_postgres_running() -> Result<()> {
     if !status.success() {
         anyhow::bail!("docker compose up -d postgres failed");
     }
+    Ok(())
+}
+
+async fn create_database(admin_database_url: &str, database_name: &str) -> Result<()> {
+    let mut connection = PgConnection::connect(admin_database_url)
+        .await
+        .context("failed to connect to test postgres admin database")?;
+    connection
+        .execute(format!(r#"CREATE DATABASE "{database_name}""#).as_str())
+        .await
+        .with_context(|| format!("failed to create disposable test database '{database_name}'"))?;
+    Ok(())
+}
+
+async fn drop_database(admin_database_url: &str, pool: PgPool, database_name: &str) -> Result<()> {
+    pool.close().await;
+
+    let mut connection = PgConnection::connect(admin_database_url)
+        .await
+        .context("failed to reconnect to test postgres admin database for cleanup")?;
+    sqlx::query(
+        r#"
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#,
+    )
+    .bind(database_name)
+    .execute(&mut connection)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to terminate active sessions for disposable test database '{database_name}'"
+        )
+    })?;
+    connection
+        .execute(format!(r#"DROP DATABASE "{database_name}""#).as_str())
+        .await
+        .with_context(|| format!("failed to drop disposable test database '{database_name}'"))?;
     Ok(())
 }
 
@@ -142,27 +246,9 @@ fn resolve_workers_binary() -> Result<PathBuf> {
     Ok(binary_path)
 }
 
-pub async fn reset_database(pool: &PgPool) -> Result<()> {
-    pool.execute("DROP TABLE IF EXISTS episode_messages CASCADE")
-        .await
-        .context("failed to drop episode_messages")?;
-    pool.execute("DROP TABLE IF EXISTS episodes CASCADE")
-        .await
-        .context("failed to drop episodes")?;
-    pool.execute("DROP TABLE IF EXISTS ingress_events CASCADE")
-        .await
-        .context("failed to drop ingress_events")?;
-    pool.execute("DROP TABLE IF EXISTS conversation_bindings CASCADE")
-        .await
-        .context("failed to drop conversation_bindings")?;
-    pool.execute("DROP TABLE IF EXISTS audit_events CASCADE")
-        .await
-        .context("failed to drop audit_events")?;
-    pool.execute("DROP TABLE IF EXISTS execution_records CASCADE")
-        .await
-        .context("failed to drop execution_records")?;
-    pool.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
-        .await
-        .context("failed to drop schema_migrations")?;
-    Ok(())
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestDatabaseProvisioning {
+    Clean,
+    Migrated,
 }

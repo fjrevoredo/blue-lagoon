@@ -27,3 +27,4 @@ assert_cmd.workspace = true
 once_cell.workspace = true
 predicates.workspace = true
 serial_test.workspace = true
+url.workspace = true

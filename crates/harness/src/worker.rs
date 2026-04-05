@@ -96,6 +96,23 @@ pub async fn launch_conscious_worker<T: ModelProviderTransport>(
     request: &WorkerRequest,
     transport: &T,
 ) -> Result<WorkerResponse> {
+    launch_conscious_worker_with_timeout(
+        config,
+        gateway,
+        request,
+        transport,
+        config.worker.timeout_ms,
+    )
+    .await
+}
+
+pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
+    config: &RuntimeConfig,
+    gateway: &ResolvedModelGatewayConfig,
+    request: &WorkerRequest,
+    transport: &T,
+    timeout_ms: u64,
+) -> Result<WorkerResponse> {
     let command_spec = resolve_command(config, "conscious-worker")?;
     let mut command = Command::new(&command_spec.command);
     command
@@ -180,21 +197,20 @@ pub async fn launch_conscious_worker<T: ModelProviderTransport>(
         Ok((response, status))
     };
 
-    let (response, status) =
-        match timeout(Duration::from_millis(config.worker.timeout_ms), operation).await {
-            Ok(result) => result?,
-            Err(_) => {
-                child
-                    .start_kill()
-                    .context("failed to terminate timed-out conscious worker subprocess")?;
-                let _ = child.wait().await;
-                let _ = read_child_stream(stderr_task, "stderr").await;
-                bail!(
-                    "conscious worker subprocess timed out after {} ms and was terminated",
-                    config.worker.timeout_ms
-                );
-            }
-        };
+    let (response, status) = match timeout(Duration::from_millis(timeout_ms), operation).await {
+        Ok(result) => result?,
+        Err(_) => {
+            child
+                .start_kill()
+                .context("failed to terminate timed-out conscious worker subprocess")?;
+            let _ = child.wait().await;
+            let _ = read_child_stream(stderr_task, "stderr").await;
+            bail!(
+                "conscious worker subprocess timed out after {} ms and was terminated",
+                timeout_ms
+            );
+        }
+    };
 
     let stderr = read_child_stream(stderr_task, "stderr").await?;
     if !status.success() {

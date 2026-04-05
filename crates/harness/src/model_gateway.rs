@@ -73,15 +73,42 @@ impl ModelProviderTransport for ReqwestModelProviderTransport {
             .json(&request.body)
             .send()
             .await
-            .map_err(|error| ModelGatewayError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                ModelGatewayError::Transport(format_reqwest_transport_error(
+                    "send request",
+                    &request.url,
+                    request.timeout_ms,
+                    &error,
+                ))
+            })?;
 
         let status = response.status().as_u16();
-        let body = response
-            .json::<Value>()
-            .await
-            .map_err(|error| ModelGatewayError::Transport(error.to_string()))?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            ModelGatewayError::Transport(format_reqwest_transport_error(
+                "decode response body",
+                &request.url,
+                request.timeout_ms,
+                &error,
+            ))
+        })?;
         Ok(ProviderHttpResponse { status, body })
     }
+}
+
+fn format_reqwest_transport_error(
+    action: &str,
+    url: &str,
+    timeout_ms: u64,
+    error: &reqwest::Error,
+) -> String {
+    let mut message = format!("{action} for {url} failed (timeout_ms={timeout_ms}): {error}");
+    let mut source = std::error::Error::source(error);
+    while let Some(next) = source {
+        message.push_str(": ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+    message
 }
 
 #[derive(Debug, Clone)]

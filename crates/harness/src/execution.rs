@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -24,7 +24,10 @@ pub struct ExecutionRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-pub async fn insert(pool: &PgPool, record: &NewExecutionRecord) -> Result<()> {
+pub async fn insert<'e, E>(executor: E, record: &NewExecutionRecord) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         INSERT INTO execution_records (
@@ -62,7 +65,7 @@ pub async fn insert(pool: &PgPool, record: &NewExecutionRecord) -> Result<()> {
     .bind(&record.synthetic_trigger)
     .bind(&record.status)
     .bind(&record.request_payload)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to insert execution record")?;
     Ok(())
