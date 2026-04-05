@@ -122,7 +122,7 @@ pub struct EpisodeMessageRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForegroundTriggerIntakeOutcome {
-    Accepted(ForegroundTrigger),
+    Accepted(Box<ForegroundTrigger>),
     Duplicate(DuplicateForegroundTrigger),
     Rejected(RejectedForegroundTrigger),
 }
@@ -855,7 +855,7 @@ pub async fn intake_telegram_foreground_trigger(
     )
     .await?;
 
-    Ok(ForegroundTriggerIntakeOutcome::Accepted(trigger))
+    Ok(ForegroundTriggerIntakeOutcome::Accepted(Box::new(trigger)))
 }
 
 fn channel_kind_as_str(channel_kind: ChannelKind) -> &'static str {

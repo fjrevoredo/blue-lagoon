@@ -134,13 +134,15 @@ pub async fn run_telegram_once(
     let updates = telegram::fetch_updates_once(telegram_config.clone())?;
     let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
     let summary = process_telegram_updates(
-        &pool,
-        config,
-        &telegram_config,
-        &model_gateway_config,
+        TelegramProcessingContext {
+            pool: &pool,
+            config,
+            telegram_config: &telegram_config,
+            model_gateway_config: &model_gateway_config,
+            transport: &transport,
+            raw_payload_ref: Some("telegram:getUpdates".to_string()),
+        },
         updates,
-        Some("telegram:getUpdates".to_string()),
-        &transport,
         &mut delivery,
     )
     .await?;
@@ -162,13 +164,15 @@ where
 {
     let updates = telegram::load_fixture_updates(fixture_path)?;
     process_telegram_updates(
-        pool,
-        config,
-        telegram_config,
-        model_gateway_config,
+        TelegramProcessingContext {
+            pool,
+            config,
+            telegram_config,
+            model_gateway_config,
+            transport,
+            raw_payload_ref: Some(fixture_path.display().to_string()),
+        },
         updates,
-        Some(fixture_path.display().to_string()),
-        transport,
         delivery,
     )
     .await
@@ -289,14 +293,18 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
     })
 }
 
-async fn process_telegram_updates<T, D>(
-    pool: &PgPool,
-    config: &RuntimeConfig,
-    telegram_config: &crate::config::ResolvedTelegramConfig,
-    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
-    updates: Vec<TelegramUpdate>,
+struct TelegramProcessingContext<'a, T> {
+    pool: &'a PgPool,
+    config: &'a RuntimeConfig,
+    telegram_config: &'a crate::config::ResolvedTelegramConfig,
+    model_gateway_config: &'a crate::config::ResolvedModelGatewayConfig,
+    transport: &'a T,
     raw_payload_ref: Option<String>,
-    transport: &T,
+}
+
+async fn process_telegram_updates<T, D>(
+    context: TelegramProcessingContext<'_, T>,
+    updates: Vec<TelegramUpdate>,
     delivery: &mut D,
 ) -> Result<TelegramProcessingSummary>
 where
@@ -309,18 +317,21 @@ where
     };
 
     for update in updates {
-        let normalization =
-            ingress::normalize_telegram_update(telegram_config, &update, raw_payload_ref.clone())?;
+        let normalization = ingress::normalize_telegram_update(
+            context.telegram_config,
+            &update,
+            context.raw_payload_ref.clone(),
+        )?;
 
         match normalization {
             TelegramNormalizationOutcome::Accepted(ingress) => {
                 match foreground_orchestration::orchestrate_telegram_foreground_ingress(
-                    pool,
-                    config,
-                    telegram_config,
-                    model_gateway_config,
-                    ingress,
-                    transport,
+                    context.pool,
+                    context.config,
+                    context.telegram_config,
+                    context.model_gateway_config,
+                    *ingress,
+                    context.transport,
                     delivery,
                 )
                 .await?
@@ -338,6 +349,13 @@ where
             }
             TelegramNormalizationOutcome::Rejected(rejected) => {
                 summary.normalization_rejected_count += 1;
+                record_telegram_normalization_rejected(
+                    context.pool,
+                    &rejected.external_event_id,
+                    &rejected.detail,
+                    context.raw_payload_ref.as_deref(),
+                )
+                .await?;
                 info!(
                     external_event_id = rejected.external_event_id,
                     detail = rejected.detail,
@@ -346,6 +364,12 @@ where
             }
             TelegramNormalizationOutcome::Ignored(ignored) => {
                 summary.ignored_count += 1;
+                record_telegram_update_ignored(
+                    context.pool,
+                    &ignored.external_event_id,
+                    context.raw_payload_ref.as_deref(),
+                )
+                .await?;
                 info!(
                     external_event_id = ignored.external_event_id,
                     "telegram update ignored during normalization",
@@ -355,6 +379,60 @@ where
     }
 
     Ok(summary)
+}
+
+async fn record_telegram_normalization_rejected(
+    pool: &PgPool,
+    external_event_id: &str,
+    detail: &str,
+    raw_payload_ref: Option<&str>,
+) -> Result<()> {
+    let trace = TraceContext::root();
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "telegram_ingress".to_string(),
+            event_kind: "telegram_ingress_normalization_rejected".to_string(),
+            severity: "warn".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "external_event_id": external_event_id,
+                "detail": detail,
+                "raw_payload_ref": raw_payload_ref,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn record_telegram_update_ignored(
+    pool: &PgPool,
+    external_event_id: &str,
+    raw_payload_ref: Option<&str>,
+) -> Result<()> {
+    let trace = TraceContext::root();
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "telegram_ingress".to_string(),
+            event_kind: "telegram_ingress_ignored".to_string(),
+            severity: "info".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "external_event_id": external_event_id,
+                "raw_payload_ref": raw_payload_ref,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn record_smoke_failure(

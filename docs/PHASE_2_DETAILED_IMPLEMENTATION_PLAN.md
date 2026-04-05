@@ -222,9 +222,10 @@ When a task is completed:
 
 Latest verification state:
 
-- Phase 2 state has been self-checked after `P2-06`, `P2-11`, `P2-12`,
-  `P2-13`, `P2-14`, `P2-15`, `P2-16`, `P2-17`, and `P2-18`
-  implementation.
+- Phase 2 state has been self-checked after the full `P2-01` through `P2-18`
+  implementation set and after the post-completion remediation pass for
+  foreground failure handling, normalization-path auditability, Telegram
+  transport bounds, conscious-worker prompt completeness, and lint hygiene.
 - `cmd.exe /c cargo fmt --all --check` is green.
 - `cmd.exe /c cargo check --workspace` is green.
 - `cmd.exe /c cargo test -p contracts -- --nocapture` is green.
@@ -232,6 +233,7 @@ Latest verification state:
 - `cmd.exe /c cargo test -p harness --test phase2_integration -- --nocapture`
   is green.
 - `cmd.exe /c cargo test -p workers -- --nocapture` is green.
+- `cmd.exe /c cargo clippy --workspace --all-targets -- -D warnings` is green.
 - `cmd.exe /c cargo test --workspace` is green.
 
 Latest review corrections already applied:
@@ -241,6 +243,13 @@ Latest review corrections already applied:
   and approval callback payloads
 - conscious worker requests now reuse one consistent request ID and timestamp
   across wrapper and payload
+- accepted foreground runs now record failed execution and episode state across
+  post-intake error paths rather than remaining in `started`
+- normalization-level Telegram rejects and ignored updates now emit durable
+  audit events
+- Telegram transport HTTP calls now use bounded client timeouts
+- conscious worker prompts now include capabilities, current goals, current
+  subgoals, and the internal-state snapshot required by Phase 2
 - task status and evidence in this document have been reconciled with the code
   state
 

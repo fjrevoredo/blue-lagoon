@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error, Result, bail};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ where
             .await?;
 
     let trigger = match intake {
-        ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        ForegroundTriggerIntakeOutcome::Accepted(trigger) => *trigger,
         ForegroundTriggerIntakeOutcome::Duplicate(duplicate) => {
             return Ok(TelegramForegroundOrchestrationOutcome::Duplicate(duplicate));
         }
@@ -56,7 +56,8 @@ where
     };
 
     let episode_id = Uuid::now_v7();
-    foreground::insert_episode(
+    let mut recorded_episode_id = None;
+    if let Err(error) = foreground::insert_episode(
         pool,
         &NewEpisode {
             episode_id,
@@ -71,10 +72,21 @@ where
             started_at: trigger.received_at,
         },
     )
-    .await?;
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
+    recorded_episode_id = Some(episode_id);
 
     if let Some(text_body) = &trigger.ingress.text_body {
-        foreground::insert_episode_message(
+        if let Err(error) = foreground::insert_episode_message(
             pool,
             &NewEpisodeMessage {
                 episode_message_id: Uuid::now_v7(),
@@ -88,17 +100,55 @@ where
                 external_message_id: trigger.ingress.external_message_id.clone(),
             },
         )
-        .await?;
+        .await
+        {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
     }
 
-    let assembly = context::assemble_foreground_context(
+    let assembly = match context::assemble_foreground_context(
         pool,
         config,
         trigger.clone(),
         context::ContextAssemblyOptions::default(),
     )
-    .await?;
-    audit::insert(
+    .await
+    {
+        Ok(assembly) => assembly,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
+    };
+    let metadata_payload = match serde_json::to_value(&assembly.metadata)
+        .context("failed to serialize context assembly metadata")
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = audit::insert(
         pool,
         &NewAuditEvent {
             loop_kind: "conscious".to_string(),
@@ -108,11 +158,20 @@ where
             trace_id: trigger.trace_id,
             execution_id: Some(trigger.execution_id),
             worker_pid: None,
-            payload: serde_json::to_value(&assembly.metadata)
-                .context("failed to serialize context assembly metadata")?,
+            payload: metadata_payload,
         },
     )
-    .await?;
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
 
     let request = contracts::WorkerRequest::conscious(
         trigger.trace_id,
@@ -129,7 +188,7 @@ where
                     pool,
                     trigger.trace_id,
                     trigger.execution_id,
-                    episode_id,
+                    recorded_episode_id,
                     &error.to_string(),
                 )
                 .await?;
@@ -143,7 +202,7 @@ where
             pool,
             trigger.trace_id,
             trigger.execution_id,
-            episode_id,
+            recorded_episode_id,
             &message,
         )
         .await?;
@@ -151,7 +210,7 @@ where
     };
 
     let assistant_episode_message_id = Uuid::now_v7();
-    foreground::insert_episode_message(
+    if let Err(error) = foreground::insert_episode_message(
         pool,
         &NewEpisodeMessage {
             episode_message_id: assistant_episode_message_id,
@@ -165,12 +224,49 @@ where
             external_message_id: None,
         },
     )
-    .await?;
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
+
+    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
+        Ok(chat_id) => chat_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
+    };
+    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
+        Ok(reply_to_message_id) => reply_to_message_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
+    };
 
     let delivery_receipt = match delivery.send_message(&TelegramOutboundMessage {
-        chat_id: parse_telegram_chat_id(&trigger.ingress)?,
+        chat_id,
         text: result.assistant_output.text.clone(),
-        reply_to_message_id: parse_telegram_reply_target(&trigger.ingress)?,
+        reply_to_message_id,
     }) {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -178,38 +274,81 @@ where
                 pool,
                 trigger.trace_id,
                 trigger.execution_id,
-                episode_id,
+                recorded_episode_id,
                 &error.to_string(),
             )
             .await?;
             return Err(error);
         }
     };
-    foreground::update_episode_message_external_message_id(
+    if let Err(error) = foreground::update_episode_message_external_message_id(
         pool,
         assistant_episode_message_id,
         &delivery_receipt.message_id.to_string(),
     )
-    .await?;
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
 
     let response_payload = serde_json::to_value(&response)
-        .context("failed to serialize conscious worker response payload")?;
-    execution::mark_succeeded(
+        .context("failed to serialize conscious worker response payload");
+    let response_payload = match response_payload {
+        Ok(response_payload) => response_payload,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                error,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = execution::mark_succeeded(
         pool,
         trigger.execution_id,
         "conscious",
         response.worker_pid as i32,
         &response_payload,
     )
-    .await?;
-    foreground::mark_episode_completed(
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
+    if let Err(error) = foreground::mark_episode_completed(
         pool,
         episode_id,
         &result.episode_summary.outcome,
         &result.episode_summary.summary,
     )
-    .await?;
-    audit::insert(
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
+    if let Err(error) = audit::insert(
         pool,
         &NewAuditEvent {
             loop_kind: "conscious".to_string(),
@@ -227,7 +366,17 @@ where
             }),
         },
     )
-    .await?;
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            error,
+        )
+        .await;
+    }
 
     Ok(TelegramForegroundOrchestrationOutcome::Completed(
         TelegramForegroundCompletion {
@@ -244,7 +393,7 @@ async fn record_foreground_failure(
     pool: &sqlx::PgPool,
     trace_id: Uuid,
     execution_id: Uuid,
-    episode_id: Uuid,
+    episode_id: Option<Uuid>,
     error_message: &str,
 ) -> Result<()> {
     execution::mark_failed(
@@ -256,7 +405,9 @@ async fn record_foreground_failure(
         }),
     )
     .await?;
-    foreground::mark_episode_failed(pool, episode_id, "failed", error_message).await?;
+    if let Some(episode_id) = episode_id {
+        foreground::mark_episode_failed(pool, episode_id, "failed", error_message).await?;
+    }
     audit::insert(
         pool,
         &NewAuditEvent {
@@ -275,6 +426,25 @@ async fn record_foreground_failure(
     )
     .await?;
     Ok(())
+}
+
+async fn record_and_return_failure<T>(
+    pool: &sqlx::PgPool,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    episode_id: Option<Uuid>,
+    error: Error,
+) -> Result<T> {
+    if let Err(record_error) =
+        record_foreground_failure(pool, trace_id, execution_id, episode_id, &error.to_string())
+            .await
+    {
+        return Err(error.context(format!(
+            "failed to record foreground execution failure: {record_error}"
+        )));
+    }
+
+    Err(error)
 }
 
 fn parse_telegram_chat_id(ingress: &contracts::NormalizedIngress) -> Result<i64> {

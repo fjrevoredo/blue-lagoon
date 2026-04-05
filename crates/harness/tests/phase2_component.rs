@@ -47,7 +47,7 @@ async fn foreground_persistence_writes_bindings_and_ingress_events() -> Result<(
         &update,
         Some("fixtures/private_text_message.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
     };
 
@@ -216,7 +216,7 @@ async fn foreground_persistence_retains_attachment_command_and_callback_fields()
         &command_update,
         Some("fixtures/private_command_with_document.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("command fixture should be accepted, got {other:?}"),
     };
     foreground::insert_ingress_event(
@@ -252,7 +252,7 @@ async fn foreground_persistence_retains_attachment_command_and_callback_fields()
         &callback_update,
         Some("fixtures/approval_callback.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("callback fixture should be accepted, got {other:?}"),
     };
     foreground::insert_ingress_event(
@@ -295,7 +295,7 @@ async fn accepted_foreground_trigger_persists_execution_budget_and_audit() -> Re
         &update,
         Some("fixtures/private_text_message.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
     };
 
@@ -308,7 +308,7 @@ async fn accepted_foreground_trigger_persists_execution_budget_and_audit() -> Re
     .await?;
 
     let trigger = match outcome {
-        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => *trigger,
         other => panic!("expected accepted trigger, got {other:?}"),
     };
 
@@ -348,7 +348,7 @@ async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()
         &update,
         Some("fixtures/approval_callback.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("callback fixture should normalize into accepted ingress, got {other:?}"),
     };
 
@@ -396,7 +396,7 @@ async fn duplicate_foreground_trigger_is_idempotent_and_audited() -> Result<()> 
         &update,
         Some("fixtures/private_text_message.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
     };
 
@@ -409,7 +409,7 @@ async fn duplicate_foreground_trigger_is_idempotent_and_audited() -> Result<()> 
     .await?;
 
     let accepted_trigger = match accepted {
-        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => *trigger,
         other => panic!("expected accepted trigger, got {other:?}"),
     };
 
@@ -473,7 +473,7 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
         &update,
         Some("fixtures/private_text_message.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
     };
     ingress.text_body = Some("trigger text that should be truncated".to_string());
@@ -486,7 +486,7 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
     )
     .await?
     {
-        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => *trigger,
         other => panic!("expected accepted trigger, got {other:?}"),
     };
 
@@ -689,7 +689,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
         &update,
         Some("fixtures/private_text_message.json".to_string()),
     )? {
-        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
         other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
     };
 
@@ -779,6 +779,93 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
 
 #[tokio::test]
 #[serial]
+async fn foreground_orchestration_marks_execution_failed_when_context_assembly_fails() -> Result<()>
+{
+    let (mut config, pool) = support::prepare_database().await?;
+    let worker_binary = assert_cmd::cargo::cargo_bin("workers");
+    config.worker.command = worker_binary.to_string_lossy().into_owned();
+    config.worker.args = vec!["conscious-worker".to_string()];
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/private_text_message.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+        other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+    };
+
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    let mut delivery = telegram::FakeTelegramDelivery::default();
+    let error = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        &sample_model_gateway_config(),
+        ingress,
+        &transport,
+        &mut delivery,
+    )
+    .await
+    .expect_err("missing self-model config should fail orchestration");
+    assert!(
+        error
+            .to_string()
+            .contains("missing Phase 2 self-model seed configuration")
+    );
+
+    let execution_row = sqlx::query(
+        r#"
+        SELECT execution_id
+        FROM execution_records
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_one(&pool)
+    .await?;
+    let execution_id: Uuid = execution_row.get("execution_id");
+    let execution = execution::get(&pool, execution_id).await?;
+    assert_eq!(execution.status, "failed");
+
+    let episode_row = sqlx::query(
+        r#"
+        SELECT episode_id
+        FROM episodes
+        WHERE execution_id = $1
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_one(&pool)
+    .await?;
+    let episode_id: Uuid = episode_row.get("episode_id");
+    let episode = foreground::get_episode(&pool, episode_id).await?;
+    assert_eq!(episode.status, "failed");
+    assert!(
+        episode
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("self-model"))
+    );
+
+    let audit_events = audit::list_for_execution(&pool, execution_id).await?;
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_execution_failed")
+    );
+    assert!(transport.seen_requests().is_empty());
+    assert!(delivery.sent_messages().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<()> {
     let (mut config, pool) = support::prepare_database().await?;
     config.self_model = Some(SelfModelConfig {
@@ -830,6 +917,82 @@ async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<
         delivery.sent_messages()[0].text,
         "assistant reply from fixture runtime path"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn runtime_fixture_rejected_normalization_is_audited() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    let mut delivery = telegram::FakeTelegramDelivery::default();
+    let summary = runtime::run_telegram_fixture_with(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        &sample_model_gateway_config(),
+        &telegram_fixture("rejected_group_message.json"),
+        &transport,
+        &mut delivery,
+    )
+    .await?;
+
+    assert_eq!(summary.fetched_updates, 1);
+    assert_eq!(summary.normalization_rejected_count, 1);
+    assert_eq!(summary.completed_count, 0);
+    assert_eq!(delivery.sent_messages().len(), 0);
+    assert!(transport.seen_requests().is_empty());
+
+    let audit_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_events
+        WHERE event_kind = 'telegram_ingress_normalization_rejected'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn runtime_fixture_ignored_update_is_audited() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let transport = model_gateway::FakeModelProviderTransport::new();
+    let mut delivery = telegram::FakeTelegramDelivery::default();
+    let summary = runtime::run_telegram_fixture_with(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        &sample_model_gateway_config(),
+        &telegram_fixture("unsupported_update.json"),
+        &transport,
+        &mut delivery,
+    )
+    .await?;
+
+    assert_eq!(summary.fetched_updates, 1);
+    assert_eq!(summary.ignored_count, 1);
+    assert_eq!(summary.completed_count, 0);
+    assert_eq!(delivery.sent_messages().len(), 0);
+    assert!(transport.seen_requests().is_empty());
+
+    let audit_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_events
+        WHERE event_kind = 'telegram_ingress_ignored'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audit_count, 1);
     Ok(())
 }
 

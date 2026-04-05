@@ -44,13 +44,13 @@ impl WorkerRequest {
             execution_id,
             sent_at,
             worker_kind: WorkerKind::Conscious,
-            payload: WorkerPayload::Conscious(ConsciousWorkerRequest {
+            payload: WorkerPayload::Conscious(Box::new(ConsciousWorkerRequest {
                 request_id,
                 trace_id,
                 execution_id,
                 sent_at,
                 context,
-            }),
+            })),
         }
     }
 
@@ -67,7 +67,7 @@ impl WorkerRequest {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum WorkerPayload {
     Smoke(SmokeWorkerRequest),
-    Conscious(ConsciousWorkerRequest),
+    Conscious(Box<ConsciousWorkerRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

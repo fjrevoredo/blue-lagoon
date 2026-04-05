@@ -23,10 +23,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
-    SmokeWorker,
-    ConsciousWorker,
-    #[command(hide = true)]
-    StallWorker {
+    #[command(name = "smoke-worker")]
+    Smoke,
+    #[command(name = "conscious-worker")]
+    Conscious,
+    #[command(name = "stall-worker", hide = true)]
+    Stall {
         #[arg(long)]
         sleep_ms: u64,
         #[arg(long)]
@@ -37,9 +39,9 @@ enum WorkerCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        WorkerCommand::SmokeWorker => run_smoke_worker(),
-        WorkerCommand::ConsciousWorker => run_conscious_worker(),
-        WorkerCommand::StallWorker { sleep_ms, pid_file } => run_stall_worker(sleep_ms, pid_file),
+        WorkerCommand::Smoke => run_smoke_worker(),
+        WorkerCommand::Conscious => run_conscious_worker(),
+        WorkerCommand::Stall { sleep_ms, pid_file } => run_stall_worker(sleep_ms, pid_file),
     }
 }
 
@@ -121,7 +123,7 @@ fn run_conscious_worker() -> Result<()> {
     }
 
     let payload = match &request.payload {
-        WorkerPayload::Conscious(payload) => payload,
+        WorkerPayload::Conscious(payload) => payload.as_ref(),
         WorkerPayload::Smoke(_) => {
             write_json_line(
                 &mut handle,
@@ -283,12 +285,22 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
 
     ModelInput {
         system_prompt: format!(
-            "You are {}. Role: {}. Communication style: {}. Constraints: {}. Preferences: {}.",
+            "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}.",
             context.self_model.stable_identity,
             context.self_model.role,
             context.self_model.communication_style,
+            join_or_none(&context.self_model.capabilities),
             join_or_none(&context.self_model.constraints),
             join_or_none(&context.self_model.preferences),
+            join_or_none(&context.self_model.current_goals),
+            join_or_none(&context.self_model.current_subgoals),
+            context.internal_state.load_pct,
+            context.internal_state.health_pct,
+            context.internal_state.reliability_pct,
+            context.internal_state.resource_pressure_pct,
+            context.internal_state.confidence_pct,
+            context.internal_state.connection_quality_pct,
+            join_or_none(&context.internal_state.active_conditions),
         ),
         messages,
     }
@@ -440,7 +452,7 @@ mod tests {
             panic!("expected conscious payload");
         };
 
-        let model_request = build_model_call_request(&request, payload);
+        let model_request = build_model_call_request(&request, payload.as_ref());
         assert_eq!(model_request.trace_id, request.trace_id);
         assert_eq!(model_request.execution_id, request.execution_id);
         assert_eq!(model_request.loop_kind, LoopKind::Conscious);
@@ -449,6 +461,26 @@ mod tests {
         assert_eq!(model_request.output_mode, ModelOutputMode::PlainText);
         assert_eq!(model_request.tool_policy, ToolPolicy::NoTools);
         assert!(model_request.input.system_prompt.contains("blue-lagoon"));
+        assert!(model_request.input.system_prompt.contains("conversation"));
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("support_the_user")
+        );
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("reply_to_current_message")
+        );
+        assert!(model_request.input.system_prompt.contains("load_pct=15"));
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("confidence_pct=80")
+        );
         assert_eq!(
             model_request
                 .input
@@ -466,7 +498,7 @@ mod tests {
         let WorkerPayload::Conscious(payload) = &request.payload else {
             panic!("expected conscious payload");
         };
-        let model_request = build_model_call_request(&request, payload);
+        let model_request = build_model_call_request(&request, payload.as_ref());
         let model_response = ModelCallResponse {
             request_id: model_request.request_id,
             trace_id: request.trace_id,
@@ -485,7 +517,7 @@ mod tests {
             },
         };
 
-        let response = build_conscious_worker_response(&request, payload, model_response);
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response);
         match response.result {
             WorkerResult::Conscious(result) => {
                 assert_eq!(result.status, ConsciousWorkerStatus::Completed);

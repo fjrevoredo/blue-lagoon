@@ -15,7 +15,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelegramNormalizationOutcome {
-    Accepted(NormalizedIngress),
+    Accepted(Box<NormalizedIngress>),
     Rejected(TelegramRejectedIngress),
     Ignored(TelegramIgnoredUpdate),
 }
@@ -104,36 +104,38 @@ pub fn normalize_telegram_update(
             ));
         }
 
-        return Ok(TelegramNormalizationOutcome::Accepted(NormalizedIngress {
-            ingress_id: Uuid::now_v7(),
-            channel_kind: ChannelKind::Telegram,
-            external_user_id: callback.from.id.to_string(),
-            external_conversation_id: message.chat.id.to_string(),
-            external_event_id: update.update_id.to_string(),
-            external_message_id: Some(message.message_id.to_string()),
-            internal_principal_ref: config.internal_principal_ref.clone(),
-            internal_conversation_ref: config.internal_conversation_ref.clone(),
-            event_kind: IngressEventKind::ApprovalCallback,
-            occurred_at: match timestamp_to_utc(message.date) {
-                Some(timestamp) => timestamp,
-                None => {
-                    return Ok(reject(
-                        update.update_id,
-                        TelegramRejectionReason::InvalidOccurredAt,
-                        "Telegram callback used an invalid occurred-at timestamp",
-                    ));
-                }
+        return Ok(TelegramNormalizationOutcome::Accepted(Box::new(
+            NormalizedIngress {
+                ingress_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: callback.from.id.to_string(),
+                external_conversation_id: message.chat.id.to_string(),
+                external_event_id: update.update_id.to_string(),
+                external_message_id: Some(message.message_id.to_string()),
+                internal_principal_ref: config.internal_principal_ref.clone(),
+                internal_conversation_ref: config.internal_conversation_ref.clone(),
+                event_kind: IngressEventKind::ApprovalCallback,
+                occurred_at: match timestamp_to_utc(message.date) {
+                    Some(timestamp) => timestamp,
+                    None => {
+                        return Ok(reject(
+                            update.update_id,
+                            TelegramRejectionReason::InvalidOccurredAt,
+                            "Telegram callback used an invalid occurred-at timestamp",
+                        ));
+                    }
+                },
+                text_body: None,
+                reply_to: None,
+                attachments: Vec::new(),
+                command_hint: None,
+                approval_payload: Some(ApprovalPayload {
+                    token: callback.id.clone(),
+                    callback_data: callback.data.clone(),
+                }),
+                raw_payload_ref,
             },
-            text_body: None,
-            reply_to: None,
-            attachments: Vec::new(),
-            command_hint: None,
-            approval_payload: Some(ApprovalPayload {
-                token: callback.id.clone(),
-                callback_data: callback.data.clone(),
-            }),
-            raw_payload_ref,
-        }));
+        )));
     }
 
     Ok(TelegramNormalizationOutcome::Ignored(
@@ -198,7 +200,7 @@ fn normalize_message_update(
         );
     };
 
-    TelegramNormalizationOutcome::Accepted(NormalizedIngress {
+    TelegramNormalizationOutcome::Accepted(Box::new(NormalizedIngress {
         ingress_id: Uuid::now_v7(),
         channel_kind: ChannelKind::Telegram,
         external_user_id: actor.id.to_string(),
@@ -220,7 +222,7 @@ fn normalize_message_update(
         command_hint: command_hint(message),
         approval_payload: None,
         raw_payload_ref,
-    })
+    }))
 }
 
 fn message_event_kind(message: &TelegramMessage) -> IngressEventKind {

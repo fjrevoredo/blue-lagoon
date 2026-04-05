@@ -6,6 +6,8 @@ use serde_json::json;
 
 use crate::config::ResolvedTelegramConfig;
 
+const DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TelegramUpdate {
     pub update_id: i64,
@@ -212,7 +214,12 @@ pub struct ReqwestTelegramSource {
 impl ReqwestTelegramSource {
     pub fn new(config: ResolvedTelegramConfig) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(
+                    DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS,
+                ))
+                .build()
+                .expect("Telegram reqwest client should build"),
             config,
         }
     }
@@ -254,7 +261,12 @@ pub struct ReqwestTelegramDelivery {
 impl ReqwestTelegramDelivery {
     pub fn new(config: ResolvedTelegramConfig) -> Self {
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(
+                    DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS,
+                ))
+                .build()
+                .expect("Telegram reqwest client should build"),
             config,
         }
     }
@@ -297,7 +309,7 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 enum TelegramFixture {
-    Single(TelegramUpdate),
+    Single(Box<TelegramUpdate>),
     Batch(TelegramBatchResponse),
     List(Vec<TelegramUpdate>),
 }
@@ -341,7 +353,7 @@ pub fn load_fixture_updates(path: &Path) -> Result<Vec<TelegramUpdate>> {
         serde_json::from_str(&raw).context("failed to parse Telegram fixture JSON")?;
 
     let updates = match fixture {
-        TelegramFixture::Single(update) => vec![update],
+        TelegramFixture::Single(update) => vec![*update],
         TelegramFixture::List(updates) => updates,
         TelegramFixture::Batch(batch) => {
             if !batch.ok {
