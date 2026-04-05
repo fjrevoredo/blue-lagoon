@@ -653,7 +653,7 @@ The following rules should be treated as fixed:
 
 The most defensible v1 codebase shape is:
 
-- `app`: thin entrypoints and runtime wiring.
+- `runtime`: thin entrypoints and runtime wiring.
 - `harness`: first-class crate and primary control plane.
 - `contracts`: first-class crate for stable shared types across process boundaries.
 - `workers`: first-class crate for conscious and unconscious worker runtimes.
