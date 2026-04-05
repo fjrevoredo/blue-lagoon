@@ -1,10 +1,12 @@
 mod support;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use contracts::ChannelKind;
 use harness::{
-    audit, config::ResolvedTelegramConfig, execution, foreground, ingress, migration, telegram,
+    audit,
+    config::{ResolvedTelegramConfig, SelfModelConfig},
+    context, execution, foreground, ingress, migration, telegram,
 };
 use serial_test::serial;
 use sqlx::Row;
@@ -444,6 +446,122 @@ async fn duplicate_foreground_trigger_is_idempotent_and_audited() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+#[serial]
+async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<()> {
+    let (mut config, pool) = support::prepare_database().await?;
+    config.self_model = Some(SelfModelConfig {
+        seed_path: support::workspace_root()
+            .join("config")
+            .join("self_model_seed.toml"),
+    });
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let mut ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/private_text_message.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+    };
+    ingress.text_body = Some("trigger text that should be truncated".to_string());
+
+    let trigger = match foreground::intake_telegram_foreground_trigger(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        ingress,
+    )
+    .await?
+    {
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        other => panic!("expected accepted trigger, got {other:?}"),
+    };
+
+    insert_completed_episode(
+        &pool,
+        "episode-older-1",
+        trigger.received_at - Duration::minutes(3),
+        "older user message that is intentionally long",
+        "older assistant message that is intentionally long",
+    )
+    .await?;
+    insert_completed_episode(
+        &pool,
+        "episode-older-2",
+        trigger.received_at - Duration::minutes(2),
+        "second older user message that is intentionally long",
+        "second older assistant message that is intentionally long",
+    )
+    .await?;
+    insert_completed_episode(
+        &pool,
+        "episode-future",
+        trigger.received_at + Duration::minutes(1),
+        "future user message",
+        "future assistant message",
+    )
+    .await?;
+
+    let assembled = context::assemble_foreground_context(
+        &pool,
+        &config,
+        trigger,
+        context::ContextAssemblyOptions {
+            limits: context::ContextAssemblyLimits {
+                recent_history_limit: 2,
+                trigger_text_char_limit: 12,
+                history_message_char_limit: 10,
+            },
+            internal_state_seed: harness::self_model::InternalStateSeed {
+                load_pct: 22,
+                health_pct: 97,
+                reliability_pct: 95,
+                resource_pressure_pct: 15,
+                confidence_pct: 78,
+                connection_quality_pct: 92,
+            },
+            active_conditions: vec!["postgres_ready".to_string()],
+        },
+    )
+    .await?;
+
+    assert_eq!(assembled.context.self_model.stable_identity, "blue-lagoon");
+    assert_eq!(
+        assembled.context.trigger.ingress.text_body.as_deref(),
+        Some("trigger text")
+    );
+    assert_eq!(assembled.context.internal_state.load_pct, 22);
+    assert_eq!(
+        assembled.context.internal_state.active_conditions,
+        vec!["postgres_ready".to_string()]
+    );
+    assert_eq!(assembled.context.recent_history.len(), 2);
+    assert_eq!(
+        assembled.context.recent_history[0].user_message.as_deref(),
+        Some("second old")
+    );
+    assert_eq!(
+        assembled.context.recent_history[1].user_message.as_deref(),
+        Some("older user")
+    );
+    assert!(
+        assembled
+            .metadata
+            .self_model_seed_path
+            .contains("self_model_seed.toml")
+    );
+    assert!(assembled.metadata.trigger_text_truncated);
+    assert_eq!(assembled.metadata.selected_recent_history_count, 2);
+    assert_eq!(assembled.metadata.truncated_history_message_count, 4);
+    Ok(())
+}
+
 fn sample_telegram_config() -> ResolvedTelegramConfig {
     ResolvedTelegramConfig {
         api_base_url: "https://api.telegram.org".to_string(),
@@ -462,4 +580,80 @@ fn telegram_fixture(name: &str) -> std::path::PathBuf {
         .join("fixtures")
         .join("telegram")
         .join(name)
+}
+
+async fn insert_completed_episode(
+    pool: &sqlx::PgPool,
+    suffix: &str,
+    started_at: chrono::DateTime<Utc>,
+    user_message: &str,
+    assistant_message: &str,
+) -> Result<()> {
+    let execution_id = Uuid::now_v7();
+    let trace_id = Uuid::now_v7();
+    execution::insert(
+        pool,
+        &execution::NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: format!("phase2-context-{suffix}"),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: serde_json::json!({ "kind": "context_assembly_test", "suffix": suffix }),
+        },
+    )
+    .await?;
+
+    let episode_id = Uuid::now_v7();
+    foreground::insert_episode(
+        pool,
+        &foreground::NewEpisode {
+            episode_id,
+            trace_id,
+            execution_id,
+            ingress_id: None,
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            trigger_kind: "user_ingress".to_string(),
+            trigger_source: "telegram".to_string(),
+            status: "started".to_string(),
+            started_at,
+        },
+    )
+    .await?;
+
+    foreground::insert_episode_message(
+        pool,
+        &foreground::NewEpisodeMessage {
+            episode_message_id: Uuid::now_v7(),
+            episode_id,
+            trace_id,
+            execution_id,
+            message_order: 0,
+            message_role: "user".to_string(),
+            channel_kind: ChannelKind::Telegram,
+            text_body: Some(user_message.to_string()),
+            external_message_id: None,
+        },
+    )
+    .await?;
+
+    foreground::insert_episode_message(
+        pool,
+        &foreground::NewEpisodeMessage {
+            episode_message_id: Uuid::now_v7(),
+            episode_id,
+            trace_id,
+            execution_id,
+            message_order: 1,
+            message_role: "assistant".to_string(),
+            channel_kind: ChannelKind::Telegram,
+            text_body: Some(assistant_message.to_string()),
+            external_message_id: None,
+        },
+    )
+    .await?;
+
+    foreground::mark_episode_completed(pool, episode_id, "completed", "context test").await?;
+    Ok(())
 }

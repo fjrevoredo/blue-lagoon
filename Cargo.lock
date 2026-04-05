@@ -2575,6 +2575,7 @@ dependencies = [
  "clap",
  "contracts",
  "predicates",
+ "serde",
  "serde_json",
  "uuid",
 ]

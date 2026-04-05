@@ -1,0 +1,285 @@
+use anyhow::{Result, bail};
+use chrono::Utc;
+use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundTrigger};
+use uuid::Uuid;
+
+use crate::{
+    config::RuntimeConfig,
+    foreground,
+    self_model::{self, InternalStateSeed},
+};
+
+pub const DEFAULT_RECENT_HISTORY_LIMIT: i64 = 3;
+pub const DEFAULT_TRIGGER_TEXT_CHAR_LIMIT: usize = 2_000;
+pub const DEFAULT_HISTORY_MESSAGE_CHAR_LIMIT: usize = 400;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAssemblyLimits {
+    pub recent_history_limit: i64,
+    pub trigger_text_char_limit: usize,
+    pub history_message_char_limit: usize,
+}
+
+impl Default for ContextAssemblyLimits {
+    fn default() -> Self {
+        Self {
+            recent_history_limit: DEFAULT_RECENT_HISTORY_LIMIT,
+            trigger_text_char_limit: DEFAULT_TRIGGER_TEXT_CHAR_LIMIT,
+            history_message_char_limit: DEFAULT_HISTORY_MESSAGE_CHAR_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextAssemblyOptions {
+    pub limits: ContextAssemblyLimits,
+    pub internal_state_seed: InternalStateSeed,
+    pub active_conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAssemblyMetadata {
+    pub source_ingress_id: Uuid,
+    pub self_model_seed_path: String,
+    pub recent_history_limit: i64,
+    pub selected_recent_history_count: usize,
+    pub selected_recent_history_episode_ids: Vec<Uuid>,
+    pub trigger_text_char_limit: usize,
+    pub trigger_text_truncated: bool,
+    pub history_message_char_limit: usize,
+    pub truncated_history_message_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextAssemblyResult {
+    pub context: ConsciousContext,
+    pub metadata: ContextAssemblyMetadata,
+}
+
+pub async fn assemble_foreground_context(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    trigger: ForegroundTrigger,
+    options: ContextAssemblyOptions,
+) -> Result<ContextAssemblyResult> {
+    options.limits.validate()?;
+
+    let self_model_config = config.require_self_model_config()?;
+    let self_model = self_model::load_self_model_snapshot(config)?;
+    let internal_state = self_model::build_internal_state_snapshot(
+        options.internal_state_seed,
+        options.active_conditions,
+    );
+    let (trigger, trigger_text_truncated) =
+        shape_trigger(trigger, options.limits.trigger_text_char_limit);
+
+    let recent_history = foreground::list_recent_episode_excerpts_before(
+        pool,
+        &trigger.ingress.internal_conversation_ref,
+        trigger.received_at,
+        options.limits.recent_history_limit,
+    )
+    .await?;
+    let (recent_history, truncated_history_message_count) =
+        shape_recent_history(recent_history, options.limits.history_message_char_limit);
+
+    let metadata = ContextAssemblyMetadata {
+        source_ingress_id: trigger.ingress.ingress_id,
+        self_model_seed_path: self_model_config.seed_path.display().to_string(),
+        recent_history_limit: options.limits.recent_history_limit,
+        selected_recent_history_count: recent_history.len(),
+        selected_recent_history_episode_ids: recent_history
+            .iter()
+            .map(|episode| episode.episode_id)
+            .collect(),
+        trigger_text_char_limit: options.limits.trigger_text_char_limit,
+        trigger_text_truncated,
+        history_message_char_limit: options.limits.history_message_char_limit,
+        truncated_history_message_count,
+    };
+
+    Ok(ContextAssemblyResult {
+        context: ConsciousContext {
+            context_id: Uuid::now_v7(),
+            assembled_at: Utc::now(),
+            trigger,
+            self_model,
+            internal_state,
+            recent_history,
+        },
+        metadata,
+    })
+}
+
+impl ContextAssemblyLimits {
+    fn validate(&self) -> Result<()> {
+        if self.recent_history_limit <= 0 {
+            bail!("context recent_history_limit must be greater than zero");
+        }
+        if self.trigger_text_char_limit == 0 {
+            bail!("context trigger_text_char_limit must be greater than zero");
+        }
+        if self.history_message_char_limit == 0 {
+            bail!("context history_message_char_limit must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+fn shape_trigger(
+    mut trigger: ForegroundTrigger,
+    trigger_text_char_limit: usize,
+) -> (ForegroundTrigger, bool) {
+    let Some(text_body) = trigger.ingress.text_body.clone() else {
+        return (trigger, false);
+    };
+
+    let (text_body, truncated) = truncate_text(&text_body, trigger_text_char_limit);
+    trigger.ingress.text_body = Some(text_body);
+    (trigger, truncated)
+}
+
+fn shape_recent_history(
+    recent_history: Vec<EpisodeExcerpt>,
+    history_message_char_limit: usize,
+) -> (Vec<EpisodeExcerpt>, u32) {
+    let mut truncated_count = 0_u32;
+    let shaped = recent_history
+        .into_iter()
+        .map(|mut episode| {
+            if let Some(text) = &episode.user_message {
+                let (truncated, did_truncate) = truncate_text(text, history_message_char_limit);
+                if did_truncate {
+                    truncated_count += 1;
+                }
+                episode.user_message = Some(truncated);
+            }
+
+            if let Some(text) = &episode.assistant_message {
+                let (truncated, did_truncate) = truncate_text(text, history_message_char_limit);
+                if did_truncate {
+                    truncated_count += 1;
+                }
+                episode.assistant_message = Some(truncated);
+            }
+
+            episode
+        })
+        .collect();
+
+    (shaped, truncated_count)
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> (String, bool) {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return (value.to_string(), false);
+    }
+
+    (value.chars().take(max_chars).collect(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use contracts::{
+        ChannelKind, EpisodeExcerpt, ForegroundBudget, ForegroundTrigger, ForegroundTriggerKind,
+        IngressEventKind, NormalizedIngress,
+    };
+
+    use super::*;
+
+    #[test]
+    fn context_limits_reject_zero_values() {
+        let error = ContextAssemblyLimits {
+            recent_history_limit: 0,
+            ..ContextAssemblyLimits::default()
+        }
+        .validate()
+        .expect_err("zero recent history limit should fail");
+        assert!(error.to_string().contains("recent_history_limit"));
+
+        let error = ContextAssemblyLimits {
+            trigger_text_char_limit: 0,
+            ..ContextAssemblyLimits::default()
+        }
+        .validate()
+        .expect_err("zero trigger text limit should fail");
+        assert!(error.to_string().contains("trigger_text_char_limit"));
+
+        let error = ContextAssemblyLimits {
+            history_message_char_limit: 0,
+            ..ContextAssemblyLimits::default()
+        }
+        .validate()
+        .expect_err("zero history message limit should fail");
+        assert!(error.to_string().contains("history_message_char_limit"));
+    }
+
+    #[test]
+    fn shape_trigger_truncates_text_body_to_limit() {
+        let trigger = sample_trigger(Some("abcdefghijklmnopqrstuvwxyz"));
+        let (shaped, truncated) = shape_trigger(trigger, 8);
+
+        assert!(truncated);
+        assert_eq!(shaped.trigger_kind, ForegroundTriggerKind::UserIngress,);
+        assert_eq!(shaped.ingress.text_body.as_deref(), Some("abcdefgh"));
+    }
+
+    #[test]
+    fn shape_recent_history_truncates_message_bodies() {
+        let (recent_history, truncated_count) = shape_recent_history(
+            vec![EpisodeExcerpt {
+                episode_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                started_at: Utc::now(),
+                user_message: Some("1234567890".to_string()),
+                assistant_message: Some("abcdefghij".to_string()),
+                outcome: "completed".to_string(),
+            }],
+            5,
+        );
+
+        assert_eq!(recent_history.len(), 1);
+        assert_eq!(recent_history[0].user_message.as_deref(), Some("12345"));
+        assert_eq!(
+            recent_history[0].assistant_message.as_deref(),
+            Some("abcde")
+        );
+        assert_eq!(truncated_count, 2);
+    }
+
+    fn sample_trigger(text_body: Option<&str>) -> ForegroundTrigger {
+        ForegroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            trigger_kind: ForegroundTriggerKind::UserIngress,
+            ingress: NormalizedIngress {
+                ingress_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                external_event_id: "update-42".to_string(),
+                external_message_id: Some("message-42".to_string()),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                event_kind: IngressEventKind::MessageCreated,
+                occurred_at: Utc::now() - Duration::seconds(5),
+                text_body: text_body.map(ToString::to_string),
+                reply_to: None,
+                attachments: Vec::new(),
+                command_hint: None,
+                approval_payload: None,
+                raw_payload_ref: None,
+            },
+            received_at: Utc::now(),
+            deduplication_key: "telegram:update-42".to_string(),
+            budget: ForegroundBudget {
+                iteration_budget: 1,
+                wall_clock_budget_ms: 30_000,
+                token_budget: 4_000,
+            },
+        }
+    }
+}

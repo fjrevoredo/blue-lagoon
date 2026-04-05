@@ -213,8 +213,8 @@ When a task is completed:
 ## Progress snapshot
 
 - Current milestone: `MILESTONE C`
-- Current active task: `P2-11`
-- Completed tasks: `9/18`
+- Current active task: `P2-12`
+- Completed tasks: `11/18`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -222,10 +222,13 @@ When a task is completed:
 
 Latest verification state:
 
-- Phase 2 state has been self-checked after `P2-09` implementation.
+- Phase 2 state has been self-checked after `P2-06` and `P2-11`
+  implementation.
 - `cmd.exe /c cargo fmt --all --check` is green.
 - `cmd.exe /c cargo check --workspace` is green.
+- `cmd.exe /c cargo test -p contracts -- --nocapture` is green.
 - `cmd.exe /c cargo test -p harness -- --nocapture` is green.
+- `cmd.exe /c cargo test -p workers -- --nocapture` is green.
 - `cmd.exe /c cargo test --workspace` is green.
 
 Latest review corrections already applied:
@@ -474,7 +477,7 @@ Milestone D is green only if:
 
 ### Task P2-06: Extend worker kinds and subprocess protocol for conscious execution
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-05`
 - Parallel-safe: no
 - Deliverables:
@@ -489,7 +492,23 @@ Milestone D is green only if:
   - worker unit tests for request validation and structured response behavior
   - existing smoke-worker tests remain green
 - Evidence:
-  - pending
+  - Added conscious-worker subprocess protocol messages in
+    `crates/contracts/src/lib.rs` for worker-to-harness model-call requests and
+    harness-to-worker model-call responses, while preserving the existing smoke
+    worker request or response path. Implemented the `conscious-worker`
+    CLI entrypoint in `crates/workers/src/main.rs`, including a line-oriented
+    protocol that emits one `ModelCallRequest`, accepts one
+    `ModelCallResponse`, and returns a structured `WorkerResponse` carrying the
+    canonical `ConsciousWorkerResult` shape without any provider-specific or
+    canonical-write authority in the worker. Added worker unit coverage for
+    model-request shaping and final response wrapping, plus CLI integration
+    coverage in `crates/workers/tests/conscious_worker_cli.rs`; the existing
+    smoke-worker tests remain green in `crates/workers/tests/smoke_worker_cli.rs`.
+    Verified with `cmd.exe /c cargo test -p contracts -- --nocapture`,
+    `cmd.exe /c cargo test -p workers -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-07: Implement the Telegram adapter boundary and fake transport fixtures
 
@@ -616,7 +635,7 @@ Milestone D is green only if:
 
 ### Task P2-11: Implement context assembly v0 for conscious foreground episodes
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-04`, `P2-05`, `P2-10`
 - Parallel-safe: no
 - Deliverables:
@@ -628,7 +647,23 @@ Milestone D is green only if:
   - unit tests for selection limits and context-shaping logic
   - component tests against disposable PostgreSQL for recent-history retrieval
 - Evidence:
-  - pending
+  - Added harness-owned context assembly in
+    `crates/harness/src/context.rs`, including deterministic limits for recent
+    history count, trigger-text truncation, and historical message truncation,
+    plus returned context-assembly metadata covering selected episode IDs,
+    truncation counts, and self-model seed provenance for later audit use.
+    Extended `crates/harness/src/foreground.rs` with
+    `list_recent_episode_excerpts_before` so context assembly reads only
+    bounded history that predates the active trigger. Exported the new module in
+    `crates/harness/src/lib.rs` and expanded
+    `crates/harness/tests/phase2_component.rs` with PostgreSQL-backed coverage
+    proving self-model loading, internal-state injection, explicit selection
+    limits, message shaping, and exclusion of future episodes from recent
+    history. Verified with
+    `cmd.exe /c cargo test -p harness -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-12: Implement the harness-owned model gateway and one provider adapter
 

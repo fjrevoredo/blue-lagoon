@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod config;
+pub mod context;
 pub mod db;
 pub mod execution;
 pub mod foreground;

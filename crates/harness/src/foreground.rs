@@ -581,6 +581,15 @@ pub async fn list_recent_episode_excerpts(
     internal_conversation_ref: &str,
     limit: i64,
 ) -> Result<Vec<EpisodeExcerpt>> {
+    list_recent_episode_excerpts_before(pool, internal_conversation_ref, Utc::now(), limit).await
+}
+
+pub async fn list_recent_episode_excerpts_before(
+    pool: &PgPool,
+    internal_conversation_ref: &str,
+    before: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<EpisodeExcerpt>> {
     let rows = sqlx::query(
         r#"
         SELECT
@@ -610,11 +619,13 @@ pub async fn list_recent_episode_excerpts(
             COALESCE(e.outcome, e.status) AS outcome
         FROM episodes e
         WHERE e.internal_conversation_ref = $1
+          AND e.started_at < $2
         ORDER BY e.started_at DESC
-        LIMIT $2
+        LIMIT $3
         "#,
     )
     .bind(internal_conversation_ref)
+    .bind(before)
     .bind(limit)
     .fetch_all(pool)
     .await

@@ -85,6 +85,19 @@ pub struct ConsciousWorkerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum ConsciousWorkerOutboundMessage {
+    ModelCallRequest(ModelCallRequest),
+    FinalResponse(WorkerResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum ConsciousWorkerInboundMessage {
+    ModelCallResponse(ModelCallResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerResponse {
     pub request_id: Uuid,
     pub trace_id: Uuid,
@@ -467,6 +480,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conscious_worker_protocol_messages_round_trip() {
+        let outbound =
+            ConsciousWorkerOutboundMessage::ModelCallRequest(sample_model_call_request());
+        let json = serde_json::to_string(&outbound).expect("outbound message should serialize");
+        let decoded: ConsciousWorkerOutboundMessage =
+            serde_json::from_str(&json).expect("outbound message should deserialize");
+        assert_eq!(decoded, outbound);
+
+        let inbound =
+            ConsciousWorkerInboundMessage::ModelCallResponse(sample_model_call_response());
+        let json = serde_json::to_string(&inbound).expect("inbound message should serialize");
+        let decoded: ConsciousWorkerInboundMessage =
+            serde_json::from_str(&json).expect("inbound message should deserialize");
+        assert_eq!(decoded, inbound);
+    }
+
     fn sample_context() -> ConsciousContext {
         ConsciousContext {
             context_id: Uuid::now_v7(),
@@ -583,6 +613,26 @@ mod tests {
                 preferred_provider: Some(ModelProviderKind::ZAi),
                 preferred_model: Some("z-ai-foreground".to_string()),
             }),
+        }
+    }
+
+    fn sample_model_call_response() -> ModelCallResponse {
+        ModelCallResponse {
+            request_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: Utc::now(),
+            output: ModelOutput {
+                text: "hello from model".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+            },
         }
     }
 }
