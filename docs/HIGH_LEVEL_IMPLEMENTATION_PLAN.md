@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-05
-Status: Phase 1 completed, Phase 1.1 implementation landed, hosted evidence pending
+Status: Phase 1 and Phase 1.1 completed; Phase 2 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -106,21 +106,22 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 ## Current status
 
 - Phase 1 status: `COMPLETE`
-- Phase 1.1 status: `IN PROGRESS`
-- Phase 2 status: `QUEUED`
+- Phase 1.1 status: `COMPLETE`
+- Phase 2 status: `READY`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
   `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
+- Detailed planning for Phase 2 lives in
+  `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
   gating, worker subprocess execution, and a verified synthetic trigger path
 - The current repository state now includes `.github/workflows/ci.yml` as the
   minimum repository-hosted CI baseline for Phase 1.1
-- The current repository state still needs at least one successful
-  GitHub-hosted run recorded in `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
-  before Phase 1.1 can be marked complete and Phase 2 can become the active
-  next phase
+- The current repository state now includes at least one successful
+  GitHub-hosted run recorded for the minimum Phase 1.1 workflow, so Phase 1.1
+  is complete and Phase 2 is now the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
 

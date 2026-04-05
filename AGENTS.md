@@ -44,6 +44,17 @@ Typical implementation workflow is:
 - `git log --oneline` to match existing commit style.
 - `markdownlint "**/*.md"` if available locally, to catch heading and spacing issues.
 
+Git environment rule:
+
+- This repository is commonly used from both WSL and Windows, and line-ending
+  normalization can make WSL Git report false-positive worktree changes.
+- Windows Git is the source of truth for repository status, diff, and staging
+  decisions when WSL Git and Windows Git disagree.
+- Before treating unexpected worktree changes as real, verify with
+  `cmd.exe /c git status --short` and `cmd.exe /c git diff --name-only`.
+- Prefer Windows Git output when deciding what actually changed, what should be
+  committed, and whether unrelated modifications are present.
+
 ## Coding Style & Naming Conventions
 Rust code should preserve the current workspace boundary posture: keep
 `crates/runtime` thin, keep control-plane logic in `crates/harness`, keep

@@ -3,7 +3,7 @@
 ## Phase 1.1 Detailed Implementation Plan
 
 Date: 2026-04-05
-Status: Repository implementation landed, hosted-run evidence pending
+Status: Complete
 Scope: High-level plan Phase 1.1 only
 Audience: LLM-assisted implementation work and human review
 
@@ -131,19 +131,17 @@ Use only these status values:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone B`
-- Current active task: `P1.1-06`
-- Completed tasks: `7/9`
+- Current milestone: `DONE`
+- Current active task: `none`
+- Completed tasks: `9/9`
 - Milestone A status: `DONE`
-- Milestone B status: `BLOCKED`
-- Milestone C status: `BLOCKED`
+- Milestone B status: `DONE`
+- Milestone C status: `DONE`
 
 Repository sequencing note:
 
-- Tasks `P1.1-07` and `P1.1-08` were completed in the same patch set as the
-  workflow changes so the repository documentation would remain aligned with
-  the committed CI baseline while `P1.1-06` waits on the first GitHub-hosted
-  run.
+- The hosted-run evidence gate is now satisfied, so Phase 1.1 is closed and
+  Phase 2 is the active next implementation phase.
 
 ## Expected Phase 1.1 verification commands
 
@@ -292,7 +290,7 @@ Milestone C is green only if:
 
 ### Task P1.1-06: Add repository-hosted workspace test execution
 
-- Status: `BLOCKED`
+- Status: `DONE`
 - Depends on: `P1.1-03`, `P1.1-04`
 - Parallel-safe: no
 - Deliverables:
@@ -305,10 +303,10 @@ Milestone C is green only if:
   - manual review that the workflow would fail if the workspace tests fail
 - Evidence:
   - `.github/workflows/ci.yml` runs `cargo test --workspace` against the
-    disposable PostgreSQL service and local verification passed on 2026-04-05
-    with `cmd.exe /c cargo test --workspace`; the remaining blocker is that a
-    real GitHub-hosted workflow run cannot be executed or recorded from the
-    current environment.
+    disposable PostgreSQL service; local verification passed on 2026-04-05
+    with `cmd.exe /c cargo test --workspace`; and a successful GitHub Actions
+    run of the minimum workflow was later confirmed by the project maintainer,
+    satisfying the repository-hosted evidence requirement for this phase.
 
 ### Task P1.1-07: Document local-to-CI command mapping
 
@@ -350,7 +348,7 @@ Milestone C is green only if:
 
 ### Task P1.1-09: Close the phase and update the progress ledger
 
-- Status: `BLOCKED`
+- Status: `DONE`
 - Depends on: `P1.1-08`
 - Parallel-safe: no
 - Deliverables:
@@ -362,10 +360,9 @@ Milestone C is green only if:
 - Verification:
   - manual review that all completed tasks contain evidence
 - Evidence:
-  - Final closure is blocked until `P1.1-06` records at least one successful
-    GitHub Actions run; `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md` was updated to
-    reflect repository implementation progress, but Phase 1.1 is not yet marked
-    complete.
+  - This document now reflects final Phase 1.1 task completion and milestone
+    closure; `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md` now marks Phase 1.1
+    complete and identifies Phase 2 as the next active implementation phase.
 
 ## Recommended execution order
 
