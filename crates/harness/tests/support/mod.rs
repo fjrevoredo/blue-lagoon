@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use harness::{config::RuntimeConfig, db};
 use sqlx::{Executor, PgPool};
 
+const LOCAL_TEST_DATABASE_URL: &str =
+    "postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon";
+
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -13,7 +16,12 @@ pub fn workspace_root() -> PathBuf {
 }
 
 pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
-    ensure_postgres_running()?;
+    let database_url =
+        configured_database_url().unwrap_or_else(|| LOCAL_TEST_DATABASE_URL.to_string());
+
+    if should_bootstrap_local_postgres() {
+        ensure_postgres_running()?;
+    }
 
     let config = RuntimeConfig {
         app: harness::config::AppConfig {
@@ -21,9 +29,7 @@ pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
             log_filter: "info".to_string(),
         },
         database: harness::config::DatabaseConfig {
-            database_url: std::env::var("BLUE_LAGOON_TEST_DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon".to_string()
-            }),
+            database_url,
             minimum_supported_schema_version: 1,
         },
         harness: harness::config::HarnessConfig {
@@ -40,6 +46,16 @@ pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
     let pool = connect_with_retry(&config).await?;
     reset_database(&pool).await?;
     Ok((config, pool))
+}
+
+fn configured_database_url() -> Option<String> {
+    std::env::var("BLUE_LAGOON_DATABASE_URL")
+        .ok()
+        .or_else(|| std::env::var("BLUE_LAGOON_TEST_DATABASE_URL").ok())
+}
+
+fn should_bootstrap_local_postgres() -> bool {
+    configured_database_url().is_none()
 }
 
 pub async fn connect_with_retry(config: &RuntimeConfig) -> Result<PgPool> {

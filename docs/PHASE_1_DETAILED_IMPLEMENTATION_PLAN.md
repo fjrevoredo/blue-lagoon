@@ -461,8 +461,9 @@ Milestone D is green only if:
   - `cargo run -p runtime -- harness --once --idle`
 - Evidence:
   - `crates/harness/src/runtime.rs` idle path plus
-    `crates/runtime/src/main.rs`; verified with
-    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --idle"`
+    `crates/runtime/src/main.rs`; verified with a Windows `cmd.exe /c`
+    invocation that set `BLUE_LAGOON_DATABASE_URL` and ran
+    `cargo run -p runtime -- harness --once --idle`
 
 ### Task P1-16: Implement synthetic trigger end-to-end harness flow
 
@@ -481,8 +482,10 @@ Milestone D is green only if:
   - integration test for trigger to worker to persisted outputs
 - Evidence:
   - end-to-end flow in `crates/harness/src/runtime.rs`; verified with
-    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --synthetic-trigger smoke"`
-    and `synthetic_trigger_runs_end_to_end_and_persists_outputs`
+    a Windows `cmd.exe /c` invocation that set
+    `BLUE_LAGOON_DATABASE_URL` and ran
+    `cargo run -p runtime -- harness --once --synthetic-trigger smoke`,
+    plus `synthetic_trigger_runs_end_to_end_and_persists_outputs`
 
 ### Task P1-17: Add Phase 1 unit-test baseline
 
@@ -536,9 +539,14 @@ Milestone D is green only if:
     `cmd.exe /c cargo test --workspace`,
     `cmd.exe /c docker compose config`,
     `cmd.exe /c docker compose up -d postgres`,
-    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- migrate"`,
-    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --idle"`,
-    `cmd.exe /c "set BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon&& cargo run -p runtime -- harness --once --synthetic-trigger smoke"`;
+    a Windows `cmd.exe /c` invocation that set
+    `BLUE_LAGOON_DATABASE_URL` and ran `cargo run -p runtime -- migrate`,
+    a Windows `cmd.exe /c` invocation that set
+    `BLUE_LAGOON_DATABASE_URL` and ran
+    `cargo run -p runtime -- harness --once --idle`,
+    and a Windows `cmd.exe /c` invocation that set
+    `BLUE_LAGOON_DATABASE_URL` and ran
+    `cargo run -p runtime -- harness --once --synthetic-trigger smoke`;
     fail-closed regression covered by
     `startup_compatibility_reports_supported_and_unsupported_states`
 
@@ -550,12 +558,13 @@ Milestone D is green only if:
 - Deliverables:
   - this document updated with final statuses
   - Phase 1 completion summary added to canonical docs if needed
-  - any follow-on notes required for Phase 2 planning
+  - any follow-on notes required for Phase 1.1 planning
 - Verification:
   - manual review that all completed tasks contain evidence
 - Evidence:
   - this document updated to `21/21` complete; README command surface refreshed
-    for Phase 1 runtime usage and verification
+    for Phase 1 runtime usage and verification; follow-on planning now proceeds
+    through `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
 
 ## Recommended execution order
 
@@ -594,10 +603,10 @@ Phase 1 is done only when all of the following are true:
 - the synthetic trigger path works end to end
 - required automated tests pass
 - the progress ledger in this document is up to date
-- the repository state is good enough to begin Phase 2 without re-opening Phase
-  1 architecture decisions
+- the repository state is good enough to begin Phase 1.1 without re-opening
+  Phase 1 architecture decisions
 
 ## Next document after this phase
 
 Once Phase 1 is complete and the progress ledger is current, the next planning
-document should be the detailed implementation plan for Phase 2.
+document should be the detailed implementation plan for Phase 1.1.
