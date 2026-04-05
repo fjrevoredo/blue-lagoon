@@ -1,11 +1,20 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use contracts::{
-    AttachmentReference, ChannelKind, EpisodeExcerpt, IngressEventKind, NormalizedIngress,
+    AttachmentReference, ChannelKind, EpisodeExcerpt, ForegroundTrigger, ForegroundTriggerKind,
+    IngressEventKind, NormalizedIngress,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+use crate::{
+    audit::{self, NewAuditEvent},
+    config::{ResolvedTelegramConfig, RuntimeConfig},
+    execution::{self, NewExecutionRecord},
+    policy::{self, PolicyDecision},
+    trace::TraceContext,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewConversationBinding {
@@ -49,6 +58,7 @@ pub struct IngressEventRecord {
     pub external_event_id: String,
     pub external_message_id: Option<String>,
     pub status: String,
+    pub rejection_reason: Option<String>,
     pub text_body: Option<String>,
     pub reply_to_external_message_id: Option<String>,
     pub attachment_count: i32,
@@ -108,6 +118,28 @@ pub struct EpisodeMessageRecord {
     pub message_role: String,
     pub text_body: Option<String>,
     pub external_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForegroundTriggerIntakeOutcome {
+    Accepted(ForegroundTrigger),
+    Duplicate(DuplicateForegroundTrigger),
+    Rejected(RejectedForegroundTrigger),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateForegroundTrigger {
+    pub ingress_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedForegroundTrigger {
+    pub ingress_id: Uuid,
+    pub trace_id: Uuid,
+    pub reason: String,
 }
 
 pub async fn upsert_conversation_binding(
@@ -308,6 +340,7 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
             external_event_id,
             external_message_id,
             status,
+            rejection_reason,
             text_body,
             reply_to_external_message_id,
             attachment_count,
@@ -337,6 +370,7 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
         external_event_id: row.get("external_event_id"),
         external_message_id: row.get("external_message_id"),
         status: row.get("status"),
+        rejection_reason: row.get("rejection_reason"),
         text_body: row.get("text_body"),
         reply_to_external_message_id: row.get("reply_to_external_message_id"),
         attachment_count: row.get("attachment_count"),
@@ -599,6 +633,174 @@ pub async fn list_recent_episode_excerpts(
         .collect())
 }
 
+pub async fn intake_telegram_foreground_trigger(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    telegram_config: &ResolvedTelegramConfig,
+    ingress: NormalizedIngress,
+) -> Result<ForegroundTriggerIntakeOutcome> {
+    let deduplication_key = foreground_deduplication_key(&ingress);
+
+    if let Some(existing) =
+        find_ingress_event_by_channel_event(pool, ingress.channel_kind, &ingress.external_event_id)
+            .await?
+    {
+        audit::insert(
+            pool,
+            &NewAuditEvent {
+                loop_kind: "conscious".to_string(),
+                subsystem: "foreground_trigger".to_string(),
+                event_kind: "foreground_trigger_duplicate".to_string(),
+                severity: "info".to_string(),
+                trace_id: existing.trace_id,
+                execution_id: existing.execution_id,
+                worker_pid: None,
+                payload: json!({
+                    "ingress_id": existing.ingress_id,
+                    "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                    "external_event_id": ingress.external_event_id,
+                    "deduplication_key": deduplication_key,
+                    "existing_status": existing.status,
+                }),
+            },
+        )
+        .await?;
+
+        return Ok(ForegroundTriggerIntakeOutcome::Duplicate(
+            DuplicateForegroundTrigger {
+                ingress_id: existing.ingress_id,
+                trace_id: existing.trace_id,
+                execution_id: existing.execution_id,
+                status: existing.status,
+            },
+        ));
+    }
+
+    match policy::evaluate_telegram_foreground_trigger(telegram_config, &ingress) {
+        PolicyDecision::Allowed => {}
+        PolicyDecision::Denied { reason } => {
+            let trace = TraceContext::root();
+            let conversation_binding_id =
+                maybe_upsert_matching_conversation_binding(pool, telegram_config, &ingress).await?;
+            insert_ingress_event(
+                pool,
+                &NewIngressEvent {
+                    ingress: ingress.clone(),
+                    conversation_binding_id,
+                    trace_id: trace.trace_id,
+                    execution_id: None,
+                    status: "rejected".to_string(),
+                    rejection_reason: Some(reason.clone()),
+                },
+            )
+            .await?;
+
+            audit::insert(
+                pool,
+                &NewAuditEvent {
+                    loop_kind: "conscious".to_string(),
+                    subsystem: "foreground_trigger".to_string(),
+                    event_kind: "foreground_trigger_rejected".to_string(),
+                    severity: "warn".to_string(),
+                    trace_id: trace.trace_id,
+                    execution_id: None,
+                    worker_pid: None,
+                    payload: json!({
+                        "ingress_id": ingress.ingress_id,
+                        "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                        "external_event_id": ingress.external_event_id,
+                        "event_kind": ingress_event_kind_as_str(ingress.event_kind),
+                        "deduplication_key": deduplication_key,
+                        "reason": reason,
+                    }),
+                },
+            )
+            .await?;
+
+            return Ok(ForegroundTriggerIntakeOutcome::Rejected(
+                RejectedForegroundTrigger {
+                    ingress_id: ingress.ingress_id,
+                    trace_id: trace.trace_id,
+                    reason,
+                },
+            ));
+        }
+    }
+
+    let budget = policy::default_foreground_budget(config);
+    policy::validate_foreground_budget(&budget)?;
+
+    let trace = TraceContext::root();
+    let execution_id = Uuid::now_v7();
+    let trigger = ForegroundTrigger {
+        trigger_id: Uuid::now_v7(),
+        trace_id: trace.trace_id,
+        execution_id,
+        trigger_kind: ForegroundTriggerKind::UserIngress,
+        ingress: ingress.clone(),
+        received_at: Utc::now(),
+        deduplication_key: deduplication_key.clone(),
+        budget,
+    };
+
+    execution::insert(
+        pool,
+        &NewExecutionRecord {
+            execution_id,
+            trace_id: trace.trace_id,
+            trigger_kind: "telegram_user_ingress".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: serde_json::to_value(&trigger)
+                .context("failed to serialize foreground trigger request payload")?,
+        },
+    )
+    .await?;
+
+    let conversation_binding_id =
+        upsert_matching_conversation_binding(pool, telegram_config, &ingress).await?;
+    insert_ingress_event(
+        pool,
+        &NewIngressEvent {
+            ingress: ingress.clone(),
+            conversation_binding_id: Some(conversation_binding_id),
+            trace_id: trace.trace_id,
+            execution_id: Some(execution_id),
+            status: "accepted".to_string(),
+            rejection_reason: None,
+        },
+    )
+    .await?;
+
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "foreground_trigger".to_string(),
+            event_kind: "foreground_trigger_accepted".to_string(),
+            severity: "info".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "ingress_id": ingress.ingress_id,
+                "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                "external_event_id": ingress.external_event_id,
+                "event_kind": ingress_event_kind_as_str(ingress.event_kind),
+                "deduplication_key": deduplication_key,
+                "budget": {
+                    "iteration_budget": trigger.budget.iteration_budget,
+                    "wall_clock_budget_ms": trigger.budget.wall_clock_budget_ms,
+                    "token_budget": trigger.budget.token_budget,
+                },
+            }),
+        },
+    )
+    .await?;
+
+    Ok(ForegroundTriggerIntakeOutcome::Accepted(trigger))
+}
+
 fn channel_kind_as_str(channel_kind: ChannelKind) -> &'static str {
     match channel_kind {
         ChannelKind::Telegram => "telegram",
@@ -619,4 +821,135 @@ where
 {
     serde_json::from_value(value)
         .with_context(|| format!("failed to decode persisted {field_name} from JSON"))
+}
+
+fn foreground_deduplication_key(ingress: &NormalizedIngress) -> String {
+    format!(
+        "{}:{}",
+        channel_kind_as_str(ingress.channel_kind),
+        ingress.external_event_id
+    )
+}
+
+async fn find_ingress_event_by_channel_event(
+    pool: &PgPool,
+    channel_kind: ChannelKind,
+    external_event_id: &str,
+) -> Result<Option<IngressEventRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            ingress_id,
+            trace_id,
+            execution_id,
+            channel_kind,
+            internal_principal_ref,
+            internal_conversation_ref,
+            event_kind,
+            external_event_id,
+            external_message_id,
+            status,
+            rejection_reason,
+            text_body,
+            reply_to_external_message_id,
+            attachment_count,
+            attachments_json,
+            command_name,
+            command_args_json,
+            approval_token,
+            approval_callback_data,
+            raw_payload_ref
+        FROM ingress_events
+        WHERE channel_kind = $1 AND external_event_id = $2
+        "#,
+    )
+    .bind(channel_kind_as_str(channel_kind))
+    .bind(external_event_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to look up ingress event by external event id")?;
+
+    row.map(decode_ingress_event_row).transpose()
+}
+
+async fn maybe_upsert_matching_conversation_binding(
+    pool: &PgPool,
+    config: &ResolvedTelegramConfig,
+    ingress: &NormalizedIngress,
+) -> Result<Option<Uuid>> {
+    let Some(binding) = matching_conversation_binding(config, ingress) else {
+        return Ok(None);
+    };
+
+    let record = upsert_conversation_binding(pool, &binding).await?;
+    Ok(Some(record.conversation_binding_id))
+}
+
+async fn upsert_matching_conversation_binding(
+    pool: &PgPool,
+    config: &ResolvedTelegramConfig,
+    ingress: &NormalizedIngress,
+) -> Result<Uuid> {
+    let binding = matching_conversation_binding(config, ingress)
+        .context("accepted Telegram ingress must match the configured conversation binding")?;
+    let record = upsert_conversation_binding(pool, &binding).await?;
+    Ok(record.conversation_binding_id)
+}
+
+fn matching_conversation_binding(
+    config: &ResolvedTelegramConfig,
+    ingress: &NormalizedIngress,
+) -> Option<NewConversationBinding> {
+    if ingress.channel_kind != ChannelKind::Telegram {
+        return None;
+    }
+    if ingress.external_user_id != config.allowed_user_id.to_string() {
+        return None;
+    }
+    if ingress.external_conversation_id != config.allowed_chat_id.to_string() {
+        return None;
+    }
+    if ingress.internal_principal_ref != config.internal_principal_ref {
+        return None;
+    }
+    if ingress.internal_conversation_ref != config.internal_conversation_ref {
+        return None;
+    }
+
+    Some(NewConversationBinding {
+        conversation_binding_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: ingress.external_user_id.clone(),
+        external_conversation_id: ingress.external_conversation_id.clone(),
+        internal_principal_ref: ingress.internal_principal_ref.clone(),
+        internal_conversation_ref: ingress.internal_conversation_ref.clone(),
+    })
+}
+
+fn decode_ingress_event_row(row: sqlx::postgres::PgRow) -> Result<IngressEventRecord> {
+    Ok(IngressEventRecord {
+        ingress_id: row.get("ingress_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        channel_kind: row.get("channel_kind"),
+        internal_principal_ref: row.get("internal_principal_ref"),
+        internal_conversation_ref: row.get("internal_conversation_ref"),
+        event_kind: row.get("event_kind"),
+        external_event_id: row.get("external_event_id"),
+        external_message_id: row.get("external_message_id"),
+        status: row.get("status"),
+        rejection_reason: row.get("rejection_reason"),
+        text_body: row.get("text_body"),
+        reply_to_external_message_id: row.get("reply_to_external_message_id"),
+        attachment_count: row.get("attachment_count"),
+        attachments: decode_json_field(
+            row.get::<Value, _>("attachments_json"),
+            "ingress attachment metadata",
+        )?,
+        command_name: row.get("command_name"),
+        command_args: decode_json_field(row.get::<Value, _>("command_args_json"), "command args")?,
+        approval_token: row.get("approval_token"),
+        approval_callback_data: row.get("approval_callback_data"),
+        raw_payload_ref: row.get("raw_payload_ref"),
+    })
 }

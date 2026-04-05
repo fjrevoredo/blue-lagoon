@@ -212,19 +212,20 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `MILESTONE A`
-- Current active task: `P2-09`
-- Completed tasks: `8/18`
-- Milestone A status: `IN PROGRESS`
-- Milestone B status: `TODO`
-- Milestone C status: `TODO`
+- Current milestone: `MILESTONE C`
+- Current active task: `P2-11`
+- Completed tasks: `9/18`
+- Milestone A status: `DONE`
+- Milestone B status: `DONE`
+- Milestone C status: `IN PROGRESS`
 - Milestone D status: `TODO`
 
 Latest verification state:
 
-- Phase 2 state has been self-checked after implementation and review fixes.
+- Phase 2 state has been self-checked after `P2-09` implementation.
 - `cmd.exe /c cargo fmt --all --check` is green.
 - `cmd.exe /c cargo check --workspace` is green.
+- `cmd.exe /c cargo test -p harness -- --nocapture` is green.
 - `cmd.exe /c cargo test --workspace` is green.
 
 Latest review corrections already applied:
@@ -554,7 +555,7 @@ Milestone D is green only if:
 
 ### Task P2-09: Implement foreground trigger validation, deduplication, and budget initialization
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P2-04`, `P2-05`, `P2-08`
 - Parallel-safe: no
 - Deliverables:
@@ -569,7 +570,24 @@ Milestone D is green only if:
   - unit tests for trigger validation, duplicate handling, and policy decisions
   - component tests for persisted trigger and audit behavior
 - Evidence:
-  - pending
+  - Added explicit foreground budget config fields in
+    `config/default.toml` and `crates/harness/src/config.rs` for iteration,
+    wall-clock, and token limits, with fail-closed validation and updated test
+    support defaults. Extended `crates/harness/src/policy.rs` with minimal
+    Telegram foreground trigger policy evaluation plus explicit foreground
+    budget initialization and validation. Implemented harness-owned Telegram
+    trigger intake in `crates/harness/src/foreground.rs`, including
+    deduplication by external event identifier, idempotent duplicate handling,
+    accepted and rejected ingress persistence, execution-record creation for
+    accepted triggers, and audit-event emission for accepted, rejected, and
+    duplicate paths. Added `audit::list_for_trace` in
+    `crates/harness/src/audit.rs` and expanded
+    `crates/harness/tests/phase2_component.rs` with PostgreSQL-backed tests for
+    accepted, rejected, and duplicate trigger paths. Verified with
+    `cmd.exe /c cargo test -p harness -- --nocapture`,
+    `cmd.exe /c cargo fmt --all --check`,
+    `cmd.exe /c cargo check --workspace`, and
+    `cmd.exe /c cargo test --workspace`.
 
 ### Task P2-10: Implement the compact self-model seed and internal-state snapshot path
 

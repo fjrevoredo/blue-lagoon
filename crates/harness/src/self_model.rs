@@ -135,7 +135,9 @@ mod tests {
             },
             harness: HarnessConfig {
                 allow_synthetic_smoke: true,
+                default_foreground_iteration_budget: 1,
                 default_wall_clock_budget_ms: 30_000,
+                default_foreground_token_budget: 4_000,
             },
             worker: WorkerConfig {
                 timeout_ms: 5_000,

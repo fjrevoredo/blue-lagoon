@@ -7,7 +7,9 @@ minimum_supported_schema_version = 1
 
 [harness]
 allow_synthetic_smoke = true
+default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 30000
+default_foreground_token_budget = 4000
 
 [worker]
 timeout_ms = 10000

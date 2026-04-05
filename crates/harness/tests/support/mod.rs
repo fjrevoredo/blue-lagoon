@@ -34,7 +34,9 @@ pub async fn prepare_database() -> Result<(RuntimeConfig, PgPool)> {
         },
         harness: harness::config::HarnessConfig {
             allow_synthetic_smoke: true,
+            default_foreground_iteration_budget: 1,
             default_wall_clock_budget_ms: 30_000,
+            default_foreground_token_budget: 4_000,
         },
         worker: harness::config::WorkerConfig {
             timeout_ms: 20_000,

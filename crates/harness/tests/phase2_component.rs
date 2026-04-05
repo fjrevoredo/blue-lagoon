@@ -4,9 +4,10 @@ use anyhow::Result;
 use chrono::Utc;
 use contracts::ChannelKind;
 use harness::{
-    config::ResolvedTelegramConfig, execution, foreground, ingress, migration, telegram,
+    audit, config::ResolvedTelegramConfig, execution, foreground, ingress, migration, telegram,
 };
 use serial_test::serial;
+use sqlx::Row;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -267,6 +268,179 @@ async fn foreground_persistence_retains_attachment_command_and_callback_fields()
         stored_callback.approval_callback_data.as_deref(),
         Some("approve:42")
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn accepted_foreground_trigger_persists_execution_budget_and_audit() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/private_text_message.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+    };
+
+    let outcome = foreground::intake_telegram_foreground_trigger(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        ingress.clone(),
+    )
+    .await?;
+
+    let trigger = match outcome {
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        other => panic!("expected accepted trigger, got {other:?}"),
+    };
+
+    assert_eq!(trigger.ingress.ingress_id, ingress.ingress_id);
+    assert_eq!(trigger.budget.iteration_budget, 1);
+    assert_eq!(trigger.budget.wall_clock_budget_ms, 30_000);
+    assert_eq!(trigger.budget.token_budget, 4_000);
+
+    let stored_ingress = foreground::get_ingress_event(&pool, ingress.ingress_id).await?;
+    assert_eq!(stored_ingress.status, "accepted");
+    assert_eq!(stored_ingress.execution_id, Some(trigger.execution_id));
+    assert_eq!(stored_ingress.rejection_reason, None);
+
+    let execution = execution::get(&pool, trigger.execution_id).await?;
+    assert_eq!(execution.trace_id, trigger.trace_id);
+    assert_eq!(execution.status, "started");
+
+    let audit_events = audit::list_for_execution(&pool, trigger.execution_id).await?;
+    assert_eq!(audit_events.len(), 1);
+    assert_eq!(audit_events[0].event_kind, "foreground_trigger_accepted");
+    assert_eq!(audit_events[0].trace_id, trigger.trace_id);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("approval_callback.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/approval_callback.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        other => panic!("callback fixture should normalize into accepted ingress, got {other:?}"),
+    };
+
+    let outcome = foreground::intake_telegram_foreground_trigger(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        ingress.clone(),
+    )
+    .await?;
+
+    let rejected = match outcome {
+        foreground::ForegroundTriggerIntakeOutcome::Rejected(rejected) => rejected,
+        other => panic!("expected rejected trigger, got {other:?}"),
+    };
+
+    let stored_ingress = foreground::get_ingress_event(&pool, rejected.ingress_id).await?;
+    assert_eq!(stored_ingress.status, "rejected");
+    assert!(
+        stored_ingress
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approval callbacks"))
+    );
+    assert_eq!(stored_ingress.execution_id, None);
+
+    let audit_events = audit::list_for_trace(&pool, rejected.trace_id).await?;
+    assert_eq!(audit_events.len(), 1);
+    assert_eq!(audit_events[0].event_kind, "foreground_trigger_rejected");
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn duplicate_foreground_trigger_is_idempotent_and_audited() -> Result<()> {
+    let (config, pool) = support::prepare_database().await?;
+    migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+
+    let update = telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+    let ingress = match ingress::normalize_telegram_update(
+        &sample_telegram_config(),
+        &update,
+        Some("fixtures/private_text_message.json".to_string()),
+    )? {
+        ingress::TelegramNormalizationOutcome::Accepted(ingress) => ingress,
+        other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+    };
+
+    let accepted = foreground::intake_telegram_foreground_trigger(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        ingress.clone(),
+    )
+    .await?;
+
+    let accepted_trigger = match accepted {
+        foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => trigger,
+        other => panic!("expected accepted trigger, got {other:?}"),
+    };
+
+    let mut duplicate_ingress = ingress.clone();
+    duplicate_ingress.ingress_id = Uuid::now_v7();
+
+    let duplicate = foreground::intake_telegram_foreground_trigger(
+        &pool,
+        &config,
+        &sample_telegram_config(),
+        duplicate_ingress,
+    )
+    .await?;
+
+    let duplicate = match duplicate {
+        foreground::ForegroundTriggerIntakeOutcome::Duplicate(duplicate) => duplicate,
+        other => panic!("expected duplicate trigger, got {other:?}"),
+    };
+
+    assert_eq!(duplicate.ingress_id, accepted_trigger.ingress.ingress_id);
+    assert_eq!(duplicate.execution_id, Some(accepted_trigger.execution_id));
+    assert_eq!(duplicate.trace_id, accepted_trigger.trace_id);
+
+    let ingress_count = sqlx::query(
+        r#"
+        SELECT COUNT(*) AS count
+        FROM ingress_events
+        WHERE channel_kind = 'telegram' AND external_event_id = $1
+        "#,
+    )
+    .bind(&ingress.external_event_id)
+    .fetch_one(&pool)
+    .await?
+    .get::<i64, _>("count");
+    assert_eq!(ingress_count, 1);
+
+    let audit_events = audit::list_for_execution(&pool, accepted_trigger.execution_id).await?;
+    assert_eq!(audit_events.len(), 2);
+    assert_eq!(audit_events[0].event_kind, "foreground_trigger_accepted");
+    assert_eq!(audit_events[1].event_kind, "foreground_trigger_duplicate");
     Ok(())
 }
 

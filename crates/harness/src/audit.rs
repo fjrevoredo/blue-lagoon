@@ -98,3 +98,28 @@ pub async fn list_for_execution(pool: &PgPool, execution_id: Uuid) -> Result<Vec
         })
         .collect())
 }
+
+pub async fn list_for_trace(pool: &PgPool, trace_id: Uuid) -> Result<Vec<AuditEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, occurred_at, event_kind, trace_id
+        FROM audit_events
+        WHERE trace_id = $1
+        ORDER BY occurred_at, event_id
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch audit events by trace")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditEvent {
+            event_id: row.get("event_id"),
+            occurred_at: row.get("occurred_at"),
+            event_kind: row.get("event_kind"),
+            trace_id: row.get("trace_id"),
+        })
+        .collect())
+}

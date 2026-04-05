@@ -32,7 +32,9 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HarnessConfig {
     pub allow_synthetic_smoke: bool,
+    pub default_foreground_iteration_budget: u32,
     pub default_wall_clock_budget_ms: u64,
+    pub default_foreground_token_budget: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -192,6 +194,12 @@ impl RuntimeConfig {
         }
         if self.harness.default_wall_clock_budget_ms == 0 {
             bail!("harness.default_wall_clock_budget_ms must be greater than zero");
+        }
+        if self.harness.default_foreground_iteration_budget == 0 {
+            bail!("harness.default_foreground_iteration_budget must be greater than zero");
+        }
+        if self.harness.default_foreground_token_budget == 0 {
+            bail!("harness.default_foreground_token_budget must be greater than zero");
         }
         if self.worker.timeout_ms == 0 {
             bail!("worker.timeout_ms must be greater than zero");
@@ -379,7 +387,9 @@ mod tests {
             },
             harness: HarnessConfig {
                 allow_synthetic_smoke: true,
+                default_foreground_iteration_budget: 1,
                 default_wall_clock_budget_ms: 30_000,
+                default_foreground_token_budget: 4_000,
             },
             worker: WorkerConfig {
                 timeout_ms: 5_000,
@@ -436,6 +446,30 @@ mod tests {
         sample_config()
             .validate()
             .expect("phase 1 configuration should remain valid");
+    }
+
+    #[test]
+    fn validate_rejects_zero_foreground_iteration_budget() {
+        let mut config = sample_config();
+        config.harness.default_foreground_iteration_budget = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("default_foreground_iteration_budget")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_foreground_token_budget() {
+        let mut config = sample_config();
+        config.harness.default_foreground_token_budget = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("default_foreground_token_budget")
+        );
     }
 
     #[test]
