@@ -1,12 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`blue-lagoon` is now a Rust workspace with implementation code plus canonical
+
+`blue-lagoon` is a Rust workspace with implementation code plus canonical
 design docs. Root documents such as `README.md` and `PHILOSOPHY.md` define
-project identity and decision principles. Authoritative design material lives in
-`docs/`, especially `docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`,
-`docs/IMPLEMENTATION_DESIGN.md`, `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`, and
-`docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`.
+repository identity and decision principles. Authoritative product and
+architecture guidance lives in `docs/`, especially `docs/REQUIREMENTS.md`,
+`docs/LOOP_ARCHITECTURE.md`, and `docs/IMPLEMENTATION_DESIGN.md`.
+
+Planning material also lives under `docs/`, but it should be treated according
+to purpose:
+
+- `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`: repository roadmap and sequencing
+- `docs/PHASE_*_DETAILED_IMPLEMENTATION_PLAN.md`: implementation ledgers and
+  historical execution records, not canonical runtime behavior
 
 Runtime code lives under `crates/`:
 
@@ -26,6 +33,7 @@ handover documents live in `docs/archive/` and should be treated as archived
 context rather than current canonical guidance.
 
 ## Build, Test, and Development Commands
+
 Typical implementation workflow is:
 
 - `rg --files` to inspect the repository quickly.
@@ -36,9 +44,14 @@ Typical implementation workflow is:
 - `docker compose config` to verify the local runtime topology.
 - `docker compose up -d postgres` to start disposable local PostgreSQL.
 - `cargo run -p runtime -- migrate` to apply reviewed migrations.
+- `cargo run -p runtime -- --help` to inspect the stable CLI surface.
 - `cargo run -p runtime -- harness --once --idle` to verify safe harness boot.
 - `cargo run -p runtime -- harness --once --synthetic-trigger smoke` to run the
-  Phase 1 end-to-end smoke path.
+  synthetic harness smoke path.
+- `cargo run -p runtime -- telegram --fixture <fixture-path>` to replay one
+  stored Telegram update through the foreground path.
+- `cargo run -p runtime -- telegram --poll-once` to perform one live Telegram
+  poll cycle.
 - `git diff -- docs/ PHILOSOPHY.md README.md AGENTS.md` to review documentation
   changes before commit.
 - `git log --oneline` to match existing commit style.
@@ -56,6 +69,7 @@ Git environment rule:
   committed, and whether unrelated modifications are present.
 
 ## Coding Style & Naming Conventions
+
 Rust code should preserve the current workspace boundary posture: keep
 `crates/runtime` thin, keep control-plane logic in `crates/harness`, keep
 cross-process types in `crates/contracts`, and keep worker process logic in
@@ -70,6 +84,7 @@ patterns: top-level canonical documents use uppercase names like
 handovers under `docs/archive/` use descriptive lowercase kebab-case filenames.
 
 ## Testing Guidelines
+
 Automated testing is required for implementation work. Fast unit tests should
 cover local logic, while persistence-critical behavior must be verified against
 disposable real PostgreSQL through the harness component and integration tests.
@@ -84,12 +99,25 @@ the relevant broader suite:
 Documentation testing remains manual. Verify that section hierarchy is
 consistent, terminology matches `PHILOSOPHY.md`, `docs/REQUIREMENTS.md`,
 `docs/LOOP_ARCHITECTURE.md`, and `docs/IMPLEMENTATION_DESIGN.md`, and
-cross-document claims do not conflict. Re-read modified files in rendered
+cross-document claims do not conflict. `README.md` and `AGENTS.md` should stay
+repository-oriented and stable rather than being written as phase handoff notes
+or temporary execution status reports. Re-read modified files in rendered
 Markdown when possible. Treat broken links, contradictory definitions, and
 unclear scope boundaries as defects that must be fixed before merge.
 
 ## Commit & Pull Request Guidelines
-Existing history uses short, direct subjects such as `initial docs`. Keep commit messages brief and imperative, and avoid bundling unrelated document changes together. Pull requests should state which documents changed, why the change is needed, and any open questions or follow-up work. Include screenshots only when a rendered artifact or visual document output materially changes.
+
+Existing history uses short, direct subjects such as `initial docs`. Keep
+commit messages brief and imperative, and avoid bundling unrelated document
+changes together. Pull requests should state which documents changed, why the
+change is needed, and any open questions or follow-up work. Include screenshots
+only when a rendered artifact or visual document output materially changes.
 
 ## Source Material Handling
-Do not treat `docs/sources/` as canonical product behavior; it is evidence and research context. Do not treat `docs/archive/` as current product guidance; it is retained for historical traceability. Promote conclusions into `docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`, `docs/IMPLEMENTATION_DESIGN.md`, or other canonical docs only after they are cleaned up, reconciled, and stated as repository-approved guidance.
+
+Do not treat `docs/sources/` as canonical product behavior; it is evidence and
+research context. Do not treat `docs/archive/` as current product guidance; it
+is retained for historical traceability. Promote conclusions into
+`docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`,
+`docs/IMPLEMENTATION_DESIGN.md`, or other canonical docs only after they are
+cleaned up, reconciled, and stated as repository-approved guidance.

@@ -1,18 +1,37 @@
 # blue-lagoon
 
-Phase 1 establishes a runnable Rust workspace with a harness-owned migration
-path, schema safety checks, a no-trigger idle boot path, and a synthetic
-end-to-end worker flow.
+Blue Lagoon is a Rust workspace for a harness-governed assistant runtime. The
+repository centers on a control-plane architecture where the harness owns
+budgets, policy, context assembly, canonical writes, auditability, and runtime
+boundaries, while worker processes provide bounded foreground reasoning.
 
-## Phase 1 Commands
+Project philosophy lives in `PHILOSOPHY.md`. Canonical product and architecture
+specification lives in:
 
-Start PostgreSQL:
+- `docs/REQUIREMENTS.md`
+- `docs/LOOP_ARCHITECTURE.md`
+- `docs/IMPLEMENTATION_DESIGN.md`
+
+Implementation plans and phase ledgers under `docs/PHASE_*` are useful project
+history, but they are not the stable description of repository behavior.
+
+## Workspace Layout
+
+- `crates/runtime`: thin CLI entrypoints
+- `crates/harness`: control-plane logic, policy, persistence, orchestration
+- `crates/contracts`: typed cross-process and cross-boundary contracts
+- `crates/workers`: worker executables and worker-facing tests
+- `migrations/`: reviewed SQL migrations
+- `config/default.toml`: versioned non-secret runtime configuration
+- `compose.yaml`: local PostgreSQL and a minimal runtime topology
+
+## Runtime Commands
+
+Inspect the command surface:
 
 ```bash
-docker compose up -d postgres
+cargo run -p runtime -- --help
 ```
-
-The default local host mapping is `localhost:55432`.
 
 Apply reviewed migrations:
 
@@ -26,116 +45,97 @@ Verify the harness can boot safely and return to idle:
 cargo run -p runtime -- harness --once --idle
 ```
 
-Before running the synthetic smoke trigger, make sure the harness can locate a
-worker executable. The intended v1 posture is an explicit worker binary rather
-than an implicit `cargo run` fallback. For local development, either:
-
-- build the worker binary first with `cargo build -p workers`, or
-- set `BLUE_LAGOON_WORKER_COMMAND` explicitly to the worker executable path
-
-If `BLUE_LAGOON_WORKER_ARGS` is needed, provide it as a JSON array of strings
-rather than as shell-split text.
-
-Run the Phase 1 synthetic smoke trigger:
+Run the synthetic harness smoke path:
 
 ```bash
 cargo run -p runtime -- harness --once --synthetic-trigger smoke
 ```
 
-## Phase 2 Foreground Commands
-
-Phase 2 adds the first Telegram foreground runtime slice. The runtime crate
-stays thin and delegates foreground orchestration, provider routing, policy, and
-canonical writes to `crates/harness`.
-
-Before running the Phase 2 foreground commands, make sure:
-
-- PostgreSQL is running and the reviewed migrations have been applied
-- the harness can locate a worker executable, either through a sibling
-  `workers` binary or `BLUE_LAGOON_WORKER_COMMAND`
-- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN` is set for the configured bot
-- `BLUE_LAGOON_ZAI_API_KEY` is set for the configured foreground model route
-- the configured Telegram user or chat binding points at the intended private
-  1:1 conversation
-- the configured self-model seed path resolves to a real file
-
-Run a fixture-driven Telegram foreground execution:
+Replay one stored Telegram update through the foreground path:
 
 ```bash
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
-Run a one-shot live Telegram poll:
+Run one live Telegram poll cycle:
 
 ```bash
 cargo run -p runtime -- telegram --poll-once
 ```
 
-`runtime telegram` is intentionally one-shot. `--fixture` replays a stored
-Telegram update through the full foreground path and still uses the configured
-model gateway and Telegram delivery boundary, so it should be run only against
-the intended bound chat. `--poll-once` fails closed when Phase 2 Telegram
-configuration is absent.
+The `telegram` command is intentionally one-shot. Live Telegram and live model
+provider checks are operator-run tasks because they require real credentials, a
+bound chat, and side-effect-aware execution.
 
-Run the baseline verification suite:
+## Local Development
+
+Start PostgreSQL:
+
+```bash
+docker compose up -d postgres
+```
+
+The default local PostgreSQL mapping is `localhost:55432`.
+
+Validate the compose topology:
+
+```bash
+docker compose config
+```
+
+If `BLUE_LAGOON_DATABASE_URL` is unset, the test support code starts local
+PostgreSQL through `docker compose up -d postgres`. In CI or other managed
+environments, set `BLUE_LAGOON_DATABASE_URL` explicitly instead.
+
+## Configuration
+
+Default non-secret settings live in `config/default.toml`. Runtime secrets are
+resolved through environment variables referenced by that file.
+
+Important runtime inputs include:
+
+- `BLUE_LAGOON_DATABASE_URL`: PostgreSQL connection string
+- `BLUE_LAGOON_CONFIG`: optional config file override
+- `BLUE_LAGOON_LOG`: optional tracing filter override
+- `BLUE_LAGOON_WORKER_COMMAND`: explicit worker executable path when a sibling
+  `workers` binary is not used
+- `BLUE_LAGOON_WORKER_ARGS`: worker arguments as a JSON array of strings
+- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`: Telegram bot token
+- `BLUE_LAGOON_ZAI_API_KEY`: foreground model provider API key
+
+The harness expects either:
+
+- a packaged sibling `workers` binary next to the runtime binary, or
+- an explicit worker command supplied in config or through
+  `BLUE_LAGOON_WORKER_COMMAND`
+
+The Telegram foreground path also requires:
+
+- a configured single allowed Telegram user and private chat binding
+- a valid self-model seed file
+- a configured foreground model route
+
+## Verification
+
+The core repository verification commands are:
 
 ```bash
 cargo fmt --all --check
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 docker compose config
 ```
 
-`cargo test --workspace` boots local PostgreSQL with `docker compose up -d
-postgres` when `BLUE_LAGOON_DATABASE_URL` is unset. Repository-hosted CI sets
-`BLUE_LAGOON_DATABASE_URL` explicitly and uses a disposable GitHub Actions
-PostgreSQL service instead.
+Useful command-surface checks:
 
-## Phase 1.1 CI Baseline
+```bash
+cargo run -p runtime -- --help
+cargo run -p runtime -- harness --once --idle
+cargo run -p runtime -- harness --once --synthetic-trigger smoke
+cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
+```
 
-The baseline repository-hosted workflow is `.github/workflows/ci.yml`. This is
-the starting point for repository CI, not a one-off Phase 1 workflow. Later
-phases should extend this baseline or add adjacent stable gates without
-replacing its role as the core workspace verification path.
-
-- Workflow name: `CI`
-- Required check name: `workspace-verification`
-- Triggers: `pull_request` and pushes to `master`
-
-The Phase 1.1 local-to-CI command mapping is:
-
-- `cargo fmt --all --check` -> `cargo fmt --all --check`
-- `cargo check --workspace` -> `cargo check --workspace`
-- `cargo test -p harness --test phase2_component -- --nocapture` ->
-  `cargo test -p harness --test phase2_component -- --nocapture`
-- `cargo test -p harness --test phase2_integration -- --nocapture` ->
-  `cargo test -p harness --test phase2_integration -- --nocapture`
-- `cargo test --workspace` -> `cargo test --workspace`
-
-The following recurring Phase 1 commands remain intentionally outside the Phase
-1.1 automation scope and must still be run locally when relevant:
-
-- `docker compose config`
-- `cargo run -p runtime -- migrate`
-- `cargo run -p runtime -- --help`
-- `cargo run -p runtime -- harness --once --idle`
-- `cargo run -p runtime -- harness --once --synthetic-trigger smoke`
-- `cargo run -p runtime -- telegram --fixture <fixture-path>`
-- `cargo run -p runtime -- telegram --poll-once`
-
-Live Telegram-network and live provider-network verification remain intentionally
-outside repository-hosted CI. The required automated suites use fake Telegram
-and provider boundaries, while live `telegram` command checks stay operator-run
-because they require bound credentials, a real chat, and side-effect-aware
-execution posture.
-
-Repository follow-up after the workflow lands:
-
-- require the `workspace-verification` check on `master` branch protection or the
-  repository's equivalent ruleset
-- keep this workflow as the foundation and extend the CI surface in later
-  phases with additional stable checks as new runtime capabilities land
-- note that no repository-hosted live-network run evidence is recorded from the
-  current implementation environment; live Telegram or provider checks remain
-  documented local operator tasks
-- release, deployment, and publish automation remain deferred
+Repository-hosted CI lives in `.github/workflows/ci.yml` and should remain a
+stable workspace verification gate. Live-network Telegram and provider checks
+remain intentionally outside repository-hosted CI.
