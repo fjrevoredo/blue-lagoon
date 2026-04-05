@@ -155,6 +155,19 @@ impl RuntimeConfig {
             .map(parse_worker_args_override)
             .transpose()?
             .unwrap_or_else(|| file_config.worker.args.clone());
+        let foreground_route_override = env::var("BLUE_LAGOON_FOREGROUND_ROUTE")
+            .ok()
+            .as_deref()
+            .map(parse_foreground_route_override)
+            .transpose()?;
+
+        let model_gateway = file_config.model_gateway.map(|mut model_gateway| {
+            if let Some((provider, model)) = &foreground_route_override {
+                model_gateway.foreground.provider = *provider;
+                model_gateway.foreground.model = model.clone();
+            }
+            model_gateway
+        });
 
         let config = Self {
             app: AppConfig {
@@ -174,7 +187,7 @@ impl RuntimeConfig {
                 args: worker_args,
             },
             telegram: file_config.telegram,
-            model_gateway: file_config.model_gateway,
+            model_gateway,
             self_model: file_config.self_model,
         };
 
@@ -255,10 +268,7 @@ impl RuntimeConfig {
                 provider: model_gateway.foreground.provider,
                 model: model_gateway.foreground.model.clone(),
                 api_base_url: model_gateway.foreground.api_base_url.clone(),
-                api_key: require_secret_env(
-                    &model_gateway.foreground.api_key_env,
-                    "Phase 2 model gateway API key environment variable",
-                )?,
+                api_key: require_foreground_api_key(&model_gateway.foreground.api_key_env)?,
                 timeout_ms: model_gateway.foreground.timeout_ms,
             },
         })
@@ -291,6 +301,28 @@ impl RuntimeConfig {
 
 fn parse_worker_args_override(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw).context("BLUE_LAGOON_WORKER_ARGS must be a JSON array of strings")
+}
+
+fn parse_model_provider_override(raw: &str) -> Result<ModelProviderKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "z_ai" | "zai" | "z-ai" => Ok(ModelProviderKind::ZAi),
+        other => bail!("BLUE_LAGOON_FOREGROUND_ROUTE provider must be one of: z_ai; got '{other}'"),
+    }
+}
+
+fn parse_foreground_route_override(raw: &str) -> Result<(ModelProviderKind, String)> {
+    let trimmed = raw.trim();
+    let (provider_raw, model_raw) = trimmed.split_once('/').with_context(|| {
+        format!(
+            "BLUE_LAGOON_FOREGROUND_ROUTE must use '<provider>/<model>' format; got '{trimmed}'"
+        )
+    })?;
+    let provider = parse_model_provider_override(provider_raw)?;
+    let model = model_raw.trim();
+    if model.is_empty() {
+        bail!("BLUE_LAGOON_FOREGROUND_ROUTE model segment must not be empty");
+    }
+    Ok((provider, model.to_string()))
 }
 
 impl TelegramConfig {
@@ -355,6 +387,20 @@ fn require_secret_env(env_name: &str, description: &str) -> Result<String> {
         bail!("{env_name} must not be empty");
     }
     Ok(value)
+}
+
+fn require_foreground_api_key(configured_env_name: &str) -> Result<String> {
+    if let Ok(value) = env::var("BLUE_LAGOON_FOREGROUND_API_KEY") {
+        if value.trim().is_empty() {
+            bail!("BLUE_LAGOON_FOREGROUND_API_KEY must not be empty");
+        }
+        return Ok(value);
+    }
+
+    require_secret_env(
+        configured_env_name,
+        "Phase 2 model gateway API key environment variable",
+    )
 }
 
 fn resolve_relative_to_config(path: &PathBuf) -> PathBuf {
@@ -442,6 +488,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_provider_override_accepts_supported_aliases() {
+        assert_eq!(
+            parse_model_provider_override("z_ai").expect("provider should parse"),
+            ModelProviderKind::ZAi
+        );
+        assert_eq!(
+            parse_model_provider_override("zai").expect("provider should parse"),
+            ModelProviderKind::ZAi
+        );
+        assert_eq!(
+            parse_model_provider_override("z-ai").expect("provider should parse"),
+            ModelProviderKind::ZAi
+        );
+    }
+
+    #[test]
+    fn parse_model_provider_override_rejects_unknown_value() {
+        let error = parse_model_provider_override("unknown")
+            .expect_err("unknown provider should be rejected");
+        assert!(error.to_string().contains("BLUE_LAGOON_FOREGROUND_ROUTE"));
+    }
+
+    #[test]
+    fn parse_foreground_route_override_accepts_exact_model_segment() {
+        let (provider, model) =
+            parse_foreground_route_override("zai/glm-5-turbo").expect("route should parse");
+        assert_eq!(provider, ModelProviderKind::ZAi);
+        assert_eq!(model, "glm-5-turbo");
+    }
+
+    #[test]
+    fn parse_foreground_route_override_rejects_missing_separator() {
+        let error = parse_foreground_route_override("zai")
+            .expect_err("route without separator should be rejected");
+        assert!(error.to_string().contains("BLUE_LAGOON_FOREGROUND_ROUTE"));
+    }
+
+    #[test]
+    fn parse_foreground_route_override_rejects_empty_model() {
+        let error = parse_foreground_route_override("zai/")
+            .expect_err("route without model should be rejected");
+        assert!(error.to_string().contains("model segment"));
+    }
+
+    #[test]
     fn validate_accepts_phase_1_only_configuration() {
         sample_config()
             .validate()
@@ -515,7 +606,7 @@ mod tests {
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: "https://api.z.ai".to_string(),
-                api_key_env: format!("BLUE_LAGOON_TEST_ZAI_API_KEY_{}", Uuid::now_v7()),
+                api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
         });
@@ -528,6 +619,104 @@ mod tests {
                 .to_string()
                 .contains("missing required Phase 2 model gateway API key")
         );
+    }
+
+    #[test]
+    fn load_applies_foreground_route_env_override() {
+        let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp dir should be created");
+        let config_path = temp_root.join("default.toml");
+        fs::write(
+            &config_path,
+            r#"
+[app]
+name = "blue-lagoon"
+log_filter = "info"
+
+[database]
+minimum_supported_schema_version = 1
+
+[harness]
+allow_synthetic_smoke = true
+default_foreground_iteration_budget = 1
+default_wall_clock_budget_ms = 30000
+default_foreground_token_budget = 4000
+
+[worker]
+timeout_ms = 10000
+command = ""
+args = []
+
+[model_gateway.foreground]
+provider = "z_ai"
+model = "configured-model"
+api_base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
+timeout_ms = 30000
+"#,
+        )
+        .expect("config file should be written");
+
+        let original_config = env::var_os("BLUE_LAGOON_CONFIG");
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        let original_route = env::var_os("BLUE_LAGOON_FOREGROUND_ROUTE");
+
+        unsafe {
+            env::set_var("BLUE_LAGOON_CONFIG", &config_path);
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+            env::set_var("BLUE_LAGOON_FOREGROUND_ROUTE", "zai/override-model");
+        }
+
+        let loaded = RuntimeConfig::load().expect("config should load with overrides");
+        let foreground = loaded
+            .model_gateway
+            .expect("model gateway should be present")
+            .foreground;
+        assert_eq!(foreground.provider, ModelProviderKind::ZAi);
+        assert_eq!(foreground.model, "override-model");
+
+        match original_config {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_CONFIG", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_CONFIG") },
+        }
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        match original_route {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_ROUTE", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_ROUTE") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn require_model_gateway_config_prefers_direct_foreground_api_key_override() {
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "zai-foreground".to_string(),
+                api_base_url: "https://api.z.ai".to_string(),
+                api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "direct-override-key");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("direct foreground api key override should resolve");
+        assert_eq!(resolved.foreground.api_key, "direct-override-key");
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
     }
 
     #[test]

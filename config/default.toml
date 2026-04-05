@@ -33,7 +33,7 @@ poll_limit = 10
 provider = "z_ai"
 model = "z-ai-foreground"
 api_base_url = "https://api.z.ai/api/paas/v4"
-api_key_env = "BLUE_LAGOON_ZAI_API_KEY"
+api_key_env = "BLUE_LAGOON_FOREGROUND_API_KEY"
 timeout_ms = 30000
 
 [self_model]

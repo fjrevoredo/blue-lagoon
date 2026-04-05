@@ -101,7 +101,9 @@ Important runtime inputs include:
   `workers` binary is not used
 - `BLUE_LAGOON_WORKER_ARGS`: worker arguments as a JSON array of strings
 - `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`: Telegram bot token
-- `BLUE_LAGOON_ZAI_API_KEY`: foreground model provider API key
+- `BLUE_LAGOON_FOREGROUND_ROUTE`: optional foreground route override in
+  `<provider>/<exact-model>` form
+- `BLUE_LAGOON_FOREGROUND_API_KEY`: foreground model provider API key
 
 The harness expects either:
 
