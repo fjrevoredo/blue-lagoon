@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -24,7 +24,10 @@ pub struct ExecutionRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-pub async fn insert(pool: &PgPool, record: &NewExecutionRecord) -> Result<()> {
+pub async fn insert<'e, E>(executor: E, record: &NewExecutionRecord) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         INSERT INTO execution_records (
@@ -62,7 +65,7 @@ pub async fn insert(pool: &PgPool, record: &NewExecutionRecord) -> Result<()> {
     .bind(&record.synthetic_trigger)
     .bind(&record.status)
     .bind(&record.request_payload)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to insert execution record")?;
     Ok(())
@@ -95,6 +98,30 @@ pub async fn mark_succeeded(
     .execute(pool)
     .await
     .context("failed to mark execution record as completed")?;
+    Ok(())
+}
+
+pub async fn mark_failed(
+    pool: &PgPool,
+    execution_id: Uuid,
+    response_payload: &Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE execution_records
+        SET
+            status = 'failed',
+            response_payload = $2,
+            updated_at = NOW(),
+            completed_at = NOW()
+        WHERE execution_id = $1
+        "#,
+    )
+    .bind(execution_id)
+    .bind(response_payload)
+    .execute(pool)
+    .await
+    .context("failed to mark execution record as failed")?;
     Ok(())
 }
 

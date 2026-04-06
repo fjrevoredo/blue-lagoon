@@ -1,0 +1,18 @@
+{
+  "update_id": 1002,
+  "message": {
+    "message_id": 43,
+    "date": 1712300010,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": -100,
+      "type": "group"
+    },
+    "text": "hello from a group"
+  }
+}

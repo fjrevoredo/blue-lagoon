@@ -1,0 +1,41 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 1001,
+      "message": {
+        "message_id": 42,
+        "date": 1712300000,
+        "from": {
+          "id": 42,
+          "is_bot": false,
+          "first_name": "Francisco",
+          "username": "fjr"
+        },
+        "chat": {
+          "id": 42,
+          "type": "private"
+        },
+        "text": "hello from telegram"
+      }
+    },
+    {
+      "update_id": 1003,
+      "message": {
+        "message_id": 44,
+        "date": 1712300020,
+        "from": {
+          "id": 42,
+          "is_bot": false,
+          "first_name": "Francisco",
+          "username": "fjr"
+        },
+        "chat": {
+          "id": 42,
+          "type": "private"
+        },
+        "text": "second telegram message"
+      }
+    }
+  ]
+}

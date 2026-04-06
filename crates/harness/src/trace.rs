@@ -1,10 +1,10 @@
 use std::sync::OnceLock;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
-static TRACING_READY: OnceLock<()> = OnceLock::new();
+static TRACING_READY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceContext {
@@ -20,14 +20,19 @@ impl TraceContext {
 }
 
 pub fn init(log_filter: &str) -> Result<()> {
-    TRACING_READY.get_or_init(|| {
-        let _ = fmt()
+    let init_result = TRACING_READY.get_or_init(|| {
+        fmt()
             .json()
             .with_current_span(false)
             .with_span_list(false)
             .with_env_filter(EnvFilter::new(log_filter))
-            .try_init();
+            .try_init()
+            .map_err(|error| error.to_string())
     });
+
+    init_result
+        .as_ref()
+        .map_err(|error| anyhow!("failed to initialize tracing subscriber: {error}"))?;
     Ok(())
 }
 

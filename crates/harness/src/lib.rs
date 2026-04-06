@@ -1,10 +1,17 @@
 pub mod audit;
 pub mod config;
+pub mod context;
 pub mod db;
 pub mod execution;
+pub mod foreground;
+pub mod foreground_orchestration;
+pub mod ingress;
 pub mod migration;
+pub mod model_gateway;
 pub mod policy;
 pub mod runtime;
 pub mod schema;
+pub mod self_model;
+pub mod telegram;
 pub mod trace;
 pub mod worker;

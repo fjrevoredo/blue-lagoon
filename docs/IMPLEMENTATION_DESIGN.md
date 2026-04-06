@@ -9,9 +9,18 @@ Audience: Implementation planning and implementation work
 
 This document defines the validated implementation design for Blue Lagoon.
 
-It consolidates the settled architectural decisions, implementation-direction choices, operational constraints, and validation guidance gathered during the design phase into one canonical baseline for implementation planning and implementation work.
+It consolidates the settled architectural decisions, implementation-direction choices, operational constraints, and validation guidance gathered during design work into one canonical baseline for implementation planning and implementation work.
 
 This document is intended to stand on its own as the current implementation-design source of truth.
+
+## Artifact naming discipline
+
+Planning labels are allowed inside planning documents, but they must not become
+the names of runtime-facing or repository-facing deliverables.
+
+Code, tests, migrations, config, workflow steps, and canonical behavior docs
+must be named by domain or capability so repository artifacts describe what
+they are, not where they happened to appear in an implementation sequence.
 
 ## Current product definition
 
@@ -352,6 +361,43 @@ The v1 recovery posture is:
 - Fail-closed in ambiguous side-effect cases.
 
 Recovery should reconstruct only the minimum safe durable context needed for continuation, retry, clarification, re-approval, deferment, or graceful abandonment.
+
+### Foreground backlog-aware recovery
+
+Foreground recovery must not assume that delayed inbound user messages should be
+replied to one by one as though they had just arrived.
+
+If the harness observes multiple pending foreground ingress events for the same
+conversation and either:
+
+- the time gap between the oldest and newest pending messages exceeds a
+  configurable backlog threshold, or
+- the pending work is being resumed because of a recovery or degraded-runtime
+  condition such as crash, timeout, restart, or supervisor-led recovery,
+
+then the harness should be allowed to switch from naive per-message replay to a
+recovery-aware backlog analysis mode.
+
+In this mode:
+
+- every inbound message remains durably stored as its own ingress event
+- the harness assembles the pending message set as an ordered, timestamped
+  backlog for one foreground recovery execution
+- the worker is told explicitly that it is analyzing a delayed backlog rather
+  than a single just-arrived message
+- the worker should reason over the whole backlog, taking timestamps and long
+  gaps into account before deciding how to reply
+- the harness remains responsible for deciding whether one recovery-aware reply,
+  clarification, deferment, or another policy outcome is appropriate
+
+This behavior is a recovery and continuity policy, not a transport-layer
+optimization. The objective is to preserve durable user history while avoiding
+mechanically stale sequential replies after downtime or degraded operation.
+
+This policy belongs at the harness foreground-orchestration layer, not in any
+channel adapter. Channel integrations may supply the normalized ingress events
+and timestamps that feed the decision, but the recovery-mode decision itself
+must remain channel-agnostic.
 
 ### Checkpoints
 
@@ -755,6 +801,14 @@ The interaction model is chat-like, but the first real production channel and lo
 - Message normalization, trigger creation, approvals, policy checks, identity handling, and rate control belong in the core harness-mediated system, not in Telegram-specific business logic.
 - Broader multi-channel rollout should be deferred until it clearly improves the single-user core assistant experience.
 
+### Telegram foreground control rules
+
+- Accepted Telegram foreground-trigger intake must be atomic: execution start, conversation-binding reconciliation, ingress persistence, and acceptance audit either commit together or do not commit.
+- Conversation rebinding is allowed, but the canonical internal conversation binding identity must be preserved across rebinds.
+- If duplicate binding rows must be merged, historical ingress rows must be rewired to the canonical binding before any superseded binding row is removed.
+- Live Telegram fetch failures must fail closed and emit durable audit events even when no foreground execution record is created.
+- Provider-specific API-surface differences belong in provider-scoped model-gateway configuration rather than Telegram-specific runtime logic.
+
 ### Proactive behavior and notifications
 
 Proactive behavior remains allowed in v1, but only in a narrow and policy-gated form.
@@ -886,10 +940,21 @@ Unit tests should use deterministic test doubles by default.
 The testing posture for dependencies is:
 
 - Storage-facing component and integration tests must use disposable real PostgreSQL where persistence semantics matter.
+- Storage-facing automated tests must provision disposable per-test databases from reviewed migrations and must not target existing operator databases.
 - Model providers should normally be stubbed or faked.
 - Telegram transport should normally be stubbed or faked.
 - External tools and services should normally be stubbed or faked unless a specific integration path requires stronger validation.
 - Real external networks or providers must not be required for the core required suites.
+
+Manual Telegram E2E remains an operator workflow against the regular local app
+configuration. Test isolation is a test-support responsibility, not a reason to
+split the local runtime into a separate E2E config profile.
+
+Live Telegram foreground timeout remains a harness-derived policy, not a
+separate operator-tuned worker timeout. The foreground wall-clock budget is
+owned by harness policy, the foreground model timeout is clamped to that budget,
+and the conscious worker timeout is derived from the same budget plus a bounded
+grace window.
 
 Mock-only testing is not acceptable for persistence, migration, recovery, or permission-boundary safety.
 

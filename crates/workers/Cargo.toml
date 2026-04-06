@@ -10,6 +10,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 contracts = { path = "../contracts" }
+serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 

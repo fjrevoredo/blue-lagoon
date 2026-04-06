@@ -7,9 +7,38 @@ minimum_supported_schema_version = 1
 
 [harness]
 allow_synthetic_smoke = true
-default_wall_clock_budget_ms = 30000
+default_foreground_iteration_budget = 1
+default_wall_clock_budget_ms = 60000
+default_foreground_token_budget = 4000
 
 [worker]
 timeout_ms = 10000
+# The harness now requires either:
+# - a packaged sibling `workers` binary next to the runtime binary, or
+# - an explicit worker command supplied here or through BLUE_LAGOON_WORKER_COMMAND.
+# BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
+# worker.timeout_ms remains the generic worker timeout. Live Telegram foreground
+# derives its conscious worker timeout from harness.default_wall_clock_budget_ms
+# plus a fixed grace window so the foreground path cannot be shorter than the
+# configured foreground budget.
 command = ""
 args = []
+
+[telegram]
+api_base_url = "https://api.telegram.org"
+bot_token_env = "BLUE_LAGOON_TELEGRAM_BOT_TOKEN"
+# Local operator bindings belong in config/local.toml under
+# [telegram.foreground_binding].
+poll_limit = 10
+
+[model_gateway.foreground]
+provider = "z_ai"
+model = "z-ai-foreground"
+api_key_env = "BLUE_LAGOON_FOREGROUND_API_KEY"
+timeout_ms = 60000
+
+[model_gateway.z_ai]
+api_surface = "coding"
+
+[self_model]
+seed_path = "config/self_model_seed.toml"

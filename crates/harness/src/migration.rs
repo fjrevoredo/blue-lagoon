@@ -60,13 +60,13 @@ pub fn load_migrations() -> Result<Vec<Migration>> {
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or_else(|| anyhow!("invalid migration filename"))?;
-        let (version, name) = parse_migration_name(file_name)?;
+        let (version, parsed_name) = parse_migration_name(file_name)?;
         let sql = fs::read_to_string(&path)
             .with_context(|| format!("failed to read migration {}", path.display()))?;
         let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
         migrations.push(Migration {
             version,
-            name,
+            name: canonical_migration_name(version, &parsed_name),
             checksum,
             sql,
         });
@@ -109,6 +109,7 @@ pub async fn apply_pending_migrations(
 ) -> Result<MigrationSummary> {
     ensure_schema_migrations_table(pool).await?;
     let migrations = load_migrations()?;
+    normalize_applied_migration_names(pool, &migrations).await?;
     let applied = applied_versions(pool).await?;
     validate_applied_history(&migrations, &load_applied_migrations(pool).await?)?;
     let applied_set = applied
@@ -199,6 +200,46 @@ pub async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<AppliedMigrati
         .collect())
 }
 
+pub async fn normalize_applied_migration_names(
+    pool: &PgPool,
+    discovered: &[Migration],
+) -> Result<()> {
+    ensure_schema_migrations_table(pool).await?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("failed to begin migration-name normalization transaction")?;
+
+    for migration in discovered {
+        sqlx::query(
+            r#"
+            UPDATE schema_migrations
+            SET name = $2
+            WHERE version = $1
+              AND checksum = $3
+              AND name <> $2
+            "#,
+        )
+        .bind(migration.version)
+        .bind(&migration.name)
+        .bind(&migration.checksum)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to normalize applied migration name for version {}",
+                migration.version
+            )
+        })?;
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("failed to commit migration-name normalization transaction")?;
+    Ok(())
+}
+
 pub fn validate_applied_history(
     discovered: &[Migration],
     applied: &[AppliedMigration],
@@ -218,15 +259,6 @@ pub fn validate_applied_history(
                 index + 1,
                 expected.version,
                 applied_migration.version
-            );
-        }
-
-        if applied_migration.name != expected.name {
-            bail!(
-                "applied migration {} has name '{}', but reviewed migration name is '{}'",
-                applied_migration.version,
-                applied_migration.name,
-                expected.name
             );
         }
 
@@ -259,6 +291,14 @@ fn parse_migration_name(file_name: &str) -> Result<(i64, String)> {
     Ok((version.parse::<i64>()?, name.to_string()))
 }
 
+fn canonical_migration_name(version: i64, parsed_name: &str) -> String {
+    match version {
+        1 => "runtime_foundation".to_string(),
+        2 => "foreground_loop".to_string(),
+        _ => parsed_name.to_string(),
+    }
+}
+
 fn applied_by() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -271,38 +311,58 @@ mod tests {
 
     #[test]
     fn parse_migration_name_accepts_expected_format() {
-        let (version, name) = parse_migration_name("0001__phase_1_foundation.sql")
+        let (version, name) = parse_migration_name("0001__runtime_foundation.sql")
             .expect("migration name should parse");
         assert_eq!(version, 1);
-        assert_eq!(name, "phase_1_foundation");
+        assert_eq!(name, "runtime_foundation");
     }
 
     #[test]
-    fn load_migrations_discovers_phase_1_files() {
-        let versions = load_migrations()
-            .expect("migrations should load")
-            .into_iter()
+    fn load_migrations_discovers_reviewed_files_in_order_with_canonical_names() {
+        let migrations = load_migrations().expect("migrations should load");
+        let versions = migrations
+            .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1]);
+        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(migrations[0].name, "runtime_foundation");
+        assert_eq!(migrations[1].name, "foreground_loop");
     }
 
     #[test]
     fn validate_applied_history_rejects_out_of_order_versions() {
         let discovered = vec![Migration {
             version: 1,
-            name: "phase_1_foundation".to_string(),
+            name: "runtime_foundation".to_string(),
             checksum: "abc".to_string(),
             sql: "SELECT 1".to_string(),
         }];
         let applied = vec![AppliedMigration {
             version: 2,
-            name: "phase_2".to_string(),
+            name: "legacy_foreground".to_string(),
             checksum: "def".to_string(),
         }];
 
         let error = validate_applied_history(&discovered, &applied)
             .expect_err("history should be rejected");
         assert!(error.to_string().contains("incomplete or out of order"));
+    }
+
+    #[test]
+    fn validate_applied_history_accepts_legacy_names_when_version_and_checksum_match() {
+        let discovered = vec![Migration {
+            version: 1,
+            name: "runtime_foundation".to_string(),
+            checksum: "abc".to_string(),
+            sql: "SELECT 1".to_string(),
+        }];
+        let applied = vec![AppliedMigration {
+            version: 1,
+            name: "legacy_foundation".to_string(),
+            checksum: "abc".to_string(),
+        }];
+
+        validate_applied_history(&discovered, &applied)
+            .expect("legacy names should remain compatible when version and checksum match");
     }
 }

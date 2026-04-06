@@ -81,6 +81,7 @@ pub fn evaluate(current: Option<i64>, policy: SchemaPolicy) -> SchemaCompatibili
 
 pub async fn verify(pool: &PgPool, policy: SchemaPolicy) -> Result<i64> {
     let discovered = migration::load_migrations()?;
+    migration::normalize_applied_migration_names(pool, &discovered).await?;
     let applied = migration::load_applied_migrations(pool).await?;
     if let Err(error) = migration::validate_applied_history(&discovered, &applied) {
         return SchemaCompatibility::IncompatibleHistory {

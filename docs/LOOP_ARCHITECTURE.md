@@ -243,9 +243,9 @@ The unconscious loop is **not** allowed to:
 
 ## 6. Example Workflows
 
-### 6.1 Nightly Dream Phase
+### 6.1 Nightly Dream Cycle
 
-**Scenario**: A scheduled dream phase consolidates the dayâ€™s experiences into long-term memory and updates the self-model.
+**Scenario**: A scheduled dream cycle consolidates the dayâ€™s experiences into long-term memory and updates the self-model.
 
 1. **Trigger**
    - A cron-like schedule fires at 03:00 local time.

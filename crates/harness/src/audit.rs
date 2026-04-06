@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -24,7 +24,10 @@ pub struct AuditEvent {
     pub trace_id: Uuid,
 }
 
-pub async fn insert(pool: &PgPool, event: &NewAuditEvent) -> Result<Uuid> {
+pub async fn insert<'e, E>(executor: E, event: &NewAuditEvent) -> Result<Uuid>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let event_id = Uuid::now_v7();
     sqlx::query(
         r#"
@@ -68,7 +71,7 @@ pub async fn insert(pool: &PgPool, event: &NewAuditEvent) -> Result<Uuid> {
     .bind(event.execution_id)
     .bind(event.worker_pid)
     .bind(&event.payload)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to insert audit event")?;
     Ok(event_id)
@@ -87,6 +90,31 @@ pub async fn list_for_execution(pool: &PgPool, execution_id: Uuid) -> Result<Vec
     .fetch_all(pool)
     .await
     .context("failed to fetch audit events")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditEvent {
+            event_id: row.get("event_id"),
+            occurred_at: row.get("occurred_at"),
+            event_kind: row.get("event_kind"),
+            trace_id: row.get("trace_id"),
+        })
+        .collect())
+}
+
+pub async fn list_for_trace(pool: &PgPool, trace_id: Uuid) -> Result<Vec<AuditEvent>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, occurred_at, event_kind, trace_id
+        FROM audit_events
+        WHERE trace_id = $1
+        ORDER BY occurred_at, event_id
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch audit events by trace")?;
 
     Ok(rows
         .into_iter()

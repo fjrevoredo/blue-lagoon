@@ -8,7 +8,7 @@ Scope: Personal AI assistant, single-user first, enterprise-extensible by design
 
 Blue Lagoon is a persistent personal AI assistant implemented as an always-on looping runtime. It is intended to preserve continuity across time, combine reactive and policy-gated proactive behavior, maintain a coherent self-model and autobiographical memory, and separate foreground cognition from background maintenance through a harness-mediated dual-loop architecture.
 
-This document defines the authoritative baseline requirements for implementation design. It specifies what must be true of the system, while intentionally leaving technology-stack and component-selection choices open for the design phase.
+This document defines the authoritative baseline requirements for implementation design. It specifies what must be true of the system, while intentionally leaving technology-stack and component-selection choices open for design work.
 
 ## 2. Normative language
 
@@ -391,7 +391,7 @@ Blue Lagoon satisfies this baseline specification only if all of the following a
 13. Identity is operationally relevant and not cosmetic only.
 14. The memory layer includes drift monitoring and contradiction monitoring.
 
-## 21. Design-phase carryover
+## 21. Design Carryover
 
 The following decisions are fixed by this specification and MUST be treated as design inputs:
 - always-on personal assistant runtime

@@ -1,0 +1,24 @@
+{
+  "update_id": 1004,
+  "message": {
+    "message_id": 45,
+    "date": 1712300030,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "text": "/start now",
+    "document": {
+      "file_id": "doc-1",
+      "file_name": "note.txt",
+      "mime_type": "text/plain",
+      "file_size": 64
+    }
+  }
+}

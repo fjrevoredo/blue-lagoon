@@ -9,7 +9,9 @@ rust-version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 contracts = { path = "../contracts" }
+dotenvy.workspace = true
 hex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -23,6 +25,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+futures-util.workspace = true
 once_cell.workspace = true
 predicates.workspace = true
 serial_test.workspace = true
+url.workspace = true

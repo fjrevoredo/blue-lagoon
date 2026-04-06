@@ -23,7 +23,6 @@ services:
         condition: service_healthy
     environment:
       BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@postgres:5432/blue_lagoon
-      BLUE_LAGOON_CONFIG: /workspace/config/default.toml
       BLUE_LAGOON_LOG: info
     command: ["cargo", "run", "-p", "runtime", "--", "harness", "--once", "--idle"]
     volumes:
