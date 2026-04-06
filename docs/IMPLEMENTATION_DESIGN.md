@@ -362,6 +362,43 @@ The v1 recovery posture is:
 
 Recovery should reconstruct only the minimum safe durable context needed for continuation, retry, clarification, re-approval, deferment, or graceful abandonment.
 
+### Foreground backlog-aware recovery
+
+Foreground recovery must not assume that delayed inbound user messages should be
+replied to one by one as though they had just arrived.
+
+If the harness observes multiple pending foreground ingress events for the same
+conversation and either:
+
+- the time gap between the oldest and newest pending messages exceeds a
+  configurable backlog threshold, or
+- the pending work is being resumed because of a recovery or degraded-runtime
+  condition such as crash, timeout, restart, or supervisor-led recovery,
+
+then the harness should be allowed to switch from naive per-message replay to a
+recovery-aware backlog analysis mode.
+
+In this mode:
+
+- every inbound message remains durably stored as its own ingress event
+- the harness assembles the pending message set as an ordered, timestamped
+  backlog for one foreground recovery execution
+- the worker is told explicitly that it is analyzing a delayed backlog rather
+  than a single just-arrived message
+- the worker should reason over the whole backlog, taking timestamps and long
+  gaps into account before deciding how to reply
+- the harness remains responsible for deciding whether one recovery-aware reply,
+  clarification, deferment, or another policy outcome is appropriate
+
+This behavior is a recovery and continuity policy, not a transport-layer
+optimization. The objective is to preserve durable user history while avoiding
+mechanically stale sequential replies after downtime or degraded operation.
+
+This policy belongs at the harness foreground-orchestration layer, not in any
+channel adapter. Channel integrations may supply the normalized ingress events
+and timestamps that feed the decision, but the recovery-mode decision itself
+must remain channel-agnostic.
+
 ### Checkpoints
 
 A checkpoint in v1 should be harness-owned structured state, not an opaque serialized model session.

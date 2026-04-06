@@ -2,8 +2,8 @@
 
 ## High-Level Implementation Plan
 
-Date: 2026-04-05
-Status: Phase 1 and Phase 1.1 completed; Phase 2 is the active next phase
+Date: 2026-04-06
+Status: Phase 1, Phase 1.1, and Phase 2 completed; Phase 3 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -107,7 +107,8 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 
 - Phase 1 status: `COMPLETE`
 - Phase 1.1 status: `COMPLETE`
-- Phase 2 status: `READY`
+- Phase 2 status: `COMPLETE`
+- Phase 3 status: `READY`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -119,9 +120,9 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   gating, worker subprocess execution, and a verified synthetic trigger path
 - The current repository state now includes `.github/workflows/ci.yml` as the
   minimum repository-hosted CI baseline for Phase 1.1
-- The current repository state now includes at least one successful
-  GitHub-hosted run recorded for the minimum Phase 1.1 workflow, so Phase 1.1
-  is complete and Phase 2 is now the active next phase
+- The current repository state now includes a completed Telegram-first
+  foreground slice with repository-hosted CI coverage, so Phase 2 is complete
+  and Phase 3 is now the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
 
@@ -270,13 +271,20 @@ and self-model flows behind the foreground loop.
   self-model-relevant observations.
 - Implement harness-side validation and merge rules for proposal-based canonical
   writes.
+- Implement backlog-aware foreground recovery intake so the harness can detect
+  multiple pending conversation messages spanning a configurable time gap or a
+  degraded-restart condition and route them into one recovery-aware foreground
+  analysis instead of naively replying message by message.
 - Establish provenance, supersession posture, contradiction-handling posture, and
   initial temporal validity handling.
 - Implement a minimal retrieval baseline sufficient for harness context assembly,
   keeping canonical retrieval artifacts distinct from re-derivable projections.
+- Preserve per-message ingress durability while allowing one foreground recovery
+  execution to analyze a backlog as a timestamped batch when policy says the
+  conversation should be recovered holistically.
 - Add persistence-critical tests for proposal validation, merge behavior,
-  retrieval assembly, and canonical memory or self-model writes using real
-  PostgreSQL where semantics matter.
+  retrieval assembly, backlog-aware recovery behavior, and canonical memory or
+  self-model writes using real PostgreSQL where semantics matter.
 - Extend CI/CD to run persistence-critical proposal, merge, retrieval, and
   migration-sensitive checks in the correct repository-hosted gate.
 
@@ -288,6 +296,9 @@ and self-model flows behind the foreground loop.
   foreground context.
 - The self-model exists as a canonical artifact rather than as a prompt-only
   stub.
+- The foreground path can detect a stale or outage-like pending-message backlog
+  and switch to one recovery-aware analysis flow without losing per-message
+  durability or blindly replaying delayed replies in sequence.
 - Proposal, merge, and persistence behavior are covered by automated tests that
   would fail on unsafe canonical write regressions.
 - Repository CI executes the required persistence-critical gates automatically so
@@ -376,6 +387,9 @@ fault-handling, migration discipline, and release-grade verification.
 
 - Implement recovery checkpoints, recovery triggers, lease and heartbeat logic,
   retry policies, and fail-closed handling for ambiguous side effects.
+- Generalize recovery policy beyond the first backlog-aware foreground slice so
+  crash, restart, stall, approval-transition, and degraded-state recovery all
+  use one coherent recovery checkpoint and continuation model.
 - Implement health surfaces, operator diagnostics, and operational metrics that
   feed both humans and internal-state modeling.
 - Complete migration operational conventions, upgrade-path validation, and
