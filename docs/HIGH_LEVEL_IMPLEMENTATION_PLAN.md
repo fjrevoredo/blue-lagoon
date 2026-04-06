@@ -115,6 +115,8 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 2 lives in
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
+- Proposed detailed planning for Phase 3 lives in
+  `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
   gating, worker subprocess execution, and a verified synthetic trigger path
@@ -460,13 +462,9 @@ core single-user v1 runtime enough to justify the added complexity now.
 This document should be used as the agreement point for implementation order and
 milestone definition.
 
-With Phase 1 complete, the next planning step should be the detailed
-implementation plan for Phase 1.1. That document should define the minimal
-GitHub Actions baseline, required verification commands, PostgreSQL service
-posture in CI, and the first repository-hosted gate names.
-
-Once Phase 1.1 is complete, the next planning step should be the detailed
-implementation plan for Phase 2. That document should break the next phase into:
+With Phases 1, 1.1, and 2 complete, the next planning step is the detailed
+implementation plan for Phase 3. That document should break the next phase
+into:
 
 - concrete subsystems
 - major schema work
@@ -474,7 +472,14 @@ implementation plan for Phase 2. That document should break the next phase into:
 - milestone-sized deliverables
 - test requirements
 - dependency ordering
+- proposal-validation and merge boundaries
+- canonical self-model and retrieval-read paths
+- backlog-aware foreground recovery behavior
 
-That next document should stay subordinate to this one. It should add execution
-detail, not re-open the high-level architectural sequence without an explicit
-decision.
+That Phase 3 document should stay subordinate to this one. It should add
+execution detail, not re-open the high-level architectural sequence without an
+explicit decision.
+
+Once Phase 3 is complete, the next planning step should be the detailed
+implementation plan for Phase 4, focused on the unconscious loop, bounded
+background maintenance, and wake-signal production and evaluation.
