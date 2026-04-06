@@ -1,10 +1,16 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use contracts::ModelProviderKind;
 use serde::Deserialize;
+use toml::Value as TomlValue;
 
-const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
+const DEFAULT_CONFIG_REL_PATH: &str = "config/default.toml";
+const LOCAL_CONFIG_REL_PATH: &str = "config/local.toml";
+const DOTENV_FILENAME: &str = ".env";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -48,11 +54,17 @@ pub struct WorkerConfig {
 pub struct TelegramConfig {
     pub api_base_url: String,
     pub bot_token_env: String,
+    pub poll_limit: u16,
+    #[serde(default)]
+    pub foreground_binding: Option<TelegramForegroundBindingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TelegramForegroundBindingConfig {
     pub allowed_user_id: i64,
     pub allowed_chat_id: i64,
     pub internal_principal_ref: String,
     pub internal_conversation_ref: String,
-    pub poll_limit: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,12 +155,13 @@ struct FileDatabaseConfig {
 
 impl RuntimeConfig {
     pub fn load() -> Result<Self> {
-        let config_path =
-            env::var("BLUE_LAGOON_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-        let file_contents = fs::read_to_string(&config_path)
-            .with_context(|| format!("failed to read config file at {config_path}"))?;
-        let file_config: FileConfig =
-            toml::from_str(&file_contents).context("failed to parse config file as TOML")?;
+        let config_root = discover_config_root()?;
+        Self::load_from_root(&config_root)
+    }
+
+    fn load_from_root(config_root: &Path) -> Result<Self> {
+        load_dotenv_from_root(config_root)?;
+        let file_config = load_file_config_from_root(config_root)?;
 
         let database_url = env::var("BLUE_LAGOON_DATABASE_URL")
             .context("missing required environment variable BLUE_LAGOON_DATABASE_URL")?;
@@ -247,18 +260,16 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    pub fn config_path() -> PathBuf {
-        env::var("BLUE_LAGOON_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
-    }
-
     pub fn require_telegram_config(&self) -> Result<ResolvedTelegramConfig> {
         let telegram = self
             .telegram
             .as_ref()
             .context("missing Telegram foreground configuration")?;
-        telegram.validate()?;
+        telegram.validate_transport()?;
+        let binding = telegram.foreground_binding.as_ref().context(
+            "missing Telegram foreground binding configuration: configure [telegram.foreground_binding] in config/local.toml or an equivalent local override",
+        )?;
+        binding.validate()?;
 
         Ok(ResolvedTelegramConfig {
             api_base_url: telegram.api_base_url.clone(),
@@ -266,10 +277,10 @@ impl RuntimeConfig {
                 &telegram.bot_token_env,
                 "Telegram bot token environment variable",
             )?,
-            allowed_user_id: telegram.allowed_user_id,
-            allowed_chat_id: telegram.allowed_chat_id,
-            internal_principal_ref: telegram.internal_principal_ref.clone(),
-            internal_conversation_ref: telegram.internal_conversation_ref.clone(),
+            allowed_user_id: binding.allowed_user_id,
+            allowed_chat_id: binding.allowed_chat_id,
+            internal_principal_ref: binding.internal_principal_ref.clone(),
+            internal_conversation_ref: binding.internal_conversation_ref.clone(),
             poll_limit: telegram.poll_limit,
         })
     }
@@ -299,7 +310,8 @@ impl RuntimeConfig {
             .context("missing foreground self-model seed configuration")?;
         self_model.validate()?;
 
-        let seed_path = resolve_relative_to_config(&self_model.seed_path);
+        let seed_path =
+            resolve_relative_to_config_root(&discover_config_root()?, &self_model.seed_path);
         let metadata = fs::metadata(&seed_path).with_context(|| {
             format!(
                 "failed to access foreground self-model seed artifact at {}",
@@ -314,6 +326,85 @@ impl RuntimeConfig {
         }
 
         Ok(ResolvedSelfModelConfig { seed_path })
+    }
+}
+
+fn discover_config_root() -> Result<PathBuf> {
+    let current_dir = env::current_dir()
+        .context("failed to determine current working directory for config discovery")?;
+    discover_config_root_from(&current_dir)
+}
+
+fn discover_config_root_from(start_dir: &Path) -> Result<PathBuf> {
+    let mut candidate = start_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize config discovery start path {}",
+            start_dir.display()
+        )
+    })?;
+
+    loop {
+        if candidate.join("Cargo.toml").is_file()
+            && candidate.join(DEFAULT_CONFIG_REL_PATH).is_file()
+        {
+            return Ok(candidate);
+        }
+        if !candidate.pop() {
+            bail!(
+                "failed to discover Blue Lagoon config root from {}: expected Cargo.toml and {} in an ancestor directory",
+                start_dir.display(),
+                DEFAULT_CONFIG_REL_PATH
+            );
+        }
+    }
+}
+
+fn load_dotenv_from_root(config_root: &Path) -> Result<()> {
+    let dotenv_path = config_root.join(DOTENV_FILENAME);
+    if !dotenv_path.exists() {
+        return Ok(());
+    }
+    dotenvy::from_path(&dotenv_path)
+        .with_context(|| format!("failed to load .env file at {}", dotenv_path.display()))?;
+    Ok(())
+}
+
+fn load_file_config_from_root(config_root: &Path) -> Result<FileConfig> {
+    let default_path = config_root.join(DEFAULT_CONFIG_REL_PATH);
+    let mut merged = parse_toml_file(&default_path)?;
+
+    let local_path = config_root.join(LOCAL_CONFIG_REL_PATH);
+    if local_path.exists() {
+        merge_toml_values(&mut merged, parse_toml_file(&local_path)?);
+    }
+
+    merged
+        .try_into()
+        .context("failed to parse merged runtime configuration as TOML")
+}
+
+fn parse_toml_file(path: &Path) -> Result<TomlValue> {
+    let file_contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file at {}", path.display()))?;
+    toml::from_str(&file_contents)
+        .with_context(|| format!("failed to parse TOML config file at {}", path.display()))
+}
+
+fn merge_toml_values(base: &mut TomlValue, overlay: TomlValue) {
+    match (base, overlay) {
+        (TomlValue::Table(base_table), TomlValue::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => merge_toml_values(base_value, overlay_value),
+                    None => {
+                        base_table.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
     }
 }
 
@@ -345,26 +436,40 @@ fn parse_foreground_route_override(raw: &str) -> Result<(ModelProviderKind, Stri
 
 impl TelegramConfig {
     fn validate(&self) -> Result<()> {
+        self.validate_transport()?;
+        if let Some(binding) = &self.foreground_binding {
+            binding.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_transport(&self) -> Result<()> {
         if self.api_base_url.trim().is_empty() {
             bail!("telegram.api_base_url must not be empty");
         }
         if self.bot_token_env.trim().is_empty() {
             bail!("telegram.bot_token_env must not be empty");
         }
-        if self.allowed_user_id == 0 {
-            bail!("telegram.allowed_user_id must not be zero");
-        }
-        if self.allowed_chat_id == 0 {
-            bail!("telegram.allowed_chat_id must not be zero");
-        }
-        if self.internal_principal_ref.trim().is_empty() {
-            bail!("telegram.internal_principal_ref must not be empty");
-        }
-        if self.internal_conversation_ref.trim().is_empty() {
-            bail!("telegram.internal_conversation_ref must not be empty");
-        }
         if self.poll_limit == 0 {
             bail!("telegram.poll_limit must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl TelegramForegroundBindingConfig {
+    fn validate(&self) -> Result<()> {
+        if self.allowed_user_id == 0 {
+            bail!("telegram.foreground_binding.allowed_user_id must not be zero");
+        }
+        if self.allowed_chat_id == 0 {
+            bail!("telegram.foreground_binding.allowed_chat_id must not be zero");
+        }
+        if self.internal_principal_ref.trim().is_empty() {
+            bail!("telegram.foreground_binding.internal_principal_ref must not be empty");
+        }
+        if self.internal_conversation_ref.trim().is_empty() {
+            bail!("telegram.foreground_binding.internal_conversation_ref must not be empty");
         }
         Ok(())
     }
@@ -476,17 +581,11 @@ fn require_foreground_api_base_url(config: &ModelGatewayConfig) -> Result<String
     }
 }
 
-fn resolve_relative_to_config(path: &PathBuf) -> PathBuf {
+fn resolve_relative_to_config_root(config_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
-        return path.clone();
+        return path.to_path_buf();
     }
-
-    let config_path = RuntimeConfig::config_path();
-    let base_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base_dir.join(path)
+    config_root.join(path)
 }
 
 #[cfg(test)]
@@ -500,7 +599,7 @@ mod tests {
         ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("env test mutex should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn sample_config() -> RuntimeConfig {
@@ -527,6 +626,71 @@ mod tests {
             telegram: None,
             model_gateway: None,
             self_model: None,
+        }
+    }
+
+    fn scoped_current_dir(path: &Path) -> ScopedCurrentDir {
+        ScopedCurrentDir::set(path)
+    }
+
+    fn write_test_root(
+        default_toml: &str,
+        local_toml: Option<&str>,
+        dotenv: Option<&str>,
+    ) -> PathBuf {
+        let root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(root.join("config")).expect("config dir should be created");
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("cargo manifest should be written");
+        fs::write(root.join(DEFAULT_CONFIG_REL_PATH), default_toml)
+            .expect("default config should be written");
+        if let Some(local_toml) = local_toml {
+            fs::write(root.join(LOCAL_CONFIG_REL_PATH), local_toml)
+                .expect("local config should be written");
+        }
+        if let Some(dotenv) = dotenv {
+            fs::write(root.join(DOTENV_FILENAME), dotenv).expect(".env should be written");
+        }
+        root
+    }
+
+    fn minimal_file_config() -> &'static str {
+        r#"
+[app]
+name = "blue-lagoon"
+log_filter = "info"
+
+[database]
+minimum_supported_schema_version = 1
+
+[harness]
+allow_synthetic_smoke = true
+default_foreground_iteration_budget = 1
+default_wall_clock_budget_ms = 30000
+default_foreground_token_budget = 4000
+
+[worker]
+timeout_ms = 10000
+command = ""
+args = []
+"#
+    }
+
+    struct ScopedCurrentDir {
+        original: PathBuf,
+    }
+
+    impl ScopedCurrentDir {
+        fn set(path: &Path) -> Self {
+            let original = env::current_dir().expect("current dir should be readable");
+            env::set_current_dir(path).expect("current dir should be set");
+            Self { original }
+        }
+    }
+
+    impl Drop for ScopedCurrentDir {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original).expect("current dir should be restored");
         }
     }
 
@@ -664,11 +828,13 @@ mod tests {
         config.telegram = Some(TelegramConfig {
             api_base_url: "https://api.telegram.org".to_string(),
             bot_token_env: format!("BLUE_LAGOON_TEST_TELEGRAM_TOKEN_{}", Uuid::now_v7()),
-            allowed_user_id: 42,
-            allowed_chat_id: 42,
-            internal_principal_ref: "primary-user".to_string(),
-            internal_conversation_ref: "telegram-primary".to_string(),
             poll_limit: 10,
+            foreground_binding: Some(TelegramForegroundBindingConfig {
+                allowed_user_id: 42,
+                allowed_chat_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            }),
         });
 
         let error = config
@@ -679,6 +845,22 @@ mod tests {
                 .to_string()
                 .contains("missing required Telegram bot token")
         );
+    }
+
+    #[test]
+    fn require_telegram_config_fails_when_binding_is_missing() {
+        let mut config = sample_config();
+        config.telegram = Some(TelegramConfig {
+            api_base_url: "https://api.telegram.org".to_string(),
+            bot_token_env: "BLUE_LAGOON_TEST_TELEGRAM_TOKEN".to_string(),
+            poll_limit: 10,
+            foreground_binding: None,
+        });
+
+        let error = config
+            .require_telegram_config()
+            .expect_err("missing foreground binding should fail closed");
+        assert!(error.to_string().contains("foreground binding"));
     }
 
     #[test]
@@ -696,6 +878,11 @@ mod tests {
             z_ai: None,
         });
 
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        unsafe {
+            env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY");
+        }
+
         let error = config
             .require_model_gateway_config()
             .expect_err("missing model gateway API key should fail closed");
@@ -704,35 +891,20 @@ mod tests {
                 .to_string()
                 .contains("missing required foreground model gateway API key")
         );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
     }
 
     #[test]
     fn load_applies_foreground_route_env_override() {
         let _env_lock = env_lock();
-        let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
-        fs::create_dir_all(&temp_root).expect("temp dir should be created");
-        let config_path = temp_root.join("default.toml");
-        fs::write(
-            &config_path,
-            r#"
-[app]
-name = "blue-lagoon"
-log_filter = "info"
-
-[database]
-minimum_supported_schema_version = 1
-
-[harness]
-allow_synthetic_smoke = true
-default_foreground_iteration_budget = 1
-default_wall_clock_budget_ms = 30000
-default_foreground_token_budget = 4000
-
-[worker]
-timeout_ms = 10000
-command = ""
-args = []
-
+        let temp_root = write_test_root(
+            &format!(
+                r#"
+{}
 [model_gateway.foreground]
 provider = "z_ai"
 model = "configured-model"
@@ -742,20 +914,21 @@ timeout_ms = 30000
 [model_gateway.z_ai]
 api_surface = "coding"
 "#,
-        )
-        .expect("config file should be written");
-
-        let original_config = env::var_os("BLUE_LAGOON_CONFIG");
+                minimal_file_config()
+            ),
+            None,
+            None,
+        );
         let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
         let original_route = env::var_os("BLUE_LAGOON_FOREGROUND_ROUTE");
 
         unsafe {
-            env::set_var("BLUE_LAGOON_CONFIG", &config_path);
             env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
             env::set_var("BLUE_LAGOON_FOREGROUND_ROUTE", "zai/override-model");
         }
 
-        let loaded = RuntimeConfig::load().expect("config should load with overrides");
+        let loaded =
+            RuntimeConfig::load_from_root(&temp_root).expect("config should load with overrides");
         let foreground = loaded
             .model_gateway
             .expect("model gateway should be present")
@@ -763,10 +936,6 @@ api_surface = "coding"
         assert_eq!(foreground.provider, ModelProviderKind::ZAi);
         assert_eq!(foreground.model, "override-model");
 
-        match original_config {
-            Some(value) => unsafe { env::set_var("BLUE_LAGOON_CONFIG", value) },
-            None => unsafe { env::remove_var("BLUE_LAGOON_CONFIG") },
-        }
         match original_database_url {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
             None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
@@ -781,30 +950,10 @@ api_surface = "coding"
     #[test]
     fn load_accepts_provider_specific_zai_surface_without_legacy_foreground_api_base_url() {
         let _env_lock = env_lock();
-        let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
-        fs::create_dir_all(&temp_root).expect("temp dir should be created");
-        let config_path = temp_root.join("default.toml");
-        fs::write(
-            &config_path,
-            r#"
-[app]
-name = "blue-lagoon"
-log_filter = "info"
-
-[database]
-minimum_supported_schema_version = 1
-
-[harness]
-allow_synthetic_smoke = true
-default_foreground_iteration_budget = 1
-default_wall_clock_budget_ms = 30000
-default_foreground_token_budget = 4000
-
-[worker]
-timeout_ms = 10000
-command = ""
-args = []
-
+        let temp_root = write_test_root(
+            &format!(
+                r#"
+{}
 [model_gateway.foreground]
 provider = "z_ai"
 model = "configured-model"
@@ -814,21 +963,21 @@ timeout_ms = 30000
 [model_gateway.z_ai]
 api_surface = "coding"
 "#,
-        )
-        .expect("config file should be written");
-
-        let original_config = env::var_os("BLUE_LAGOON_CONFIG");
+                minimal_file_config()
+            ),
+            None,
+            None,
+        );
         let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
 
         unsafe {
-            env::set_var("BLUE_LAGOON_CONFIG", &config_path);
             env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
             env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "provider-key");
         }
 
-        let loaded =
-            RuntimeConfig::load().expect("config should load with provider-specific z_ai surface");
+        let loaded = RuntimeConfig::load_from_root(&temp_root)
+            .expect("config should load with provider-specific z_ai surface");
         let resolved = loaded
             .require_model_gateway_config()
             .expect("provider-specific api surface should resolve without legacy base url");
@@ -837,10 +986,6 @@ api_surface = "coding"
             "https://api.z.ai/api/coding/paas/v4"
         );
 
-        match original_config {
-            Some(value) => unsafe { env::set_var("BLUE_LAGOON_CONFIG", value) },
-            None => unsafe { env::remove_var("BLUE_LAGOON_CONFIG") },
-        }
         match original_database_url {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
             None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
@@ -1015,32 +1160,132 @@ api_surface = "coding"
     #[test]
     fn require_self_model_config_resolves_relative_seed_path() {
         let _env_lock = env_lock();
-        let temp_root = env::temp_dir().join(format!("blue-lagoon-config-test-{}", Uuid::now_v7()));
-        fs::create_dir_all(temp_root.join("config")).expect("temp config dir should be created");
+        let temp_root = write_test_root(minimal_file_config(), None, None);
         let seed_path = temp_root.join("config").join("self_model_seed.toml");
         fs::write(&seed_path, "role = 'assistant'\n").expect("seed file should be written");
+        let nested_dir = temp_root.join("crates").join("runtime");
+        fs::create_dir_all(&nested_dir).expect("nested cwd should be created");
+        {
+            let _cwd = scoped_current_dir(&nested_dir);
 
-        let original_config = env::var_os("BLUE_LAGOON_CONFIG");
-        unsafe {
-            env::set_var(
-                "BLUE_LAGOON_CONFIG",
-                temp_root.join("config").join("default.toml"),
+            let mut config = sample_config();
+            config.self_model = Some(SelfModelConfig {
+                seed_path: PathBuf::from("config/self_model_seed.toml"),
+            });
+
+            let resolved = config
+                .require_self_model_config()
+                .expect("seed path should resolve relative to config root");
+            assert_eq!(
+                resolved
+                    .seed_path
+                    .canonicalize()
+                    .expect("resolved path should exist"),
+                seed_path.canonicalize().expect("seed path should exist"),
             );
         }
 
-        let mut config = sample_config();
-        config.self_model = Some(SelfModelConfig {
-            seed_path: PathBuf::from("self_model_seed.toml"),
-        });
+        let _ = fs::remove_dir_all(temp_root);
+    }
 
-        let resolved = config
-            .require_self_model_config()
-            .expect("seed path should resolve relative to config path");
-        assert_eq!(resolved.seed_path, seed_path);
+    #[test]
+    fn load_merges_optional_local_config_recursively() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(
+            &format!(
+                r#"
+{}
+[telegram]
+api_base_url = "https://api.telegram.org"
+bot_token_env = "BLUE_LAGOON_TEST_TELEGRAM_TOKEN"
+poll_limit = 10
+"#,
+                minimal_file_config()
+            ),
+            Some(
+                r#"
+[telegram.foreground_binding]
+allowed_user_id = 42
+allowed_chat_id = 24
+internal_principal_ref = "primary-user"
+internal_conversation_ref = "telegram-primary"
+"#,
+            ),
+            None,
+        );
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+        }
 
-        match original_config {
-            Some(value) => unsafe { env::set_var("BLUE_LAGOON_CONFIG", value) },
-            None => unsafe { env::remove_var("BLUE_LAGOON_CONFIG") },
+        let loaded = RuntimeConfig::load_from_root(&temp_root).expect("layered config should load");
+        let telegram = loaded.telegram.expect("telegram config should be present");
+        assert_eq!(telegram.api_base_url, "https://api.telegram.org");
+        let binding = telegram
+            .foreground_binding
+            .expect("foreground binding should merge from local config");
+        assert_eq!(binding.allowed_user_id, 42);
+        assert_eq!(binding.allowed_chat_id, 24);
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn load_reads_database_url_from_dotenv_without_overriding_process_env() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(
+            minimal_file_config(),
+            None,
+            Some("BLUE_LAGOON_DATABASE_URL=postgres://from-dotenv\nBLUE_LAGOON_LOG=warn\n"),
+        );
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        let original_log = env::var_os("BLUE_LAGOON_LOG");
+        unsafe {
+            env::set_var("BLUE_LAGOON_LOG", "debug");
+            env::remove_var("BLUE_LAGOON_DATABASE_URL");
+        }
+
+        let loaded =
+            RuntimeConfig::load_from_root(&temp_root).expect("dotenv-backed config should load");
+        assert_eq!(loaded.database.database_url, "postgres://from-dotenv");
+        assert_eq!(loaded.app.log_filter, "debug");
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        match original_log {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_LOG", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_LOG") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn load_discovers_config_root_from_nested_current_directory() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(minimal_file_config(), None, None);
+        let nested_dir = temp_root.join("crates").join("runtime");
+        fs::create_dir_all(&nested_dir).expect("nested cwd should be created");
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+        }
+
+        {
+            let _cwd = scoped_current_dir(&nested_dir);
+            let loaded =
+                RuntimeConfig::load().expect("config root should be discovered from nested cwd");
+            assert_eq!(loaded.database.database_url, "postgres://example");
+        }
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
         }
         let _ = fs::remove_dir_all(temp_root);
     }

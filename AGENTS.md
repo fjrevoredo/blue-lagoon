@@ -26,6 +26,7 @@ Operational assets live at the repository root:
 
 - `migrations/`: reviewed SQL migrations
 - `config/default.toml`: versioned non-secret config
+- `config/local.example.toml`: template for untracked local operator overrides
 - `compose.yaml`: local PostgreSQL plus runtime topology
 
 Use `docs/sources/` for research inputs and external references. Historical
@@ -64,6 +65,9 @@ Typical implementation workflow is:
   stored Telegram update through the foreground path.
 - `cargo run -p runtime -- telegram --poll-once` to perform one live Telegram
   poll cycle.
+- `cp config/local.example.toml config/local.toml` to prepare local Telegram
+  binding overrides.
+- `cp .env.example .env` to prepare local runtime secrets and env overrides.
 - `git diff -- docs/ PHILOSOPHY.md README.md AGENTS.md` to review documentation
   changes before commit.
 - `git log --oneline` to match existing commit style.
@@ -112,6 +116,13 @@ Database-using automated tests must follow the repository fixture pattern:
   Telegram E2E validation
 - use `with_clean_database(...)` for unmigrated DB scenarios
 - use `with_migrated_database(...)` for normal migrated persistence tests
+
+Local operator config must stay separated from repository config:
+
+- keep committed repo-safe defaults in `config/default.toml`
+- keep local non-secret operator overrides in untracked `config/local.toml`
+- keep local secrets and env-style overrides in untracked `.env`
+- do not reintroduce `BLUE_LAGOON_CONFIG` as a public/operator workflow
 
 When modifying code, prefer to run the lowest effective layer first, then rerun
 the relevant broader suite:

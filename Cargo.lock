@@ -615,6 +615,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "contracts",
+ "dotenvy",
  "futures-util",
  "hex",
  "once_cell",

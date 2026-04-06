@@ -29,6 +29,7 @@ project plan.
 - `crates/workers`: worker executables and worker-facing tests
 - `migrations/`: reviewed SQL migrations
 - `config/default.toml`: versioned non-secret runtime configuration
+- `config/local.example.toml`: template for untracked local operator overrides
 - `compose.yaml`: local PostgreSQL and a minimal runtime topology
 
 ## Runtime Commands
@@ -98,13 +99,14 @@ create and drop per-test databases.
 
 ## Configuration
 
-Default non-secret settings live in `config/default.toml`. Runtime secrets are
-resolved through environment variables referenced by that file.
+Default non-secret settings live in `config/default.toml`. Local operator
+overrides belong in untracked `config/local.toml`, typically created from
+`config/local.example.toml`. Runtime secrets are resolved through `.env` and
+process environment variables.
 
 Important runtime inputs include:
 
 - `BLUE_LAGOON_DATABASE_URL`: PostgreSQL connection string
-- `BLUE_LAGOON_CONFIG`: optional config file override
 - `BLUE_LAGOON_LOG`: optional tracing filter override
 - `BLUE_LAGOON_WORKER_COMMAND`: explicit worker executable path when a sibling
   `workers` binary is not used
@@ -125,6 +127,14 @@ The harness expects either:
 - a packaged sibling `workers` binary next to the runtime binary, or
 - an explicit worker command supplied in config or through
   `BLUE_LAGOON_WORKER_COMMAND`
+
+The normal local workflow is:
+
+- copy `config/local.example.toml` to `config/local.toml`
+- fill in local Telegram binding values in `config/local.toml`
+- copy `.env.example` to `.env`
+- fill in runtime secrets in `.env`
+- run runtime commands directly without manually sourcing `.env`
 
 The Telegram foreground path also requires:
 
@@ -166,6 +176,12 @@ Automated DB tests follow one repository-wide rule:
   dedicated test profile
 - use `with_clean_database(...)` when a test needs an unmigrated DB
 - use `with_migrated_database(...)` when a test needs the latest reviewed schema
+
+Repository config boundaries are strict:
+
+- `config/default.toml` must stay committed and repository-safe
+- `config/local.toml` is local operator config and must not be committed
+- `.env` is local secret/config override state and must not be committed
 
 ## Verification
 

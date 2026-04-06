@@ -8,14 +8,27 @@ Use this sequence.
 docker compose up -d postgres
 ```
 
-## 2. Export the required env vars
+## 2. Prepare local config and secrets
 
 ```bash
-export BLUE_LAGOON_CONFIG='config/default.toml'
-export BLUE_LAGOON_DATABASE_URL='postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon'
-export BLUE_LAGOON_TELEGRAM_BOT_TOKEN='...'
-export BLUE_LAGOON_FOREGROUND_ROUTE='zai/glm-5-turbo'
-export BLUE_LAGOON_FOREGROUND_API_KEY='...'
+cp config/local.example.toml config/local.toml
+cp .env.example .env
+```
+
+Set these correctly in `config/local.toml`:
+
+- `telegram.foreground_binding.allowed_user_id`
+- `telegram.foreground_binding.allowed_chat_id`
+- `telegram.foreground_binding.internal_principal_ref`
+- `telegram.foreground_binding.internal_conversation_ref`
+
+Set the required secrets and env values in `.env`:
+
+```bash
+BLUE_LAGOON_DATABASE_URL=postgres://blue_lagoon:blue_lagoon@localhost:55432/blue_lagoon
+BLUE_LAGOON_TELEGRAM_BOT_TOKEN=...
+BLUE_LAGOON_FOREGROUND_ROUTE=zai/glm-5-turbo
+BLUE_LAGOON_FOREGROUND_API_KEY=...
 ```
 
 If the regular local database does not exist yet:
@@ -28,12 +41,10 @@ Automated tests now provision disposable per-test databases through the harness
 test support fixtures, so manual Telegram E2E should run against the normal
 local app config rather than a dedicated E2E profile.
 
-## 3. Configure the Telegram binding and self-model in `config/default.toml`
+## 3. Verify the repository baseline config
 
-Set these correctly:
+Confirm these are right in `config/default.toml`:
 
-- `telegram.allowed_user_id`
-- `telegram.allowed_chat_id`
 - `self_model.seed_path`
 - optionally `model_gateway.foreground.*` if you need a non-default route
 - use provider-specific config such as `[model_gateway.z_ai] api_surface = "coding"` when the provider exposes multiple API surfaces
@@ -68,8 +79,8 @@ cargo run -p runtime -- harness --once --idle
 
 Copy these values:
 
-- `message.from.id` -> `telegram.allowed_user_id`
-- `message.chat.id` -> `telegram.allowed_chat_id`
+- `message.from.id` -> `telegram.foreground_binding.allowed_user_id`
+- `message.chat.id` -> `telegram.foreground_binding.allowed_chat_id`
 
 Example:
 
@@ -122,6 +133,6 @@ cargo test -p harness --test foreground_component -- --nocapture
 cargo test -p harness --test foreground_integration -- --nocapture
 ```
 
-If needed, prepare a minimal known-good local config in `config/default.toml`
-or another explicit local operator override, but do not rely on a dedicated
-test-only E2E profile.
+If needed, prepare a minimal known-good local override in `config/local.toml`,
+not in `config/default.toml`, and do not rely on a dedicated test-only E2E
+profile.

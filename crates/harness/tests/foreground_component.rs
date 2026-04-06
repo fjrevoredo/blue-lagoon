@@ -1353,11 +1353,13 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
         config.telegram = Some(harness::config::TelegramConfig {
             api_base_url: "http://127.0.0.1:1".to_string(),
             bot_token_env: bot_token_env.clone(),
-            allowed_user_id: 42,
-            allowed_chat_id: 42,
-            internal_principal_ref: "primary-user".to_string(),
-            internal_conversation_ref: "telegram-primary".to_string(),
             poll_limit: 10,
+            foreground_binding: Some(harness::config::TelegramForegroundBindingConfig {
+                allowed_user_id: 42,
+                allowed_chat_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            }),
         });
         config.model_gateway = Some(ModelGatewayConfig {
             foreground: ForegroundModelRouteConfig {

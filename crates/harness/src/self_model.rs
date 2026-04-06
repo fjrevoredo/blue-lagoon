@@ -147,11 +147,13 @@ mod tests {
             telegram: Some(TelegramConfig {
                 api_base_url: "https://api.telegram.org".to_string(),
                 bot_token_env: "BLUE_LAGOON_TEST_TELEGRAM_TOKEN".to_string(),
-                allowed_user_id: 42,
-                allowed_chat_id: 42,
-                internal_principal_ref: "primary-user".to_string(),
-                internal_conversation_ref: "telegram-primary".to_string(),
                 poll_limit: 10,
+                foreground_binding: Some(crate::config::TelegramForegroundBindingConfig {
+                    allowed_user_id: 42,
+                    allowed_chat_id: 42,
+                    internal_principal_ref: "primary-user".to_string(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                }),
             }),
             model_gateway: None,
             self_model: Some(SelfModelConfig { seed_path }),

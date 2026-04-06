@@ -27,10 +27,8 @@ args = []
 [telegram]
 api_base_url = "https://api.telegram.org"
 bot_token_env = "BLUE_LAGOON_TELEGRAM_BOT_TOKEN"
-allowed_user_id = 1
-allowed_chat_id = 1
-internal_principal_ref = "primary-user"
-internal_conversation_ref = "telegram-primary"
+# Local operator bindings belong in config/local.toml under
+# [telegram.foreground_binding].
 poll_limit = 10
 
 [model_gateway.foreground]
@@ -43,4 +41,4 @@ timeout_ms = 60000
 api_surface = "coding"
 
 [self_model]
-seed_path = "self_model_seed.toml"
+seed_path = "config/self_model_seed.toml"
