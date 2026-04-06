@@ -6,7 +6,7 @@ use contracts::{
     ForegroundTrigger, RetrievedContext, RetrievedContextItem, RetrievedEpisodeContext,
     RetrievedMemoryArtifactContext,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -27,6 +27,7 @@ struct RetrievalCandidate {
     source_episode_id: Option<Uuid>,
     source_memory_artifact_id: Option<Uuid>,
     lexical_document: String,
+    semantic_document: String,
     relevance_timestamp: DateTime<Utc>,
     internal_conversation_ref: Option<String>,
 }
@@ -185,10 +186,13 @@ async fn ensure_episode_retrieval_artifacts(
                 source_episode_id: Some(episode_id),
                 source_memory_artifact_id: None,
                 internal_conversation_ref: Some(row.get("internal_conversation_ref")),
-                lexical_document,
+                lexical_document: lexical_document.clone(),
                 relevance_timestamp: row.get("started_at"),
                 status: "active".to_string(),
-                payload: json!({ "projection": "episode_retrieval_baseline" }),
+                payload: json!({
+                    "projection": "episode_retrieval_baseline",
+                    "semantic_document": build_semantic_document(&[&lexical_document]),
+                }),
             },
         )
         .await?;
@@ -206,6 +210,8 @@ async fn ensure_memory_retrieval_artifacts(
         r#"
         SELECT
             ma.memory_artifact_id,
+            ma.artifact_kind,
+            ma.subject_ref,
             ma.content_text,
             COALESCE(ma.valid_from, ma.created_at) AS relevance_timestamp,
             ie.internal_conversation_ref
@@ -229,6 +235,10 @@ async fn ensure_memory_retrieval_artifacts(
             continue;
         }
 
+        let artifact_kind: String = row.get("artifact_kind");
+        let subject_ref: String = row.get("subject_ref");
+        let content_text: String = row.get("content_text");
+
         continuity::insert_retrieval_artifact(
             pool,
             &continuity::NewRetrievalArtifact {
@@ -237,10 +247,17 @@ async fn ensure_memory_retrieval_artifacts(
                 source_episode_id: None,
                 source_memory_artifact_id: Some(memory_artifact_id),
                 internal_conversation_ref: row.get("internal_conversation_ref"),
-                lexical_document: row.get("content_text"),
+                lexical_document: content_text.clone(),
                 relevance_timestamp: row.get("relevance_timestamp"),
                 status: "active".to_string(),
-                payload: json!({ "projection": "memory_retrieval_baseline" }),
+                payload: json!({
+                    "projection": "memory_retrieval_baseline",
+                    "semantic_document": build_semantic_document(&[
+                        artifact_kind.as_str(),
+                        subject_ref.as_str(),
+                        content_text.as_str(),
+                    ]),
+                }),
             },
         )
         .await?;
@@ -295,6 +312,7 @@ async fn fetch_retrieval_candidates(
             ra.source_episode_id,
             ra.source_memory_artifact_id,
             ra.lexical_document,
+            ra.payload_json,
             ra.relevance_timestamp,
             ra.internal_conversation_ref
         FROM retrieval_artifacts ra
@@ -317,17 +335,27 @@ async fn fetch_retrieval_candidates(
 
     Ok(rows
         .into_iter()
-        .map(|row| RetrievalCandidate {
-            retrieval_artifact_id: row.get("retrieval_artifact_id"),
-            source_kind: match row.get::<String, _>("source_kind").as_str() {
-                "episode" => RetrievalSourceKind::Episode,
-                _ => RetrievalSourceKind::MemoryArtifact,
-            },
-            source_episode_id: row.get("source_episode_id"),
-            source_memory_artifact_id: row.get("source_memory_artifact_id"),
-            lexical_document: row.get("lexical_document"),
-            relevance_timestamp: row.get("relevance_timestamp"),
-            internal_conversation_ref: row.get("internal_conversation_ref"),
+        .map(|row| {
+            let lexical_document: String = row.get("lexical_document");
+            let payload: Value = row.get("payload_json");
+
+            RetrievalCandidate {
+                retrieval_artifact_id: row.get("retrieval_artifact_id"),
+                source_kind: match row.get::<String, _>("source_kind").as_str() {
+                    "episode" => RetrievalSourceKind::Episode,
+                    _ => RetrievalSourceKind::MemoryArtifact,
+                },
+                source_episode_id: row.get("source_episode_id"),
+                source_memory_artifact_id: row.get("source_memory_artifact_id"),
+                lexical_document: lexical_document.clone(),
+                semantic_document: payload
+                    .get("semantic_document")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| build_semantic_document(&[&lexical_document])),
+                relevance_timestamp: row.get("relevance_timestamp"),
+                internal_conversation_ref: row.get("internal_conversation_ref"),
+            }
         })
         .collect())
 }
@@ -338,19 +366,27 @@ fn score_candidates(
     internal_conversation_ref: &str,
 ) -> Vec<ScoredCandidate> {
     let trigger_tokens = tokenize(trigger_text);
+    let trigger_semantic_tokens = semantic_tokens(trigger_text);
 
     let mut scored = candidates
         .into_iter()
         .map(|candidate| {
             let candidate_tokens = tokenize(&candidate.lexical_document);
+            let candidate_semantic_tokens = semantic_tokens(&candidate.semantic_document);
             let lexical_match_count = trigger_tokens.intersection(&candidate_tokens).count();
+            let semantic_match_count = trigger_semantic_tokens
+                .intersection(&candidate_semantic_tokens)
+                .count();
             let same_conversation =
                 candidate.internal_conversation_ref.as_deref() == Some(internal_conversation_ref);
             let score = lexical_match_count as i64 * 100
+                + semantic_match_count as i64 * 40
                 + if same_conversation { 50 } else { 0 }
                 + recency_bonus(candidate.relevance_timestamp);
             let relevance_reason = if lexical_match_count > 0 {
                 format!("lexical_match:{lexical_match_count}")
+            } else if semantic_match_count > 0 {
+                format!("semantic_match:{semantic_match_count}")
             } else if same_conversation {
                 "same_conversation_recent".to_string()
             } else {
@@ -469,6 +505,65 @@ fn tokenize(value: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn semantic_tokens(value: &str) -> BTreeSet<String> {
+    tokenize(value)
+        .into_iter()
+        .flat_map(|token| {
+            let normalized = normalize_semantic_token(&token);
+            let mut variants = vec![normalized.clone()];
+            variants.extend(
+                semantic_expansions(&normalized)
+                    .iter()
+                    .map(|value| (*value).to_string()),
+            );
+            variants
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn build_semantic_document(values: &[&str]) -> String {
+    let mut tokens = BTreeSet::new();
+    for value in values {
+        tokens.extend(semantic_tokens(value));
+    }
+    tokens.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_semantic_token(token: &str) -> String {
+    let token = token.trim().to_ascii_lowercase();
+    if token.len() > 4 && token.ends_with("ies") {
+        return format!("{}y", &token[..token.len() - 3]);
+    }
+    if token.len() > 5 && token.ends_with("ing") {
+        return token[..token.len() - 3].to_string();
+    }
+    if token.len() > 4 && token.ends_with("ed") {
+        return token[..token.len() - 2].to_string();
+    }
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        return token[..token.len() - 1].to_string();
+    }
+    token
+}
+
+fn semantic_expansions(token: &str) -> &'static [&'static str] {
+    match token {
+        "brief" => &["concise", "succinct", "short", "direct"],
+        "concise" => &["brief", "succinct", "short", "direct"],
+        "succinct" => &["brief", "concise", "short"],
+        "short" => &["brief", "concise", "succinct"],
+        "direct" => &["concise", "brief", "straightforward"],
+        "straightforward" => &["direct", "concise"],
+        "reply" | "response" | "answer" => &["reply", "response", "answer"],
+        "preference" | "prefer" | "like" => &["preference", "prefer", "like"],
+        "travel" => &["trip", "journey"],
+        "trip" => &["travel", "journey"],
+        "journey" => &["travel", "trip"],
+        _ => &[],
+    }
+}
+
 fn recency_bonus(relevance_timestamp: DateTime<Utc>) -> i64 {
     let age_minutes = (Utc::now() - relevance_timestamp).num_minutes().max(0);
     20 - age_minutes.min(20)
@@ -491,6 +586,7 @@ mod tests {
                     source_episode_id: None,
                     source_memory_artifact_id: Some(Uuid::now_v7()),
                     lexical_document: "prefers concise replies".to_string(),
+                    semantic_document: build_semantic_document(&["prefers concise replies"]),
                     relevance_timestamp: now - Duration::minutes(10),
                     internal_conversation_ref: Some("telegram-primary".to_string()),
                 },
@@ -500,6 +596,7 @@ mod tests {
                     source_episode_id: Some(Uuid::now_v7()),
                     source_memory_artifact_id: None,
                     lexical_document: "discussed travel plans".to_string(),
+                    semantic_document: build_semantic_document(&["discussed travel plans"]),
                     relevance_timestamp: now,
                     internal_conversation_ref: Some("telegram-primary".to_string()),
                 },
@@ -510,6 +607,29 @@ mod tests {
 
         assert_eq!(scored[0].source_kind, RetrievalSourceKind::MemoryArtifact);
         assert!(scored[0].lexical_match_count > 0);
+    }
+
+    #[test]
+    fn score_candidates_uses_semantic_match_when_lexical_overlap_is_absent() {
+        let now = Utc::now();
+        let scored = score_candidates(
+            vec![RetrievalCandidate {
+                retrieval_artifact_id: Uuid::now_v7(),
+                source_kind: RetrievalSourceKind::MemoryArtifact,
+                source_episode_id: None,
+                source_memory_artifact_id: Some(Uuid::now_v7()),
+                lexical_document: "prefers concise replies".to_string(),
+                semantic_document: build_semantic_document(&["prefers concise replies"]),
+                relevance_timestamp: now,
+                internal_conversation_ref: Some("telegram-primary".to_string()),
+            }],
+            "please be brief",
+            "telegram-primary",
+        );
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].lexical_match_count, 0);
+        assert!(scored[0].relevance_reason.starts_with("semantic_match:"));
     }
 
     #[test]

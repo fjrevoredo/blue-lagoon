@@ -393,6 +393,12 @@ where
         }
     }
 
+    for internal_conversation_ref in
+        foreground::list_recoverable_foreground_conversations(context.pool, context.config).await?
+    {
+        staged_conversations.insert(internal_conversation_ref);
+    }
+
     for internal_conversation_ref in staged_conversations {
         let trace_id = Uuid::now_v7();
         let execution_id = Uuid::now_v7();

@@ -171,7 +171,9 @@ Verify:
 - the latest audit payload shows:
   - `foreground_execution_mode = "normal"`
   - `self_model_source_kind = "canonical_artifact"`
-  - at least one retrieved context item when prior memory is relevant
+  - at least one retrieved context item when prior memory is relevant, including
+    semantically related phrasing rather than only exact token overlap where the
+    retrieval baseline has a meaningful synonym or concept match
 
 Useful query:
 
@@ -204,6 +206,10 @@ Verify:
   - `foreground_execution_mode = "backlog_recovery"`
   - `recovery_ingress_count > 1`
   - multiple `recovery_ingress_ids`
+
+The same recovery mode should also apply when a prior foreground attempt left
+multiple ingress rows in stale `processing` state and a later Telegram cycle
+resumes that conversation after degraded operation.
 
 Useful queries:
 

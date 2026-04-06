@@ -207,6 +207,7 @@ pub struct ExecutionIngressLinkRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForegroundExecutionDecisionReason {
     SingleIngress,
+    StaleProcessingResume,
     PendingSpanThreshold,
     StalePendingBatch,
     ForcedRecovery,
@@ -216,6 +217,7 @@ impl ForegroundExecutionDecisionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SingleIngress => "single_ingress",
+            Self::StaleProcessingResume => "stale_processing_resume",
             Self::PendingSpanThreshold => "pending_span_threshold",
             Self::StalePendingBatch => "stale_pending_batch",
             Self::ForcedRecovery => "forced_recovery",
@@ -1005,6 +1007,41 @@ pub async fn plan_pending_foreground_execution(
         ordered_ingress,
         decision_reason: decision.reason,
     }))
+}
+
+pub async fn list_recoverable_foreground_conversations(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+) -> Result<Vec<String>> {
+    let stale_cutoff = Utc::now()
+        - chrono::Duration::seconds(
+            config
+                .continuity
+                .backlog_recovery
+                .stale_pending_ingress_age_seconds_threshold as i64,
+        );
+
+    let rows = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT DISTINCT internal_conversation_ref
+        FROM ingress_events
+        WHERE internal_conversation_ref IS NOT NULL
+          AND status = 'accepted'
+          AND (
+              foreground_status = 'pending'
+              OR (
+                  foreground_status = 'processing'
+                  AND COALESCE(last_processed_at, received_at) <= $1
+              )
+          )
+        "#,
+    )
+    .bind(stale_cutoff)
+    .fetch_all(pool)
+    .await
+    .context("failed to list recoverable foreground conversations")?;
+
+    Ok(rows)
 }
 
 pub async fn mark_ingress_event_processed(
@@ -1890,11 +1927,21 @@ fn evaluate_pending_foreground_execution(
         .expect("pending foreground execution evaluation requires an oldest touch");
     let stale_pending_age_seconds =
         now.signed_duration_since(oldest_touch).num_seconds().max(0) as u64;
+    let resumed_processing_exists = pending
+        .iter()
+        .any(|ingress| ingress.foreground_status == "processing");
 
     if force_recovery {
         return PendingForegroundExecutionDecision {
             mode: ForegroundExecutionMode::BacklogRecovery,
             reason: ForegroundExecutionDecisionReason::ForcedRecovery,
+        };
+    }
+
+    if resumed_processing_exists {
+        return PendingForegroundExecutionDecision {
+            mode: ForegroundExecutionMode::BacklogRecovery,
+            reason: ForegroundExecutionDecisionReason::StaleProcessingResume,
         };
     }
 
@@ -2106,6 +2153,27 @@ mod tests {
         assert_eq!(
             decision.reason,
             ForegroundExecutionDecisionReason::PendingSpanThreshold
+        );
+    }
+
+    #[test]
+    fn pending_execution_switches_to_backlog_when_stale_processing_is_resumed() {
+        let now = Utc::now();
+        let mut resumed = sample_ingress_event(4, Some(10));
+        resumed.foreground_status = "processing".to_string();
+        let pending = vec![resumed, sample_ingress_event(0, None)];
+
+        let decision = evaluate_pending_foreground_execution(
+            &sample_backlog_recovery_config(),
+            &pending,
+            now,
+            false,
+        );
+
+        assert_eq!(decision.mode, ForegroundExecutionMode::BacklogRecovery);
+        assert_eq!(
+            decision.reason,
+            ForegroundExecutionDecisionReason::StaleProcessingResume
         );
     }
 
