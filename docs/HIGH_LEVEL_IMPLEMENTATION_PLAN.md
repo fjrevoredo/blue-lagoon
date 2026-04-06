@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, and Phase 2 completed; Phase 3 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, and Phase 3 completed; Phase 4 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -108,14 +108,14 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 - Phase 1 status: `COMPLETE`
 - Phase 1.1 status: `COMPLETE`
 - Phase 2 status: `COMPLETE`
-- Phase 3 status: `READY`
+- Phase 3 status: `COMPLETE`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
   `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 2 lives in
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
-- Proposed detailed planning for Phase 3 lives in
+- Detailed planning and execution evidence for Phase 3 lives in
   `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
@@ -123,8 +123,9 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 - The current repository state now includes `.github/workflows/ci.yml` as the
   minimum repository-hosted CI baseline for Phase 1.1
 - The current repository state now includes a completed Telegram-first
-  foreground slice with repository-hosted CI coverage, so Phase 2 is complete
-  and Phase 3 is now the active next phase
+  foreground slice plus canonical continuity, retrieval, self-model, and
+  backlog-aware recovery coverage, so Phase 3 is complete and Phase 4 is now
+  the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
 

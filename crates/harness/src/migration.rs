@@ -324,9 +324,10 @@ mod tests {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
         assert_eq!(migrations[0].name, "runtime_foundation");
         assert_eq!(migrations[1].name, "foreground_loop");
+        assert_eq!(migrations[3].name, "canonical_continuity");
     }
 
     #[test]

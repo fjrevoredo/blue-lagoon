@@ -64,6 +64,12 @@ Replay one stored Telegram update through the foreground path:
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
+Replay a stored delayed-backlog batch through the foreground path:
+
+```bash
+cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json
+```
+
 Run one live Telegram poll cycle:
 
 ```bash
@@ -73,6 +79,16 @@ cargo run -p runtime -- telegram --poll-once
 The `telegram` command is intentionally one-shot. Live Telegram and live model
 provider checks are operator-run tasks because they require real credentials, a
 bound chat, and side-effect-aware execution.
+
+Before using the runtime entrypoints directly, make sure the runtime can locate
+the `workers` binary. The simplest local path is:
+
+```bash
+cargo build -p runtime -p workers
+```
+
+If you are not using a sibling `workers` binary in `target/debug`, set an
+explicit `BLUE_LAGOON_WORKER_COMMAND` instead.
 
 ## Local Development
 
@@ -185,17 +201,21 @@ Repository config boundaries are strict:
 
 ## Verification
 
-The core repository verification commands are:
+The CI-aligned local verification commands are:
 
 ```bash
 cargo fmt --all --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --lib -- --nocapture
+cargo test -p harness --test foreground_component -- --nocapture
+cargo test -p harness --test foreground_integration -- --nocapture
+cargo test -p harness --test continuity_component -- --nocapture
+cargo test -p harness --test continuity_integration -- --nocapture
 docker compose config
 ```
 
-Matched pre-commit helper scripts are available for the same validation set:
+Matched pre-commit helper scripts run the same verification bundle locally:
 
 - bash/WSL: `./scripts/pre-commit.sh`
 - PowerShell: `./scripts/pre-commit.ps1`
@@ -214,6 +234,11 @@ cargo run -p runtime -- harness --once --synthetic-trigger smoke
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
-Repository-hosted CI lives in `.github/workflows/ci.yml` and should remain a
-stable workspace verification gate. Live-network Telegram and provider checks
-remain intentionally outside repository-hosted CI.
+For operator-driven local validation of continuity, retrieval, canonical
+proposals and backlog recovery, use
+[`docs/continuity-manual-verification.md`](/mnt/d/Repos/blue-lagoon/docs/continuity-manual-verification.md).
+
+Repository-hosted CI lives in `.github/workflows/ci.yml` and exposes the stable
+jobs `workspace-verification`, `foreground-runtime`, and
+`canonical-persistence`. Live-network Telegram and provider checks remain
+intentionally outside repository-hosted CI.

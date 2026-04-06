@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use contracts::{
-    AttachmentReference, ChannelKind, EpisodeExcerpt, ForegroundTrigger, ForegroundTriggerKind,
-    IngressEventKind, NormalizedIngress,
+    AttachmentReference, ChannelKind, EpisodeExcerpt, ForegroundExecutionMode, ForegroundTrigger,
+    ForegroundTriggerKind, IngressEventKind, NormalizedIngress, OrderedIngressReference,
 };
 use serde_json::{Value, json};
 use sqlx::{Executor, PgPool, Postgres, Row};
@@ -76,6 +76,8 @@ pub struct IngressEventRecord {
     pub ingress_id: Uuid,
     pub trace_id: Uuid,
     pub execution_id: Option<Uuid>,
+    pub occurred_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
     pub channel_kind: String,
     pub internal_principal_ref: Option<String>,
     pub internal_conversation_ref: Option<String>,
@@ -83,6 +85,8 @@ pub struct IngressEventRecord {
     pub external_event_id: String,
     pub external_message_id: Option<String>,
     pub status: String,
+    pub foreground_status: String,
+    pub last_processed_at: Option<DateTime<Utc>>,
     pub rejection_reason: Option<String>,
     pub text_body: Option<String>,
     pub reply_to_external_message_id: Option<String>,
@@ -153,6 +157,20 @@ pub enum ForegroundTriggerIntakeOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedForegroundIngressOutcome {
+    Accepted(StagedForegroundIngress),
+    Duplicate(DuplicateForegroundTrigger),
+    Rejected(RejectedForegroundTrigger),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedForegroundIngress {
+    pub ingress_id: Uuid,
+    pub trace_id: Uuid,
+    pub internal_conversation_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateForegroundTrigger {
     pub ingress_id: Uuid,
     pub trace_id: Uuid,
@@ -165,6 +183,57 @@ pub struct RejectedForegroundTrigger {
     pub ingress_id: Uuid,
     pub trace_id: Uuid,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewExecutionIngressLink {
+    pub execution_ingress_link_id: Uuid,
+    pub execution_id: Uuid,
+    pub ingress_id: Uuid,
+    pub link_role: String,
+    pub sequence_index: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionIngressLinkRecord {
+    pub execution_ingress_link_id: Uuid,
+    pub execution_id: Uuid,
+    pub ingress_id: Uuid,
+    pub link_role: String,
+    pub sequence_index: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundExecutionDecisionReason {
+    SingleIngress,
+    PendingSpanThreshold,
+    StalePendingBatch,
+    ForcedRecovery,
+}
+
+impl ForegroundExecutionDecisionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleIngress => "single_ingress",
+            Self::PendingSpanThreshold => "pending_span_threshold",
+            Self::StalePendingBatch => "stale_pending_batch",
+            Self::ForcedRecovery => "forced_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PendingForegroundExecutionOptions {
+    pub force_recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingForegroundExecutionPlan {
+    pub mode: ForegroundExecutionMode,
+    pub primary_ingress: IngressEventRecord,
+    pub ordered_ingress: Vec<OrderedIngressReference>,
+    pub decision_reason: ForegroundExecutionDecisionReason,
 }
 
 pub async fn upsert_conversation_binding(
@@ -573,6 +642,8 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
             ingress_id,
             trace_id,
             execution_id,
+            occurred_at,
+            received_at,
             channel_kind,
             internal_principal_ref,
             internal_conversation_ref,
@@ -580,6 +651,8 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
             external_event_id,
             external_message_id,
             status,
+            foreground_status,
+            last_processed_at,
             rejection_reason,
             text_body,
             reply_to_external_message_id,
@@ -603,6 +676,8 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
         ingress_id: row.get("ingress_id"),
         trace_id: row.get("trace_id"),
         execution_id: row.get("execution_id"),
+        occurred_at: row.get("occurred_at"),
+        received_at: row.get("received_at"),
         channel_kind: row.get("channel_kind"),
         internal_principal_ref: row.get("internal_principal_ref"),
         internal_conversation_ref: row.get("internal_conversation_ref"),
@@ -610,6 +685,8 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
         external_event_id: row.get("external_event_id"),
         external_message_id: row.get("external_message_id"),
         status: row.get("status"),
+        foreground_status: row.get("foreground_status"),
+        last_processed_at: row.get("last_processed_at"),
         rejection_reason: row.get("rejection_reason"),
         text_body: row.get("text_body"),
         reply_to_external_message_id: row.get("reply_to_external_message_id"),
@@ -624,6 +701,329 @@ pub async fn get_ingress_event(pool: &PgPool, ingress_id: Uuid) -> Result<Ingres
         approval_callback_data: row.get("approval_callback_data"),
         raw_payload_ref: row.get("raw_payload_ref"),
     })
+}
+
+pub async fn load_normalized_ingress(pool: &PgPool, ingress_id: Uuid) -> Result<NormalizedIngress> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            ingress_id,
+            channel_kind,
+            external_user_id,
+            external_conversation_id,
+            external_event_id,
+            external_message_id,
+            internal_principal_ref,
+            internal_conversation_ref,
+            event_kind,
+            occurred_at,
+            text_body,
+            reply_to_external_message_id,
+            attachments_json,
+            command_name,
+            command_args_json,
+            approval_token,
+            approval_callback_data,
+            raw_payload_ref
+        FROM ingress_events
+        WHERE ingress_id = $1
+        "#,
+    )
+    .bind(ingress_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to load normalized ingress from persistence")?;
+
+    let command_hint = if let Some(command) = row.get::<Option<String>, _>("command_name") {
+        let args: Vec<String> = decode_json_field(
+            row.get::<Value, _>("command_args_json"),
+            "normalized ingress command args",
+        )?;
+        Some(contracts::CommandHint { command, args })
+    } else {
+        None
+    };
+
+    Ok(NormalizedIngress {
+        ingress_id: row.get("ingress_id"),
+        channel_kind: parse_channel_kind(row.get::<String, _>("channel_kind").as_str())?,
+        external_user_id: row.get("external_user_id"),
+        external_conversation_id: row.get("external_conversation_id"),
+        external_event_id: row.get("external_event_id"),
+        external_message_id: row.get("external_message_id"),
+        internal_principal_ref: row
+            .get::<Option<String>, _>("internal_principal_ref")
+            .context("persisted ingress is missing internal_principal_ref")?,
+        internal_conversation_ref: row
+            .get::<Option<String>, _>("internal_conversation_ref")
+            .context("persisted ingress is missing internal_conversation_ref")?,
+        event_kind: parse_ingress_event_kind(row.get::<String, _>("event_kind").as_str())?,
+        occurred_at: row.get("occurred_at"),
+        text_body: row.get("text_body"),
+        reply_to: row
+            .get::<Option<String>, _>("reply_to_external_message_id")
+            .map(|external_message_id| contracts::ReplyReference {
+                external_message_id,
+            }),
+        attachments: decode_json_field(
+            row.get::<Value, _>("attachments_json"),
+            "normalized ingress attachments",
+        )?,
+        command_hint,
+        approval_payload: row.get::<Option<String>, _>("approval_token").map(|token| {
+            contracts::ApprovalPayload {
+                token,
+                callback_data: row.get("approval_callback_data"),
+            }
+        }),
+        raw_payload_ref: row.get("raw_payload_ref"),
+    })
+}
+
+pub fn build_foreground_trigger(
+    config: &RuntimeConfig,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    ingress: NormalizedIngress,
+) -> Result<ForegroundTrigger> {
+    let budget = policy::default_foreground_budget(config);
+    policy::validate_foreground_budget(&budget)?;
+    let deduplication_key = foreground_deduplication_key(&ingress);
+
+    Ok(ForegroundTrigger {
+        trigger_id: Uuid::now_v7(),
+        trace_id,
+        execution_id,
+        trigger_kind: ForegroundTriggerKind::UserIngress,
+        ingress,
+        received_at: Utc::now(),
+        deduplication_key,
+        budget,
+    })
+}
+
+pub async fn insert_execution_ingress_link<'e, E>(
+    executor: E,
+    link: &NewExecutionIngressLink,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        r#"
+        INSERT INTO execution_ingress_links (
+            execution_ingress_link_id,
+            execution_id,
+            ingress_id,
+            link_role,
+            sequence_index,
+            created_at
+        ) VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            NOW()
+        )
+        "#,
+    )
+    .bind(link.execution_ingress_link_id)
+    .bind(link.execution_id)
+    .bind(link.ingress_id)
+    .bind(&link.link_role)
+    .bind(link.sequence_index)
+    .execute(executor)
+    .await
+    .context("failed to insert execution ingress link")?;
+    Ok(())
+}
+
+pub async fn list_execution_ingress_links(
+    pool: &PgPool,
+    execution_id: Uuid,
+) -> Result<Vec<ExecutionIngressLinkRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            execution_ingress_link_id,
+            execution_id,
+            ingress_id,
+            link_role,
+            sequence_index,
+            created_at
+        FROM execution_ingress_links
+        WHERE execution_id = $1
+        ORDER BY sequence_index ASC
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to list execution ingress links")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ExecutionIngressLinkRecord {
+            execution_ingress_link_id: row.get("execution_ingress_link_id"),
+            execution_id: row.get("execution_id"),
+            ingress_id: row.get("ingress_id"),
+            link_role: row.get("link_role"),
+            sequence_index: row.get("sequence_index"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn plan_pending_foreground_execution(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    internal_conversation_ref: &str,
+    options: PendingForegroundExecutionOptions,
+) -> Result<Option<PendingForegroundExecutionPlan>> {
+    let max_recovery_batch_size = config.continuity.backlog_recovery.max_recovery_batch_size as i64;
+    let now = Utc::now();
+    let stale_cutoff = now
+        - chrono::Duration::seconds(
+            config
+                .continuity
+                .backlog_recovery
+                .stale_pending_ingress_age_seconds_threshold as i64,
+        );
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start pending foreground execution planning transaction")?;
+
+    let pending = list_recoverable_ingress_events_for_conversation_locked(
+        &mut tx,
+        internal_conversation_ref,
+        stale_cutoff,
+        max_recovery_batch_size,
+    )
+    .await?;
+    if pending.is_empty() {
+        tx.commit()
+            .await
+            .context("failed to commit empty pending foreground planning transaction")?;
+        return Ok(None);
+    }
+
+    let decision = evaluate_pending_foreground_execution(
+        &config.continuity.backlog_recovery,
+        &pending,
+        now,
+        options.force_recovery,
+    );
+    let selected = match decision.mode {
+        ForegroundExecutionMode::SingleIngress => vec![
+            pending
+                .first()
+                .expect("single-ingress planning requires one pending ingress")
+                .clone(),
+        ],
+        ForegroundExecutionMode::BacklogRecovery => pending.clone(),
+    };
+    let primary_ingress = match decision.mode {
+        ForegroundExecutionMode::SingleIngress => selected
+            .first()
+            .expect("single-ingress planning requires one selected ingress")
+            .clone(),
+        ForegroundExecutionMode::BacklogRecovery => selected
+            .last()
+            .expect("backlog planning requires at least one selected ingress")
+            .clone(),
+    };
+    let ordered_ingress = selected
+        .iter()
+        .map(|ingress| OrderedIngressReference {
+            ingress_id: ingress.ingress_id,
+            external_message_id: ingress.external_message_id.clone(),
+            occurred_at: ingress.occurred_at,
+            text_body: ingress.text_body.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    for (index, ingress) in selected.iter().enumerate() {
+        mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
+        insert_execution_ingress_link(
+            &mut *tx,
+            &NewExecutionIngressLink {
+                execution_ingress_link_id: Uuid::now_v7(),
+                execution_id,
+                ingress_id: ingress.ingress_id,
+                link_role: if ingress.ingress_id == primary_ingress.ingress_id {
+                    "primary".to_string()
+                } else {
+                    "batch_member".to_string()
+                },
+                sequence_index: index as i32,
+            },
+        )
+        .await?;
+    }
+
+    audit::insert(
+        &mut *tx,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "foreground_recovery".to_string(),
+            event_kind: "foreground_recovery_mode_decided".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "internal_conversation_ref": internal_conversation_ref,
+                "mode": match decision.mode {
+                    ForegroundExecutionMode::SingleIngress => "single_ingress",
+                    ForegroundExecutionMode::BacklogRecovery => "backlog_recovery",
+                },
+                "decision_reason": decision.reason.as_str(),
+                "selected_ingress_ids": selected
+                    .iter()
+                    .map(|ingress| ingress.ingress_id)
+                    .collect::<Vec<_>>(),
+                "primary_ingress_id": primary_ingress.ingress_id,
+                "force_recovery": options.force_recovery,
+                "selected_count": selected.len(),
+            }),
+        },
+    )
+    .await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit pending foreground execution planning transaction")?;
+
+    Ok(Some(PendingForegroundExecutionPlan {
+        mode: decision.mode,
+        primary_ingress,
+        ordered_ingress,
+        decision_reason: decision.reason,
+    }))
+}
+
+pub async fn mark_ingress_event_processed(
+    pool: &PgPool,
+    ingress_id: Uuid,
+    execution_id: Uuid,
+) -> Result<()> {
+    set_ingress_event_foreground_state(pool, ingress_id, Some(execution_id), "processed").await
+}
+
+pub async fn mark_ingress_events_processed(
+    pool: &PgPool,
+    ingress_ids: &[Uuid],
+    execution_id: Uuid,
+) -> Result<()> {
+    for ingress_id in ingress_ids {
+        mark_ingress_event_processed(pool, *ingress_id, execution_id).await?;
+    }
+    Ok(())
 }
 
 pub async fn insert_episode(pool: &PgPool, episode: &NewEpisode) -> Result<()> {
@@ -966,6 +1366,7 @@ pub async fn intake_telegram_foreground_trigger(
                 },
             )
             .await?;
+            set_ingress_event_foreground_state(pool, ingress.ingress_id, None, "rejected").await?;
 
             audit::insert(
                 pool,
@@ -1002,21 +1403,9 @@ pub async fn intake_telegram_foreground_trigger(
         }
     }
 
-    let budget = policy::default_foreground_budget(config);
-    policy::validate_foreground_budget(&budget)?;
-
     let trace = TraceContext::root();
     let execution_id = Uuid::now_v7();
-    let trigger = ForegroundTrigger {
-        trigger_id: Uuid::now_v7(),
-        trace_id: trace.trace_id,
-        execution_id,
-        trigger_kind: ForegroundTriggerKind::UserIngress,
-        ingress: ingress.clone(),
-        received_at: Utc::now(),
-        deduplication_key: deduplication_key.clone(),
-        budget,
-    };
+    let trigger = build_foreground_trigger(config, trace.trace_id, execution_id, ingress.clone())?;
 
     let request_payload = serde_json::to_value(&trigger)
         .context("failed to serialize foreground trigger request payload")?;
@@ -1077,6 +1466,7 @@ pub async fn intake_telegram_foreground_trigger(
         }
         return Err(error);
     }
+    mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
 
     audit::insert(
         &mut *tx,
@@ -1110,6 +1500,142 @@ pub async fn intake_telegram_foreground_trigger(
         .context("failed to commit accepted foreground trigger transaction")?;
 
     Ok(ForegroundTriggerIntakeOutcome::Accepted(Box::new(trigger)))
+}
+
+pub async fn stage_telegram_foreground_ingress(
+    pool: &PgPool,
+    telegram_config: &ResolvedTelegramConfig,
+    ingress: NormalizedIngress,
+) -> Result<StagedForegroundIngressOutcome> {
+    let deduplication_key = foreground_deduplication_key(&ingress);
+
+    if let Some(existing) =
+        find_ingress_event_by_channel_event(pool, ingress.channel_kind, &ingress.external_event_id)
+            .await?
+    {
+        return duplicate_foreground_trigger_outcome(pool, &ingress, &deduplication_key, existing)
+            .await
+            .map(|outcome| match outcome {
+                ForegroundTriggerIntakeOutcome::Duplicate(duplicate) => {
+                    StagedForegroundIngressOutcome::Duplicate(duplicate)
+                }
+                ForegroundTriggerIntakeOutcome::Accepted(_) => unreachable!(),
+                ForegroundTriggerIntakeOutcome::Rejected(_) => unreachable!(),
+            });
+    }
+
+    match policy::evaluate_telegram_foreground_trigger(telegram_config, &ingress) {
+        PolicyDecision::Allowed => {}
+        PolicyDecision::Denied { reason } => {
+            let trace = TraceContext::root();
+            let conversation_binding =
+                maybe_upsert_matching_conversation_binding(pool, telegram_config, &ingress).await?;
+            insert_ingress_event(
+                pool,
+                &NewIngressEvent {
+                    ingress: ingress.clone(),
+                    conversation_binding_id: conversation_binding
+                        .as_ref()
+                        .map(|binding| binding.record.conversation_binding_id),
+                    trace_id: trace.trace_id,
+                    execution_id: None,
+                    status: "rejected".to_string(),
+                    rejection_reason: Some(reason.clone()),
+                },
+            )
+            .await?;
+            set_ingress_event_foreground_state(pool, ingress.ingress_id, None, "rejected").await?;
+
+            audit::insert(
+                pool,
+                &NewAuditEvent {
+                    loop_kind: "conscious".to_string(),
+                    subsystem: "foreground_trigger".to_string(),
+                    event_kind: "foreground_trigger_rejected".to_string(),
+                    severity: "warn".to_string(),
+                    trace_id: trace.trace_id,
+                    execution_id: None,
+                    worker_pid: None,
+                    payload: json!({
+                        "ingress_id": ingress.ingress_id,
+                        "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                        "external_event_id": ingress.external_event_id,
+                        "event_kind": ingress_event_kind_as_str(ingress.event_kind),
+                        "deduplication_key": deduplication_key,
+                        "reason": reason,
+                        "conversation_binding_action": conversation_binding
+                            .as_ref()
+                            .map(|binding| binding.action.as_str()),
+                    }),
+                },
+            )
+            .await?;
+
+            return Ok(StagedForegroundIngressOutcome::Rejected(
+                RejectedForegroundTrigger {
+                    ingress_id: ingress.ingress_id,
+                    trace_id: trace.trace_id,
+                    reason,
+                },
+            ));
+        }
+    }
+
+    let trace = TraceContext::root();
+    let binding = matching_conversation_binding(telegram_config, &ingress)
+        .context("accepted Telegram ingress must match the configured conversation binding")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start staged foreground ingress transaction")?;
+
+    let conversation_binding = reconcile_conversation_binding_in_tx(&mut tx, &binding).await?;
+    insert_ingress_event(
+        &mut *tx,
+        &NewIngressEvent {
+            ingress: ingress.clone(),
+            conversation_binding_id: Some(conversation_binding.record.conversation_binding_id),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            status: "accepted".to_string(),
+            rejection_reason: None,
+        },
+    )
+    .await?;
+
+    audit::insert(
+        &mut *tx,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "foreground_trigger".to_string(),
+            event_kind: "foreground_trigger_staged".to_string(),
+            severity: "info".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "ingress_id": ingress.ingress_id,
+                "channel_kind": channel_kind_as_str(ingress.channel_kind),
+                "external_event_id": ingress.external_event_id,
+                "event_kind": ingress_event_kind_as_str(ingress.event_kind),
+                "deduplication_key": deduplication_key,
+                "conversation_binding_action": conversation_binding.action.as_str(),
+            }),
+        },
+    )
+    .await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit staged foreground ingress transaction")?;
+
+    Ok(StagedForegroundIngressOutcome::Accepted(
+        StagedForegroundIngress {
+            ingress_id: ingress.ingress_id,
+            trace_id: trace.trace_id,
+            internal_conversation_ref: ingress.internal_conversation_ref,
+        },
+    ))
 }
 
 async fn duplicate_foreground_trigger_outcome(
@@ -1155,11 +1681,27 @@ fn channel_kind_as_str(channel_kind: ChannelKind) -> &'static str {
     }
 }
 
+fn parse_channel_kind(value: &str) -> Result<ChannelKind> {
+    match value {
+        "telegram" => Ok(ChannelKind::Telegram),
+        other => anyhow::bail!("unsupported persisted channel_kind '{other}'"),
+    }
+}
+
 fn ingress_event_kind_as_str(event_kind: IngressEventKind) -> &'static str {
     match event_kind {
         IngressEventKind::MessageCreated => "message_created",
         IngressEventKind::CommandIssued => "command_issued",
         IngressEventKind::ApprovalCallback => "approval_callback",
+    }
+}
+
+fn parse_ingress_event_kind(value: &str) -> Result<IngressEventKind> {
+    match value {
+        "message_created" => Ok(IngressEventKind::MessageCreated),
+        "command_issued" => Ok(IngressEventKind::CommandIssued),
+        "approval_callback" => Ok(IngressEventKind::ApprovalCallback),
+        other => anyhow::bail!("unsupported persisted ingress event_kind '{other}'"),
     }
 }
 
@@ -1203,6 +1745,8 @@ async fn find_ingress_event_by_channel_event(
             ingress_id,
             trace_id,
             execution_id,
+            occurred_at,
+            received_at,
             channel_kind,
             internal_principal_ref,
             internal_conversation_ref,
@@ -1210,6 +1754,8 @@ async fn find_ingress_event_by_channel_event(
             external_event_id,
             external_message_id,
             status,
+            foreground_status,
+            last_processed_at,
             rejection_reason,
             text_body,
             reply_to_external_message_id,
@@ -1280,6 +1826,8 @@ fn decode_ingress_event_row(row: sqlx::postgres::PgRow) -> Result<IngressEventRe
         ingress_id: row.get("ingress_id"),
         trace_id: row.get("trace_id"),
         execution_id: row.get("execution_id"),
+        occurred_at: row.get("occurred_at"),
+        received_at: row.get("received_at"),
         channel_kind: row.get("channel_kind"),
         internal_principal_ref: row.get("internal_principal_ref"),
         internal_conversation_ref: row.get("internal_conversation_ref"),
@@ -1287,6 +1835,8 @@ fn decode_ingress_event_row(row: sqlx::postgres::PgRow) -> Result<IngressEventRe
         external_event_id: row.get("external_event_id"),
         external_message_id: row.get("external_message_id"),
         status: row.get("status"),
+        foreground_status: row.get("foreground_status"),
+        last_processed_at: row.get("last_processed_at"),
         rejection_reason: row.get("rejection_reason"),
         text_body: row.get("text_body"),
         reply_to_external_message_id: row.get("reply_to_external_message_id"),
@@ -1301,4 +1851,303 @@ fn decode_ingress_event_row(row: sqlx::postgres::PgRow) -> Result<IngressEventRe
         approval_callback_data: row.get("approval_callback_data"),
         raw_payload_ref: row.get("raw_payload_ref"),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingForegroundExecutionDecision {
+    mode: ForegroundExecutionMode,
+    reason: ForegroundExecutionDecisionReason,
+}
+
+fn evaluate_pending_foreground_execution(
+    config: &crate::config::BacklogRecoveryConfig,
+    pending: &[IngressEventRecord],
+    now: DateTime<Utc>,
+    force_recovery: bool,
+) -> PendingForegroundExecutionDecision {
+    if pending.len() < 2 {
+        return PendingForegroundExecutionDecision {
+            mode: ForegroundExecutionMode::SingleIngress,
+            reason: ForegroundExecutionDecisionReason::SingleIngress,
+        };
+    }
+
+    let oldest = pending
+        .first()
+        .expect("pending foreground execution evaluation requires a first ingress");
+    let newest = pending
+        .last()
+        .expect("pending foreground execution evaluation requires a last ingress");
+    let pending_span_seconds = newest
+        .occurred_at
+        .signed_duration_since(oldest.occurred_at)
+        .num_seconds()
+        .max(0) as u64;
+    let oldest_touch = pending
+        .iter()
+        .map(|ingress| ingress.last_processed_at.unwrap_or(ingress.received_at))
+        .min()
+        .expect("pending foreground execution evaluation requires an oldest touch");
+    let stale_pending_age_seconds =
+        now.signed_duration_since(oldest_touch).num_seconds().max(0) as u64;
+
+    if force_recovery {
+        return PendingForegroundExecutionDecision {
+            mode: ForegroundExecutionMode::BacklogRecovery,
+            reason: ForegroundExecutionDecisionReason::ForcedRecovery,
+        };
+    }
+
+    if pending.len() >= config.pending_message_count_threshold as usize
+        && pending_span_seconds >= config.pending_message_span_seconds_threshold
+    {
+        return PendingForegroundExecutionDecision {
+            mode: ForegroundExecutionMode::BacklogRecovery,
+            reason: ForegroundExecutionDecisionReason::PendingSpanThreshold,
+        };
+    }
+
+    if pending.len() >= config.pending_message_count_threshold as usize
+        && stale_pending_age_seconds >= config.stale_pending_ingress_age_seconds_threshold
+    {
+        return PendingForegroundExecutionDecision {
+            mode: ForegroundExecutionMode::BacklogRecovery,
+            reason: ForegroundExecutionDecisionReason::StalePendingBatch,
+        };
+    }
+
+    PendingForegroundExecutionDecision {
+        mode: ForegroundExecutionMode::SingleIngress,
+        reason: ForegroundExecutionDecisionReason::SingleIngress,
+    }
+}
+
+async fn list_recoverable_ingress_events_for_conversation_locked(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    internal_conversation_ref: &str,
+    stale_cutoff: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<IngressEventRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            ingress_id,
+            trace_id,
+            execution_id,
+            occurred_at,
+            received_at,
+            channel_kind,
+            internal_principal_ref,
+            internal_conversation_ref,
+            event_kind,
+            external_event_id,
+            external_message_id,
+            status,
+            foreground_status,
+            last_processed_at,
+            rejection_reason,
+            text_body,
+            reply_to_external_message_id,
+            attachment_count,
+            attachments_json,
+            command_name,
+            command_args_json,
+            approval_token,
+            approval_callback_data,
+            raw_payload_ref
+        FROM ingress_events
+        WHERE internal_conversation_ref = $1
+          AND status = 'accepted'
+          AND (
+              foreground_status = 'pending'
+              OR (
+                  foreground_status = 'processing'
+                  AND COALESCE(last_processed_at, received_at) <= $2
+              )
+          )
+        ORDER BY occurred_at ASC, received_at ASC
+        LIMIT $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(internal_conversation_ref)
+    .bind(stale_cutoff)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await
+    .context("failed to list recoverable ingress events for conversation")?;
+
+    rows.into_iter().map(decode_ingress_event_row).collect()
+}
+
+async fn mark_ingress_event_processing<'e, E>(
+    executor: E,
+    ingress_id: Uuid,
+    execution_id: Uuid,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    set_ingress_event_foreground_state(executor, ingress_id, Some(execution_id), "processing").await
+}
+
+async fn set_ingress_event_foreground_state<'e, E>(
+    executor: E,
+    ingress_id: Uuid,
+    execution_id: Option<Uuid>,
+    foreground_status: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        r#"
+        UPDATE ingress_events
+        SET
+            execution_id = COALESCE($2, execution_id),
+            foreground_status = $3,
+            last_processed_at = NOW()
+        WHERE ingress_id = $1
+        "#,
+    )
+    .bind(ingress_id)
+    .bind(execution_id)
+    .bind(foreground_status)
+    .execute(executor)
+    .await
+    .context("failed to update ingress foreground state")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BacklogRecoveryConfig;
+
+    fn sample_ingress_event(
+        minutes_ago: i64,
+        last_processed_minutes_ago: Option<i64>,
+    ) -> IngressEventRecord {
+        let now = Utc::now();
+        IngressEventRecord {
+            ingress_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            occurred_at: now - chrono::Duration::minutes(minutes_ago),
+            received_at: now - chrono::Duration::minutes(minutes_ago),
+            channel_kind: "telegram".to_string(),
+            internal_principal_ref: Some("primary-user".to_string()),
+            internal_conversation_ref: Some("telegram-primary".to_string()),
+            event_kind: "message_created".to_string(),
+            external_event_id: format!("event-{minutes_ago}"),
+            external_message_id: Some(format!("{minutes_ago}")),
+            status: "accepted".to_string(),
+            foreground_status: "pending".to_string(),
+            last_processed_at: last_processed_minutes_ago
+                .map(|value| now - chrono::Duration::minutes(value)),
+            rejection_reason: None,
+            text_body: Some(format!("message {minutes_ago}")),
+            reply_to_external_message_id: None,
+            attachment_count: 0,
+            attachments: Vec::new(),
+            command_name: None,
+            command_args: Vec::new(),
+            approval_token: None,
+            approval_callback_data: None,
+            raw_payload_ref: None,
+        }
+    }
+
+    fn sample_backlog_recovery_config() -> BacklogRecoveryConfig {
+        BacklogRecoveryConfig {
+            pending_message_count_threshold: 3,
+            pending_message_span_seconds_threshold: 120,
+            stale_pending_ingress_age_seconds_threshold: 300,
+            max_recovery_batch_size: 8,
+        }
+    }
+
+    #[test]
+    fn pending_execution_stays_single_below_threshold() {
+        let now = Utc::now();
+        let pending = vec![sample_ingress_event(1, None), sample_ingress_event(0, None)];
+
+        let decision = evaluate_pending_foreground_execution(
+            &sample_backlog_recovery_config(),
+            &pending,
+            now,
+            false,
+        );
+
+        assert_eq!(decision.mode, ForegroundExecutionMode::SingleIngress);
+        assert_eq!(
+            decision.reason,
+            ForegroundExecutionDecisionReason::SingleIngress
+        );
+    }
+
+    #[test]
+    fn pending_execution_switches_to_backlog_on_span_threshold() {
+        let now = Utc::now();
+        let pending = vec![
+            sample_ingress_event(5, None),
+            sample_ingress_event(3, None),
+            sample_ingress_event(0, None),
+        ];
+
+        let decision = evaluate_pending_foreground_execution(
+            &sample_backlog_recovery_config(),
+            &pending,
+            now,
+            false,
+        );
+
+        assert_eq!(decision.mode, ForegroundExecutionMode::BacklogRecovery);
+        assert_eq!(
+            decision.reason,
+            ForegroundExecutionDecisionReason::PendingSpanThreshold
+        );
+    }
+
+    #[test]
+    fn pending_execution_switches_to_backlog_on_stale_batch() {
+        let now = Utc::now();
+        let pending = vec![
+            sample_ingress_event(10, Some(10)),
+            sample_ingress_event(9, None),
+            sample_ingress_event(9, None),
+        ];
+
+        let decision = evaluate_pending_foreground_execution(
+            &sample_backlog_recovery_config(),
+            &pending,
+            now,
+            false,
+        );
+
+        assert_eq!(decision.mode, ForegroundExecutionMode::BacklogRecovery);
+        assert_eq!(
+            decision.reason,
+            ForegroundExecutionDecisionReason::StalePendingBatch
+        );
+    }
+
+    #[test]
+    fn pending_execution_switches_to_backlog_when_forced() {
+        let now = Utc::now();
+        let pending = vec![sample_ingress_event(1, None), sample_ingress_event(0, None)];
+
+        let decision = evaluate_pending_foreground_execution(
+            &sample_backlog_recovery_config(),
+            &pending,
+            now,
+            true,
+        );
+
+        assert_eq!(decision.mode, ForegroundExecutionMode::BacklogRecovery);
+        assert_eq!(
+            decision.reason,
+            ForegroundExecutionDecisionReason::ForcedRecovery
+        );
+    }
 }

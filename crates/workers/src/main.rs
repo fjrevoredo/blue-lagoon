@@ -5,12 +5,15 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use contracts::{
-    AssistantOutput, ConsciousContext, ConsciousWorkerInboundMessage,
+    AssistantOutput, CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload,
+    CanonicalTargetKind, ConsciousContext, ConsciousWorkerInboundMessage,
     ConsciousWorkerOutboundMessage, ConsciousWorkerRequest, ConsciousWorkerResult,
-    ConsciousWorkerStatus, EpisodeSummary, LoopKind, ModelBudget, ModelCallPurpose,
-    ModelCallRequest, ModelCallResponse, ModelInput, ModelInputMessage, ModelMessageRole,
-    ModelOutputMode, SmokeWorkerResult, ToolPolicy, WorkerErrorCode, WorkerFailure, WorkerPayload,
-    WorkerRequest, WorkerResponse, WorkerResult,
+    ConsciousWorkerStatus, EpisodeSummary, ForegroundExecutionMode, LoopKind,
+    MemoryArtifactProposal, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelCallResponse,
+    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, ProposalConflictPosture,
+    ProposalProvenance, ProposalProvenanceKind, SelfModelObservationProposal, SmokeWorkerResult,
+    ToolPolicy, WorkerErrorCode, WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse,
+    WorkerResult,
 };
 use serde::Serialize;
 
@@ -185,13 +188,13 @@ fn run_conscious_worker() -> Result<()> {
         return Ok(());
     }
 
+    let response = match build_conscious_worker_response(&request, payload, model_response) {
+        Ok(response) => response,
+        Err(message) => request_error_response(&request, WorkerErrorCode::InvalidRequest, message),
+    };
     write_json_line(
         &mut handle,
-        &ConsciousWorkerOutboundMessage::FinalResponse(build_conscious_worker_response(
-            &request,
-            payload,
-            model_response,
-        )),
+        &ConsciousWorkerOutboundMessage::FinalResponse(response),
     )?;
     Ok(())
 }
@@ -283,9 +286,43 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         });
     }
 
+    if context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery
+        && !context.recovery_context.ordered_ingress.is_empty()
+    {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: format!(
+                "Recovery mode is backlog_recovery. Ordered delayed ingress batch: {}.",
+                join_or_none(
+                    &context
+                        .recovery_context
+                        .ordered_ingress
+                        .iter()
+                        .map(|ingress| {
+                            ingress
+                                .text_body
+                                .clone()
+                                .unwrap_or_else(|| "<empty>".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                )
+            ),
+        });
+    }
+
+    if !context.retrieved_context.items.is_empty() {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: format!(
+                "Retrieved canonical context: {}.",
+                retrieved_context_summary(&context.retrieved_context.items)
+            ),
+        });
+    }
+
     ModelInput {
         system_prompt: format!(
-            "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}.",
+            "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}. Execution mode: {}.",
             context.self_model.stable_identity,
             context.self_model.role,
             context.self_model.communication_style,
@@ -301,6 +338,7 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
             context.internal_state.confidence_pct,
             context.internal_state.connection_quality_pct,
             join_or_none(&context.internal_state.active_conditions),
+            foreground_execution_mode_as_str(context.recovery_context.mode),
         ),
         messages,
     }
@@ -310,8 +348,9 @@ fn build_conscious_worker_response(
     request: &WorkerRequest,
     payload: &ConsciousWorkerRequest,
     model_response: ModelCallResponse,
-) -> WorkerResponse {
-    WorkerResponse {
+) -> std::result::Result<WorkerResponse, String> {
+    let candidate_proposals = build_candidate_proposals(&payload.context)?;
+    Ok(WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
         execution_id: request.execution_id,
@@ -337,8 +376,9 @@ fn build_conscious_worker_response(
                 outcome: "completed".to_string(),
                 message_count: history_message_count(&payload.context) + 2,
             },
+            candidate_proposals,
         }),
-    }
+    })
 }
 
 fn history_message_count(context: &ConsciousContext) -> u32 {
@@ -376,6 +416,202 @@ fn join_or_none(items: &[String]) -> String {
     }
 
     items.join(", ")
+}
+
+fn foreground_execution_mode_as_str(mode: ForegroundExecutionMode) -> &'static str {
+    match mode {
+        ForegroundExecutionMode::SingleIngress => "single_ingress",
+        ForegroundExecutionMode::BacklogRecovery => "backlog_recovery",
+    }
+}
+
+fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> String {
+    items
+        .iter()
+        .map(|item| match item {
+            contracts::RetrievedContextItem::Episode(episode) => {
+                format!("episode:{}:{}", episode.episode_id, episode.summary)
+            }
+            contracts::RetrievedContextItem::MemoryArtifact(artifact) => {
+                format!(
+                    "memory:{}:{}",
+                    artifact.memory_artifact_id, artifact.content_text
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn build_candidate_proposals(
+    context: &ConsciousContext,
+) -> std::result::Result<Vec<CanonicalProposal>, String> {
+    let mut proposals = Vec::new();
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return Ok(proposals);
+    };
+    let lowered = trigger_text.to_ascii_lowercase();
+
+    if lowered.contains("remember that ") || lowered.contains("i prefer ") {
+        proposals.push(CanonicalProposal {
+            proposal_id: uuid::Uuid::now_v7(),
+            proposal_kind: CanonicalProposalKind::MemoryArtifact,
+            canonical_target: CanonicalTargetKind::MemoryArtifacts,
+            confidence_pct: 85,
+            conflict_posture: ProposalConflictPosture::Independent,
+            subject_ref: format!(
+                "principal:{}",
+                context.trigger.ingress.internal_principal_ref
+            ),
+            rationale: Some(
+                "Foreground trigger explicitly expressed a user preference or fact.".to_string(),
+            ),
+            valid_from: Some(context.trigger.ingress.occurred_at),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: ProposalProvenance {
+                provenance_kind: match context.recovery_context.mode {
+                    ForegroundExecutionMode::SingleIngress => {
+                        ProposalProvenanceKind::EpisodeObservation
+                    }
+                    ForegroundExecutionMode::BacklogRecovery => {
+                        ProposalProvenanceKind::BacklogRecovery
+                    }
+                },
+                source_ingress_ids: current_source_ingress_ids(context),
+                source_episode_id: None,
+            },
+            payload: CanonicalProposalPayload::MemoryArtifact(MemoryArtifactProposal {
+                artifact_kind: "preference".to_string(),
+                content_text: trigger_text.trim().to_string(),
+            }),
+        });
+    }
+
+    if lowered.contains("be concise")
+        || lowered.contains("more concise")
+        || lowered.contains("be direct")
+        || lowered.contains("more direct")
+    {
+        proposals.push(CanonicalProposal {
+            proposal_id: uuid::Uuid::now_v7(),
+            proposal_kind: CanonicalProposalKind::SelfModelObservation,
+            canonical_target: CanonicalTargetKind::SelfModelArtifacts,
+            confidence_pct: 78,
+            conflict_posture: ProposalConflictPosture::Independent,
+            subject_ref: "self".to_string(),
+            rationale: Some(
+                "Foreground trigger contained an explicit instruction about assistant style."
+                    .to_string(),
+            ),
+            valid_from: Some(context.trigger.ingress.occurred_at),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: ProposalProvenance {
+                provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+                source_ingress_ids: current_source_ingress_ids(context),
+                source_episode_id: None,
+            },
+            payload: CanonicalProposalPayload::SelfModelObservation(SelfModelObservationProposal {
+                observation_kind: "interaction_style".to_string(),
+                content_text: trigger_text.trim().to_string(),
+            }),
+        });
+    }
+
+    validate_candidate_proposals(context, &proposals)?;
+    Ok(proposals)
+}
+
+fn validate_candidate_proposals(
+    context: &ConsciousContext,
+    proposals: &[CanonicalProposal],
+) -> std::result::Result<(), String> {
+    let allowed_ingress_ids = current_source_ingress_ids(context);
+
+    for proposal in proposals {
+        if proposal.confidence_pct == 0 {
+            return Err("candidate proposal confidence_pct must be greater than zero".to_string());
+        }
+        if proposal.subject_ref.trim().is_empty() {
+            return Err("candidate proposal subject_ref must not be empty".to_string());
+        }
+        if proposal.provenance.source_ingress_ids.is_empty() {
+            return Err(
+                "candidate proposal provenance must include source ingress ids".to_string(),
+            );
+        }
+        if proposal
+            .provenance
+            .source_ingress_ids
+            .iter()
+            .any(|ingress_id| !allowed_ingress_ids.contains(ingress_id))
+        {
+            return Err(
+                "candidate proposal provenance referenced an unknown ingress id".to_string(),
+            );
+        }
+        match (
+            &proposal.proposal_kind,
+            &proposal.canonical_target,
+            &proposal.payload,
+        ) {
+            (
+                CanonicalProposalKind::MemoryArtifact,
+                CanonicalTargetKind::MemoryArtifacts,
+                CanonicalProposalPayload::MemoryArtifact(payload),
+            ) if !payload.artifact_kind.trim().is_empty()
+                && !payload.content_text.trim().is_empty() => {}
+            (
+                CanonicalProposalKind::SelfModelObservation,
+                CanonicalTargetKind::SelfModelArtifacts,
+                CanonicalProposalPayload::SelfModelObservation(payload),
+            ) if !payload.observation_kind.trim().is_empty()
+                && !payload.content_text.trim().is_empty() => {}
+            _ => {
+                return Err(
+                    "candidate proposal payload did not match the declared proposal kind"
+                        .to_string(),
+                );
+            }
+        }
+        match proposal.conflict_posture {
+            ProposalConflictPosture::Independent | ProposalConflictPosture::Conflicts
+                if proposal.supersedes_artifact_id.is_some() =>
+            {
+                return Err(
+                    "candidate proposal conflict posture allows no supersedes_artifact_id"
+                        .to_string(),
+                );
+            }
+            ProposalConflictPosture::Revises | ProposalConflictPosture::Supersedes
+                if proposal.supersedes_artifact_id.is_none() =>
+            {
+                return Err(
+                    "candidate proposal conflict posture requires supersedes_artifact_id"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn current_source_ingress_ids(context: &ConsciousContext) -> Vec<uuid::Uuid> {
+    if context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery
+        && !context.recovery_context.ordered_ingress.is_empty()
+    {
+        return context
+            .recovery_context
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect();
+    }
+
+    vec![context.trigger.ingress.ingress_id]
 }
 
 fn write_json_line<T: Serialize>(handle: &mut impl Write, value: &T) -> Result<()> {
@@ -487,7 +723,7 @@ mod tests {
                 .messages
                 .last()
                 .map(|message| message.content.as_str()),
-            Some("hello from trigger")
+            Some("remember that I prefer concise replies and be direct")
         );
     }
 
@@ -517,7 +753,8 @@ mod tests {
             },
         };
 
-        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response);
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("worker response should be valid");
         match response.result {
             WorkerResult::Conscious(result) => {
                 assert_eq!(result.status, ConsciousWorkerStatus::Completed);
@@ -527,6 +764,7 @@ mod tests {
                     "telegram-primary"
                 );
                 assert_eq!(result.episode_summary.outcome, "completed");
+                assert_eq!(result.candidate_proposals.len(), 2);
             }
             WorkerResult::Smoke(_) => panic!("conscious worker should not emit a smoke result"),
             WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
@@ -553,7 +791,9 @@ mod tests {
                     internal_conversation_ref: "telegram-primary".to_string(),
                     event_kind: IngressEventKind::MessageCreated,
                     occurred_at: chrono::Utc::now(),
-                    text_body: Some("hello from trigger".to_string()),
+                    text_body: Some(
+                        "remember that I prefer concise replies and be direct".to_string(),
+                    ),
                     reply_to: None,
                     attachments: Vec::new(),
                     command_hint: None,
@@ -595,6 +835,8 @@ mod tests {
                 assistant_message: Some("older assistant".to_string()),
                 outcome: "completed".to_string(),
             }],
+            retrieved_context: contracts::RetrievedContext::default(),
+            recovery_context: contracts::ForegroundRecoveryContext::default(),
         }
     }
 }

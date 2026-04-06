@@ -17,6 +17,7 @@ pub struct RuntimeConfig {
     pub app: AppConfig,
     pub database: DatabaseConfig,
     pub harness: HarnessConfig,
+    pub continuity: ContinuityConfig,
     pub worker: WorkerConfig,
     pub telegram: Option<TelegramConfig>,
     pub model_gateway: Option<ModelGatewayConfig>,
@@ -41,6 +42,27 @@ pub struct HarnessConfig {
     pub default_foreground_iteration_budget: u32,
     pub default_wall_clock_budget_ms: u64,
     pub default_foreground_token_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ContinuityConfig {
+    pub retrieval: RetrievalConfig,
+    pub backlog_recovery: BacklogRecoveryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RetrievalConfig {
+    pub max_recent_episode_candidates: u32,
+    pub max_memory_artifact_candidates: u32,
+    pub max_context_items: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BacklogRecoveryConfig {
+    pub pending_message_count_threshold: u32,
+    pub pending_message_span_seconds_threshold: u64,
+    pub stale_pending_ingress_age_seconds_threshold: u64,
+    pub max_recovery_batch_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -139,6 +161,7 @@ struct FileConfig {
     app: AppConfig,
     database: FileDatabaseConfig,
     harness: HarnessConfig,
+    continuity: ContinuityConfig,
     worker: WorkerConfig,
     #[serde(default)]
     telegram: Option<TelegramConfig>,
@@ -212,6 +235,7 @@ impl RuntimeConfig {
                     .minimum_supported_schema_version,
             },
             harness: file_config.harness,
+            continuity: file_config.continuity,
             worker: WorkerConfig {
                 timeout_ms: worker_timeout_ms,
                 command: worker_command,
@@ -245,6 +269,7 @@ impl RuntimeConfig {
         if self.harness.default_foreground_token_budget == 0 {
             bail!("harness.default_foreground_token_budget must be greater than zero");
         }
+        self.continuity.validate()?;
         if self.worker.timeout_ms == 0 {
             bail!("worker.timeout_ms must be greater than zero");
         }
@@ -516,6 +541,67 @@ impl ModelGatewayConfig {
     }
 }
 
+impl ContinuityConfig {
+    fn validate(&self) -> Result<()> {
+        self.retrieval.validate()?;
+        self.backlog_recovery.validate()?;
+        Ok(())
+    }
+}
+
+impl RetrievalConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_recent_episode_candidates == 0 {
+            bail!("continuity.retrieval.max_recent_episode_candidates must be greater than zero");
+        }
+        if self.max_memory_artifact_candidates == 0 {
+            bail!("continuity.retrieval.max_memory_artifact_candidates must be greater than zero");
+        }
+        if self.max_context_items == 0 {
+            bail!("continuity.retrieval.max_context_items must be greater than zero");
+        }
+        if self.max_context_items
+            < self
+                .max_recent_episode_candidates
+                .min(self.max_memory_artifact_candidates)
+        {
+            bail!(
+                "continuity.retrieval.max_context_items must be at least the smaller retrieval candidate bound"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl BacklogRecoveryConfig {
+    fn validate(&self) -> Result<()> {
+        if self.pending_message_count_threshold < 2 {
+            bail!(
+                "continuity.backlog_recovery.pending_message_count_threshold must be at least two"
+            );
+        }
+        if self.pending_message_span_seconds_threshold == 0 {
+            bail!(
+                "continuity.backlog_recovery.pending_message_span_seconds_threshold must be greater than zero"
+            );
+        }
+        if self.stale_pending_ingress_age_seconds_threshold == 0 {
+            bail!(
+                "continuity.backlog_recovery.stale_pending_ingress_age_seconds_threshold must be greater than zero"
+            );
+        }
+        if self.max_recovery_batch_size == 0 {
+            bail!("continuity.backlog_recovery.max_recovery_batch_size must be greater than zero");
+        }
+        if self.max_recovery_batch_size < self.pending_message_count_threshold {
+            bail!(
+                "continuity.backlog_recovery.max_recovery_batch_size must be greater than or equal to pending_message_count_threshold"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl SelfModelConfig {
     fn validate(&self) -> Result<()> {
         if self.seed_path.as_os_str().is_empty() {
@@ -618,6 +704,19 @@ mod tests {
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
             },
+            continuity: ContinuityConfig {
+                retrieval: RetrievalConfig {
+                    max_recent_episode_candidates: 3,
+                    max_memory_artifact_candidates: 5,
+                    max_context_items: 6,
+                },
+                backlog_recovery: BacklogRecoveryConfig {
+                    pending_message_count_threshold: 3,
+                    pending_message_span_seconds_threshold: 120,
+                    stale_pending_ingress_age_seconds_threshold: 300,
+                    max_recovery_batch_size: 8,
+                },
+            },
             worker: WorkerConfig {
                 timeout_ms: 5_000,
                 command: String::new(),
@@ -668,6 +767,17 @@ allow_synthetic_smoke = true
 default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 30000
 default_foreground_token_budget = 4000
+
+[continuity.retrieval]
+max_recent_episode_candidates = 3
+max_memory_artifact_candidates = 5
+max_context_items = 6
+
+[continuity.backlog_recovery]
+pending_message_count_threshold = 3
+pending_message_span_seconds_threshold = 120
+stale_pending_ingress_age_seconds_threshold = 300
+max_recovery_batch_size = 8
 
 [worker]
 timeout_ms = 10000
@@ -807,6 +917,44 @@ args = []
                 .to_string()
                 .contains("default_foreground_token_budget")
         );
+    }
+
+    #[test]
+    fn validate_rejects_zero_retrieval_bounds() {
+        let mut config = sample_config();
+        config.continuity.retrieval.max_recent_episode_candidates = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("max_recent_episode_candidates"));
+
+        let mut config = sample_config();
+        config.continuity.retrieval.max_memory_artifact_candidates = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("max_memory_artifact_candidates"));
+
+        let mut config = sample_config();
+        config.continuity.retrieval.max_context_items = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("max_context_items"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_backlog_recovery_thresholds() {
+        let mut config = sample_config();
+        config
+            .continuity
+            .backlog_recovery
+            .pending_message_count_threshold = 1;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("pending_message_count_threshold")
+        );
+
+        let mut config = sample_config();
+        config.continuity.backlog_recovery.max_recovery_batch_size = 2;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("max_recovery_batch_size"));
     }
 
     #[test]

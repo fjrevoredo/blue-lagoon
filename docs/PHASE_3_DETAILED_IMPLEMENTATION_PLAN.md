@@ -3,7 +3,7 @@
 ## Phase 3 Detailed Implementation Plan
 
 Date: 2026-04-06
-Status: Ready for execution
+Status: Complete
 Scope: High-level plan Phase 3 only
 Audience: LLM-assisted implementation work and human review
 
@@ -57,9 +57,10 @@ No blocking contradiction was found between
 `docs/IMPLEMENTATION_DESIGN.md` and
 `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`.
 
-Phase 3 still needs explicit execution clarifications before coding starts.
-Those clarifications are locked in the next section so implementation can begin
-without reopening canonical design questions mid-flight.
+The required execution clarifications were resolved before implementation and
+remained stable through completion. They are recorded in the next section so
+the execution ledger stays tied to the design decisions that governed the
+implementation.
 
 ## CI assessment for Phase 3
 
@@ -345,18 +346,18 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone A`
-- Current active task: `none`
-- Completed tasks: `0/18`
-- Milestone A status: `TODO`
-- Milestone B status: `TODO`
-- Milestone C status: `TODO`
-- Milestone D status: `TODO`
+- Current milestone: `Milestone D`
+- Current active task: `none (Phase 3 complete; Phase 4 planning is next)`
+- Completed tasks: `18/18`
+- Milestone A status: `DONE`
+- Milestone B status: `DONE`
+- Milestone C status: `DONE`
+- Milestone D status: `DONE`
 
 Repository sequencing note:
 
-- Phase 2 is complete, so this document is now the proposed Phase 3 execution
-  ledger pending review and approval.
+- Phase 2 is complete, and this document now serves as the completed Phase 3
+  execution ledger and evidence record.
 
 ## Execution refinement notes
 
@@ -386,7 +387,7 @@ The most likely split candidates are:
 
 The default new artifact names for Phase 3 implementation are:
 
-- reviewed migration file: `migrations/0004__phase_3_continuity.sql`
+- reviewed migration file: `migrations/0004__canonical_continuity.sql`
 - PostgreSQL-backed harness component suite: `continuity_component`
 - architecture-critical harness integration suite: `continuity_integration`
 
@@ -485,7 +486,7 @@ Milestone D is green only if:
 
 ### Task P3-01: Lock the Phase 3 continuity slice boundary
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
@@ -500,11 +501,15 @@ Milestone D is green only if:
     `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
     `docs/LOOP_ARCHITECTURE.md`
 - Evidence:
-  - not started
+  - confirmed the settled Phase 3 scope, retrieval baseline, self-model
+    precedence, and backlog-aware recovery activation rules already recorded in
+    this document against `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`,
+    `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
+    `docs/LOOP_ARCHITECTURE.md` on 2026-04-06 before implementation started
 
 ### Task P3-02: Extend runtime config for retrieval and backlog-aware recovery
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-01`
 - Parallel-safe: no
 - Deliverables:
@@ -517,16 +522,20 @@ Milestone D is green only if:
   - unit tests for config parsing and validation
   - failed startup on invalid Phase 3 settings
 - Evidence:
-  - not started
+  - updated `crates/harness/src/config.rs`, `crates/harness/src/policy.rs`,
+    `crates/harness/src/self_model.rs`,
+    `crates/harness/tests/support/mod.rs`, and `config/default.toml`
+  - `cmd.exe /c cargo test -p harness config:: -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-03: Add reviewed SQL migration for canonical continuity tables
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-01`
 - Parallel-safe: no
 - Deliverables:
   - reviewed migration file
-    `migrations/0004__phase_3_continuity.sql`
+    `migrations/0004__canonical_continuity.sql`
   - canonical tables for proposals, merge decisions, long-term memory
     artifacts, self-model artifacts, and retrieval-layer records
   - indexes and constraints for provenance references, active-record lookup,
@@ -540,11 +549,15 @@ Milestone D is green only if:
   - reuse the existing `episodes`, `episode_messages`, and `ingress_events`
     baseline where possible rather than introducing duplicate continuity tables
 - Evidence:
-  - not started
+  - added `migrations/0004__canonical_continuity.sql`
+  - updated `crates/harness/src/migration.rs` and
+    `crates/harness/tests/foundation_component.rs`
+  - `cmd.exe /c cargo test -p harness migration:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foundation_component migration_application_creates_foundation_and_foreground_tables -- --nocapture`
 
 ### Task P3-04: Implement harness persistence services for canonical continuity state
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-03`
 - Parallel-safe: no
 - Deliverables:
@@ -561,11 +574,16 @@ Milestone D is green only if:
     persistence, and retrieval-layer persistence stop fitting one coherent
     storage pass
 - Evidence:
-  - not started
+  - added `crates/harness/src/continuity.rs`,
+    `crates/harness/tests/continuity_component.rs`, and
+    `crates/harness/src/lib.rs`
+  - `cmd.exe /c cargo test -p harness continuity:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-05: Define canonical Phase 3 contracts
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-01`
 - Parallel-safe: yes
 - Deliverables:
@@ -580,11 +598,18 @@ Milestone D is green only if:
   - manual review that contract names are capability-based rather than
     phase-labeled
 - Evidence:
-  - not started
+  - updated `crates/contracts/src/lib.rs`,
+    `crates/harness/src/context.rs`,
+    `crates/workers/src/main.rs`,
+    `crates/workers/tests/conscious_worker_cli.rs`, and
+    `crates/harness/tests/foreground_component.rs`
+  - `cmd.exe /c cargo test -p contracts -- --nocapture`
+  - `cmd.exe /c cargo test -p workers conscious_worker -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-06: Extend the conscious worker protocol for Phase 3 proposal outputs
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-05`
 - Parallel-safe: no
 - Deliverables:
@@ -597,11 +622,16 @@ Milestone D is green only if:
   - worker protocol tests
   - fakeable conscious-worker round-trip tests
 - Evidence:
-  - not started
+  - updated `crates/contracts/src/lib.rs`,
+    `crates/workers/src/main.rs`, and
+    `crates/workers/tests/conscious_worker_cli.rs`
+  - `cmd.exe /c cargo test -p workers conscious_worker -- --nocapture`
+  - `cmd.exe /c cargo test -p contracts -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-07: Implement harness-side proposal validation and merge decision recording
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-04`, `P3-05`
 - Parallel-safe: no
 - Deliverables:
@@ -617,11 +647,17 @@ Milestone D is green only if:
   - likely split point if pure validation logic and merge-recording plus audit
     integration need to land separately
 - Evidence:
-  - not started
+  - added `crates/harness/src/proposal.rs`
+  - updated `crates/harness/src/lib.rs`,
+    `crates/harness/src/continuity.rs`, and
+    `crates/harness/tests/continuity_component.rs`
+  - `cmd.exe /c cargo test -p harness proposal:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-08: Implement canonical self-model bootstrap and read path
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-04`, `P3-07`
 - Parallel-safe: no
 - Deliverables:
@@ -635,11 +671,20 @@ Milestone D is green only if:
   - unit tests for bootstrap precedence and invalid-state handling
   - component tests with real PostgreSQL for seeded and already-canonical cases
 - Evidence:
-  - not started
+  - updated `crates/harness/src/self_model.rs`,
+    `crates/harness/src/context.rs`,
+    `crates/harness/src/foreground_orchestration.rs`,
+    `crates/harness/src/continuity.rs`,
+    `crates/harness/tests/continuity_component.rs`, and
+    `crates/harness/tests/foreground_component.rs`
+  - `cmd.exe /c cargo test -p harness self_model:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness context:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-09: Implement canonical long-term memory artifact merge rules
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-04`, `P3-07`
 - Parallel-safe: no
 - Deliverables:
@@ -652,11 +697,17 @@ Milestone D is green only if:
   - unit tests for supersession and temporal-validity decisions
   - component tests proving canonical active-artifact selection works
 - Evidence:
-  - not started
+  - added `crates/harness/src/memory.rs`
+  - updated `crates/harness/src/continuity.rs`,
+    `crates/harness/src/lib.rs`, and
+    `crates/harness/tests/continuity_component.rs`
+  - `cmd.exe /c cargo test -p harness memory:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-10: Implement the minimal canonical retrieval baseline for context assembly
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-02`, `P3-04`, `P3-08`, `P3-09`
 - Parallel-safe: no
 - Deliverables:
@@ -677,11 +728,18 @@ Milestone D is green only if:
   - likely split point if retrieval selection and ranking logic should land
     before the context-assembly integration
 - Evidence:
-  - not started
+  - added `crates/harness/src/retrieval.rs`
+  - updated `crates/harness/src/context.rs`,
+    `crates/harness/src/lib.rs`, and
+    `crates/harness/tests/foreground_component.rs`
+  - `cmd.exe /c cargo test -p harness retrieval:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component context_assembly_v0_loads_seed_and_bounded_recent_history -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component context_assembly_injects_retrieved_episode_and_memory_context -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-11: Integrate proposal emission and merge flow into normal foreground orchestration
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-06`, `P3-07`, `P3-08`, `P3-09`
 - Parallel-safe: no
 - Deliverables:
@@ -696,11 +754,21 @@ Milestone D is green only if:
   - likely split point if foreground proposal persistence should land before
     merge application and episode-finalization updates
 - Evidence:
-  - not started
+  - updated [crates/harness/src/foreground_orchestration.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground_orchestration.rs),
+    [crates/harness/src/memory.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/memory.rs),
+    [crates/harness/src/self_model.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/self_model.rs), and
+    [crates/harness/tests/foreground_component.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/foreground_component.rs)
+    to persist worker-emitted proposals, execute canonical merges, update
+    episode completion summaries with proposal outcomes, and emit canonical
+    write audit events only for accepted writes
+  - `cmd.exe /c cargo test -p harness --test foreground_component foreground_orchestration_runs_from_ingress_to_delivery -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component foreground_persistence_writes_bindings_and_ingress_events -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-12: Implement pending-ingress backlog detection and recovery trigger shaping
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-02`, `P3-03`, `P3-05`
 - Parallel-safe: no
 - Deliverables:
@@ -714,11 +782,23 @@ Milestone D is green only if:
   - unit tests for threshold and routing decisions
   - component tests with real PostgreSQL for pending-ingress selection
 - Evidence:
-  - not started
+  - updated [crates/harness/src/foreground.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground.rs),
+    [crates/harness/src/foreground_orchestration.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground_orchestration.rs), and
+    [crates/harness/tests/foreground_component.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/foreground_component.rs)
+    with backlog-aware pending-ingress planning, threshold evaluation,
+    `execution_ingress_links` persistence, ingress foreground-state transitions,
+    and recovery-mode audit emission
+  - `cmd.exe /c cargo test -p harness foreground:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component pending_foreground_execution_switches_to_backlog_recovery_and_links_selected_ingress -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component pending_foreground_execution_stays_single_when_backlog_threshold_is_not_met -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component foreground_orchestration_runs_from_ingress_to_delivery -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component accepted_foreground_trigger_persists_execution_budget_and_audit -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component rejected_foreground_trigger_persists_rejection_and_audit -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-13: Implement recovery-aware foreground context assembly and batched reply flow
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-06`, `P3-10`, `P3-12`
 - Parallel-safe: no
 - Deliverables:
@@ -735,11 +815,21 @@ Milestone D is green only if:
   - likely split point if backlog-aware context shaping should land before the
     final batched reply orchestration path
 - Evidence:
-  - not started
+  - updated [crates/harness/src/context.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/context.rs),
+    [crates/harness/src/foreground.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground.rs),
+    [crates/harness/src/foreground_orchestration.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground_orchestration.rs), and
+    [crates/harness/tests/foreground_component.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/foreground_component.rs)
+    to carry recovery context through context assembly, load persisted ingress
+    into planned execution, run one batched backlog-aware foreground episode,
+    and mark every selected ingress processed after one reply
+  - `cmd.exe /c cargo test -p harness context:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component planned_foreground_orchestration_processes_backlog_batch_with_single_reply -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component foreground_orchestration_runs_from_ingress_to_delivery -- --nocapture`
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-14: Extend runtime Telegram execution paths for backlog-aware processing
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-02`, `P3-11`, `P3-12`, `P3-13`
 - Parallel-safe: no
 - Deliverables:
@@ -753,11 +843,22 @@ Milestone D is green only if:
   - fixture-driven runtime checks using a multi-message backlog scenario
   - manual review that Telegram adapter files do not own Phase 3 recovery policy
 - Evidence:
-  - not started
+  - updated [crates/harness/src/runtime.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/runtime.rs),
+    [crates/harness/src/foreground.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground.rs),
+    [crates/harness/tests/foreground_integration.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/foreground_integration.rs), and
+    [crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json](/mnt/d/Repos/blue-lagoon/crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json)
+    to stage accepted Telegram ingress, plan one execution per conversation,
+    route fixture/runtime batches through the planned foreground path, and
+    expose backlog recovery activation in runtime summaries
+  - `cmd.exe /c cargo test -p harness --test foreground_integration telegram_fixture_runtime_run_persists_response_and_trace_linked_audit -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_integration telegram_fixture_runtime_batch_activates_backlog_recovery -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_integration telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited -- --nocapture`
+  - manual review confirmed the Telegram adapter in [crates/harness/src/telegram.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/telegram.rs) remains transport-only while recovery decisions live in [crates/harness/src/runtime.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/runtime.rs) and [crates/harness/src/foreground.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground.rs)
+  - `cmd.exe /c cargo fmt --all --check`
 
 ### Task P3-15: Add unit coverage for proposal, merge, retrieval, and backlog policy logic
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-07`, `P3-09`, `P3-10`, `P3-12`
 - Parallel-safe: no
 - Deliverables:
@@ -768,11 +869,18 @@ Milestone D is green only if:
 - Verification:
   - `cargo test` at the smallest relevant crate or module scope
 - Evidence:
-  - not started
+  - unit coverage is present in [crates/harness/src/proposal.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/proposal.rs),
+    [crates/harness/src/memory.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/memory.rs),
+    [crates/harness/src/retrieval.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/retrieval.rs), and
+    [crates/harness/src/foreground.rs](/mnt/d/Repos/blue-lagoon/crates/harness/src/foreground.rs)
+  - `cmd.exe /c cargo test -p harness proposal:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness memory:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness retrieval:: -- --nocapture`
+  - `cmd.exe /c cargo test -p harness foreground:: -- --nocapture`
 
 ### Task P3-16: Add PostgreSQL-backed component coverage for canonical continuity services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-11`, `P3-13`
 - Parallel-safe: no
 - Deliverables:
@@ -786,11 +894,17 @@ Milestone D is green only if:
 - Verification:
   - disposable PostgreSQL component suites under the harness test support
 - Evidence:
-  - not started
+  - component coverage is present in [crates/harness/tests/continuity_component.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/continuity_component.rs) and
+    [crates/harness/tests/foreground_component.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/foreground_component.rs)
+    for proposal persistence, merge history, canonical self-model bootstrap/read,
+    retrieval-backed context assembly, and pending-ingress backlog linkage
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component pending_foreground_execution_switches_to_backlog_recovery_and_links_selected_ingress -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component planned_foreground_orchestration_processes_backlog_batch_with_single_reply -- --nocapture`
 
 ### Task P3-17: Add architecture-critical integration tests for Phase 3 continuity flows
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-14`, `P3-16`
 - Parallel-safe: no
 - Deliverables:
@@ -806,11 +920,19 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test continuity_integration -- --nocapture`
 - Evidence:
-  - not started
+  - added [crates/harness/tests/continuity_integration.rs](/mnt/d/Repos/blue-lagoon/crates/harness/tests/continuity_integration.rs)
+    plus the supporting fixtures
+    [crates/harness/tests/fixtures/telegram/private_preference_message.json](/mnt/d/Repos/blue-lagoon/crates/harness/tests/fixtures/telegram/private_preference_message.json),
+    [crates/harness/tests/fixtures/telegram/private_preference_followup.json](/mnt/d/Repos/blue-lagoon/crates/harness/tests/fixtures/telegram/private_preference_followup.json), and
+    [crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json](/mnt/d/Repos/blue-lagoon/crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json)
+    for proposal-to-merge-to-later-retrieval, self-model carry-forward, and
+    backlog-aware recovery integration coverage
+  - `cmd.exe /c cargo test -p harness --test continuity_integration -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_integration -- --nocapture`
 
 ### Task P3-18: Extend repository CI and canonical docs for the Phase 3 gate
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P3-15`, `P3-16`, `P3-17`
 - Parallel-safe: no
 - Deliverables:
@@ -829,4 +951,29 @@ Milestone D is green only if:
     `canonical-persistence`
   - successful local verification of the documented Phase 3 command set
 - Evidence:
-  - not started
+  - updated [`.github/workflows/ci.yml`](/mnt/d/Repos/blue-lagoon/.github/workflows/ci.yml)
+    to preserve `workspace-verification` as the fast baseline gate and add the
+    PostgreSQL-backed `foreground-runtime` and `canonical-persistence` jobs
+    with the Phase 3 suite split defined by this plan
+  - updated
+    [`docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`](/mnt/d/Repos/blue-lagoon/docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md)
+    to mark Phase 3 complete and Phase 4 as the active next phase
+  - updated
+    [`docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`](/mnt/d/Repos/blue-lagoon/docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md)
+    to record the completed Phase 3 ledger, evidence, and milestone state
+  - manual review confirmed the workflow exposes the intended stable gate names
+    `workspace-verification`, `foreground-runtime`, and
+    `canonical-persistence`
+  - manual review confirmed the gate-to-suite mapping avoids unnecessary
+    duplicate execution by keeping format, check, clippy, and library-unit
+    coverage in `workspace-verification`, foreground runtime regression suites
+    in `foreground-runtime`, and canonical continuity suites in
+    `canonical-persistence`
+  - `cmd.exe /c cargo fmt --all --check`
+  - `cmd.exe /c cargo check --workspace`
+  - `cmd.exe /c cargo clippy --workspace --all-targets -- -D warnings`
+  - `cmd.exe /c cargo test --workspace --lib -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_component -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test foreground_integration -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_component -- --nocapture`
+  - `cmd.exe /c cargo test -p harness --test continuity_integration -- --nocapture`

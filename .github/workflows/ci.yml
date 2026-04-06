@@ -15,6 +15,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo check --workspace
+        run: cargo check --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace --lib
+        run: cargo test --workspace --lib -- --nocapture
+
+  foreground-runtime:
+    name: foreground-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - workspace-verification
+    env:
       BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@localhost:5432/blue_lagoon
       CARGO_TERM_COLOR: always
     services:
@@ -37,20 +69,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt --all --check
-        run: cargo fmt --all --check
-
-      - name: cargo check --workspace
-        run: cargo check --workspace
-
-      - name: cargo build -p workers
-        run: cargo build -p workers
 
       - name: cargo test -p harness --test foreground_component -- --nocapture
         run: cargo test -p harness --test foreground_component -- --nocapture
@@ -58,5 +79,41 @@ jobs:
       - name: cargo test -p harness --test foreground_integration -- --nocapture
         run: cargo test -p harness --test foreground_integration -- --nocapture
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+  canonical-persistence:
+    name: canonical-persistence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - workspace-verification
+    env:
+      BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@localhost:5432/blue_lagoon
+      CARGO_TERM_COLOR: always
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: blue_lagoon
+          POSTGRES_USER: blue_lagoon
+          POSTGRES_PASSWORD: blue_lagoon
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blue_lagoon -d blue_lagoon"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -p harness --test continuity_component -- --nocapture
+        run: cargo test -p harness --test continuity_component -- --nocapture
+
+      - name: cargo test -p harness --test continuity_integration -- --nocapture
+        run: cargo test -p harness --test continuity_integration -- --nocapture

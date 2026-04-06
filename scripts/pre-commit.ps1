@@ -21,7 +21,21 @@ Invoke-Step "cargo check --workspace" { cargo check --workspace }
 Invoke-Step "cargo clippy --workspace --all-targets -- -D warnings" {
     cargo clippy --workspace --all-targets -- -D warnings
 }
-Invoke-Step "cargo test --workspace" { cargo test --workspace }
+Invoke-Step "cargo test --workspace --lib -- --nocapture" {
+    cargo test --workspace --lib -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_component -- --nocapture" {
+    cargo test -p harness --test foreground_component -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_integration -- --nocapture" {
+    cargo test -p harness --test foreground_integration -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test continuity_component -- --nocapture" {
+    cargo test -p harness --test continuity_component -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test continuity_integration -- --nocapture" {
+    cargo test -p harness --test continuity_integration -- --nocapture
+}
 
 if (Get-Command markdownlint -ErrorAction SilentlyContinue) {
     Write-Host ""

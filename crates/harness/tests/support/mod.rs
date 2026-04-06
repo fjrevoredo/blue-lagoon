@@ -142,6 +142,19 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
             default_wall_clock_budget_ms: 30_000,
             default_foreground_token_budget: 4_000,
         },
+        continuity: harness::config::ContinuityConfig {
+            retrieval: harness::config::RetrievalConfig {
+                max_recent_episode_candidates: 3,
+                max_memory_artifact_candidates: 5,
+                max_context_items: 6,
+            },
+            backlog_recovery: harness::config::BacklogRecoveryConfig {
+                pending_message_count_threshold: 3,
+                pending_message_span_seconds_threshold: 120,
+                stale_pending_ingress_age_seconds_threshold: 300,
+                max_recovery_batch_size: 8,
+            },
+        },
         worker: harness::config::WorkerConfig {
             timeout_ms: 20_000,
             command: String::new(),
