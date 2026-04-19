@@ -117,6 +117,8 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning and execution evidence for Phase 3 lives in
   `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
+- Detailed planning for Phase 4 now lives in
+  `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
   gating, worker subprocess execution, and a verified synthetic trigger path
@@ -481,6 +483,11 @@ That Phase 3 document should stay subordinate to this one. It should add
 execution detail, not re-open the high-level architectural sequence without an
 explicit decision.
 
-Once Phase 3 is complete, the next planning step should be the detailed
-implementation plan for Phase 4, focused on the unconscious loop, bounded
-background maintenance, and wake-signal production and evaluation.
+With Phase 3 complete, detailed planning for Phase 4 now lives in
+`docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`, focused on the unconscious
+loop, bounded background maintenance, and wake-signal production and
+evaluation.
+
+Once Phase 4 is complete, the next planning step should be the detailed
+implementation plan for Phase 5, focused on governed tool execution, workspace
+boundaries, approvals, and policy re-check behavior.
