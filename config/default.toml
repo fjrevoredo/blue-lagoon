@@ -11,6 +11,26 @@ default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 60000
 default_foreground_token_budget = 4000
 
+[background.scheduler]
+poll_interval_seconds = 300
+max_due_jobs_per_iteration = 4
+lease_timeout_ms = 300000
+
+[background.thresholds]
+episode_backlog_threshold = 25
+candidate_memory_threshold = 10
+contradiction_alert_threshold = 3
+
+[background.execution]
+default_iteration_budget = 2
+default_wall_clock_budget_ms = 120000
+default_token_budget = 6000
+
+[background.wake_signals]
+allow_foreground_conversion = true
+max_pending_signals = 8
+cooldown_seconds = 900
+
 [continuity.retrieval]
 max_recent_episode_candidates = 3
 max_memory_artifact_candidates = 5

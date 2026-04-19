@@ -17,6 +17,7 @@ pub struct RuntimeConfig {
     pub app: AppConfig,
     pub database: DatabaseConfig,
     pub harness: HarnessConfig,
+    pub background: BackgroundConfig,
     pub continuity: ContinuityConfig,
     pub worker: WorkerConfig,
     pub telegram: Option<TelegramConfig>,
@@ -42,6 +43,42 @@ pub struct HarnessConfig {
     pub default_foreground_iteration_budget: u32,
     pub default_wall_clock_budget_ms: u64,
     pub default_foreground_token_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundConfig {
+    pub scheduler: BackgroundSchedulerConfig,
+    pub thresholds: BackgroundThresholdsConfig,
+    pub execution: BackgroundExecutionConfig,
+    pub wake_signals: WakeSignalPolicyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundSchedulerConfig {
+    pub poll_interval_seconds: u64,
+    pub max_due_jobs_per_iteration: u32,
+    pub lease_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundThresholdsConfig {
+    pub episode_backlog_threshold: u32,
+    pub candidate_memory_threshold: u32,
+    pub contradiction_alert_threshold: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundExecutionConfig {
+    pub default_iteration_budget: u32,
+    pub default_wall_clock_budget_ms: u64,
+    pub default_token_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WakeSignalPolicyConfig {
+    pub allow_foreground_conversion: bool,
+    pub max_pending_signals: u32,
+    pub cooldown_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -161,6 +198,7 @@ struct FileConfig {
     app: AppConfig,
     database: FileDatabaseConfig,
     harness: HarnessConfig,
+    background: BackgroundConfig,
     continuity: ContinuityConfig,
     worker: WorkerConfig,
     #[serde(default)]
@@ -235,6 +273,7 @@ impl RuntimeConfig {
                     .minimum_supported_schema_version,
             },
             harness: file_config.harness,
+            background: file_config.background,
             continuity: file_config.continuity,
             worker: WorkerConfig {
                 timeout_ms: worker_timeout_ms,
@@ -269,6 +308,7 @@ impl RuntimeConfig {
         if self.harness.default_foreground_token_budget == 0 {
             bail!("harness.default_foreground_token_budget must be greater than zero");
         }
+        self.background.validate()?;
         self.continuity.validate()?;
         if self.worker.timeout_ms == 0 {
             bail!("worker.timeout_ms must be greater than zero");
@@ -549,6 +589,73 @@ impl ContinuityConfig {
     }
 }
 
+impl BackgroundConfig {
+    fn validate(&self) -> Result<()> {
+        self.scheduler.validate()?;
+        self.thresholds.validate()?;
+        self.execution.validate()?;
+        self.wake_signals.validate()?;
+        Ok(())
+    }
+}
+
+impl BackgroundSchedulerConfig {
+    fn validate(&self) -> Result<()> {
+        if self.poll_interval_seconds == 0 {
+            bail!("background.scheduler.poll_interval_seconds must be greater than zero");
+        }
+        if self.max_due_jobs_per_iteration == 0 {
+            bail!("background.scheduler.max_due_jobs_per_iteration must be greater than zero");
+        }
+        if self.lease_timeout_ms == 0 {
+            bail!("background.scheduler.lease_timeout_ms must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl BackgroundThresholdsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.episode_backlog_threshold == 0 {
+            bail!("background.thresholds.episode_backlog_threshold must be greater than zero");
+        }
+        if self.candidate_memory_threshold == 0 {
+            bail!("background.thresholds.candidate_memory_threshold must be greater than zero");
+        }
+        if self.contradiction_alert_threshold == 0 {
+            bail!("background.thresholds.contradiction_alert_threshold must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl BackgroundExecutionConfig {
+    fn validate(&self) -> Result<()> {
+        if self.default_iteration_budget == 0 {
+            bail!("background.execution.default_iteration_budget must be greater than zero");
+        }
+        if self.default_wall_clock_budget_ms == 0 {
+            bail!("background.execution.default_wall_clock_budget_ms must be greater than zero");
+        }
+        if self.default_token_budget == 0 {
+            bail!("background.execution.default_token_budget must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl WakeSignalPolicyConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_pending_signals == 0 {
+            bail!("background.wake_signals.max_pending_signals must be greater than zero");
+        }
+        if self.cooldown_seconds == 0 {
+            bail!("background.wake_signals.cooldown_seconds must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
 impl RetrievalConfig {
     fn validate(&self) -> Result<()> {
         if self.max_recent_episode_candidates == 0 {
@@ -704,6 +811,28 @@ mod tests {
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
             },
+            background: BackgroundConfig {
+                scheduler: BackgroundSchedulerConfig {
+                    poll_interval_seconds: 300,
+                    max_due_jobs_per_iteration: 4,
+                    lease_timeout_ms: 300_000,
+                },
+                thresholds: BackgroundThresholdsConfig {
+                    episode_backlog_threshold: 25,
+                    candidate_memory_threshold: 10,
+                    contradiction_alert_threshold: 3,
+                },
+                execution: BackgroundExecutionConfig {
+                    default_iteration_budget: 2,
+                    default_wall_clock_budget_ms: 120_000,
+                    default_token_budget: 6_000,
+                },
+                wake_signals: WakeSignalPolicyConfig {
+                    allow_foreground_conversion: true,
+                    max_pending_signals: 8,
+                    cooldown_seconds: 900,
+                },
+            },
             continuity: ContinuityConfig {
                 retrieval: RetrievalConfig {
                     max_recent_episode_candidates: 3,
@@ -767,6 +896,26 @@ allow_synthetic_smoke = true
 default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 30000
 default_foreground_token_budget = 4000
+
+[background.scheduler]
+poll_interval_seconds = 300
+max_due_jobs_per_iteration = 4
+lease_timeout_ms = 300000
+
+[background.thresholds]
+episode_backlog_threshold = 25
+candidate_memory_threshold = 10
+contradiction_alert_threshold = 3
+
+[background.execution]
+default_iteration_budget = 2
+default_wall_clock_budget_ms = 120000
+default_token_budget = 6000
+
+[background.wake_signals]
+allow_foreground_conversion = true
+max_pending_signals = 8
+cooldown_seconds = 900
 
 [continuity.retrieval]
 max_recent_episode_candidates = 3
@@ -935,6 +1084,59 @@ args = []
         config.continuity.retrieval.max_context_items = 0;
         let error = config.validate().expect_err("config should be rejected");
         assert!(error.to_string().contains("max_context_items"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_background_settings() {
+        let mut config = sample_config();
+        config.background.scheduler.poll_interval_seconds = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("background.scheduler.poll_interval_seconds")
+        );
+
+        let mut config = sample_config();
+        config.background.execution.default_iteration_budget = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("background.execution.default_iteration_budget")
+        );
+
+        let mut config = sample_config();
+        config.background.wake_signals.max_pending_signals = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("background.wake_signals.max_pending_signals")
+        );
+    }
+
+    #[test]
+    fn load_reads_background_sections_from_file_config() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(minimal_file_config(), None, None);
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+        }
+
+        let loaded =
+            RuntimeConfig::load_from_root(&temp_root).expect("config should load from file");
+        assert_eq!(loaded.background.scheduler.poll_interval_seconds, 300);
+        assert_eq!(loaded.background.scheduler.max_due_jobs_per_iteration, 4);
+        assert_eq!(loaded.background.execution.default_token_budget, 6_000);
+        assert!(loaded.background.wake_signals.allow_foreground_conversion);
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

@@ -343,9 +343,9 @@ When a task is completed:
 ## Progress snapshot
 
 - Current milestone: `Milestone A`
-- Current active task: `none (planning baseline only)`
-- Completed tasks: `0/18`
-- Milestone A status: `TODO`
+- Current active task: `P4-03`
+- Completed tasks: `4/18`
+- Milestone A status: `IN PROGRESS`
 - Milestone B status: `TODO`
 - Milestone C status: `TODO`
 - Milestone D status: `TODO`
@@ -479,7 +479,7 @@ Milestone D is green only if:
 
 ### Task P4-01: Lock the Phase 4 unconscious-loop slice boundary
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
@@ -494,11 +494,15 @@ Milestone D is green only if:
     `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
     `docs/LOOP_ARCHITECTURE.md`
 - Evidence:
-  - not started
+  - confirmed the settled Phase 4 scope, trigger posture, wake-signal posture,
+    and Phase 6 recovery deferrals already recorded in this document against
+    `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`,
+    `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
+    `docs/LOOP_ARCHITECTURE.md` on 2026-04-19 before implementation started
 
 ### Task P4-02: Extend runtime config for background scheduling and wake policy
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-01`
 - Parallel-safe: no
 - Deliverables:
@@ -511,7 +515,13 @@ Milestone D is green only if:
   - unit tests for config parsing and validation
   - failed startup on invalid Phase 4 settings
 - Evidence:
-  - not started
+  - updated `crates/harness/src/config.rs`,
+    `crates/harness/src/policy.rs`,
+    `crates/harness/src/self_model.rs`,
+    `crates/harness/tests/support/mod.rs`, and `config/default.toml`
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --lib -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-03: Add reviewed SQL migration for background scheduling state
 
@@ -556,7 +566,7 @@ Milestone D is green only if:
 
 ### Task P4-05: Define canonical Phase 4 contracts
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-01`
 - Parallel-safe: yes
 - Deliverables:
@@ -570,11 +580,14 @@ Milestone D is green only if:
   - manual review that contract names are capability-based rather than
     phase-labeled
 - Evidence:
-  - not started
+  - updated `crates/contracts/src/lib.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p contracts -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-06: Extend the worker protocol for unconscious execution
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-05`
 - Parallel-safe: no
 - Deliverables:
@@ -587,7 +600,13 @@ Milestone D is green only if:
   - worker protocol tests
   - fakeable unconscious-worker round-trip tests
 - Evidence:
-  - not started
+  - updated `crates/workers/src/main.rs`,
+    `crates/workers/tests/conscious_worker_cli.rs`,
+    `crates/workers/tests/smoke_worker_cli.rs`, and
+    `crates/workers/tests/unconscious_worker_cli.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p workers -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-07: Implement harness-side background trigger validation and job planning
 

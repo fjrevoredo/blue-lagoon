@@ -283,6 +283,7 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
     let result_summary = match &response.result {
         WorkerResult::Smoke(result) => result.summary.clone(),
         WorkerResult::Conscious(result) => result.episode_summary.summary.clone(),
+        WorkerResult::Unconscious(result) => result.summary.clone(),
         WorkerResult::Error(error) => error.message.clone(),
     };
 

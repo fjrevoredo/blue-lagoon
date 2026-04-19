@@ -386,8 +386,10 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AppConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, HarnessConfig,
-        RetrievalConfig, SelfModelConfig, TelegramConfig, WorkerConfig,
+        AppConfig, BackgroundConfig, BackgroundExecutionConfig, BackgroundSchedulerConfig,
+        BackgroundThresholdsConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig,
+        HarnessConfig, RetrievalConfig, SelfModelConfig, TelegramConfig, WakeSignalPolicyConfig,
+        WorkerConfig,
     };
     use uuid::Uuid;
 
@@ -406,6 +408,28 @@ mod tests {
                 default_foreground_iteration_budget: 1,
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
+            },
+            background: BackgroundConfig {
+                scheduler: BackgroundSchedulerConfig {
+                    poll_interval_seconds: 300,
+                    max_due_jobs_per_iteration: 4,
+                    lease_timeout_ms: 300_000,
+                },
+                thresholds: BackgroundThresholdsConfig {
+                    episode_backlog_threshold: 25,
+                    candidate_memory_threshold: 10,
+                    contradiction_alert_threshold: 3,
+                },
+                execution: BackgroundExecutionConfig {
+                    default_iteration_budget: 2,
+                    default_wall_clock_budget_ms: 120_000,
+                    default_token_budget: 6_000,
+                },
+                wake_signals: WakeSignalPolicyConfig {
+                    allow_foreground_conversion: true,
+                    max_pending_signals: 8,
+                    cooldown_seconds: 900,
+                },
             },
             continuity: ContinuityConfig {
                 retrieval: RetrievalConfig {
