@@ -35,6 +35,8 @@ enum WorkerCommand {
     Conscious,
     #[command(name = "unconscious-worker")]
     Unconscious,
+    #[command(name = "wrong-result-worker", hide = true)]
+    WrongResult,
     #[command(name = "stall-worker", hide = true)]
     Stall {
         #[arg(long)]
@@ -50,6 +52,7 @@ fn main() -> Result<()> {
         WorkerCommand::Smoke => run_smoke_worker(),
         WorkerCommand::Conscious => run_conscious_worker(),
         WorkerCommand::Unconscious => run_unconscious_worker(),
+        WorkerCommand::WrongResult => run_wrong_result_worker(),
         WorkerCommand::Stall { sleep_ms, pid_file } => run_stall_worker(sleep_ms, pid_file),
     }
 }
@@ -83,6 +86,57 @@ fn run_stall_worker(sleep_ms: u64, pid_file: Option<PathBuf>) -> Result<()> {
             .context("failed to write stall-worker pid file")?;
     }
     std::thread::sleep(Duration::from_millis(sleep_ms));
+    Ok(())
+}
+
+fn run_wrong_result_worker() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
+    let Some(request_line) = lines.next() else {
+        write_json_line(
+            &mut handle,
+            &ConsciousWorkerOutboundMessage::FinalResponse(error_response(
+                WorkerErrorCode::InvalidRequest,
+                "missing worker request on stdin".to_string(),
+            )),
+        )?;
+        return Ok(());
+    };
+
+    let request = match serde_json::from_str::<WorkerRequest>(
+        &request_line.context("failed to read wrong-result worker request line")?,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            write_json_line(
+                &mut handle,
+                &ConsciousWorkerOutboundMessage::FinalResponse(error_response(
+                    WorkerErrorCode::InvalidRequest,
+                    format!("invalid worker request: {error}"),
+                )),
+            )?;
+            return Ok(());
+        }
+    };
+
+    write_json_line(
+        &mut handle,
+        &ConsciousWorkerOutboundMessage::FinalResponse(WorkerResponse {
+            request_id: request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            finished_at: chrono::Utc::now(),
+            worker_pid: std::process::id(),
+            result: WorkerResult::Smoke(SmokeWorkerResult {
+                status: "completed".to_string(),
+                summary: "wrong-result worker intentionally returned a mismatched payload"
+                    .to_string(),
+            }),
+        }),
+    )?;
     Ok(())
 }
 

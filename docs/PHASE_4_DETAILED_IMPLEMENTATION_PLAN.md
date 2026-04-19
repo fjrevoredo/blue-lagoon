@@ -343,8 +343,8 @@ When a task is completed:
 ## Progress snapshot
 
 - Current milestone: `Milestone B`
-- Current active task: `P4-08`
-- Completed tasks: `7/18`
+- Current active task: `P4-09`
+- Completed tasks: `8/18`
 - Milestone A status: `DONE`
 - Milestone B status: `IN PROGRESS`
 - Milestone C status: `TODO`
@@ -650,7 +650,7 @@ Milestone D is green only if:
 
 ### Task P4-08: Implement due-job selection, leasing, and bounded execution coordination
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-04`, `P4-06`, `P4-07`
 - Parallel-safe: no
 - Deliverables:
@@ -666,7 +666,18 @@ Milestone D is green only if:
   - likely split point if due-job selection and worker coordination evolve at
     different speeds
 - Evidence:
-  - not started
+  - added `crates/harness/src/background_execution.rs`
+  - updated `crates/harness/src/background.rs`,
+    `crates/harness/src/lib.rs`,
+    `crates/harness/src/model_gateway.rs`,
+    `crates/harness/src/worker.rs`,
+    `crates/harness/tests/unconscious_component.rs`, and
+    `crates/workers/src/main.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --lib -- --nocapture`
+  - `cargo test -p workers -- --nocapture`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-09: Implement the first memory consolidation maintenance job
 

@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod background;
+pub mod background_execution;
 pub mod background_planning;
 pub mod config;
 pub mod context;

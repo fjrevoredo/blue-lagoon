@@ -10,15 +10,19 @@ use contracts::{
 use harness::{
     audit,
     background::{self, BackgroundJobRunStatus, BackgroundJobStatus, WakeSignalStatus},
+    background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
+    config::{ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig},
     continuity,
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
     migration,
+    model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
 };
 use serde_json::json;
 use serial_test::serial;
 use sqlx::Row;
+use std::{fs, process::Command, time::Duration as StdDuration};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -482,6 +486,235 @@ async fn background_planning_rejects_recognized_but_unsupported_trigger_kinds() 
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn background_execution_leases_due_job_and_creates_execution_state() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let background_job_id = seed_planned_background_job(&ctx.pool, Utc::now()).await?;
+
+        let leased = background_execution::lease_next_due_job(&ctx.pool, &ctx.config, Utc::now())
+            .await?
+            .expect("expected a due background job to be leased");
+
+        assert_eq!(leased.job.background_job_id, background_job_id);
+        assert_eq!(leased.job.status, BackgroundJobStatus::Leased);
+
+        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
+        assert_eq!(stored_job.status, BackgroundJobStatus::Leased);
+        assert!(stored_job.lease_expires_at.is_some());
+
+        let stored_run = background::get_job_run(&ctx.pool, leased.background_job_run_id).await?;
+        assert_eq!(stored_run.status, BackgroundJobRunStatus::Leased);
+        assert_eq!(stored_run.execution_id, Some(leased.execution_id));
+
+        let execution = execution::get(&ctx.pool, leased.execution_id).await?;
+        assert_eq!(execution.status, "started");
+        assert!(execution.completed_at.is_none());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_completes_due_job_and_records_audit_history() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+
+        let background_job_id = seed_planned_background_job(&ctx.pool, Utc::now()).await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "maintenance lexical summary" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        assert!(outcome.summary.contains("memory_consolidation"));
+
+        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
+        assert_eq!(stored_job.status, BackgroundJobStatus::Completed);
+        assert!(stored_job.last_started_at.is_some());
+        assert!(stored_job.last_completed_at.is_some());
+        assert!(stored_job.lease_expires_at.is_none());
+
+        let stored_run = background::get_job_run(&ctx.pool, outcome.background_job_run_id).await?;
+        assert_eq!(stored_run.status, BackgroundJobRunStatus::Completed);
+        assert_eq!(stored_run.execution_id, Some(outcome.execution_id));
+        assert!(stored_run.result_payload.is_some());
+        assert!(stored_run.failure_payload.is_none());
+
+        let execution = execution::get(&ctx.pool, outcome.execution_id).await?;
+        assert_eq!(execution.status, "completed");
+        assert_eq!(execution.worker_pid, Some(outcome.worker_pid as i32));
+
+        let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_started")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_completed")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_times_out_and_marks_run_timed_out() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let pid_file =
+            std::env::temp_dir().join(format!("blue-lagoon-unconscious-{}.pid", Uuid::now_v7()));
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec![
+            "stall-worker".to_string(),
+            "--sleep-ms".to_string(),
+            "5000".to_string(),
+            "--pid-file".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        config.worker.timeout_ms = 100;
+
+        let background_job_id = seed_planned_background_job(&ctx.pool, Utc::now()).await?;
+        let error = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &FakeModelProviderTransport::new(),
+            Utc::now(),
+        )
+        .await
+        .expect_err("timed-out background execution should fail");
+        assert!(error.to_string().contains("timed out"));
+
+        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
+        assert_eq!(stored_job.status, BackgroundJobStatus::Failed);
+
+        let completed_runs =
+            background::list_completed_job_runs(&ctx.pool, background_job_id, 5).await?;
+        assert_eq!(completed_runs.len(), 1);
+        assert_eq!(completed_runs[0].status, BackgroundJobRunStatus::TimedOut);
+        let execution_id = completed_runs[0]
+            .execution_id
+            .expect("timed-out run should retain execution linkage");
+
+        let execution = execution::get(&ctx.pool, execution_id).await?;
+        assert_eq!(execution.status, "failed");
+        assert!(
+            execution
+                .response_payload
+                .as_ref()
+                .and_then(|payload| payload.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "worker_timeout")
+        );
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_started")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_timed_out")
+        );
+
+        let pid = read_pid_file(&pid_file).await?;
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        assert!(
+            !process_is_running(pid),
+            "timed-out unconscious worker process {pid} should have been terminated"
+        );
+        let _ = fs::remove_file(pid_file);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_rejects_mismatched_worker_result_payloads() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["wrong-result-worker".to_string()];
+
+        let background_job_id = seed_planned_background_job(&ctx.pool, Utc::now()).await?;
+        let error = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &FakeModelProviderTransport::new(),
+            Utc::now(),
+        )
+        .await
+        .expect_err("mismatched worker result should fail closed");
+        assert!(error.to_string().contains("non-unconscious result payload"));
+
+        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
+        assert_eq!(stored_job.status, BackgroundJobStatus::Failed);
+
+        let completed_runs =
+            background::list_completed_job_runs(&ctx.pool, background_job_id, 5).await?;
+        assert_eq!(completed_runs.len(), 1);
+        assert_eq!(completed_runs[0].status, BackgroundJobRunStatus::Failed);
+        let execution_id = completed_runs[0]
+            .execution_id
+            .expect("failed run should retain execution linkage");
+
+        let execution = execution::get(&ctx.pool, execution_id).await?;
+        assert_eq!(execution.status, "failed");
+        assert!(
+            execution
+                .response_payload
+                .as_ref()
+                .and_then(|payload| payload.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "worker_failure")
+        );
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_failed")
+        );
+        Ok(())
+    })
+    .await
+}
+
 fn sample_trigger(kind: BackgroundTriggerKind, reason_summary: &str) -> BackgroundTrigger {
     BackgroundTrigger {
         trigger_id: Uuid::now_v7(),
@@ -647,4 +880,82 @@ async fn count_background_jobs(pool: &sqlx::PgPool) -> Result<i64> {
         .fetch_one(pool)
         .await?;
     Ok(count)
+}
+
+async fn seed_planned_background_job(
+    pool: &sqlx::PgPool,
+    available_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Uuid> {
+    let trace_id = Uuid::now_v7();
+    let background_job_id = Uuid::now_v7();
+    background::insert_job(
+        pool,
+        &background::NewBackgroundJob {
+            background_job_id,
+            trace_id,
+            job_kind: UnconsciousJobKind::MemoryConsolidation,
+            trigger: sample_trigger(BackgroundTriggerKind::TimeSchedule, "scheduled maintenance"),
+            deduplication_key: format!("job:memory:scheduled:{background_job_id}"),
+            scope: sample_scope("maintenance scope"),
+            budget: sample_budget(),
+            status: BackgroundJobStatus::Planned,
+            available_at,
+            lease_expires_at: None,
+            last_started_at: None,
+            last_completed_at: None,
+        },
+    )
+    .await?;
+    Ok(background_job_id)
+}
+
+fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
+    ResolvedModelGatewayConfig {
+        foreground: ResolvedForegroundModelRouteConfig {
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-background".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "test-key".to_string(),
+            timeout_ms: 20_000,
+        },
+    }
+}
+
+async fn read_pid_file(path: &std::path::Path) -> Result<u32> {
+    for _ in 0..20 {
+        match fs::read_to_string(path) {
+            Ok(contents) => return Ok(contents.trim().parse()?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    anyhow::bail!("worker pid file was never created")
+}
+
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        let output = Command::new("tasklist")
+            .args(["/FI", &filter])
+            .output()
+            .expect("tasklist should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains(&pid.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
 }

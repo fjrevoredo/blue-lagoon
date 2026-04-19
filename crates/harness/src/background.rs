@@ -6,7 +6,7 @@ use contracts::{
     WakeSignalReason,
 };
 use serde_json::Value;
-use sqlx::{Executor, PgPool, Postgres, Row};
+use sqlx::{Executor, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +389,73 @@ pub async fn list_due_jobs(
     rows.into_iter().map(decode_background_job_row).collect()
 }
 
+pub async fn lease_due_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    due_before_or_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
+) -> Result<Option<BackgroundJobRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            background_job_id,
+            trace_id,
+            job_kind,
+            trigger_id,
+            trigger_kind,
+            trigger_requested_at,
+            trigger_reason_summary,
+            trigger_payload_ref,
+            deduplication_key,
+            scope_json,
+            iteration_budget,
+            wall_clock_budget_ms,
+            token_budget,
+            status,
+            available_at,
+            lease_expires_at,
+            last_started_at,
+            last_completed_at,
+            created_at,
+            updated_at
+        FROM background_jobs
+        WHERE status = 'planned'
+          AND available_at <= $1
+        ORDER BY available_at ASC, created_at ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        "#,
+    )
+    .bind(due_before_or_at)
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("failed to select due background job for lease")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let mut job = decode_background_job_row(row)?;
+    sqlx::query(
+        r#"
+        UPDATE background_jobs
+        SET
+            status = 'leased',
+            lease_expires_at = $2,
+            updated_at = NOW()
+        WHERE background_job_id = $1
+        "#,
+    )
+    .bind(job.background_job_id)
+    .bind(lease_expires_at)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to lease background job")?;
+
+    job.status = BackgroundJobStatus::Leased;
+    job.lease_expires_at = Some(lease_expires_at);
+    Ok(Some(job))
+}
+
 pub async fn find_active_job_by_deduplication_key<'e, E>(
     executor: E,
     deduplication_key: &str,
@@ -434,11 +501,14 @@ where
     row.map(decode_background_job_row).transpose()
 }
 
-pub async fn update_job_status(
-    pool: &PgPool,
+pub async fn update_job_status<'e, E>(
+    executor: E,
     background_job_id: Uuid,
     update: &UpdateBackgroundJobStatus,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         UPDATE background_jobs
@@ -456,7 +526,7 @@ pub async fn update_job_status(
     .bind(update.lease_expires_at)
     .bind(update.last_started_at)
     .bind(update.last_completed_at)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to update background job status")?;
     Ok(())
@@ -635,11 +705,14 @@ pub async fn list_completed_job_runs(
         .collect()
 }
 
-pub async fn update_job_run_status(
-    pool: &PgPool,
+pub async fn update_job_run_status<'e, E>(
+    executor: E,
     background_job_run_id: Uuid,
     update: &UpdateBackgroundJobRunStatus,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         UPDATE background_job_runs
@@ -661,7 +734,7 @@ pub async fn update_job_run_status(
     .bind(update.completed_at)
     .bind(&update.result_payload)
     .bind(&update.failure_payload)
-    .execute(pool)
+    .execute(executor)
     .await
     .context("failed to update background job run status")?;
     Ok(())

@@ -223,6 +223,148 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
             error.message
         );
     }
+    if !matches!(response.result, WorkerResult::Conscious(_)) {
+        bail!("conscious worker returned a non-conscious result payload");
+    }
+    Ok(response)
+}
+
+pub async fn launch_unconscious_worker<T: ModelProviderTransport>(
+    config: &RuntimeConfig,
+    gateway: &ResolvedModelGatewayConfig,
+    request: &WorkerRequest,
+    transport: &T,
+) -> Result<WorkerResponse> {
+    launch_unconscious_worker_with_timeout(
+        config,
+        gateway,
+        request,
+        transport,
+        config.worker.timeout_ms,
+    )
+    .await
+}
+
+pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
+    config: &RuntimeConfig,
+    gateway: &ResolvedModelGatewayConfig,
+    request: &WorkerRequest,
+    transport: &T,
+    timeout_ms: u64,
+) -> Result<WorkerResponse> {
+    let command_spec = resolve_command(config, "unconscious-worker")?;
+    let mut command = Command::new(&command_spec.command);
+    command
+        .args(&command_spec.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn unconscious worker subprocess")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to take unconscious worker stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to take unconscious worker stdout")?;
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let mut stderr = stderr;
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        })
+    });
+    let mut stdout_lines = BufReader::new(stdout).lines();
+
+    let operation = async {
+        write_json_line(&mut stdin, request).await?;
+
+        let first_line = stdout_lines
+            .next_line()
+            .await
+            .context("failed to read unconscious worker model-request line")?
+            .context("unconscious worker exited before sending a protocol message")?;
+        let first_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&first_line)
+            .context("failed to decode first worker protocol message")?;
+
+        let model_request = match first_message {
+            ConsciousWorkerOutboundMessage::ModelCallRequest(model_request) => model_request,
+            ConsciousWorkerOutboundMessage::FinalResponse(response) => {
+                let status = child
+                    .wait()
+                    .await
+                    .context("unconscious worker failed while waiting for exit status")?;
+                return Ok((response, status));
+            }
+        };
+
+        let model_response =
+            model_gateway::execute_background_model_call(gateway, &model_request, transport)
+                .await
+                .context("unconscious worker model-call execution failed in the harness")?;
+        write_json_line(
+            &mut stdin,
+            &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),
+        )
+        .await?;
+        drop(stdin);
+
+        let final_line = stdout_lines
+            .next_line()
+            .await
+            .context("failed to read unconscious worker final-response line")?
+            .context("unconscious worker exited before sending a final response")?;
+        let final_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&final_line)
+            .context("failed to decode final worker protocol message")?;
+        let response = match final_message {
+            ConsciousWorkerOutboundMessage::ModelCallRequest(_) => {
+                bail!(
+                    "unconscious worker emitted more than one model-call request; background execution supports only one"
+                )
+            }
+            ConsciousWorkerOutboundMessage::FinalResponse(response) => response,
+        };
+
+        let status = child
+            .wait()
+            .await
+            .context("unconscious worker failed while waiting for exit status")?;
+        Ok((response, status))
+    };
+
+    let (response, status) = match timeout(Duration::from_millis(timeout_ms), operation).await {
+        Ok(result) => result?,
+        Err(_) => {
+            child
+                .start_kill()
+                .context("failed to terminate timed-out unconscious worker subprocess")?;
+            let _ = child.wait().await;
+            let _ = read_child_stream(stderr_task, "stderr").await;
+            bail!(
+                "unconscious worker subprocess timed out after {} ms and was terminated",
+                timeout_ms
+            );
+        }
+    };
+
+    let stderr = read_child_stream(stderr_task, "stderr").await?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        bail!("unconscious worker subprocess failed: {stderr}");
+    }
+    if let WorkerResult::Error(error) = &response.result {
+        bail!(
+            "unconscious worker returned an error response: {}",
+            error.message
+        );
+    }
+    if !matches!(response.result, WorkerResult::Unconscious(_)) {
+        bail!("unconscious worker returned a non-unconscious result payload");
+    }
     Ok(response)
 }
 

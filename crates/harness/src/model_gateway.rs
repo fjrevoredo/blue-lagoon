@@ -179,6 +179,24 @@ pub async fn execute_foreground_model_call<T: ModelProviderTransport>(
     transport: &T,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_foreground_request(request)?;
+    execute_model_call_unchecked(gateway, request, transport).await
+}
+
+pub async fn execute_background_model_call<T: ModelProviderTransport>(
+    gateway: &ResolvedModelGatewayConfig,
+    request: &ModelCallRequest,
+    transport: &T,
+) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
+    validate_background_request(request)?;
+    execute_model_call_unchecked(gateway, request, transport).await
+}
+
+async fn execute_model_call_unchecked<T: ModelProviderTransport>(
+    gateway: &ResolvedModelGatewayConfig,
+    request: &ModelCallRequest,
+    transport: &T,
+) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
+    validate_common_request(request)?;
     let route = resolve_foreground_route(gateway, request)?;
 
     match route.provider {
@@ -199,6 +217,28 @@ fn validate_foreground_request(
             "foreground model gateway supports only foreground-response requests".to_string(),
         ));
     }
+    Ok(())
+}
+
+fn validate_background_request(
+    request: &ModelCallRequest,
+) -> std::result::Result<(), ModelGatewayError> {
+    if request.loop_kind != LoopKind::Unconscious {
+        return Err(ModelGatewayError::Validation(
+            "background model gateway supports only unconscious-loop requests".to_string(),
+        ));
+    }
+    if request.purpose != ModelCallPurpose::BackgroundAnalysis {
+        return Err(ModelGatewayError::Validation(
+            "background model gateway supports only background-analysis requests".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_common_request(
+    request: &ModelCallRequest,
+) -> std::result::Result<(), ModelGatewayError> {
     if request.budget.max_input_tokens == 0 {
         return Err(ModelGatewayError::Validation(
             "model-call max_input_tokens must be greater than zero".to_string(),
@@ -528,6 +568,52 @@ mod tests {
                 .await
                 .expect_err("invalid request should fail");
         assert!(error.to_string().contains("messages"));
+    }
+
+    #[tokio::test]
+    async fn executes_background_call_through_same_route() {
+        let gateway = sample_gateway();
+        let mut request = sample_request();
+        request.loop_kind = LoopKind::Unconscious;
+        request.purpose = ModelCallPurpose::BackgroundAnalysis;
+        request.task_class = "memory_consolidation".to_string();
+        request.tool_policy = ToolPolicy::ProposalOnly;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "background summary" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+
+        let response = execute_background_model_call(&gateway, &request, &transport)
+            .await
+            .expect("background gateway call should succeed");
+
+        assert_eq!(response.output.text, "background summary");
+        assert_eq!(transport.seen_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_background_request_from_foreground_entrypoint() {
+        let gateway = sample_gateway();
+        let mut request = sample_request();
+        request.loop_kind = LoopKind::Unconscious;
+        request.purpose = ModelCallPurpose::BackgroundAnalysis;
+        request.tool_policy = ToolPolicy::ProposalOnly;
+
+        let error =
+            execute_foreground_model_call(&gateway, &request, &FakeModelProviderTransport::new())
+                .await
+                .expect_err("background request should fail on foreground entrypoint");
+        assert!(error.to_string().contains("foreground model gateway"));
     }
 
     fn sample_gateway() -> ResolvedModelGatewayConfig {
