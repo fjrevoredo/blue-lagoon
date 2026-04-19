@@ -1,12 +1,12 @@
 use anyhow::{Result, bail};
 use chrono::Utc;
-use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundTrigger};
+use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundRecoveryContext, ForegroundTrigger};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
     config::RuntimeConfig,
-    foreground,
+    foreground, retrieval,
     self_model::{self, InternalStateSeed},
 };
 
@@ -36,15 +36,25 @@ pub struct ContextAssemblyOptions {
     pub limits: ContextAssemblyLimits,
     pub internal_state_seed: InternalStateSeed,
     pub active_conditions: Vec<String>,
+    pub episode_id: Option<Uuid>,
+    pub recovery_context: ForegroundRecoveryContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContextAssemblyMetadata {
     pub source_ingress_id: Uuid,
+    pub foreground_execution_mode: String,
+    pub recovery_ingress_count: usize,
+    pub recovery_ingress_ids: Vec<Uuid>,
     pub self_model_seed_path: String,
+    pub self_model_source_kind: String,
+    pub self_model_canonical_artifact_id: Option<Uuid>,
+    pub self_model_bootstrap_performed: bool,
     pub recent_history_limit: i64,
     pub selected_recent_history_count: usize,
     pub selected_recent_history_episode_ids: Vec<Uuid>,
+    pub selected_retrieved_context_count: usize,
+    pub selected_retrieved_context_item_ids: Vec<Uuid>,
     pub trigger_text_char_limit: usize,
     pub trigger_text_truncated: bool,
     pub history_message_char_limit: usize,
@@ -65,8 +75,16 @@ pub async fn assemble_foreground_context(
 ) -> Result<ContextAssemblyResult> {
     options.limits.validate()?;
 
-    let self_model_config = config.require_self_model_config()?;
-    let self_model = self_model::load_self_model_snapshot(config)?;
+    let loaded_self_model = self_model::load_self_model_snapshot(
+        pool,
+        config,
+        &self_model::SelfModelLoadContext {
+            trace_id: trigger.trace_id,
+            execution_id: trigger.execution_id,
+            episode_id: options.episode_id,
+        },
+    )
+    .await?;
     let internal_state = self_model::build_internal_state_snapshot(
         options.internal_state_seed,
         options.active_conditions,
@@ -83,15 +101,39 @@ pub async fn assemble_foreground_context(
     .await?;
     let (recent_history, truncated_history_message_count) =
         shape_recent_history(recent_history, options.limits.history_message_char_limit);
+    let retrieved_context = retrieval::assemble_retrieved_context(pool, config, &trigger).await?;
 
     let metadata = ContextAssemblyMetadata {
         source_ingress_id: trigger.ingress.ingress_id,
-        self_model_seed_path: self_model_config.seed_path.display().to_string(),
+        foreground_execution_mode: match options.recovery_context.mode {
+            contracts::ForegroundExecutionMode::SingleIngress => "single_ingress".to_string(),
+            contracts::ForegroundExecutionMode::BacklogRecovery => "backlog_recovery".to_string(),
+        },
+        recovery_ingress_count: options.recovery_context.ordered_ingress.len(),
+        recovery_ingress_ids: options
+            .recovery_context
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect(),
+        self_model_seed_path: loaded_self_model.seed_path.clone(),
+        self_model_source_kind: match loaded_self_model.source_kind {
+            self_model::SelfModelSourceKind::BootstrapSeed => "bootstrap_seed".to_string(),
+            self_model::SelfModelSourceKind::CanonicalArtifact => "canonical_artifact".to_string(),
+        },
+        self_model_canonical_artifact_id: loaded_self_model.canonical_artifact_id,
+        self_model_bootstrap_performed: loaded_self_model.bootstrap_performed,
         recent_history_limit: options.limits.recent_history_limit,
         selected_recent_history_count: recent_history.len(),
         selected_recent_history_episode_ids: recent_history
             .iter()
             .map(|episode| episode.episode_id)
+            .collect(),
+        selected_retrieved_context_count: retrieved_context.items.len(),
+        selected_retrieved_context_item_ids: retrieved_context
+            .items
+            .iter()
+            .map(retrieved_context_item_id)
             .collect(),
         trigger_text_char_limit: options.limits.trigger_text_char_limit,
         trigger_text_truncated,
@@ -104,9 +146,11 @@ pub async fn assemble_foreground_context(
             context_id: Uuid::now_v7(),
             assembled_at: Utc::now(),
             trigger,
-            self_model,
+            self_model: loaded_self_model.snapshot,
             internal_state,
             recent_history,
+            retrieved_context,
+            recovery_context: options.recovery_context,
         },
         metadata,
     })
@@ -178,6 +222,13 @@ fn truncate_text(value: &str, max_chars: usize) -> (String, bool) {
     }
 
     (value.chars().take(max_chars).collect(), true)
+}
+
+fn retrieved_context_item_id(item: &contracts::RetrievedContextItem) -> Uuid {
+    match item {
+        contracts::RetrievedContextItem::Episode(episode) => episode.episode_id,
+        contracts::RetrievedContextItem::MemoryArtifact(artifact) => artifact.memory_artifact_id,
+    }
 }
 
 #[cfg(test)]

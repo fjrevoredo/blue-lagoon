@@ -93,6 +93,7 @@ fn conscious_worker_cli_emits_model_request_and_final_response() {
                 "telegram-primary"
             );
             assert_eq!(result.episode_summary.outcome, "completed");
+            assert_eq!(result.candidate_proposals.len(), 1);
         }
         WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
         WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
@@ -122,7 +123,7 @@ fn sample_context() -> ConsciousContext {
                 internal_conversation_ref: "telegram-primary".to_string(),
                 event_kind: IngressEventKind::MessageCreated,
                 occurred_at: chrono::Utc::now(),
-                text_body: Some("hello from trigger".to_string()),
+                text_body: Some("remember that I prefer concise replies".to_string()),
                 reply_to: None,
                 attachments: Vec::new(),
                 command_hint: None,
@@ -157,5 +158,7 @@ fn sample_context() -> ConsciousContext {
             active_conditions: Vec::new(),
         },
         recent_history: vec![],
+        retrieved_context: contracts::RetrievedContext::default(),
+        recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }

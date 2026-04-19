@@ -7,8 +7,9 @@ use crate::{
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
+    memory,
     model_gateway::ModelProviderTransport,
-    policy,
+    policy, proposal, self_model,
     telegram::{TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
@@ -27,6 +28,25 @@ pub struct TelegramForegroundCompletion {
     pub episode_id: Uuid,
     pub ingress_id: Uuid,
     pub outbound_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundExecutionIds {
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserEpisodeMessage {
+    text_body: String,
+    external_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForegroundExecutionInput {
+    trigger: contracts::ForegroundTrigger,
+    recovery_context: contracts::ForegroundRecoveryContext,
+    user_messages: Vec<UserEpisodeMessage>,
 }
 
 pub async fn orchestrate_telegram_foreground_ingress<T, D>(
@@ -55,6 +75,103 @@ where
             return Ok(TelegramForegroundOrchestrationOutcome::Rejected(rejected));
         }
     };
+
+    let user_messages = trigger
+        .ingress
+        .text_body
+        .clone()
+        .into_iter()
+        .map(|text_body| UserEpisodeMessage {
+            text_body,
+            external_message_id: trigger.ingress.external_message_id.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    orchestrate_telegram_foreground_trigger(
+        pool,
+        config,
+        model_gateway_config,
+        ForegroundExecutionInput {
+            trigger,
+            recovery_context: contracts::ForegroundRecoveryContext::default(),
+            user_messages,
+        },
+        transport,
+        delivery,
+    )
+    .await
+}
+
+pub async fn orchestrate_telegram_foreground_plan<T, D>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
+    execution: ForegroundExecutionIds,
+    plan: foreground::PendingForegroundExecutionPlan,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<TelegramForegroundOrchestrationOutcome>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let primary_ingress =
+        foreground::load_normalized_ingress(pool, plan.primary_ingress.ingress_id).await?;
+    let trigger = foreground::build_foreground_trigger(
+        config,
+        execution.trace_id,
+        execution.execution_id,
+        primary_ingress,
+    )?;
+    let user_messages = plan
+        .ordered_ingress
+        .iter()
+        .filter_map(|ingress| {
+            ingress
+                .text_body
+                .clone()
+                .map(|text_body| UserEpisodeMessage {
+                    text_body,
+                    external_message_id: ingress.external_message_id.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+
+    orchestrate_telegram_foreground_trigger(
+        pool,
+        config,
+        model_gateway_config,
+        ForegroundExecutionInput {
+            trigger,
+            recovery_context: contracts::ForegroundRecoveryContext {
+                mode: plan.mode,
+                ordered_ingress: plan.ordered_ingress,
+            },
+            user_messages,
+        },
+        transport,
+        delivery,
+    )
+    .await
+}
+
+async fn orchestrate_telegram_foreground_trigger<T, D>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
+    execution_input: ForegroundExecutionInput,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<TelegramForegroundOrchestrationOutcome>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let ForegroundExecutionInput {
+        trigger,
+        recovery_context,
+        user_messages,
+    } = execution_input;
 
     let episode_id = Uuid::now_v7();
     let mut recorded_episode_id = None;
@@ -87,7 +204,7 @@ where
     }
     recorded_episode_id = Some(episode_id);
 
-    if let Some(text_body) = &trigger.ingress.text_body {
+    for (index, user_message) in user_messages.iter().enumerate() {
         if let Err(error) = foreground::insert_episode_message(
             pool,
             &NewEpisodeMessage {
@@ -95,11 +212,11 @@ where
                 episode_id,
                 trace_id: trigger.trace_id,
                 execution_id: trigger.execution_id,
-                message_order: 0,
+                message_order: index as i32,
                 message_role: "user".to_string(),
                 channel_kind: trigger.ingress.channel_kind,
-                text_body: Some(text_body.clone()),
-                external_message_id: trigger.ingress.external_message_id.clone(),
+                text_body: Some(user_message.text_body.clone()),
+                external_message_id: user_message.external_message_id.clone(),
             },
         )
         .await
@@ -120,7 +237,11 @@ where
         pool,
         config,
         trigger.clone(),
-        context::ContextAssemblyOptions::default(),
+        context::ContextAssemblyOptions {
+            episode_id: Some(episode_id),
+            recovery_context: recovery_context.clone(),
+            ..context::ContextAssemblyOptions::default()
+        },
     )
     .await
     {
@@ -230,7 +351,7 @@ where
             episode_id,
             trace_id: trigger.trace_id,
             execution_id: trigger.execution_id,
-            message_order: 1,
+            message_order: user_messages.len() as i32,
             message_role: "assistant".to_string(),
             channel_kind: result.assistant_output.channel_kind,
             text_body: Some(result.assistant_output.text.clone()),
@@ -319,6 +440,34 @@ where
         .await;
     }
 
+    let proposal_summary = match apply_foreground_candidate_proposals(
+        pool,
+        config,
+        &proposal::ProposalProcessingContext {
+            trace_id: trigger.trace_id,
+            execution_id: trigger.execution_id,
+            episode_id: Some(episode_id),
+            source_ingress_id: Some(trigger.ingress.ingress_id),
+            source_loop_kind: "conscious".to_string(),
+        },
+        &result.candidate_proposals,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+                error,
+            )
+            .await;
+        }
+    };
+
     let response_payload = serde_json::to_value(&response)
         .context("failed to serialize conscious worker response payload");
     let response_payload = match response_payload {
@@ -358,7 +507,40 @@ where
         pool,
         episode_id,
         &result.episode_summary.outcome,
-        &result.episode_summary.summary,
+        &format!(
+            "{} | proposals evaluated={}, accepted={}, rejected={}, canonical_writes={}",
+            result.episode_summary.summary,
+            proposal_summary.evaluated_count,
+            proposal_summary.accepted_count,
+            proposal_summary.rejected_count,
+            proposal_summary.canonical_write_count
+        ),
+    )
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
+            error,
+        )
+        .await;
+    }
+    let processed_ingress_ids = if recovery_context.ordered_ingress.is_empty() {
+        vec![trigger.ingress.ingress_id]
+    } else {
+        recovery_context
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect::<Vec<_>>()
+    };
+    if let Err(error) = foreground::mark_ingress_events_processed(
+        pool,
+        &processed_ingress_ids,
+        trigger.execution_id,
     )
     .await
     {
@@ -385,8 +567,16 @@ where
             payload: json!({
                 "episode_id": episode_id,
                 "ingress_id": trigger.ingress.ingress_id,
+                "processed_ingress_ids": processed_ingress_ids,
                 "outbound_message_id": delivery_receipt.message_id,
                 "assistant_summary": result.episode_summary.summary,
+                "candidate_proposal_count": result.candidate_proposals.len(),
+                "proposal_summary": {
+                    "evaluated": proposal_summary.evaluated_count,
+                    "accepted": proposal_summary.accepted_count,
+                    "rejected": proposal_summary.rejected_count,
+                    "canonical_writes": proposal_summary.canonical_write_count,
+                },
             }),
         },
     )
@@ -526,6 +716,78 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     }
 
     ForegroundFailureKind::WorkerProtocolFailure
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProposalApplicationSummary {
+    evaluated_count: usize,
+    accepted_count: usize,
+    rejected_count: usize,
+    canonical_write_count: usize,
+}
+
+async fn apply_foreground_candidate_proposals(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    context: &proposal::ProposalProcessingContext,
+    proposals: &[contracts::CanonicalProposal],
+) -> Result<ProposalApplicationSummary> {
+    let mut summary = ProposalApplicationSummary::default();
+
+    for candidate in proposals {
+        summary.evaluated_count += 1;
+        let validation = proposal::validate_and_record_proposal(pool, context, candidate).await?;
+        match validation.outcome {
+            contracts::ProposalEvaluationOutcome::Rejected => {
+                summary.rejected_count += 1;
+            }
+            contracts::ProposalEvaluationOutcome::Accepted => {
+                let merge_outcome = match candidate.proposal_kind {
+                    contracts::CanonicalProposalKind::MemoryArtifact => {
+                        memory::apply_memory_proposal_merge(pool, context, candidate).await?
+                    }
+                    contracts::CanonicalProposalKind::SelfModelObservation => {
+                        self_model::apply_self_model_proposal_merge(
+                            pool, config, context, candidate,
+                        )
+                        .await?
+                    }
+                };
+
+                match merge_outcome.outcome {
+                    contracts::ProposalEvaluationOutcome::Accepted => {
+                        summary.accepted_count += 1;
+                        if merge_outcome.target.is_some() {
+                            summary.canonical_write_count += 1;
+                            audit::insert(
+                                pool,
+                                &NewAuditEvent {
+                                    loop_kind: context.source_loop_kind.clone(),
+                                    subsystem: "foreground_orchestration".to_string(),
+                                    event_kind: "canonical_write_applied".to_string(),
+                                    severity: "info".to_string(),
+                                    trace_id: context.trace_id,
+                                    execution_id: Some(context.execution_id),
+                                    worker_pid: None,
+                                    payload: json!({
+                                        "proposal_id": candidate.proposal_id,
+                                        "outcome": "accepted",
+                                        "target": merge_outcome.target,
+                                    }),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    contracts::ProposalEvaluationOutcome::Rejected => {
+                        summary.rejected_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 fn parse_telegram_chat_id(ingress: &contracts::NormalizedIngress) -> Result<i64> {

@@ -1,0 +1,33 @@
+{
+  "update_id": 3002,
+  "message": {
+    "message_id": 62,
+    "date": 1712302600,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "text": "can you stay concise in replies now?",
+    "reply_to_message": {
+      "message_id": 61,
+      "date": 1712302000,
+      "from": {
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Francisco",
+        "username": "fjr"
+      },
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "remember that I prefer concise replies and be direct"
+    }
+  }
+}

@@ -45,7 +45,18 @@ Typical implementation workflow is:
 - `cargo fmt --all --check` to verify formatting.
 - `cargo check --workspace` to verify compilation.
 - `cargo clippy --workspace --all-targets -- -D warnings` to keep linting clean.
-- `cargo test --workspace` to run unit, component, and integration tests.
+- `cargo test --workspace --lib -- --nocapture` to run the fast workspace
+  library and unit verification surface.
+- `cargo test -p harness --test foreground_component -- --nocapture` to run
+  the PostgreSQL-backed foreground component suite.
+- `cargo test -p harness --test foreground_integration -- --nocapture` to run
+  the foreground runtime integration suite.
+- `cargo test -p harness --test continuity_component -- --nocapture` to run
+  the canonical continuity component suite.
+- `cargo test -p harness --test continuity_integration -- --nocapture` to run
+  the canonical continuity integration suite.
+- `cargo test --workspace` to run the full repository test surface when a
+  broader local check is warranted.
 - `docker compose config` to verify the local runtime topology.
 - `./scripts/pre-commit.sh` to run the standard pre-commit verification bundle
   from bash/WSL.
@@ -68,10 +79,15 @@ Typical implementation workflow is:
 - `cp config/local.example.toml config/local.toml` to prepare local Telegram
   binding overrides.
 - `cp .env.example .env` to prepare local runtime secrets and env overrides.
+- `cargo build -p runtime -p workers` to ensure the default sibling worker
+  lookup works before manual runtime verification.
 - `git diff -- docs/ PHILOSOPHY.md README.md AGENTS.md` to review documentation
   changes before commit.
 - `git log --oneline` to match existing commit style.
 - `markdownlint "**/*.md"` if available locally, to catch heading and spacing issues.
+- `docs/continuity-manual-verification.md` for the operator-facing local manual
+  verification checklist covering continuity, retrieval, canonical writes, and
+  backlog recovery.
 
 Git environment rule:
 

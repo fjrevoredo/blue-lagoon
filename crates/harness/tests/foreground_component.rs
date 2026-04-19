@@ -12,8 +12,8 @@ use harness::{
         ForegroundModelRouteConfig, ModelGatewayConfig, ResolvedForegroundModelRouteConfig,
         ResolvedModelGatewayConfig, ResolvedTelegramConfig, SelfModelConfig,
     },
-    context, execution, foreground, foreground_orchestration, ingress, model_gateway, runtime,
-    telegram, worker,
+    context, continuity, execution, foreground, foreground_orchestration, ingress, model_gateway,
+    runtime, telegram, worker,
 };
 use serial_test::serial;
 use sqlx::{Connection, PgConnection, Row};
@@ -481,6 +481,7 @@ async fn accepted_foreground_trigger_persists_execution_budget_and_audit() -> Re
 
         let stored_ingress = foreground::get_ingress_event(&ctx.pool, ingress.ingress_id).await?;
         assert_eq!(stored_ingress.status, "accepted");
+        assert_eq!(stored_ingress.foreground_status, "processing");
         assert_eq!(stored_ingress.execution_id, Some(trigger.execution_id));
         assert_eq!(stored_ingress.rejection_reason, None);
 
@@ -531,6 +532,7 @@ async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()
 
         let stored_ingress = foreground::get_ingress_event(&ctx.pool, rejected.ingress_id).await?;
         assert_eq!(stored_ingress.status, "rejected");
+        assert_eq!(stored_ingress.foreground_status, "rejected");
         assert!(
             stored_ingress
                 .rejection_reason
@@ -542,6 +544,267 @@ async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()
         let audit_events = audit::list_for_trace(&ctx.pool, rejected.trace_id).await?;
         assert_eq!(audit_events.len(), 1);
         assert_eq!(audit_events[0].event_kind, "foreground_trigger_rejected");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn pending_foreground_execution_switches_to_backlog_recovery_and_links_selected_ingress()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let now = Utc::now();
+        let ingress_one = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(10),
+            "first delayed message",
+        )
+        .await?;
+        let ingress_two = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(6),
+            "second delayed message",
+        )
+        .await?;
+        let ingress_three = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(1),
+            "latest delayed message",
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "pending_backlog_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "pending_backlog_test" }),
+            },
+        )
+        .await?;
+
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &ctx.config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions::default(),
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        assert_eq!(
+            plan.mode,
+            contracts::ForegroundExecutionMode::BacklogRecovery
+        );
+        assert_eq!(
+            plan.decision_reason,
+            foreground::ForegroundExecutionDecisionReason::PendingSpanThreshold
+        );
+        assert_eq!(plan.primary_ingress.ingress_id, ingress_three.ingress_id);
+        assert_eq!(
+            plan.ordered_ingress
+                .iter()
+                .map(|ingress| ingress.ingress_id)
+                .collect::<Vec<_>>(),
+            vec![
+                ingress_one.ingress_id,
+                ingress_two.ingress_id,
+                ingress_three.ingress_id,
+            ]
+        );
+
+        let links = foreground::list_execution_ingress_links(&ctx.pool, execution_id).await?;
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].ingress_id, ingress_one.ingress_id);
+        assert_eq!(links[0].link_role, "batch_member");
+        assert_eq!(links[1].ingress_id, ingress_two.ingress_id);
+        assert_eq!(links[1].link_role, "batch_member");
+        assert_eq!(links[2].ingress_id, ingress_three.ingress_id);
+        assert_eq!(links[2].link_role, "primary");
+
+        for ingress_id in [
+            ingress_one.ingress_id,
+            ingress_two.ingress_id,
+            ingress_three.ingress_id,
+        ] {
+            let stored = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+            assert_eq!(stored.execution_id, Some(execution_id));
+            assert_eq!(stored.foreground_status, "processing");
+        }
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_recovery_mode_decided")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn pending_foreground_execution_stays_single_when_backlog_threshold_is_not_met() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let now = Utc::now();
+        let oldest = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::seconds(30),
+            "first pending message",
+        )
+        .await?;
+        let newest = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::seconds(5),
+            "second pending message",
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "single_pending_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "single_pending_test" }),
+            },
+        )
+        .await?;
+
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &ctx.config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions::default(),
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        assert_eq!(plan.mode, contracts::ForegroundExecutionMode::SingleIngress);
+        assert_eq!(
+            plan.decision_reason,
+            foreground::ForegroundExecutionDecisionReason::SingleIngress
+        );
+        assert_eq!(plan.primary_ingress.ingress_id, oldest.ingress_id);
+        assert_eq!(plan.ordered_ingress.len(), 1);
+        assert_eq!(plan.ordered_ingress[0].ingress_id, oldest.ingress_id);
+
+        let links = foreground::list_execution_ingress_links(&ctx.pool, execution_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].ingress_id, oldest.ingress_id);
+        assert_eq!(links[0].link_role, "primary");
+
+        let oldest_stored = foreground::get_ingress_event(&ctx.pool, oldest.ingress_id).await?;
+        assert_eq!(oldest_stored.execution_id, Some(execution_id));
+        assert_eq!(oldest_stored.foreground_status, "processing");
+
+        let newest_stored = foreground::get_ingress_event(&ctx.pool, newest.ingress_id).await?;
+        assert_eq!(newest_stored.execution_id, None);
+        assert_eq!(newest_stored.foreground_status, "pending");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn pending_foreground_execution_switches_to_backlog_when_stale_processing_is_resumed()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let now = Utc::now();
+        let resumed = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(8),
+            "earlier interrupted message",
+        )
+        .await?;
+        let latest = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::seconds(20),
+            "latest pending message",
+        )
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE ingress_events
+            SET
+                foreground_status = 'processing',
+                last_processed_at = $2
+            WHERE ingress_id = $1
+            "#,
+        )
+        .bind(resumed.ingress_id)
+        .bind(now - Duration::minutes(10))
+        .execute(&ctx.pool)
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "stale_processing_resume_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "stale_processing_resume_test" }),
+            },
+        )
+        .await?;
+
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &ctx.config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions::default(),
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        assert_eq!(
+            plan.mode,
+            contracts::ForegroundExecutionMode::BacklogRecovery
+        );
+        assert_eq!(
+            plan.decision_reason,
+            foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
+        );
+        assert_eq!(plan.primary_ingress.ingress_id, latest.ingress_id);
+        assert_eq!(plan.ordered_ingress.len(), 2);
         Ok(())
     })
     .await
@@ -840,6 +1103,8 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
                     connection_quality_pct: 92,
                 },
                 active_conditions: vec!["postgres_ready".to_string()],
+                episode_id: None,
+                recovery_context: contracts::ForegroundRecoveryContext::default(),
             },
         )
         .await?;
@@ -917,6 +1182,139 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
         Some(3)
     );
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn context_assembly_injects_retrieved_episode_and_memory_context() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        let mut trigger = sample_conscious_context().trigger;
+        trigger.received_at = Utc::now();
+        trigger.ingress.occurred_at = trigger.received_at;
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id: trigger.execution_id,
+                trace_id: trigger.trace_id,
+                trigger_kind: "retrieval_context_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "retrieval_context_test" }),
+            },
+        )
+        .await?;
+        insert_completed_episode(
+            &ctx.pool,
+            "episode-retrieval",
+            trigger.received_at - Duration::minutes(30),
+            "remember the travel preference",
+            "noted the travel preference",
+        )
+        .await?;
+        insert_active_memory_artifact(
+            &ctx.pool,
+            "user:primary",
+            "The user prefers direct answers about travel.",
+        )
+        .await?;
+
+        let assembled = context::assemble_foreground_context(
+            &ctx.pool,
+            &config,
+            trigger,
+            context::ContextAssemblyOptions::default(),
+        )
+        .await?;
+
+        assert!(
+            assembled
+                .context
+                .retrieved_context
+                .items
+                .iter()
+                .any(|item| matches!(item, contracts::RetrievedContextItem::Episode(_)))
+        );
+        assert!(
+            assembled
+                .context
+                .retrieved_context
+                .items
+                .iter()
+                .any(|item| matches!(item, contracts::RetrievedContextItem::MemoryArtifact(_)))
+        );
+        assert!(assembled.metadata.selected_retrieved_context_count >= 2);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn context_assembly_retrieves_semantic_match_from_prior_memory() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        let mut trigger = sample_conscious_context().trigger;
+        trigger.received_at = Utc::now();
+        trigger.ingress.occurred_at = trigger.received_at;
+        trigger.ingress.text_body = Some("please be brief when you answer".to_string());
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id: trigger.execution_id,
+                trace_id: trigger.trace_id,
+                trigger_kind: "semantic_retrieval_context_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "semantic_retrieval_context_test" }),
+            },
+        )
+        .await?;
+        insert_active_memory_artifact(
+            &ctx.pool,
+            "user:primary",
+            "The user prefers concise replies.",
+        )
+        .await?;
+
+        let assembled = context::assemble_foreground_context(
+            &ctx.pool,
+            &config,
+            trigger,
+            context::ContextAssemblyOptions::default(),
+        )
+        .await?;
+
+        let semantic_memory = assembled
+            .context
+            .retrieved_context
+            .items
+            .iter()
+            .find_map(|item| match item {
+                contracts::RetrievedContextItem::MemoryArtifact(artifact)
+                    if artifact.relevance_reason.starts_with("semantic_match:") =>
+                {
+                    Some(artifact)
+                }
+                _ => None,
+            })
+            .expect("semantic match should be retrieved");
+        assert!(semantic_memory.content_text.contains("concise replies"));
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]
@@ -1005,6 +1403,9 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
             other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
         };
+        let mut ingress = ingress;
+        ingress.text_body =
+            Some("remember that I prefer concise replies and be direct".to_string());
 
         let gateway = sample_model_gateway_config();
         let transport = model_gateway::FakeModelProviderTransport::new();
@@ -1045,10 +1446,20 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
         assert_eq!(execution.status, "completed");
         assert_eq!(execution.trace_id, completed.trace_id);
 
+        let stored_ingress = foreground::get_ingress_event(&ctx.pool, completed.ingress_id).await?;
+        assert_eq!(stored_ingress.foreground_status, "processed");
+        assert_eq!(stored_ingress.execution_id, Some(completed.execution_id));
+
         let episode = foreground::get_episode(&ctx.pool, completed.episode_id).await?;
         assert_eq!(episode.status, "completed");
         assert_eq!(episode.execution_id, completed.execution_id);
         assert_eq!(episode.outcome.as_deref(), Some("completed"));
+        assert!(
+            episode
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("proposals evaluated=2"))
+        );
 
         let messages = foreground::list_episode_messages(&ctx.pool, completed.episode_id).await?;
         assert_eq!(messages.len(), 2);
@@ -1071,6 +1482,33 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             "assistant reply from fake provider"
         );
 
+        let proposals =
+            continuity::list_proposals_for_execution(&ctx.pool, completed.execution_id).await?;
+        assert_eq!(proposals.len(), 2);
+        assert!(
+            proposals
+                .iter()
+                .all(|proposal| proposal.status == "accepted")
+        );
+
+        let active_memory = continuity::list_active_memory_artifacts_by_subject(
+            &ctx.pool,
+            "principal:primary-user",
+            10,
+        )
+        .await?;
+        assert_eq!(active_memory.len(), 1);
+
+        let active_self_model = continuity::get_latest_active_self_model_artifact(&ctx.pool)
+            .await?
+            .expect("active self-model artifact should exist");
+        assert!(
+            active_self_model
+                .preferences
+                .iter()
+                .any(|value| value.contains("be direct"))
+        );
+
         let audit_events = audit::list_for_execution(&ctx.pool, completed.execution_id).await?;
         assert!(
             audit_events
@@ -1081,6 +1519,216 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             audit_events
                 .iter()
                 .any(|event| event.event_kind == "foreground_context_assembled")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "proposal_evaluated")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "merge_decision_recorded")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "canonical_write_applied")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_completed")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn planned_foreground_orchestration_processes_backlog_batch_with_single_reply() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let now = Utc::now();
+        let ingress_one = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(10),
+            "first delayed hello",
+        )
+        .await?;
+        let ingress_two = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(6),
+            "second delayed hello",
+        )
+        .await?;
+        let ingress_three = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(1),
+            "remember that I prefer concise replies and be direct",
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "planned_backlog_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "planned_backlog_test" }),
+            },
+        )
+        .await?;
+
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions::default(),
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        let gateway = sample_model_gateway_config();
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply for delayed backlog" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 21,
+                    "completion_tokens": 7
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_plan(
+            &ctx.pool,
+            &config,
+            &gateway,
+            foreground_orchestration::ForegroundExecutionIds {
+                trace_id,
+                execution_id,
+            },
+            plan,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed orchestration, got {other:?}"),
+        };
+
+        let execution = execution::get(&ctx.pool, completed.execution_id).await?;
+        assert_eq!(execution.status, "completed");
+
+        let episode = foreground::get_episode(&ctx.pool, completed.episode_id).await?;
+        assert_eq!(episode.status, "completed");
+
+        let messages = foreground::list_episode_messages(&ctx.pool, completed.episode_id).await?;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[0].text_body.as_deref(),
+            Some("first delayed hello")
+        );
+        assert_eq!(
+            messages[1].text_body.as_deref(),
+            Some("second delayed hello")
+        );
+        assert_eq!(
+            messages[2].text_body.as_deref(),
+            Some("remember that I prefer concise replies and be direct")
+        );
+        assert_eq!(messages[3].message_role, "assistant");
+        assert_eq!(
+            messages[3].text_body.as_deref(),
+            Some("assistant reply for delayed backlog")
+        );
+
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(delivery.sent_messages()[0].chat_id, 42);
+        assert_eq!(
+            delivery.sent_messages()[0].reply_to_message_id,
+            Some(
+                ingress_three
+                    .external_message_id
+                    .as_deref()
+                    .expect("latest ingress should have external message id")
+                    .parse::<i64>()?
+            )
+        );
+
+        for ingress_id in [
+            ingress_one.ingress_id,
+            ingress_two.ingress_id,
+            ingress_three.ingress_id,
+        ] {
+            let stored = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+            assert_eq!(stored.execution_id, Some(completed.execution_id));
+            assert_eq!(stored.foreground_status, "processed");
+        }
+
+        let active_memory = continuity::list_active_memory_artifacts_by_subject(
+            &ctx.pool,
+            "principal:primary-user",
+            10,
+        )
+        .await?;
+        assert_eq!(active_memory.len(), 1);
+        assert_eq!(active_memory[0].provenance_kind, "backlog_recovery");
+
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        let message_contents = seen[0]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(message_contents.iter().any(|content| {
+            content.contains("Recovery mode is backlog_recovery")
+                && content.contains("first delayed hello")
+                && content.contains("second delayed hello")
+        }));
+
+        let audit_events = audit::list_for_execution(&ctx.pool, completed.execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_recovery_mode_decided")
         );
         assert!(
             audit_events
@@ -1311,6 +1959,98 @@ async fn runtime_fixture_ignored_update_is_audited() -> Result<()> {
         .fetch_one(&ctx.pool)
         .await?;
         assert_eq!(audit_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn runtime_fixture_resumes_stale_processing_backlog_without_new_accepted_updates()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let now = Utc::now();
+        let resumed = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(12),
+            "first interrupted message",
+        )
+        .await?;
+        let latest = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(1),
+            "latest backlog message",
+        )
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE ingress_events
+            SET
+                foreground_status = 'processing',
+                last_processed_at = $2
+            WHERE ingress_id = $1
+            "#,
+        )
+        .bind(resumed.ingress_id)
+        .bind(now - Duration::minutes(15))
+        .execute(&ctx.pool)
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply after resumed backlog" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("unsupported_update.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.ignored_count, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(summary.backlog_recovery_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "assistant reply after resumed backlog"
+        );
+
+        let resumed_stored = foreground::get_ingress_event(&ctx.pool, resumed.ingress_id).await?;
+        let latest_stored = foreground::get_ingress_event(&ctx.pool, latest.ingress_id).await?;
+        assert_eq!(resumed_stored.foreground_status, "processed");
+        assert_eq!(latest_stored.foreground_status, "processed");
         Ok(())
     })
     .await
@@ -1561,6 +2301,8 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
             assistant_message: Some("older assistant".to_string()),
             outcome: "completed".to_string(),
         }],
+        retrieved_context: contracts::RetrievedContext::default(),
+        recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }
 
@@ -1638,6 +2380,153 @@ async fn insert_completed_episode(
 
     foreground::mark_episode_completed(pool, episode_id, "completed", "context test").await?;
     Ok(())
+}
+
+async fn insert_active_memory_artifact(
+    pool: &sqlx::PgPool,
+    subject_ref: &str,
+    content_text: &str,
+) -> Result<()> {
+    let execution_id = Uuid::now_v7();
+    let trace_id = Uuid::now_v7();
+    execution::insert(
+        pool,
+        &execution::NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "memory-retrieval-test".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: serde_json::json!({ "kind": "memory_retrieval_test" }),
+        },
+    )
+    .await?;
+
+    let ingress = contracts::NormalizedIngress {
+        ingress_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: "42".to_string(),
+        external_conversation_id: "42".to_string(),
+        external_event_id: format!("memory-{}", Uuid::now_v7()),
+        external_message_id: Some("memory-message".to_string()),
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        event_kind: contracts::IngressEventKind::MessageCreated,
+        occurred_at: Utc::now() - Duration::minutes(20),
+        text_body: Some("remember travel preference".to_string()),
+        reply_to: None,
+        attachments: Vec::new(),
+        command_hint: None,
+        approval_payload: None,
+        raw_payload_ref: Some("memory-retrieval-test".to_string()),
+    };
+    foreground::insert_ingress_event(
+        pool,
+        &foreground::NewIngressEvent {
+            ingress: ingress.clone(),
+            conversation_binding_id: None,
+            trace_id,
+            execution_id: Some(execution_id),
+            status: "accepted".to_string(),
+            rejection_reason: None,
+        },
+    )
+    .await?;
+
+    let proposal_id = Uuid::now_v7();
+    continuity::insert_proposal(
+        pool,
+        &continuity::NewProposalRecord {
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            source_ingress_id: Some(ingress.ingress_id),
+            source_loop_kind: "conscious".to_string(),
+            proposal_kind: "memory_artifact".to_string(),
+            canonical_target: "memory_artifacts".to_string(),
+            status: "accepted".to_string(),
+            confidence: 0.9,
+            conflict_posture: "independent".to_string(),
+            subject_ref: subject_ref.to_string(),
+            content_text: content_text.to_string(),
+            rationale: Some("retrieval context test".to_string()),
+            valid_from: Some(ingress.occurred_at),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            supersedes_artifact_kind: None,
+            payload: serde_json::json!({ "artifact_kind": "preference" }),
+        },
+    )
+    .await?;
+
+    continuity::insert_memory_artifact(
+        pool,
+        &continuity::NewMemoryArtifact {
+            memory_artifact_id: Uuid::now_v7(),
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            source_ingress_id: Some(ingress.ingress_id),
+            artifact_kind: "preference".to_string(),
+            subject_ref: subject_ref.to_string(),
+            content_text: content_text.to_string(),
+            confidence: 0.9,
+            provenance_kind: "episode_observation".to_string(),
+            status: "active".to_string(),
+            valid_from: Some(ingress.occurred_at),
+            valid_to: None,
+            superseded_at: None,
+            superseded_by_artifact_id: None,
+            supersedes_artifact_id: None,
+            payload: serde_json::json!({}),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_pending_ingress(
+    pool: &sqlx::PgPool,
+    internal_conversation_ref: &str,
+    internal_principal_ref: &str,
+    occurred_at: chrono::DateTime<Utc>,
+    text_body: &str,
+) -> Result<contracts::NormalizedIngress> {
+    let ingress = contracts::NormalizedIngress {
+        ingress_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: "42".to_string(),
+        external_conversation_id: "42".to_string(),
+        external_event_id: format!("pending-{}", Uuid::now_v7()),
+        external_message_id: Some(occurred_at.timestamp_millis().to_string()),
+        internal_principal_ref: internal_principal_ref.to_string(),
+        internal_conversation_ref: internal_conversation_ref.to_string(),
+        event_kind: contracts::IngressEventKind::MessageCreated,
+        occurred_at,
+        text_body: Some(text_body.to_string()),
+        reply_to: None,
+        attachments: Vec::new(),
+        command_hint: None,
+        approval_payload: None,
+        raw_payload_ref: Some("pending-ingress-test".to_string()),
+    };
+    foreground::insert_ingress_event(
+        pool,
+        &foreground::NewIngressEvent {
+            ingress: ingress.clone(),
+            conversation_binding_id: None,
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            status: "accepted".to_string(),
+            rejection_reason: None,
+        },
+    )
+    .await?;
+
+    Ok(ingress)
 }
 
 async fn wait_for_binding_reconcile_lock(database_url: &str) -> Result<()> {

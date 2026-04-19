@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, and Phase 2 completed; Phase 3 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, and Phase 3 completed; Phase 4 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -108,21 +108,26 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 - Phase 1 status: `COMPLETE`
 - Phase 1.1 status: `COMPLETE`
 - Phase 2 status: `COMPLETE`
-- Phase 3 status: `READY`
+- Phase 3 status: `COMPLETE`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
   `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 2 lives in
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
+- Detailed planning and execution evidence for Phase 3 lives in
+  `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
+- Detailed planning for Phase 4 now lives in
+  `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
   gating, worker subprocess execution, and a verified synthetic trigger path
 - The current repository state now includes `.github/workflows/ci.yml` as the
   minimum repository-hosted CI baseline for Phase 1.1
 - The current repository state now includes a completed Telegram-first
-  foreground slice with repository-hosted CI coverage, so Phase 2 is complete
-  and Phase 3 is now the active next phase
+  foreground slice plus canonical continuity, retrieval, self-model, and
+  backlog-aware recovery coverage, so Phase 3 is complete and Phase 4 is now
+  the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
 
@@ -460,13 +465,9 @@ core single-user v1 runtime enough to justify the added complexity now.
 This document should be used as the agreement point for implementation order and
 milestone definition.
 
-With Phase 1 complete, the next planning step should be the detailed
-implementation plan for Phase 1.1. That document should define the minimal
-GitHub Actions baseline, required verification commands, PostgreSQL service
-posture in CI, and the first repository-hosted gate names.
-
-Once Phase 1.1 is complete, the next planning step should be the detailed
-implementation plan for Phase 2. That document should break the next phase into:
+With Phases 1, 1.1, and 2 complete, the next planning step is the detailed
+implementation plan for Phase 3. That document should break the next phase
+into:
 
 - concrete subsystems
 - major schema work
@@ -474,7 +475,19 @@ implementation plan for Phase 2. That document should break the next phase into:
 - milestone-sized deliverables
 - test requirements
 - dependency ordering
+- proposal-validation and merge boundaries
+- canonical self-model and retrieval-read paths
+- backlog-aware foreground recovery behavior
 
-That next document should stay subordinate to this one. It should add execution
-detail, not re-open the high-level architectural sequence without an explicit
-decision.
+That Phase 3 document should stay subordinate to this one. It should add
+execution detail, not re-open the high-level architectural sequence without an
+explicit decision.
+
+With Phase 3 complete, detailed planning for Phase 4 now lives in
+`docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`, focused on the unconscious
+loop, bounded background maintenance, and wake-signal production and
+evaluation.
+
+Once Phase 4 is complete, the next planning step should be the detailed
+implementation plan for Phase 5, focused on governed tool execution, workspace
+boundaries, approvals, and policy re-check behavior.

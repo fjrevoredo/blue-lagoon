@@ -1,0 +1,71 @@
+[
+  {
+    "update_id": 2001,
+    "message": {
+      "message_id": 51,
+      "date": 1712300000,
+      "from": {
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Francisco",
+        "username": "fjr"
+      },
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "first delayed hello"
+    }
+  },
+  {
+    "update_id": 2002,
+    "message": {
+      "message_id": 52,
+      "date": 1712300300,
+      "from": {
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Francisco",
+        "username": "fjr"
+      },
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "second delayed hello"
+    }
+  },
+  {
+    "update_id": 2003,
+    "message": {
+      "message_id": 53,
+      "date": 1712300900,
+      "from": {
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Francisco",
+        "username": "fjr"
+      },
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "remember that I prefer concise replies and be direct",
+      "reply_to_message": {
+        "message_id": 52,
+        "date": 1712300300,
+        "from": {
+          "id": 42,
+          "is_bot": false,
+          "first_name": "Francisco",
+          "username": "fjr"
+        },
+        "chat": {
+          "id": 42,
+          "type": "private"
+        },
+        "text": "second delayed hello"
+      }
+    }
+  }
+]

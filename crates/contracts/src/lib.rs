@@ -126,6 +126,7 @@ pub struct ConsciousWorkerResult {
     pub status: ConsciousWorkerStatus,
     pub assistant_output: AssistantOutput,
     pub episode_summary: EpisodeSummary,
+    pub candidate_proposals: Vec<CanonicalProposal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +228,13 @@ pub enum ForegroundTriggerKind {
     UserIngress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForegroundExecutionMode {
+    SingleIngress,
+    BacklogRecovery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForegroundBudget {
     pub iteration_budget: u32,
@@ -254,6 +262,8 @@ pub struct ConsciousContext {
     pub self_model: SelfModelSnapshot,
     pub internal_state: InternalStateSnapshot,
     pub recent_history: Vec<EpisodeExcerpt>,
+    pub retrieved_context: RetrievedContext,
+    pub recovery_context: ForegroundRecoveryContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +297,156 @@ pub struct EpisodeExcerpt {
     pub user_message: Option<String>,
     pub assistant_message: Option<String>,
     pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RetrievedContext {
+    pub items: Vec<RetrievedContextItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum RetrievedContextItem {
+    Episode(RetrievedEpisodeContext),
+    MemoryArtifact(RetrievedMemoryArtifactContext),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievedEpisodeContext {
+    pub episode_id: Uuid,
+    pub internal_conversation_ref: String,
+    pub started_at: DateTime<Utc>,
+    pub summary: String,
+    pub outcome: String,
+    pub relevance_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievedMemoryArtifactContext {
+    pub memory_artifact_id: Uuid,
+    pub artifact_kind: String,
+    pub subject_ref: String,
+    pub content_text: String,
+    pub validity_status: String,
+    pub relevance_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundRecoveryContext {
+    pub mode: ForegroundExecutionMode,
+    pub ordered_ingress: Vec<OrderedIngressReference>,
+}
+
+impl Default for ForegroundRecoveryContext {
+    fn default() -> Self {
+        Self {
+            mode: ForegroundExecutionMode::SingleIngress,
+            ordered_ingress: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedIngressReference {
+    pub ingress_id: Uuid,
+    pub external_message_id: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub text_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalProposalKind {
+    MemoryArtifact,
+    SelfModelObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalTargetKind {
+    MemoryArtifacts,
+    SelfModelArtifacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalConflictPosture {
+    Independent,
+    Revises,
+    Supersedes,
+    Conflicts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalProvenanceKind {
+    EpisodeObservation,
+    BacklogRecovery,
+    SelfModelReflection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalProvenance {
+    pub provenance_kind: ProposalProvenanceKind,
+    pub source_ingress_ids: Vec<Uuid>,
+    pub source_episode_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalProposal {
+    pub proposal_id: Uuid,
+    pub proposal_kind: CanonicalProposalKind,
+    pub canonical_target: CanonicalTargetKind,
+    pub confidence_pct: u8,
+    pub conflict_posture: ProposalConflictPosture,
+    pub subject_ref: String,
+    pub rationale: Option<String>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub supersedes_artifact_id: Option<Uuid>,
+    pub provenance: ProposalProvenance,
+    pub payload: CanonicalProposalPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum CanonicalProposalPayload {
+    MemoryArtifact(MemoryArtifactProposal),
+    SelfModelObservation(SelfModelObservationProposal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryArtifactProposal {
+    pub artifact_kind: String,
+    pub content_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfModelObservationProposal {
+    pub observation_kind: String,
+    pub content_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalEvaluationOutcome {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "artifact_id")]
+pub enum MergeDecisionTarget {
+    MemoryArtifact(Uuid),
+    SelfModelArtifact(Uuid),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalEvaluation {
+    pub proposal_id: Uuid,
+    pub outcome: ProposalEvaluationOutcome,
+    pub reason: String,
+    pub target: Option<MergeDecisionTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +657,33 @@ mod tests {
         assert_eq!(decoded, inbound);
     }
 
+    #[test]
+    fn canonical_proposal_contract_round_trips() {
+        let proposal = sample_memory_proposal();
+        let json = serde_json::to_string(&proposal).expect("proposal should serialize");
+        let decoded: CanonicalProposal =
+            serde_json::from_str(&json).expect("proposal should deserialize");
+        assert_eq!(decoded, proposal);
+        assert_eq!(decoded.proposal_kind, CanonicalProposalKind::MemoryArtifact);
+        assert_eq!(
+            decoded.canonical_target,
+            CanonicalTargetKind::MemoryArtifacts
+        );
+    }
+
+    #[test]
+    fn retrieval_and_recovery_contracts_round_trip() {
+        let context = sample_context();
+        let json = serde_json::to_string(&context).expect("context should serialize");
+        let decoded: ConsciousContext =
+            serde_json::from_str(&json).expect("context should deserialize");
+        assert_eq!(
+            decoded.recovery_context.mode,
+            ForegroundExecutionMode::BacklogRecovery
+        );
+        assert_eq!(decoded.retrieved_context.items.len(), 2);
+    }
+
     fn sample_context() -> ConsciousContext {
         ConsciousContext {
             context_id: Uuid::now_v7(),
@@ -542,6 +729,67 @@ mod tests {
                 assistant_message: Some("hi".to_string()),
                 outcome: "completed".to_string(),
             }],
+            retrieved_context: RetrievedContext {
+                items: vec![
+                    RetrievedContextItem::Episode(RetrievedEpisodeContext {
+                        episode_id: Uuid::now_v7(),
+                        internal_conversation_ref: "telegram-primary".to_string(),
+                        started_at: Utc::now(),
+                        summary: "Discussed travel preferences.".to_string(),
+                        outcome: "completed".to_string(),
+                        relevance_reason: "same_conversation_recent".to_string(),
+                    }),
+                    RetrievedContextItem::MemoryArtifact(RetrievedMemoryArtifactContext {
+                        memory_artifact_id: Uuid::now_v7(),
+                        artifact_kind: "preference".to_string(),
+                        subject_ref: "user:primary".to_string(),
+                        content_text: "Prefers direct answers.".to_string(),
+                        validity_status: "active".to_string(),
+                        relevance_reason: "lexical_match".to_string(),
+                    }),
+                ],
+            },
+            recovery_context: ForegroundRecoveryContext {
+                mode: ForegroundExecutionMode::BacklogRecovery,
+                ordered_ingress: vec![
+                    OrderedIngressReference {
+                        ingress_id: Uuid::now_v7(),
+                        external_message_id: Some("message-40".to_string()),
+                        occurred_at: Utc::now(),
+                        text_body: Some("First delayed message".to_string()),
+                    },
+                    OrderedIngressReference {
+                        ingress_id: Uuid::now_v7(),
+                        external_message_id: Some("message-41".to_string()),
+                        occurred_at: Utc::now(),
+                        text_body: Some("Second delayed message".to_string()),
+                    },
+                ],
+            },
+        }
+    }
+
+    fn sample_memory_proposal() -> CanonicalProposal {
+        CanonicalProposal {
+            proposal_id: Uuid::now_v7(),
+            proposal_kind: CanonicalProposalKind::MemoryArtifact,
+            canonical_target: CanonicalTargetKind::MemoryArtifacts,
+            confidence_pct: 92,
+            conflict_posture: ProposalConflictPosture::Independent,
+            subject_ref: "user:primary".to_string(),
+            rationale: Some("Observed a stable preference during conversation.".to_string()),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: ProposalProvenance {
+                provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+                source_ingress_ids: vec![Uuid::now_v7()],
+                source_episode_id: Some(Uuid::now_v7()),
+            },
+            payload: CanonicalProposalPayload::MemoryArtifact(MemoryArtifactProposal {
+                artifact_kind: "preference".to_string(),
+                content_text: "Prefers concise replies.".to_string(),
+            }),
         }
     }
 

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use contracts::{WorkerRequest, WorkerResult};
@@ -12,6 +15,7 @@ use crate::{
     config::RuntimeConfig,
     db,
     execution::{self, NewExecutionRecord},
+    foreground,
     foreground_orchestration::{self, TelegramForegroundOrchestrationOutcome},
     ingress::{self, TelegramNormalizationOutcome},
     migration,
@@ -65,6 +69,7 @@ pub enum TelegramOutcome {
 pub struct TelegramProcessingSummary {
     pub fetched_updates: usize,
     pub completed_count: usize,
+    pub backlog_recovery_count: usize,
     pub duplicate_count: usize,
     pub trigger_rejected_count: usize,
     pub normalization_rejected_count: usize,
@@ -328,6 +333,7 @@ where
         fetched_updates: updates.len(),
         ..TelegramProcessingSummary::default()
     };
+    let mut staged_conversations = BTreeSet::new();
 
     for update in updates {
         let normalization = ingress::normalize_telegram_update(
@@ -338,24 +344,20 @@ where
 
         match normalization {
             TelegramNormalizationOutcome::Accepted(ingress) => {
-                match foreground_orchestration::orchestrate_telegram_foreground_ingress(
+                match foreground::stage_telegram_foreground_ingress(
                     context.pool,
-                    context.config,
                     context.telegram_config,
-                    context.model_gateway_config,
                     *ingress,
-                    context.transport,
-                    delivery,
                 )
                 .await?
                 {
-                    TelegramForegroundOrchestrationOutcome::Completed(_) => {
-                        summary.completed_count += 1;
+                    foreground::StagedForegroundIngressOutcome::Accepted(staged) => {
+                        staged_conversations.insert(staged.internal_conversation_ref);
                     }
-                    TelegramForegroundOrchestrationOutcome::Duplicate(_) => {
+                    foreground::StagedForegroundIngressOutcome::Duplicate(_) => {
                         summary.duplicate_count += 1;
                     }
-                    TelegramForegroundOrchestrationOutcome::Rejected(_) => {
+                    foreground::StagedForegroundIngressOutcome::Rejected(_) => {
                         summary.trigger_rejected_count += 1;
                     }
                 }
@@ -387,6 +389,74 @@ where
                     external_event_id = ignored.external_event_id,
                     "telegram update ignored during normalization",
                 );
+            }
+        }
+    }
+
+    for internal_conversation_ref in
+        foreground::list_recoverable_foreground_conversations(context.pool, context.config).await?
+    {
+        staged_conversations.insert(internal_conversation_ref);
+    }
+
+    for internal_conversation_ref in staged_conversations {
+        let trace_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        execution::insert(
+            context.pool,
+            &NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "telegram_pending_ingress".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({
+                    "internal_conversation_ref": internal_conversation_ref,
+                    "kind": "telegram_pending_ingress",
+                }),
+            },
+        )
+        .await?;
+
+        let Some(plan) = foreground::plan_pending_foreground_execution(
+            context.pool,
+            context.config,
+            trace_id,
+            execution_id,
+            &internal_conversation_ref,
+            foreground::PendingForegroundExecutionOptions::default(),
+        )
+        .await?
+        else {
+            continue;
+        };
+        let is_backlog_recovery = plan.mode == contracts::ForegroundExecutionMode::BacklogRecovery;
+
+        match foreground_orchestration::orchestrate_telegram_foreground_plan(
+            context.pool,
+            context.config,
+            context.model_gateway_config,
+            foreground_orchestration::ForegroundExecutionIds {
+                trace_id,
+                execution_id,
+            },
+            plan,
+            context.transport,
+            delivery,
+        )
+        .await?
+        {
+            TelegramForegroundOrchestrationOutcome::Completed(_) => {
+                summary.completed_count += 1;
+                if is_backlog_recovery {
+                    summary.backlog_recovery_count += 1;
+                }
+            }
+            TelegramForegroundOrchestrationOutcome::Duplicate(_) => {
+                summary.duplicate_count += 1;
+            }
+            TelegramForegroundOrchestrationOutcome::Rejected(_) => {
+                summary.trigger_rejected_count += 1;
             }
         }
     }

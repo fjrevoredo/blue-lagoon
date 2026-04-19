@@ -136,7 +136,8 @@ mod tests {
     use contracts::{ChannelKind, IngressEventKind, NormalizedIngress};
 
     use crate::config::{
-        AppConfig, DatabaseConfig, HarnessConfig, ResolvedTelegramConfig, WorkerConfig,
+        AppConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, HarnessConfig,
+        ResolvedTelegramConfig, RetrievalConfig, WorkerConfig,
     };
 
     fn config(allow_synthetic_smoke: bool) -> RuntimeConfig {
@@ -154,6 +155,19 @@ mod tests {
                 default_foreground_iteration_budget: 1,
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
+            },
+            continuity: ContinuityConfig {
+                retrieval: RetrievalConfig {
+                    max_recent_episode_candidates: 3,
+                    max_memory_artifact_candidates: 5,
+                    max_context_items: 6,
+                },
+                backlog_recovery: BacklogRecoveryConfig {
+                    pending_message_count_threshold: 3,
+                    pending_message_span_seconds_threshold: 120,
+                    stale_pending_ingress_age_seconds_threshold: 300,
+                    max_recovery_batch_size: 8,
+                },
             },
             worker: WorkerConfig {
                 timeout_ms: 10_000,
