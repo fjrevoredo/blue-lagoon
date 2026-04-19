@@ -55,6 +55,10 @@ Typical implementation workflow is:
   the canonical continuity component suite.
 - `cargo test -p harness --test continuity_integration -- --nocapture` to run
   the canonical continuity integration suite.
+- `cargo test -p harness --test unconscious_component -- --nocapture` to run
+  the PostgreSQL-backed background-maintenance component suite.
+- `cargo test -p harness --test unconscious_integration -- --nocapture` to run
+  the architecture-critical background-maintenance integration suite.
 - `cargo test --workspace` to run the full repository test surface when a
   broader local check is warranted.
 - `docker compose config` to verify the local runtime topology.
@@ -70,6 +74,8 @@ Typical implementation workflow is:
 - `cargo run -p runtime -- migrate` to apply reviewed migrations.
 - `cargo run -p runtime -- --help` to inspect the stable CLI surface.
 - `cargo run -p runtime -- harness --once --idle` to verify safe harness boot.
+- `cargo run -p runtime -- harness --once --background-once` to execute one
+  due background-maintenance job through the harness one-shot path.
 - `cargo run -p runtime -- harness --once --synthetic-trigger smoke` to run the
   synthetic harness smoke path.
 - `cargo run -p runtime -- telegram --fixture <fixture-path>` to replay one

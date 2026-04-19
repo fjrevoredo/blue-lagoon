@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     audit::{self, NewAuditEvent},
+    config::RuntimeConfig,
     continuity::{self, NewMergeDecision, NewProposalRecord},
+    memory, self_model,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +22,80 @@ pub struct ProposalProcessingContext {
     pub episode_id: Option<Uuid>,
     pub source_ingress_id: Option<Uuid>,
     pub source_loop_kind: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProposalApplicationSummary {
+    pub evaluated_count: usize,
+    pub accepted_count: usize,
+    pub rejected_count: usize,
+    pub canonical_write_count: usize,
+}
+
+pub async fn apply_candidate_proposals(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    context: &ProposalProcessingContext,
+    subsystem: &str,
+    worker_pid: Option<i32>,
+    proposals: &[CanonicalProposal],
+) -> Result<ProposalApplicationSummary> {
+    let mut summary = ProposalApplicationSummary::default();
+
+    for candidate in proposals {
+        summary.evaluated_count += 1;
+        let validation = validate_and_record_proposal(pool, context, candidate).await?;
+        match validation.outcome {
+            ProposalEvaluationOutcome::Rejected => {
+                summary.rejected_count += 1;
+            }
+            ProposalEvaluationOutcome::Accepted => {
+                let merge_outcome = match candidate.proposal_kind {
+                    CanonicalProposalKind::MemoryArtifact => {
+                        memory::apply_memory_proposal_merge(pool, context, candidate).await?
+                    }
+                    CanonicalProposalKind::SelfModelObservation => {
+                        self_model::apply_self_model_proposal_merge(
+                            pool, config, context, candidate,
+                        )
+                        .await?
+                    }
+                };
+
+                match merge_outcome.outcome {
+                    ProposalEvaluationOutcome::Accepted => {
+                        summary.accepted_count += 1;
+                        if merge_outcome.target.is_some() {
+                            summary.canonical_write_count += 1;
+                            audit::insert(
+                                pool,
+                                &NewAuditEvent {
+                                    loop_kind: context.source_loop_kind.clone(),
+                                    subsystem: subsystem.to_string(),
+                                    event_kind: "canonical_write_applied".to_string(),
+                                    severity: "info".to_string(),
+                                    trace_id: context.trace_id,
+                                    execution_id: Some(context.execution_id),
+                                    worker_pid,
+                                    payload: json!({
+                                        "proposal_id": candidate.proposal_id,
+                                        "outcome": "accepted",
+                                        "target": merge_outcome.target,
+                                    }),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    ProposalEvaluationOutcome::Rejected => {
+                        summary.rejected_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 pub async fn validate_and_record_proposal(

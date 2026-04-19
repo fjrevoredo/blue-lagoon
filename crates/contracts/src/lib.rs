@@ -271,6 +271,7 @@ pub struct ApprovalPayload {
 #[serde(rename_all = "snake_case")]
 pub enum ForegroundTriggerKind {
     UserIngress,
+    ApprovedWakeSignal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +342,8 @@ pub struct UnconsciousScope {
     pub memory_artifact_ids: Vec<Uuid>,
     pub retrieval_artifact_ids: Vec<Uuid>,
     pub self_model_artifact_id: Option<Uuid>,
+    pub internal_principal_ref: Option<String>,
+    pub internal_conversation_ref: Option<String>,
     pub summary: String,
 }
 
@@ -1016,6 +1019,8 @@ mod tests {
                 memory_artifact_ids: vec![Uuid::now_v7()],
                 retrieval_artifact_ids: vec![Uuid::now_v7()],
                 self_model_artifact_id: Some(Uuid::now_v7()),
+                internal_principal_ref: Some("primary-user".to_string()),
+                internal_conversation_ref: Some("telegram-primary".to_string()),
                 summary: "Consolidate recent episodes into stable memory.".to_string(),
             },
             budget: BackgroundExecutionBudget {

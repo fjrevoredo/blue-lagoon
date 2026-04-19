@@ -12,7 +12,10 @@ use harness::{
     background::{self, BackgroundJobRunStatus, BackgroundJobStatus, WakeSignalStatus},
     background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
-    config::{ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig},
+    config::{
+        ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, SelfModelConfig,
+        TelegramConfig, TelegramForegroundBindingConfig,
+    },
     continuity,
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
@@ -22,7 +25,7 @@ use harness::{
 use serde_json::json;
 use serial_test::serial;
 use sqlx::Row;
-use std::{fs, process::Command, time::Duration as StdDuration};
+use std::{fs, path::PathBuf, process::Command, time::Duration as StdDuration};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -569,6 +572,42 @@ async fn background_execution_completes_due_job_and_records_audit_history() -> R
         assert_eq!(execution.status, "completed");
         assert_eq!(execution.worker_pid, Some(outcome.worker_pid as i32));
 
+        let proposals =
+            continuity::list_proposals_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert_eq!(proposals.len(), 1);
+        let proposal = &proposals[0];
+        assert_eq!(proposal.status, "accepted");
+        assert_eq!(proposal.source_loop_kind, "unconscious");
+        assert_eq!(proposal.subject_ref, "primary-user");
+
+        let merge_decision =
+            continuity::get_merge_decision_by_proposal(&ctx.pool, proposal.proposal_id)
+                .await?
+                .expect("accepted background proposal should have a merge decision");
+        assert_eq!(merge_decision.decision_kind, "accepted");
+        let memory_artifact_id = merge_decision
+            .accepted_memory_artifact_id
+            .expect("accepted background memory proposal should create a canonical artifact");
+        let memory_artifact =
+            continuity::get_memory_artifact(&ctx.pool, memory_artifact_id).await?;
+        assert_eq!(memory_artifact.proposal_id, proposal.proposal_id);
+        assert_eq!(memory_artifact.subject_ref, "primary-user");
+        assert_eq!(memory_artifact.content_text, "maintenance lexical summary");
+        let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
+            &ctx.pool,
+            "telegram-primary",
+            10,
+        )
+        .await?;
+        assert_eq!(retrieval_artifacts.len(), 1);
+        assert_eq!(retrieval_artifacts[0].source_kind, "episode");
+        assert!(retrieval_artifacts[0].source_episode_id.is_some());
+        assert!(retrieval_artifacts[0].source_memory_artifact_id.is_none());
+        assert_eq!(
+            retrieval_artifacts[0].lexical_document,
+            "maintenance lexical summary"
+        );
+
         let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
         assert!(
             audit_events
@@ -580,6 +619,473 @@ async fn background_execution_completes_due_job_and_records_audit_history() -> R
                 .iter()
                 .any(|event| event.event_kind == "background_job_completed")
         );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "canonical_write_applied")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "retrieval_update_applied")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_persists_retrieval_maintenance_outputs() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::RetrievalMaintenance,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "retrieval lexical summary" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 7
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due retrieval-maintenance job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        let proposals =
+            continuity::list_proposals_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(proposals.is_empty());
+
+        let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
+            &ctx.pool,
+            "telegram-primary",
+            10,
+        )
+        .await?;
+        assert_eq!(retrieval_artifacts.len(), 1);
+        assert_eq!(retrieval_artifacts[0].source_kind, "episode");
+        assert!(retrieval_artifacts[0].source_episode_id.is_some());
+        assert!(retrieval_artifacts[0].source_memory_artifact_id.is_none());
+        assert_eq!(
+            retrieval_artifacts[0].lexical_document,
+            "retrieval lexical summary"
+        );
+        assert!(
+            retrieval_artifacts[0]
+                .payload
+                .get("source_ref")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.starts_with("background_job:"))
+        );
+
+        let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "retrieval_update_applied")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_records_contradiction_diagnostics_without_mutating_state()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::ContradictionAndDriftScan,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "Potential contradiction detected between recent memory snapshots." },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due contradiction-and-drift job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        let proposals =
+            continuity::list_proposals_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(proposals.is_empty());
+
+        let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
+            &ctx.pool,
+            "telegram-primary",
+            10,
+        )
+        .await?;
+        assert!(retrieval_artifacts.is_empty());
+
+        let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_diagnostic_recorded")
+        );
+        let diagnostic_row = sqlx::query(
+            r#"
+            SELECT severity, payload
+            FROM audit_events
+            WHERE execution_id = $1
+              AND event_kind = 'background_diagnostic_recorded'
+            ORDER BY occurred_at DESC, event_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(outcome.execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let severity: String = sqlx::Row::get(&diagnostic_row, "severity");
+        let payload: serde_json::Value = sqlx::Row::get(&diagnostic_row, "payload");
+        assert_eq!(severity, "critical");
+        assert_eq!(
+            payload.get("code").and_then(serde_json::Value::as_str),
+            Some("contradiction_detected")
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_applies_self_model_reflection_through_canonical_merge_path()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+        let prior_self_model_artifact_id = seed_self_model_artifact(&ctx.pool, Uuid::now_v7()).await?;
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::SelfModelReflection,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 16,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due self-model-reflection job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        let proposals =
+            continuity::list_proposals_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].proposal_kind, "self_model_observation");
+        assert_eq!(proposals[0].status, "accepted");
+
+        let merge_decision =
+            continuity::get_merge_decision_by_proposal(&ctx.pool, proposals[0].proposal_id)
+                .await?
+                .expect("accepted self-model reflection should have a merge decision");
+        let accepted_artifact_id = merge_decision
+            .accepted_self_model_artifact_id
+            .expect("accepted self-model reflection should create a canonical artifact");
+        let active_artifacts = continuity::list_active_self_model_artifacts(&ctx.pool, 10).await?;
+        assert_eq!(active_artifacts.len(), 1);
+        assert_eq!(active_artifacts[0].self_model_artifact_id, accepted_artifact_id);
+        assert!(
+            active_artifacts[0].preferences.iter().any(|value| {
+                value == "Prefer concise progress updates during long maintenance runs."
+            })
+        );
+
+        let superseded_artifacts =
+            continuity::list_superseded_self_model_artifacts(&ctx.pool, 10).await?;
+        assert_eq!(superseded_artifacts.len(), 1);
+        assert_eq!(
+            superseded_artifacts[0].self_model_artifact_id,
+            prior_self_model_artifact_id
+        );
+
+        let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
+            &ctx.pool,
+            "telegram-primary",
+            10,
+        )
+        .await?;
+        assert!(retrieval_artifacts.is_empty());
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_converts_accepted_wake_signal_into_staged_foreground_work()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: PathBuf::from("config/self_model_seed.toml"),
+        });
+        config.telegram = Some(TelegramConfig {
+            api_base_url: "https://api.telegram.org".to_string(),
+            bot_token_env: "BLUE_LAGOON_TEST_TELEGRAM_TOKEN".to_string(),
+            poll_limit: 10,
+            foreground_binding: Some(TelegramForegroundBindingConfig {
+                allowed_user_id: 42,
+                allowed_chat_id: 24,
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            }),
+        });
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::SelfModelReflection,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 16,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due self-model-reflection job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        assert!(background::list_pending_wake_signals(&ctx.pool, 10).await?.is_empty());
+
+        let signal_row = sqlx::query(
+            r#"
+            SELECT wake_signal_id
+            FROM wake_signals
+            WHERE execution_id = $1
+            "#,
+        )
+        .bind(outcome.execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let wake_signal_id: Uuid = signal_row.get("wake_signal_id");
+        let stored_signal = background::get_wake_signal(&ctx.pool, wake_signal_id).await?;
+        assert_eq!(stored_signal.status, WakeSignalStatus::Accepted);
+        assert_eq!(
+            stored_signal
+                .decision
+                .as_ref()
+                .expect("accepted wake signal should record a decision")
+                .decision,
+            WakeSignalDecisionKind::Accepted
+        );
+
+        let ingress_row = sqlx::query(
+            r#"
+            SELECT ingress_id, internal_conversation_ref, foreground_status, text_body
+            FROM ingress_events
+            WHERE external_event_id = $1
+            "#,
+        )
+        .bind(format!("wake-signal:{wake_signal_id}"))
+        .fetch_one(&ctx.pool)
+        .await?;
+        let staged_ingress_id: Uuid = ingress_row.get("ingress_id");
+        assert_eq!(
+            ingress_row.get::<String, _>("internal_conversation_ref"),
+            "telegram-primary".to_string()
+        );
+        assert_eq!(
+            ingress_row.get::<String, _>("foreground_status"),
+            "pending".to_string()
+        );
+        assert!(
+            ingress_row
+                .get::<String, _>("text_body")
+                .contains("policy-approved maintenance wake signal")
+        );
+
+        let normalized_ingress =
+            foreground::load_normalized_ingress(&ctx.pool, staged_ingress_id).await?;
+        let trigger = foreground::build_foreground_trigger(
+            &config,
+            outcome.trace_id,
+            Uuid::now_v7(),
+            normalized_ingress,
+        )?;
+        assert_eq!(
+            trigger.trigger_kind,
+            contracts::ForegroundTriggerKind::ApprovedWakeSignal
+        );
+
+        let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
+        assert!(audit_events.iter().any(|event| event.event_kind == "wake_signal_recorded"));
+        assert!(audit_events.iter().any(|event| event.event_kind == "wake_signal_reviewed"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "wake_signal_foreground_conversion_staged")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_execution_rejects_wake_signal_when_no_foreground_binding_is_available()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: PathBuf::from("config/self_model_seed.toml"),
+        });
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::SelfModelReflection,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 16,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = background_execution::execute_next_due_job(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            Utc::now(),
+        )
+        .await?
+        .expect("expected a due self-model-reflection job to execute");
+
+        assert_eq!(outcome.background_job_id, background_job_id);
+        let signal_row = sqlx::query(
+            r#"
+            SELECT wake_signal_id
+            FROM wake_signals
+            WHERE execution_id = $1
+            "#,
+        )
+        .bind(outcome.execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let wake_signal_id: Uuid = signal_row.get("wake_signal_id");
+        let stored_signal = background::get_wake_signal(&ctx.pool, wake_signal_id).await?;
+        assert_eq!(stored_signal.status, WakeSignalStatus::Rejected);
+        assert_eq!(
+            stored_signal
+                .decision
+                .as_ref()
+                .expect("rejected wake signal should record a decision")
+                .decision,
+            WakeSignalDecisionKind::Rejected
+        );
+
+        let staged_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_events
+            WHERE external_event_id = $1
+            "#,
+        )
+        .bind(format!("wake-signal:{wake_signal_id}"))
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(staged_count, 0);
         Ok(())
     })
     .await
@@ -726,11 +1232,17 @@ fn sample_trigger(kind: BackgroundTriggerKind, reason_summary: &str) -> Backgrou
 }
 
 fn sample_scope(summary: &str) -> UnconsciousScope {
+    sample_scope_with_episode(summary, Uuid::now_v7())
+}
+
+fn sample_scope_with_episode(summary: &str, episode_id: Uuid) -> UnconsciousScope {
     UnconsciousScope {
-        episode_ids: vec![Uuid::now_v7()],
+        episode_ids: vec![episode_id],
         memory_artifact_ids: vec![Uuid::now_v7()],
         retrieval_artifact_ids: vec![Uuid::now_v7()],
         self_model_artifact_id: Some(Uuid::now_v7()),
+        internal_principal_ref: Some("primary-user".to_string()),
+        internal_conversation_ref: Some("telegram-primary".to_string()),
         summary: summary.to_string(),
     }
 }
@@ -886,17 +1398,32 @@ async fn seed_planned_background_job(
     pool: &sqlx::PgPool,
     available_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Uuid> {
+    seed_planned_background_job_with_kind(
+        pool,
+        available_at,
+        UnconsciousJobKind::MemoryConsolidation,
+    )
+    .await
+}
+
+async fn seed_planned_background_job_with_kind(
+    pool: &sqlx::PgPool,
+    available_at: chrono::DateTime<chrono::Utc>,
+    job_kind: UnconsciousJobKind,
+) -> Result<Uuid> {
     let trace_id = Uuid::now_v7();
+    let scoped_episode_id =
+        seed_episode_for_conversation(pool, trace_id, "telegram-primary").await?;
     let background_job_id = Uuid::now_v7();
     background::insert_job(
         pool,
         &background::NewBackgroundJob {
             background_job_id,
             trace_id,
-            job_kind: UnconsciousJobKind::MemoryConsolidation,
+            job_kind,
             trigger: sample_trigger(BackgroundTriggerKind::TimeSchedule, "scheduled maintenance"),
-            deduplication_key: format!("job:memory:scheduled:{background_job_id}"),
-            scope: sample_scope("maintenance scope"),
+            deduplication_key: format!("job:{job_kind:?}:scheduled:{background_job_id}"),
+            scope: sample_scope_with_episode("maintenance scope", scoped_episode_id),
             budget: sample_budget(),
             status: BackgroundJobStatus::Planned,
             available_at,

@@ -278,6 +278,8 @@ async fn assemble_scope(
     let self_model_artifact_id = continuity::get_latest_active_self_model_artifact(pool)
         .await?
         .map(|artifact| artifact.self_model_artifact_id);
+    let internal_principal_ref =
+        resolve_scope_internal_principal_ref(pool, internal_conversation_ref).await?;
     let episode_count = episode_ids.len();
     let memory_count = memory_artifact_ids.len();
     let retrieval_count = retrieval_artifact_ids.len();
@@ -287,6 +289,8 @@ async fn assemble_scope(
         memory_artifact_ids,
         retrieval_artifact_ids,
         self_model_artifact_id,
+        internal_principal_ref,
+        internal_conversation_ref: internal_conversation_ref.map(str::to_string),
         summary: format!(
             "{} scope with {} episodes, {} memory artifacts, {} retrieval artifacts, self-model: {}",
             human_job_kind(job_kind),
@@ -300,6 +304,49 @@ async fn assemble_scope(
             }
         ),
     })
+}
+
+async fn resolve_scope_internal_principal_ref(
+    pool: &PgPool,
+    internal_conversation_ref: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(internal_conversation_ref) = internal_conversation_ref else {
+        return Ok(None);
+    };
+
+    let binding_row = sqlx::query(
+        r#"
+        SELECT internal_principal_ref
+        FROM conversation_bindings
+        WHERE internal_conversation_ref = $1
+        ORDER BY updated_at DESC, conversation_binding_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(internal_conversation_ref)
+    .fetch_optional(pool)
+    .await
+    .context("failed to resolve background scope principal from conversation binding")?;
+    if let Some(row) = binding_row {
+        let internal_principal_ref: String = row.get("internal_principal_ref");
+        return Ok(Some(internal_principal_ref));
+    }
+
+    let episode_row = sqlx::query(
+        r#"
+        SELECT internal_principal_ref
+        FROM episodes
+        WHERE internal_conversation_ref = $1
+        ORDER BY started_at DESC, episode_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(internal_conversation_ref)
+    .fetch_optional(pool)
+    .await
+    .context("failed to resolve background scope principal from recent episodes")?;
+
+    Ok(episode_row.map(|row| row.get("internal_principal_ref")))
 }
 
 async fn list_recent_episode_ids(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
@@ -452,5 +499,26 @@ mod tests {
 
         let key = build_deduplication_key(UnconsciousJobKind::MemoryConsolidation, &trigger, None);
         assert_eq!(key, "background:memory_consolidation:time_schedule:global");
+    }
+
+    #[test]
+    fn deduplication_key_falls_back_to_reason_summary_when_no_payload_or_conversation_exists() {
+        let trigger = BackgroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trigger_kind: BackgroundTriggerKind::MaintenanceTrigger,
+            requested_at: Utc::now(),
+            reason_summary: "Maintenance: contradiction scan / nightly".to_string(),
+            payload_ref: None,
+        };
+
+        let key = build_deduplication_key(
+            UnconsciousJobKind::ContradictionAndDriftScan,
+            &trigger,
+            None,
+        );
+        assert_eq!(
+            key,
+            "background:contradiction_and_drift_scan:maintenance_trigger:maintenance-contradiction-scan-nightly"
+        );
     }
 }

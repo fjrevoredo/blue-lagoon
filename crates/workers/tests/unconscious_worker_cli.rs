@@ -118,6 +118,8 @@ fn sample_context() -> UnconsciousContext {
             memory_artifact_ids: vec![uuid::Uuid::now_v7()],
             retrieval_artifact_ids: vec![uuid::Uuid::now_v7()],
             self_model_artifact_id: None,
+            internal_principal_ref: Some("primary-user".to_string()),
+            internal_conversation_ref: Some("telegram-primary".to_string()),
             summary: "Consolidate the latest scoped memory batch.".to_string(),
         },
         budget: BackgroundExecutionBudget {

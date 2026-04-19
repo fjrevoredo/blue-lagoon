@@ -3,14 +3,19 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use contracts::{
-    ForegroundTrigger, RetrievedContext, RetrievedContextItem, RetrievedEpisodeContext,
-    RetrievedMemoryArtifactContext,
+    ForegroundTrigger, RetrievalUpdateOperation, RetrievalUpdateProposal, RetrievedContext,
+    RetrievedContextItem, RetrievedEpisodeContext, RetrievedMemoryArtifactContext,
+    UnconsciousScope,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::{config::RuntimeConfig, continuity};
+use crate::{
+    audit::{self, NewAuditEvent},
+    config::RuntimeConfig,
+    continuity,
+};
 
 const RETRIEVAL_REFRESH_SCAN_MULTIPLIER: i64 = 4;
 
@@ -41,6 +46,123 @@ struct ScoredCandidate {
     score: i64,
     lexical_match_count: usize,
     relevance_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetrievalUpdateApplicationSummary {
+    pub evaluated_count: usize,
+    pub upserted_count: usize,
+    pub archived_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetrievalUpdateApplicationContext<'a> {
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub source_loop_kind: &'a str,
+    pub subsystem: &'a str,
+    pub worker_pid: Option<i32>,
+    pub scope: &'a UnconsciousScope,
+}
+
+pub async fn apply_retrieval_updates(
+    pool: &PgPool,
+    context: RetrievalUpdateApplicationContext<'_>,
+    updates: &[RetrievalUpdateProposal],
+) -> Result<RetrievalUpdateApplicationSummary> {
+    let mut summary = RetrievalUpdateApplicationSummary::default();
+    let source_episode_id = context.scope.episode_ids.first().copied();
+
+    for update in updates {
+        summary.evaluated_count += 1;
+        validate_retrieval_update(update)?;
+
+        match update.operation {
+            RetrievalUpdateOperation::Upsert => {
+                let archived_count = continuity::archive_retrieval_artifacts_by_source_ref(
+                    pool,
+                    &update.source_ref,
+                    update.internal_conversation_ref.as_deref(),
+                )
+                .await?;
+                continuity::insert_retrieval_artifact(
+                    pool,
+                    &continuity::NewRetrievalArtifact {
+                        retrieval_artifact_id: update.update_id,
+                        source_kind: "episode".to_string(),
+                        source_episode_id: Some(source_episode_id.context(
+                            "retrieval maintenance upsert requires a scoped episode anchor",
+                        )?),
+                        source_memory_artifact_id: None,
+                        internal_conversation_ref: update.internal_conversation_ref.clone(),
+                        lexical_document: update.lexical_document.clone(),
+                        relevance_timestamp: update.relevance_timestamp,
+                        status: "active".to_string(),
+                        payload: json!({
+                            "projection": "background_retrieval_maintenance",
+                            "source_ref": update.source_ref,
+                            "rationale": update.rationale,
+                        }),
+                    },
+                )
+                .await?;
+                summary.upserted_count += 1;
+                audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: context.source_loop_kind.to_string(),
+                        subsystem: context.subsystem.to_string(),
+                        event_kind: "retrieval_update_applied".to_string(),
+                        severity: "info".to_string(),
+                        trace_id: context.trace_id,
+                        execution_id: Some(context.execution_id),
+                        worker_pid: context.worker_pid,
+                        payload: json!({
+                            "update_id": update.update_id,
+                            "operation": "upsert",
+                            "source_ref": update.source_ref,
+                            "archived_prior_count": archived_count,
+                            "source_kind": "episode",
+                            "source_episode_id": source_episode_id,
+                            "internal_conversation_ref": update.internal_conversation_ref,
+                        }),
+                    },
+                )
+                .await?;
+            }
+            RetrievalUpdateOperation::Archive => {
+                let archived_count = continuity::archive_retrieval_artifacts_by_source_ref(
+                    pool,
+                    &update.source_ref,
+                    update.internal_conversation_ref.as_deref(),
+                )
+                .await?;
+                summary.archived_count += archived_count as usize;
+                audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: context.source_loop_kind.to_string(),
+                        subsystem: context.subsystem.to_string(),
+                        event_kind: "retrieval_update_applied".to_string(),
+                        severity: "info".to_string(),
+                        trace_id: context.trace_id,
+                        execution_id: Some(context.execution_id),
+                        worker_pid: context.worker_pid,
+                        payload: json!({
+                            "update_id": update.update_id,
+                            "operation": "archive",
+                            "source_ref": update.source_ref,
+                            "archived_count": archived_count,
+                            "internal_conversation_ref": update.internal_conversation_ref,
+                        }),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 pub async fn assemble_retrieved_context(
@@ -530,6 +652,32 @@ fn build_semantic_document(values: &[&str]) -> String {
     tokens.into_iter().collect::<Vec<_>>().join(" ")
 }
 
+fn validate_retrieval_update(update: &RetrievalUpdateProposal) -> Result<()> {
+    if update.source_ref.trim().is_empty() {
+        anyhow::bail!("retrieval update source_ref must not be empty");
+    }
+
+    match update.operation {
+        RetrievalUpdateOperation::Upsert => {
+            if update.lexical_document.trim().is_empty() {
+                anyhow::bail!("retrieval upsert lexical_document must not be empty");
+            }
+            let Some(internal_conversation_ref) = update.internal_conversation_ref.as_deref()
+            else {
+                anyhow::bail!(
+                    "retrieval upsert requires an internal_conversation_ref for conservative persistence"
+                );
+            };
+            if internal_conversation_ref.trim().is_empty() {
+                anyhow::bail!("retrieval upsert internal_conversation_ref must not be empty");
+            }
+        }
+        RetrievalUpdateOperation::Archive => {}
+    }
+
+    Ok(())
+}
+
 fn normalize_semantic_token(token: &str) -> String {
     let token = token.trim().to_ascii_lowercase();
     if token.len() > 4 && token.ends_with("ies") {
@@ -645,6 +793,41 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].source_kind, RetrievalSourceKind::Episode);
         assert_eq!(selected[1].source_kind, RetrievalSourceKind::MemoryArtifact);
+    }
+
+    #[test]
+    fn validate_retrieval_update_accepts_conversation_scoped_upsert() {
+        let update = RetrievalUpdateProposal {
+            update_id: Uuid::now_v7(),
+            operation: RetrievalUpdateOperation::Upsert,
+            source_ref: "background_job:test".to_string(),
+            lexical_document: "retrieval maintenance summary".to_string(),
+            relevance_timestamp: Utc::now(),
+            internal_conversation_ref: Some("telegram-primary".to_string()),
+            rationale: Some("refresh lexical retrieval projection".to_string()),
+        };
+
+        assert!(validate_retrieval_update(&update).is_ok());
+    }
+
+    #[test]
+    fn validate_retrieval_update_rejects_upsert_without_conversation_scope() {
+        let update = RetrievalUpdateProposal {
+            update_id: Uuid::now_v7(),
+            operation: RetrievalUpdateOperation::Upsert,
+            source_ref: "background_job:test".to_string(),
+            lexical_document: "retrieval maintenance summary".to_string(),
+            relevance_timestamp: Utc::now(),
+            internal_conversation_ref: None,
+            rationale: None,
+        };
+
+        let error = validate_retrieval_update(&update).expect_err("missing scope should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an internal_conversation_ref")
+        );
     }
 
     fn sample_scored_candidate(source_kind: RetrievalSourceKind, score: i64) -> ScoredCandidate {

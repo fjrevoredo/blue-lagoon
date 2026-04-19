@@ -204,21 +204,25 @@ pub async fn apply_self_model_proposal_merge(
     };
 
     let active_artifacts = continuity::list_active_self_model_artifacts(pool, 2).await?;
-    let current = if let Some(artifact) = select_single_active_artifact(&active_artifacts)? {
-        snapshot_from_canonical_artifact(artifact)?
-    } else {
-        load_self_model_snapshot(
-            pool,
-            config,
-            &SelfModelLoadContext {
-                trace_id: context.trace_id,
-                execution_id: context.execution_id,
-                episode_id: context.episode_id,
-            },
-        )
-        .await?
-        .snapshot
-    };
+    let (current, superseded_artifact_id) =
+        if let Some(artifact) = select_single_active_artifact(&active_artifacts)? {
+            (
+                snapshot_from_canonical_artifact(artifact)?,
+                Some(artifact.self_model_artifact_id),
+            )
+        } else {
+            let loaded = load_self_model_snapshot(
+                pool,
+                config,
+                &SelfModelLoadContext {
+                    trace_id: context.trace_id,
+                    execution_id: context.execution_id,
+                    episode_id: context.episode_id,
+                },
+            )
+            .await?;
+            (loaded.snapshot, loaded.canonical_artifact_id)
+        };
 
     if current
         .preferences
@@ -244,10 +248,6 @@ pub async fn apply_self_model_proposal_merge(
 
     let next_snapshot = merge_self_model_observation(current, payload);
     let next_artifact_id = Uuid::now_v7();
-    let superseded_artifact_id = active_artifacts
-        .first()
-        .map(|artifact| artifact.self_model_artifact_id);
-
     let mut transaction = pool.begin().await?;
     continuity::insert_self_model_artifact(
         &mut *transaction,
@@ -612,5 +612,41 @@ mod tests {
             created_at: Utc::now(),
             payload: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn merge_self_model_observation_appends_preferences_for_interaction_style() {
+        let snapshot = sample_self_model_artifact("active");
+        let merged = merge_self_model_observation(
+            snapshot_from_canonical_artifact(&snapshot).expect("snapshot should decode"),
+            &SelfModelObservationProposal {
+                observation_kind: "interaction_style".to_string(),
+                content_text: "Prefer concise progress updates.".to_string(),
+            },
+        );
+
+        assert!(
+            merged
+                .preferences
+                .contains(&"Prefer concise progress updates.".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_self_model_observation_routes_subgoals_to_current_subgoals() {
+        let snapshot = sample_self_model_artifact("active");
+        let merged = merge_self_model_observation(
+            snapshot_from_canonical_artifact(&snapshot).expect("snapshot should decode"),
+            &SelfModelObservationProposal {
+                observation_kind: "subgoal".to_string(),
+                content_text: "Monitor drift signals during maintenance.".to_string(),
+            },
+        );
+
+        assert!(
+            merged
+                .current_subgoals
+                .contains(&"Monitor drift signals during maintenance.".to_string())
+        );
     }
 }

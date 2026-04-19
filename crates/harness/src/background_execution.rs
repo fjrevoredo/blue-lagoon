@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use contracts::{UnconsciousContext, WorkerRequest, WorkerResult};
+use contracts::{
+    DiagnosticAlert, DiagnosticSeverity, UnconsciousContext, WakeSignal, WakeSignalDecision,
+    WakeSignalDecisionKind, WorkerRequest, WorkerResult,
+};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,8 +16,9 @@ use crate::{
     },
     config::{ResolvedModelGatewayConfig, RuntimeConfig},
     execution::{self, NewExecutionRecord},
+    foreground::{self, StagedForegroundIngressOutcome},
     model_gateway::ModelProviderTransport,
-    worker,
+    policy, proposal, retrieval, worker,
 };
 
 #[derive(Debug, Clone)]
@@ -229,8 +233,8 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
         }
     };
 
-    let summary = match &response.result {
-        WorkerResult::Unconscious(result) => result.summary.clone(),
+    let uncon_result = match &response.result {
+        WorkerResult::Unconscious(result) => result,
         WorkerResult::Smoke(_) | WorkerResult::Conscious(_) | WorkerResult::Error(_) => {
             let message = "unconscious worker returned an invalid result shape".to_string();
             persist_background_failure(
@@ -245,6 +249,130 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
             anyhow::bail!(message);
         }
     };
+    let proposal_summary = match proposal::apply_candidate_proposals(
+        pool,
+        config,
+        &proposal::ProposalProcessingContext {
+            trace_id: leased.job.trace_id,
+            execution_id: leased.execution_id,
+            episode_id: None,
+            source_ingress_id: None,
+            source_loop_kind: "unconscious".to_string(),
+        },
+        "background_execution",
+        Some(response.worker_pid as i32),
+        &uncon_result.maintenance_outputs.canonical_proposals,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let error_message = error.to_string();
+            persist_background_failure(
+                pool,
+                &leased,
+                started_at,
+                Some(response.worker_pid as i32),
+                &error_message,
+                false,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let retrieval_summary = match retrieval::apply_retrieval_updates(
+        pool,
+        retrieval::RetrievalUpdateApplicationContext {
+            trace_id: leased.job.trace_id,
+            execution_id: leased.execution_id,
+            source_loop_kind: "unconscious",
+            subsystem: "background_execution",
+            worker_pid: Some(response.worker_pid as i32),
+            scope: &leased.job.scope,
+        },
+        &uncon_result.maintenance_outputs.retrieval_updates,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let error_message = error.to_string();
+            persist_background_failure(
+                pool,
+                &leased,
+                started_at,
+                Some(response.worker_pid as i32),
+                &error_message,
+                false,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let diagnostic_count = match persist_diagnostic_alerts(
+        pool,
+        &leased,
+        Some(response.worker_pid as i32),
+        &uncon_result.maintenance_outputs.diagnostics,
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            let error_message = error.to_string();
+            persist_background_failure(
+                pool,
+                &leased,
+                started_at,
+                Some(response.worker_pid as i32),
+                &error_message,
+                false,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let wake_signal_summary = match persist_wake_signals(
+        pool,
+        config,
+        &leased,
+        &uncon_result.maintenance_outputs.wake_signals,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let error_message = error.to_string();
+            persist_background_failure(
+                pool,
+                &leased,
+                started_at,
+                Some(response.worker_pid as i32),
+                &error_message,
+                false,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let summary = format!(
+        "{} | proposals evaluated={}, accepted={}, rejected={}, canonical_writes={}, retrieval_updates={}, retrieval_upserts={}, retrieval_archives={}, diagnostics={}, wake_signals={} (accepted={}, deferred={}, suppressed={}, rejected={}, staged={})",
+        uncon_result.summary,
+        proposal_summary.evaluated_count,
+        proposal_summary.accepted_count,
+        proposal_summary.rejected_count,
+        proposal_summary.canonical_write_count,
+        retrieval_summary.evaluated_count,
+        retrieval_summary.upserted_count,
+        retrieval_summary.archived_count,
+        diagnostic_count,
+        wake_signal_summary.total_count,
+        wake_signal_summary.accepted_count,
+        wake_signal_summary.deferred_count,
+        wake_signal_summary.suppressed_count,
+        wake_signal_summary.rejected_count,
+        wake_signal_summary.staged_count
+    );
 
     let completed_at = Utc::now();
     background::update_job_run_status(
@@ -385,6 +513,297 @@ async fn persist_background_failure(
     Ok(())
 }
 
+async fn persist_diagnostic_alerts(
+    pool: &PgPool,
+    leased: &LeasedBackgroundExecution,
+    worker_pid: Option<i32>,
+    diagnostics: &[DiagnosticAlert],
+) -> Result<usize> {
+    for diagnostic in diagnostics {
+        validate_diagnostic_alert(diagnostic)?;
+        audit::insert(
+            pool,
+            &NewAuditEvent {
+                loop_kind: "unconscious".to_string(),
+                subsystem: "background_execution".to_string(),
+                event_kind: "background_diagnostic_recorded".to_string(),
+                severity: diagnostic_severity_as_str(diagnostic.severity).to_string(),
+                trace_id: leased.job.trace_id,
+                execution_id: Some(leased.execution_id),
+                worker_pid,
+                payload: json!({
+                    "alert_id": diagnostic.alert_id,
+                    "code": diagnostic.code,
+                    "summary": diagnostic.summary,
+                    "details": diagnostic.details,
+                    "background_job_id": leased.job.background_job_id,
+                    "background_job_run_id": leased.background_job_run_id,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    Ok(diagnostics.len())
+}
+
+#[derive(Debug, Clone, Default)]
+struct WakeSignalPersistenceSummary {
+    total_count: usize,
+    accepted_count: usize,
+    deferred_count: usize,
+    suppressed_count: usize,
+    rejected_count: usize,
+    staged_count: usize,
+}
+
+async fn persist_wake_signals(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    leased: &LeasedBackgroundExecution,
+    wake_signals: &[WakeSignal],
+) -> Result<WakeSignalPersistenceSummary> {
+    let mut summary = WakeSignalPersistenceSummary::default();
+    let foreground_binding = config
+        .telegram
+        .as_ref()
+        .and_then(|telegram| telegram.foreground_binding.as_ref());
+
+    for signal in wake_signals {
+        validate_wake_signal(signal)?;
+        summary.total_count += 1;
+
+        let requested_at = Utc::now();
+        background::insert_wake_signal(
+            pool,
+            &background::NewWakeSignalRecord {
+                background_job_id: leased.job.background_job_id,
+                background_job_run_id: Some(leased.background_job_run_id),
+                trace_id: leased.job.trace_id,
+                execution_id: Some(leased.execution_id),
+                signal: signal.clone(),
+                status: background::WakeSignalStatus::PendingReview,
+                requested_at,
+                cooldown_until: None,
+            },
+        )
+        .await?;
+
+        let recorded_signal = background::get_wake_signal(pool, signal.signal_id).await?;
+        audit::insert(
+            pool,
+            &NewAuditEvent {
+                loop_kind: "unconscious".to_string(),
+                subsystem: "background_execution".to_string(),
+                event_kind: "wake_signal_recorded".to_string(),
+                severity: "info".to_string(),
+                trace_id: leased.job.trace_id,
+                execution_id: Some(leased.execution_id),
+                worker_pid: None,
+                payload: json!({
+                    "wake_signal_id": recorded_signal.wake_signal_id,
+                    "background_job_id": leased.job.background_job_id,
+                    "background_job_run_id": leased.background_job_run_id,
+                    "reason": recorded_signal.signal.reason,
+                    "priority": recorded_signal.signal.priority,
+                    "reason_code": recorded_signal.signal.reason_code,
+                    "summary": recorded_signal.signal.summary,
+                }),
+            },
+        )
+        .await?;
+
+        let evaluation_context = policy::WakeSignalEvaluationContext {
+            pending_signal_count: background::count_open_wake_signals(pool, requested_at).await?,
+            cooldown_active: background::has_active_wake_signal_cooldown(
+                pool,
+                &recorded_signal.signal.reason_code,
+                requested_at,
+                recorded_signal.wake_signal_id,
+            )
+            .await?,
+            foreground_channel_available: foreground_binding.is_some(),
+        };
+        let policy_decision =
+            policy::evaluate_wake_signal(config, &recorded_signal.signal, evaluation_context);
+        let mut persisted_decision = policy_decision.clone();
+        let cooldown_until = cooldown_until(config, policy_decision.decision, requested_at);
+
+        if policy_decision.decision == WakeSignalDecisionKind::Accepted {
+            let binding = foreground_binding.context(
+                "accepted wake signal requires a configured Telegram foreground binding",
+            )?;
+            match foreground::stage_approved_wake_signal_foreground_ingress(
+                pool,
+                binding,
+                &recorded_signal,
+            )
+            .await?
+            {
+                StagedForegroundIngressOutcome::Accepted(staged) => {
+                    summary.staged_count += 1;
+                    audit::insert(
+                        pool,
+                        &NewAuditEvent {
+                            loop_kind: "unconscious".to_string(),
+                            subsystem: "background_execution".to_string(),
+                            event_kind: "wake_signal_foreground_conversion_staged".to_string(),
+                            severity: "info".to_string(),
+                            trace_id: leased.job.trace_id,
+                            execution_id: Some(leased.execution_id),
+                            worker_pid: None,
+                            payload: json!({
+                                "wake_signal_id": recorded_signal.wake_signal_id,
+                                "ingress_id": staged.ingress_id,
+                                "internal_conversation_ref": staged.internal_conversation_ref,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                StagedForegroundIngressOutcome::Duplicate(duplicate) => {
+                    persisted_decision = WakeSignalDecision {
+                        signal_id: recorded_signal.wake_signal_id,
+                        decision: WakeSignalDecisionKind::Accepted,
+                        reason: format!(
+                            "{}; equivalent foreground ingress was already staged",
+                            policy_decision.reason
+                        ),
+                    };
+                    audit::insert(
+                        pool,
+                        &NewAuditEvent {
+                            loop_kind: "unconscious".to_string(),
+                            subsystem: "background_execution".to_string(),
+                            event_kind: "wake_signal_foreground_conversion_duplicate".to_string(),
+                            severity: "info".to_string(),
+                            trace_id: leased.job.trace_id,
+                            execution_id: Some(leased.execution_id),
+                            worker_pid: None,
+                            payload: json!({
+                                "wake_signal_id": recorded_signal.wake_signal_id,
+                                "existing_ingress_id": duplicate.ingress_id,
+                                "existing_trace_id": duplicate.trace_id,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                StagedForegroundIngressOutcome::Rejected(_) => {
+                    anyhow::bail!(
+                        "approved wake-signal staging returned an unexpected rejected outcome"
+                    );
+                }
+            }
+        }
+
+        background::record_wake_signal_decision(
+            pool,
+            recorded_signal.wake_signal_id,
+            &persisted_decision,
+            requested_at,
+            cooldown_until,
+        )
+        .await?;
+        record_wake_signal_decision_audit(
+            pool,
+            leased,
+            &recorded_signal,
+            &persisted_decision,
+            cooldown_until,
+        )
+        .await?;
+
+        match persisted_decision.decision {
+            WakeSignalDecisionKind::Accepted => summary.accepted_count += 1,
+            WakeSignalDecisionKind::Deferred => summary.deferred_count += 1,
+            WakeSignalDecisionKind::Suppressed => summary.suppressed_count += 1,
+            WakeSignalDecisionKind::Rejected => summary.rejected_count += 1,
+        }
+    }
+
+    Ok(summary)
+}
+
+async fn record_wake_signal_decision_audit(
+    pool: &PgPool,
+    leased: &LeasedBackgroundExecution,
+    recorded_signal: &background::WakeSignalRecord,
+    decision: &WakeSignalDecision,
+    cooldown_until: Option<DateTime<Utc>>,
+) -> Result<()> {
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "unconscious".to_string(),
+            subsystem: "background_execution".to_string(),
+            event_kind: "wake_signal_reviewed".to_string(),
+            severity: match decision.decision {
+                WakeSignalDecisionKind::Accepted => "info",
+                WakeSignalDecisionKind::Deferred
+                | WakeSignalDecisionKind::Suppressed
+                | WakeSignalDecisionKind::Rejected => "warn",
+            }
+            .to_string(),
+            trace_id: leased.job.trace_id,
+            execution_id: Some(leased.execution_id),
+            worker_pid: None,
+            payload: json!({
+                "wake_signal_id": recorded_signal.wake_signal_id,
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "reason_code": recorded_signal.signal.reason_code,
+                "cooldown_until": cooldown_until,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn validate_wake_signal(signal: &WakeSignal) -> Result<()> {
+    if signal.reason_code.trim().is_empty() {
+        anyhow::bail!("wake signal reason_code must not be empty");
+    }
+    if signal.summary.trim().is_empty() {
+        anyhow::bail!("wake signal summary must not be empty");
+    }
+    Ok(())
+}
+
+fn cooldown_until(
+    config: &RuntimeConfig,
+    decision_kind: WakeSignalDecisionKind,
+    reviewed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match decision_kind {
+        WakeSignalDecisionKind::Accepted
+        | WakeSignalDecisionKind::Deferred
+        | WakeSignalDecisionKind::Suppressed => Some(
+            reviewed_at + Duration::seconds(config.background.wake_signals.cooldown_seconds as i64),
+        ),
+        WakeSignalDecisionKind::Rejected => None,
+    }
+}
+
+fn validate_diagnostic_alert(diagnostic: &DiagnosticAlert) -> Result<()> {
+    if diagnostic.code.trim().is_empty() {
+        anyhow::bail!("diagnostic alert code must not be empty");
+    }
+    if diagnostic.summary.trim().is_empty() {
+        anyhow::bail!("diagnostic alert summary must not be empty");
+    }
+    Ok(())
+}
+
+fn diagnostic_severity_as_str(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Info => "info",
+        DiagnosticSeverity::Warning => "warning",
+        DiagnosticSeverity::Critical => "critical",
+    }
+}
+
 fn background_trigger_kind_as_str(kind: contracts::BackgroundTriggerKind) -> &'static str {
     match kind {
         contracts::BackgroundTriggerKind::TimeSchedule => "time_schedule",
@@ -409,8 +828,9 @@ fn job_kind_as_str(kind: contracts::UnconsciousJobKind) -> &'static str {
 mod tests {
     use chrono::Duration;
     use contracts::{
-        BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, UnconsciousJobKind,
-        UnconsciousScope, WorkerPayload,
+        BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, DiagnosticAlert,
+        DiagnosticSeverity, UnconsciousJobKind, UnconsciousScope, WakeSignalPriority,
+        WakeSignalReason, WorkerPayload,
     };
 
     use super::*;
@@ -440,6 +860,8 @@ mod tests {
                     memory_artifact_ids: vec![Uuid::now_v7()],
                     retrieval_artifact_ids: vec![],
                     self_model_artifact_id: None,
+                    internal_principal_ref: Some("primary-user".to_string()),
+                    internal_conversation_ref: Some("telegram-primary".to_string()),
                     summary: "memory scope".to_string(),
                 },
                 budget: BackgroundExecutionBudget {
@@ -458,5 +880,146 @@ mod tests {
                 panic!("expected unconscious request payload")
             }
         }
+    }
+
+    #[test]
+    fn validate_diagnostic_alert_accepts_structured_alert() {
+        let diagnostic = DiagnosticAlert {
+            alert_id: Uuid::now_v7(),
+            code: "drift_scan_clear".to_string(),
+            severity: DiagnosticSeverity::Info,
+            summary: "No contradiction detected.".to_string(),
+            details: None,
+        };
+
+        assert!(validate_diagnostic_alert(&diagnostic).is_ok());
+    }
+
+    #[test]
+    fn validate_diagnostic_alert_rejects_empty_summary() {
+        let diagnostic = DiagnosticAlert {
+            alert_id: Uuid::now_v7(),
+            code: "drift_scan_clear".to_string(),
+            severity: DiagnosticSeverity::Info,
+            summary: "   ".to_string(),
+            details: None,
+        };
+
+        let error = validate_diagnostic_alert(&diagnostic)
+            .expect_err("empty diagnostic summary should fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("diagnostic alert summary must not be empty")
+        );
+    }
+
+    #[test]
+    fn validate_wake_signal_rejects_empty_reason_code() {
+        let signal = WakeSignal {
+            signal_id: Uuid::now_v7(),
+            reason: WakeSignalReason::MaintenanceInsightReady,
+            priority: WakeSignalPriority::Normal,
+            reason_code: "   ".to_string(),
+            summary: "A user-relevant maintenance insight is ready.".to_string(),
+            payload_ref: None,
+        };
+
+        let error =
+            validate_wake_signal(&signal).expect_err("empty wake signal reason_code should fail");
+        assert!(error.to_string().contains("reason_code"));
+    }
+
+    #[test]
+    fn validate_wake_signal_rejects_empty_summary() {
+        let signal = WakeSignal {
+            signal_id: Uuid::now_v7(),
+            reason: WakeSignalReason::MaintenanceInsightReady,
+            priority: WakeSignalPriority::High,
+            reason_code: "maintenance_insight_ready".to_string(),
+            summary: "   ".to_string(),
+            payload_ref: None,
+        };
+
+        let error =
+            validate_wake_signal(&signal).expect_err("empty wake signal summary should fail");
+        assert!(error.to_string().contains("summary"));
+    }
+
+    #[test]
+    fn cooldown_until_uses_policy_window_for_non_rejected_decisions() {
+        let config = crate::config::RuntimeConfig {
+            app: crate::config::AppConfig {
+                name: "blue-lagoon".to_string(),
+                log_filter: "info".to_string(),
+            },
+            database: crate::config::DatabaseConfig {
+                database_url: "postgres://unused".to_string(),
+                minimum_supported_schema_version: 1,
+            },
+            harness: crate::config::HarnessConfig {
+                allow_synthetic_smoke: true,
+                default_foreground_iteration_budget: 1,
+                default_wall_clock_budget_ms: 30_000,
+                default_foreground_token_budget: 4_000,
+            },
+            background: crate::config::BackgroundConfig {
+                scheduler: crate::config::BackgroundSchedulerConfig {
+                    poll_interval_seconds: 300,
+                    max_due_jobs_per_iteration: 4,
+                    lease_timeout_ms: 300_000,
+                },
+                thresholds: crate::config::BackgroundThresholdsConfig {
+                    episode_backlog_threshold: 25,
+                    candidate_memory_threshold: 10,
+                    contradiction_alert_threshold: 3,
+                },
+                execution: crate::config::BackgroundExecutionConfig {
+                    default_iteration_budget: 2,
+                    default_wall_clock_budget_ms: 120_000,
+                    default_token_budget: 6_000,
+                },
+                wake_signals: crate::config::WakeSignalPolicyConfig {
+                    allow_foreground_conversion: true,
+                    max_pending_signals: 8,
+                    cooldown_seconds: 900,
+                },
+            },
+            continuity: crate::config::ContinuityConfig {
+                retrieval: crate::config::RetrievalConfig {
+                    max_recent_episode_candidates: 3,
+                    max_memory_artifact_candidates: 5,
+                    max_context_items: 6,
+                },
+                backlog_recovery: crate::config::BacklogRecoveryConfig {
+                    pending_message_count_threshold: 3,
+                    pending_message_span_seconds_threshold: 120,
+                    stale_pending_ingress_age_seconds_threshold: 300,
+                    max_recovery_batch_size: 8,
+                },
+            },
+            worker: crate::config::WorkerConfig {
+                timeout_ms: 20_000,
+                command: String::new(),
+                args: Vec::new(),
+            },
+            telegram: None,
+            model_gateway: None,
+            self_model: None,
+        };
+        let reviewed_at = Utc::now();
+
+        let accepted = cooldown_until(&config, WakeSignalDecisionKind::Accepted, reviewed_at)
+            .expect("accepted wake signals should record cooldown");
+        let deferred = cooldown_until(&config, WakeSignalDecisionKind::Deferred, reviewed_at)
+            .expect("deferred wake signals should record cooldown");
+        let suppressed = cooldown_until(&config, WakeSignalDecisionKind::Suppressed, reviewed_at)
+            .expect("suppressed wake signals should record cooldown");
+        let rejected = cooldown_until(&config, WakeSignalDecisionKind::Rejected, reviewed_at);
+
+        assert_eq!(accepted, reviewed_at + Duration::seconds(900));
+        assert_eq!(deferred, reviewed_at + Duration::seconds(900));
+        assert_eq!(suppressed, reviewed_at + Duration::seconds(900));
+        assert!(rejected.is_none());
     }
 }

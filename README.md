@@ -58,6 +58,12 @@ Run the synthetic harness smoke path:
 cargo run -p runtime -- harness --once --synthetic-trigger smoke
 ```
 
+Run one due background-maintenance job through the harness one-shot path:
+
+```bash
+cargo run -p runtime -- harness --once --background-once
+```
+
 Replay one stored Telegram update through the foreground path:
 
 ```bash
@@ -89,6 +95,33 @@ cargo build -p runtime -p workers
 
 If you are not using a sibling `workers` binary in `target/debug`, set an
 explicit `BLUE_LAGOON_WORKER_COMMAND` instead.
+
+## Test Commands
+
+Fast workspace verification:
+
+```bash
+cargo fmt --all --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --lib -- --nocapture
+```
+
+Foreground and continuity regression suites:
+
+```bash
+cargo test -p harness --test foreground_component -- --nocapture
+cargo test -p harness --test foreground_integration -- --nocapture
+cargo test -p harness --test continuity_component -- --nocapture
+cargo test -p harness --test continuity_integration -- --nocapture
+```
+
+Background-maintenance regression suites:
+
+```bash
+cargo test -p harness --test unconscious_component -- --nocapture
+cargo test -p harness --test unconscious_integration -- --nocapture
+```
 
 ## Local Development
 

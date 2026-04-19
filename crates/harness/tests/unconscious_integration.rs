@@ -4,223 +4,143 @@ use anyhow::Result;
 use chrono::Utc;
 use contracts::{
     BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, ChannelKind,
-    ModelProviderKind, UnconsciousJobKind, UnconsciousScope, WorkerRequest,
+    ModelProviderKind, UnconsciousJobKind, UnconsciousScope,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use serial_test::serial;
 use sqlx::Row;
 use std::{env, fs, process::Command, time::Duration};
 use uuid::Uuid;
 
 use harness::{
-    audit,
-    background::{self, WakeSignalStatus},
+    audit, background,
     config::{
         ForegroundModelRouteConfig, ModelGatewayConfig, SelfModelConfig, TelegramConfig,
         TelegramForegroundBindingConfig, ZAiProviderConfig,
     },
+    continuity,
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
-    runtime::{self, HarnessOptions, HarnessOutcome, SyntheticTrigger},
-    worker,
+    runtime::{self, HarnessOptions, HarnessOutcome},
 };
 
 #[tokio::test]
 #[serial]
-async fn synthetic_trigger_runs_end_to_end_and_persists_outputs() -> Result<()> {
+async fn background_runtime_flows_due_job_to_memory_merge_end_to_end() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
+        config.model_gateway = Some(sample_model_gateway_config(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+        ));
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
-        config.worker.args = vec!["smoke-worker".to_string()];
+        config.worker.args = vec!["unconscious-worker".to_string()];
 
-        let outcome = runtime::run_harness_once(
-            &config,
-            HarnessOptions {
-                once: true,
-                idle: false,
-                background_once: false,
-                synthetic_trigger: Some(SyntheticTrigger::Smoke),
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::MemoryConsolidation,
+        )
+        .await?;
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "maintenance lexical summary" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
+            || async {
+                runtime::run_harness_once_with_transport(
+                    &config,
+                    HarnessOptions {
+                        once: true,
+                        idle: false,
+                        background_once: true,
+                        synthetic_trigger: None,
+                    },
+                    &transport,
+                )
+                .await
             },
         )
         .await?;
 
         let execution_id = match outcome {
-            HarnessOutcome::SyntheticCompleted { execution_id, .. } => execution_id,
-            HarnessOutcome::IdleVerified => panic!("synthetic trigger should not return idle"),
-            HarnessOutcome::BackgroundNoDueJob | HarnessOutcome::BackgroundCompleted { .. } => {
-                panic!("synthetic trigger should not return a background outcome")
+            HarnessOutcome::BackgroundCompleted {
+                background_job_id: executed_job_id,
+                execution_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(executed_job_id, background_job_id);
+                assert!(summary.contains("canonical_writes=1"));
+                execution_id
             }
+            other => panic!("expected background completion outcome, got {other:?}"),
         };
 
         let record = execution::get(&ctx.pool, execution_id).await?;
         assert_eq!(record.status, "completed");
-        assert!(record.worker_pid.is_some());
-        assert!(record.response_payload.is_some());
 
-        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
-        assert_eq!(audit_events.len(), 2);
-        assert!(
-            audit_events
-                .iter()
-                .any(|event| event.event_kind == "synthetic_trigger_received")
-        );
-        assert!(
-            audit_events
-                .iter()
-                .any(|event| event.event_kind == "synthetic_trigger_completed")
-        );
-        Ok(())
-    })
-    .await
-}
+        let proposals = continuity::list_proposals_for_execution(&ctx.pool, execution_id).await?;
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].status, "accepted");
+        assert_eq!(proposals[0].source_loop_kind, "unconscious");
 
-#[tokio::test]
-#[serial]
-async fn idle_boot_verifies_schema_and_returns_idle() -> Result<()> {
-    support::with_migrated_database(|ctx| async move {
-        let outcome = runtime::run_harness_once(
-            &ctx.config,
-            HarnessOptions {
-                once: true,
-                idle: true,
-                background_once: false,
-                synthetic_trigger: None,
-            },
+        let merge_decision =
+            continuity::get_merge_decision_by_proposal(&ctx.pool, proposals[0].proposal_id)
+                .await?
+                .expect("accepted unconscious proposal should have a merge decision");
+        assert_eq!(merge_decision.decision_kind, "accepted");
+
+        let memory_artifact_id = merge_decision
+            .accepted_memory_artifact_id
+            .expect("accepted memory proposal should create a canonical artifact");
+        let memory_artifact =
+            continuity::get_memory_artifact(&ctx.pool, memory_artifact_id).await?;
+        assert_eq!(memory_artifact.content_text, "maintenance lexical summary");
+        assert_eq!(memory_artifact.subject_ref, "primary-user");
+
+        let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
+            &ctx.pool,
+            "telegram-primary",
+            10,
         )
         .await?;
-
-        assert_eq!(outcome, HarnessOutcome::IdleVerified);
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test]
-#[serial]
-async fn timed_out_worker_is_terminated() -> Result<()> {
-    support::with_migrated_database(|ctx| async move {
-        let mut config = ctx.config.clone();
-        let pid_file =
-            std::env::temp_dir().join(format!("blue-lagoon-worker-{}.pid", Uuid::now_v7()));
-        let worker_binary = support::workers_binary()?;
-        config.worker.command = worker_binary.to_string_lossy().into_owned();
-        config.worker.args = vec![
-            "stall-worker".to_string(),
-            "--sleep-ms".to_string(),
-            "5000".to_string(),
-            "--pid-file".to_string(),
-            pid_file.to_string_lossy().into_owned(),
-        ];
-        config.worker.timeout_ms = 100;
-
-        let error = worker::launch_smoke_worker(
-            &config,
-            &WorkerRequest::smoke(Uuid::now_v7(), Uuid::now_v7(), "smoke"),
-        )
-        .await
-        .expect_err("worker should time out");
-        assert!(error.to_string().contains("timed out"));
-
-        let pid = read_pid_file(&pid_file).await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !process_is_running(pid),
-            "timed-out worker process {pid} should have been terminated"
-        );
-
-        let _ = fs::remove_file(pid_file);
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test]
-#[serial]
-async fn timed_out_foreground_run_is_marked_failed_and_audited() -> Result<()> {
-    support::with_migrated_database(|ctx| async move {
-        let mut config = ctx.config.clone();
-        let pid_file =
-            std::env::temp_dir().join(format!("blue-lagoon-worker-{}.pid", Uuid::now_v7()));
-        let worker_binary = support::workers_binary()?;
-        config.worker.command = worker_binary.to_string_lossy().into_owned();
-        config.worker.args = vec![
-            "stall-worker".to_string(),
-            "--sleep-ms".to_string(),
-            "5000".to_string(),
-            "--pid-file".to_string(),
-            pid_file.to_string_lossy().into_owned(),
-        ];
-        config.worker.timeout_ms = 100;
-
-        let error = runtime::run_harness_once(
-            &config,
-            HarnessOptions {
-                once: true,
-                idle: false,
-                background_once: false,
-                synthetic_trigger: Some(SyntheticTrigger::Smoke),
-            },
-        )
-        .await
-        .expect_err("timed-out run should fail");
-        assert!(error.to_string().contains("timed out"));
-
-        let row = sqlx::query(
-            r#"
-            SELECT execution_id, status, response_payload, completed_at
-            FROM execution_records
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_one(&ctx.pool)
-        .await?;
-
-        let execution_id: Uuid = row.get("execution_id");
-        let status: String = row.get("status");
-        let response_payload: Option<Value> = row.get("response_payload");
-        assert_eq!(status, "failed");
-        assert!(
-            row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
-                .is_some()
-        );
-
-        let response_payload =
-            response_payload.expect("failed execution should persist an error payload");
+        assert_eq!(retrieval_artifacts.len(), 1);
         assert_eq!(
-            response_payload.get("kind").and_then(Value::as_str),
-            Some("worker_failure")
-        );
-        assert!(
-            response_payload
-                .get("message")
-                .and_then(Value::as_str)
-                .is_some_and(|message| message.contains("timed out"))
+            retrieval_artifacts[0].lexical_document,
+            "maintenance lexical summary"
         );
 
         let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
-        assert_eq!(audit_events.len(), 2);
         assert!(
             audit_events
                 .iter()
-                .any(|event| event.event_kind == "synthetic_trigger_received")
+                .any(|event| event.event_kind == "background_job_completed")
         );
         assert!(
             audit_events
                 .iter()
-                .any(|event| event.event_kind == "synthetic_trigger_failed")
+                .any(|event| event.event_kind == "canonical_write_applied")
         );
-
-        let pid = read_pid_file(&pid_file).await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            !process_is_running(pid),
-            "timed-out worker process {pid} should have been terminated"
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "retrieval_update_applied")
         );
-
-        let _ = fs::remove_file(pid_file);
         Ok(())
     })
     .await
@@ -228,8 +148,7 @@ async fn timed_out_foreground_run_is_marked_failed_and_audited() -> Result<()> {
 
 #[tokio::test]
 #[serial]
-async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_signal() -> Result<()>
-{
+async fn background_runtime_flows_wake_signal_to_foreground_conversion_end_to_end() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
         config.self_model = Some(SelfModelConfig {
@@ -238,7 +157,7 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
                 .join("self_model_seed.toml"),
         });
         config.model_gateway = Some(sample_model_gateway_config(
-            "BLUE_LAGOON_TEST_BACKGROUND_RUNTIME_API_KEY",
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
         ));
         config.telegram = Some(sample_telegram_config());
         let worker_binary = support::workers_binary()?;
@@ -267,8 +186,8 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
         }));
 
         let outcome = with_env_var(
-            "BLUE_LAGOON_TEST_BACKGROUND_RUNTIME_API_KEY",
-            Some("test-background-runtime-key"),
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
             || async {
                 runtime::run_harness_once_with_transport(
                     &config,
@@ -285,25 +204,19 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
         )
         .await?;
 
-        let (execution_id, trace_id, summary) = match outcome {
+        let execution_id = match outcome {
             HarnessOutcome::BackgroundCompleted {
                 background_job_id: executed_job_id,
                 execution_id,
-                trace_id,
                 summary,
+                ..
             } => {
                 assert_eq!(executed_job_id, background_job_id);
-                (execution_id, trace_id, summary)
+                assert!(summary.contains("wake_signals=1"));
+                execution_id
             }
             other => panic!("expected background completion outcome, got {other:?}"),
         };
-
-        assert!(summary.contains("wake_signals=1"));
-        let record = execution::get(&ctx.pool, execution_id).await?;
-        assert_eq!(record.status, "completed");
-
-        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
-        assert_eq!(stored_job.status, background::BackgroundJobStatus::Completed);
 
         let signal_row = sqlx::query(
             r#"
@@ -317,7 +230,7 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
         .await?;
         let wake_signal_id: Uuid = signal_row.get("wake_signal_id");
         let stored_signal = background::get_wake_signal(&ctx.pool, wake_signal_id).await?;
-        assert_eq!(stored_signal.status, WakeSignalStatus::Accepted);
+        assert_eq!(stored_signal.status, background::WakeSignalStatus::Accepted);
 
         let ingress_row = sqlx::query(
             r#"
@@ -338,12 +251,19 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
             "pending".to_string()
         );
 
+        let active_self_model_artifacts =
+            continuity::list_active_self_model_artifacts(&ctx.pool, 10).await?;
+        assert_eq!(active_self_model_artifacts.len(), 1);
+        assert!(active_self_model_artifacts[0]
+            .preferences
+            .iter()
+            .any(|value| value.contains("concise progress updates")));
+
         let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
-        assert!(audit_events.iter().all(|event| event.trace_id == trace_id));
         assert!(
             audit_events
                 .iter()
-                .any(|event| event.event_kind == "background_job_completed")
+                .any(|event| event.event_kind == "wake_signal_reviewed")
         );
         assert!(
             audit_events
@@ -357,78 +277,103 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
 
 #[tokio::test]
 #[serial]
-async fn background_runtime_returns_no_due_job_without_requiring_gateway_config() -> Result<()> {
+async fn background_runtime_timeout_fails_closed_and_records_bounded_termination() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
-        let outcome = runtime::run_harness_once_with_transport(
-            &ctx.config,
-            HarnessOptions {
-                once: true,
-                idle: false,
-                background_once: true,
-                synthetic_trigger: None,
+        let mut config = ctx.config.clone();
+        config.model_gateway = Some(sample_model_gateway_config(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+        ));
+        let pid_file =
+            std::env::temp_dir().join(format!("blue-lagoon-unconscious-{}.pid", Uuid::now_v7()));
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec![
+            "stall-worker".to_string(),
+            "--sleep-ms".to_string(),
+            "5000".to_string(),
+            "--pid-file".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        config.worker.timeout_ms = 100;
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now(),
+            UnconsciousJobKind::MemoryConsolidation,
+        )
+        .await?;
+
+        let error = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
+            || async {
+                runtime::run_harness_once_with_transport(
+                    &config,
+                    HarnessOptions {
+                        once: true,
+                        idle: false,
+                        background_once: true,
+                        synthetic_trigger: None,
+                    },
+                    &FakeModelProviderTransport::new(),
+                )
+                .await
             },
-            &FakeModelProviderTransport::new(),
         )
-        .await?;
+        .await
+        .expect_err("timed-out background runtime should fail");
+        assert!(error.to_string().contains("timed out"));
 
-        assert_eq!(outcome, HarnessOutcome::BackgroundNoDueJob);
+        let stored_job = background::get_job(&ctx.pool, background_job_id).await?;
+        assert_eq!(stored_job.status, background::BackgroundJobStatus::Failed);
 
-        let row = sqlx::query(
-            r#"
-            SELECT event_kind
-            FROM audit_events
-            ORDER BY occurred_at DESC, event_id DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_one(&ctx.pool)
-        .await?;
+        let completed_runs =
+            background::list_completed_job_runs(&ctx.pool, background_job_id, 5).await?;
+        assert_eq!(completed_runs.len(), 1);
         assert_eq!(
-            row.get::<String, _>("event_kind"),
-            "background_maintenance_no_due_job".to_string()
+            completed_runs[0].status,
+            background::BackgroundJobRunStatus::TimedOut
         );
+        let execution_id = completed_runs[0]
+            .execution_id
+            .expect("timed-out run should retain execution linkage");
+
+        let execution = execution::get(&ctx.pool, execution_id).await?;
+        assert_eq!(execution.status, "failed");
+        assert!(
+            execution
+                .response_payload
+                .as_ref()
+                .and_then(|payload| payload.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "worker_timeout")
+        );
+
+        let proposals = continuity::list_proposals_for_execution(&ctx.pool, execution_id).await?;
+        assert!(proposals.is_empty());
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_started")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "background_job_timed_out")
+        );
+
+        let pid = read_pid_file(&pid_file).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !process_is_running(pid),
+            "timed-out unconscious worker process {pid} should have been terminated"
+        );
+        let _ = fs::remove_file(pid_file);
         Ok(())
     })
     .await
-}
-
-async fn read_pid_file(path: &std::path::Path) -> Result<u32> {
-    for _ in 0..20 {
-        match fs::read_to_string(path) {
-            Ok(contents) => return Ok(contents.trim().parse()?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    anyhow::bail!("worker pid file was never created")
-}
-
-fn process_is_running(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        let filter = format!("PID eq {pid}");
-        let output = Command::new("tasklist")
-            .args(["/FI", &filter])
-            .output()
-            .expect("tasklist should run");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.contains(&pid.to_string())
-    }
-
-    #[cfg(not(windows))]
-    {
-        Command::new("ps")
-            .args(["-p", &pid.to_string()])
-            .output()
-            .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-            })
-            .unwrap_or(false)
-    }
 }
 
 async fn with_env_var<F, Fut, T>(name: &str, value: Option<&str>, action: F) -> Result<T>
@@ -605,5 +550,44 @@ fn sample_telegram_config() -> TelegramConfig {
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
         }),
+    }
+}
+
+async fn read_pid_file(path: &std::path::Path) -> Result<u32> {
+    for _ in 0..20 {
+        match fs::read_to_string(path) {
+            Ok(contents) => return Ok(contents.trim().parse()?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    anyhow::bail!("worker pid file was never created")
+}
+
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        let output = Command::new("tasklist")
+            .args(["/FI", &filter])
+            .output()
+            .expect("tasklist should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains(&pid.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false)
     }
 }

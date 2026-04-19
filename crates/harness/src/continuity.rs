@@ -820,6 +820,31 @@ where
     Ok(())
 }
 
+pub async fn archive_retrieval_artifacts_by_source_ref<'e, E>(
+    executor: E,
+    source_ref: &str,
+    internal_conversation_ref: Option<&str>,
+) -> Result<u64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE retrieval_artifacts
+        SET status = 'archived'
+        WHERE status = 'active'
+          AND payload_json ->> 'source_ref' = $1
+          AND ($2::text IS NULL OR internal_conversation_ref = $2)
+        "#,
+    )
+    .bind(source_ref)
+    .bind(internal_conversation_ref)
+    .execute(executor)
+    .await
+    .context("failed to archive retrieval artifacts by source_ref")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_active_retrieval_artifacts_for_conversation(
     pool: &PgPool,
     internal_conversation_ref: &str,

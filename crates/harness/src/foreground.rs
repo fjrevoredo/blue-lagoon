@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::{
     audit::{self, NewAuditEvent},
-    config::{ResolvedTelegramConfig, RuntimeConfig},
+    background,
+    config::{ResolvedTelegramConfig, RuntimeConfig, TelegramForegroundBindingConfig},
     execution::{self, NewExecutionRecord},
     policy::{self, PolicyDecision},
     trace::TraceContext,
@@ -237,6 +238,9 @@ pub struct PendingForegroundExecutionPlan {
     pub ordered_ingress: Vec<OrderedIngressReference>,
     pub decision_reason: ForegroundExecutionDecisionReason,
 }
+
+const WAKE_SIGNAL_EXTERNAL_EVENT_PREFIX: &str = "wake-signal:";
+const WAKE_SIGNAL_RAW_PAYLOAD_PREFIX: &str = "wake_signal:";
 
 pub async fn upsert_conversation_binding(
     pool: &PgPool,
@@ -788,6 +792,17 @@ pub fn build_foreground_trigger(
     execution_id: Uuid,
     ingress: NormalizedIngress,
 ) -> Result<ForegroundTrigger> {
+    let trigger_kind = infer_foreground_trigger_kind(&ingress);
+    build_foreground_trigger_with_kind(config, trace_id, execution_id, trigger_kind, ingress)
+}
+
+pub fn build_foreground_trigger_with_kind(
+    config: &RuntimeConfig,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    trigger_kind: ForegroundTriggerKind,
+    ingress: NormalizedIngress,
+) -> Result<ForegroundTrigger> {
     let budget = policy::default_foreground_budget(config);
     policy::validate_foreground_budget(&budget)?;
     let deduplication_key = foreground_deduplication_key(&ingress);
@@ -796,12 +811,27 @@ pub fn build_foreground_trigger(
         trigger_id: Uuid::now_v7(),
         trace_id,
         execution_id,
-        trigger_kind: ForegroundTriggerKind::UserIngress,
+        trigger_kind,
         ingress,
         received_at: Utc::now(),
         deduplication_key,
         budget,
     })
+}
+
+pub fn infer_foreground_trigger_kind(ingress: &NormalizedIngress) -> ForegroundTriggerKind {
+    if ingress
+        .external_event_id
+        .starts_with(WAKE_SIGNAL_EXTERNAL_EVENT_PREFIX)
+        || ingress
+            .raw_payload_ref
+            .as_deref()
+            .is_some_and(|value| value.starts_with(WAKE_SIGNAL_RAW_PAYLOAD_PREFIX))
+    {
+        ForegroundTriggerKind::ApprovedWakeSignal
+    } else {
+        ForegroundTriggerKind::UserIngress
+    }
 }
 
 pub async fn insert_execution_ingress_link<'e, E>(
@@ -1675,6 +1705,87 @@ pub async fn stage_telegram_foreground_ingress(
     ))
 }
 
+pub async fn stage_approved_wake_signal_foreground_ingress(
+    pool: &PgPool,
+    binding_config: &TelegramForegroundBindingConfig,
+    wake_signal: &background::WakeSignalRecord,
+) -> Result<StagedForegroundIngressOutcome> {
+    let ingress = build_approved_wake_signal_ingress(binding_config, wake_signal);
+    let deduplication_key = foreground_deduplication_key(&ingress);
+
+    if let Some(existing) =
+        find_ingress_event_by_channel_event(pool, ingress.channel_kind, &ingress.external_event_id)
+            .await?
+    {
+        return duplicate_foreground_trigger_outcome(pool, &ingress, &deduplication_key, existing)
+            .await
+            .map(|outcome| match outcome {
+                ForegroundTriggerIntakeOutcome::Duplicate(duplicate) => {
+                    StagedForegroundIngressOutcome::Duplicate(duplicate)
+                }
+                ForegroundTriggerIntakeOutcome::Accepted(_) => unreachable!(),
+                ForegroundTriggerIntakeOutcome::Rejected(_) => unreachable!(),
+            });
+    }
+
+    let binding = matching_conversation_binding_for_binding_config(binding_config, &ingress)
+        .context("approved wake-signal ingress must match the configured conversation binding")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start wake-signal foreground staging transaction")?;
+
+    let conversation_binding = reconcile_conversation_binding_in_tx(&mut tx, &binding).await?;
+    insert_ingress_event(
+        &mut *tx,
+        &NewIngressEvent {
+            ingress: ingress.clone(),
+            conversation_binding_id: Some(conversation_binding.record.conversation_binding_id),
+            trace_id: wake_signal.trace_id,
+            execution_id: None,
+            status: "accepted".to_string(),
+            rejection_reason: None,
+        },
+    )
+    .await?;
+
+    audit::insert(
+        &mut *tx,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "foreground_trigger".to_string(),
+            event_kind: "foreground_trigger_staged_from_wake_signal".to_string(),
+            severity: "info".to_string(),
+            trace_id: wake_signal.trace_id,
+            execution_id: wake_signal.execution_id,
+            worker_pid: None,
+            payload: json!({
+                "wake_signal_id": wake_signal.wake_signal_id,
+                "background_job_id": wake_signal.background_job_id,
+                "background_job_run_id": wake_signal.background_job_run_id,
+                "ingress_id": ingress.ingress_id,
+                "external_event_id": ingress.external_event_id,
+                "deduplication_key": deduplication_key,
+                "reason_code": wake_signal.signal.reason_code,
+                "conversation_binding_action": conversation_binding.action.as_str(),
+            }),
+        },
+    )
+    .await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit wake-signal foreground staging transaction")?;
+
+    Ok(StagedForegroundIngressOutcome::Accepted(
+        StagedForegroundIngress {
+            ingress_id: ingress.ingress_id,
+            trace_id: wake_signal.trace_id,
+            internal_conversation_ref: ingress.internal_conversation_ref,
+        },
+    ))
+}
+
 async fn duplicate_foreground_trigger_outcome(
     pool: &PgPool,
     ingress: &NormalizedIngress,
@@ -1758,6 +1869,44 @@ fn foreground_deduplication_key(ingress: &NormalizedIngress) -> String {
     )
 }
 
+fn build_approved_wake_signal_ingress(
+    binding_config: &TelegramForegroundBindingConfig,
+    wake_signal: &background::WakeSignalRecord,
+) -> NormalizedIngress {
+    NormalizedIngress {
+        ingress_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: binding_config.allowed_user_id.to_string(),
+        external_conversation_id: binding_config.allowed_chat_id.to_string(),
+        external_event_id: format!(
+            "{WAKE_SIGNAL_EXTERNAL_EVENT_PREFIX}{}",
+            wake_signal.wake_signal_id
+        ),
+        external_message_id: None,
+        internal_principal_ref: binding_config.internal_principal_ref.clone(),
+        internal_conversation_ref: binding_config.internal_conversation_ref.clone(),
+        event_kind: IngressEventKind::MessageCreated,
+        occurred_at: wake_signal.requested_at,
+        text_body: Some(format!(
+            "A policy-approved maintenance wake signal requires conscious follow-up.\nReason code: {}\nSummary: {}\nUse the maintenance insight to produce one concise user-facing reply if a proactive update is warranted.",
+            wake_signal.signal.reason_code, wake_signal.signal.summary
+        )),
+        reply_to: None,
+        attachments: Vec::new(),
+        command_hint: None,
+        approval_payload: None,
+        raw_payload_ref: Some(format!(
+            "{WAKE_SIGNAL_RAW_PAYLOAD_PREFIX}{}:background_job:{}:background_run:{}",
+            wake_signal.wake_signal_id,
+            wake_signal.background_job_id,
+            wake_signal
+                .background_job_run_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )),
+    }
+}
+
 fn is_unique_violation(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1832,19 +1981,48 @@ fn matching_conversation_binding(
     config: &ResolvedTelegramConfig,
     ingress: &NormalizedIngress,
 ) -> Option<NewConversationBinding> {
+    matching_conversation_binding_from_parts(
+        config.allowed_user_id,
+        config.allowed_chat_id,
+        &config.internal_principal_ref,
+        &config.internal_conversation_ref,
+        ingress,
+    )
+}
+
+fn matching_conversation_binding_for_binding_config(
+    config: &TelegramForegroundBindingConfig,
+    ingress: &NormalizedIngress,
+) -> Option<NewConversationBinding> {
+    matching_conversation_binding_from_parts(
+        config.allowed_user_id,
+        config.allowed_chat_id,
+        &config.internal_principal_ref,
+        &config.internal_conversation_ref,
+        ingress,
+    )
+}
+
+fn matching_conversation_binding_from_parts(
+    allowed_user_id: i64,
+    allowed_chat_id: i64,
+    internal_principal_ref: &str,
+    internal_conversation_ref: &str,
+    ingress: &NormalizedIngress,
+) -> Option<NewConversationBinding> {
     if ingress.channel_kind != ChannelKind::Telegram {
         return None;
     }
-    if ingress.external_user_id != config.allowed_user_id.to_string() {
+    if ingress.external_user_id != allowed_user_id.to_string() {
         return None;
     }
-    if ingress.external_conversation_id != config.allowed_chat_id.to_string() {
+    if ingress.external_conversation_id != allowed_chat_id.to_string() {
         return None;
     }
-    if ingress.internal_principal_ref != config.internal_principal_ref {
+    if ingress.internal_principal_ref != internal_principal_ref {
         return None;
     }
-    if ingress.internal_conversation_ref != config.internal_conversation_ref {
+    if ingress.internal_conversation_ref != internal_conversation_ref {
         return None;
     }
 

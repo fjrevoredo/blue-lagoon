@@ -876,6 +876,51 @@ pub async fn list_pending_wake_signals(pool: &PgPool, limit: u32) -> Result<Vec<
     rows.into_iter().map(decode_wake_signal_row).collect()
 }
 
+pub async fn count_open_wake_signals(pool: &PgPool, now: DateTime<Utc>) -> Result<u32> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM wake_signals
+        WHERE status IN ('pending_review', 'accepted', 'deferred')
+          AND (cooldown_until IS NULL OR cooldown_until > $1)
+        "#,
+    )
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .context("failed to count open wake signals")?;
+
+    u32::try_from(count).map_err(|_| anyhow!("wake signal count exceeded u32 range"))
+}
+
+pub async fn has_active_wake_signal_cooldown(
+    pool: &PgPool,
+    reason_code: &str,
+    now: DateTime<Utc>,
+    exclude_wake_signal_id: Uuid,
+) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM wake_signals
+            WHERE reason_code = $1
+              AND wake_signal_id <> $2
+              AND cooldown_until IS NOT NULL
+              AND cooldown_until > $3
+        )
+        "#,
+    )
+    .bind(reason_code)
+    .bind(exclude_wake_signal_id)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .context("failed to check active wake-signal cooldown")?;
+
+    Ok(exists)
+}
+
 pub async fn record_wake_signal_decision(
     pool: &PgPool,
     wake_signal_id: Uuid,

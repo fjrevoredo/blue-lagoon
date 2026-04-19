@@ -1,5 +1,8 @@
 use anyhow::{Result, bail};
-use contracts::{BackgroundExecutionBudget, ForegroundBudget, IngressEventKind, NormalizedIngress};
+use contracts::{
+    BackgroundExecutionBudget, ForegroundBudget, IngressEventKind, NormalizedIngress, WakeSignal,
+    WakeSignalDecision, WakeSignalDecisionKind, WakeSignalPriority,
+};
 
 use crate::config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig};
 
@@ -14,6 +17,13 @@ pub struct ExecutionBudget {
 pub enum PolicyDecision {
     Allowed,
     Denied { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeSignalEvaluationContext {
+    pub pending_signal_count: u32,
+    pub cooldown_active: bool,
+    pub foreground_channel_available: bool,
 }
 
 pub fn default_foreground_budget(config: &RuntimeConfig) -> ForegroundBudget {
@@ -150,11 +160,69 @@ pub fn evaluate_synthetic_smoke(config: &RuntimeConfig) -> PolicyDecision {
     }
 }
 
+pub fn evaluate_wake_signal(
+    config: &RuntimeConfig,
+    signal: &WakeSignal,
+    context: WakeSignalEvaluationContext,
+) -> WakeSignalDecision {
+    if !context.foreground_channel_available {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Rejected,
+            reason: "no foreground conversation binding is configured for wake-signal conversion"
+                .to_string(),
+        };
+    }
+
+    if !config.background.wake_signals.allow_foreground_conversion {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: "wake-signal foreground conversion is disabled by policy".to_string(),
+        };
+    }
+
+    if context.cooldown_active && signal.priority != WakeSignalPriority::High {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: format!(
+                "wake signal '{}' remains within the active cooldown window",
+                signal.reason_code
+            ),
+        };
+    }
+
+    if context.pending_signal_count >= config.background.wake_signals.max_pending_signals {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: match signal.priority {
+                WakeSignalPriority::Low => WakeSignalDecisionKind::Suppressed,
+                WakeSignalPriority::Normal => WakeSignalDecisionKind::Deferred,
+                WakeSignalPriority::High => WakeSignalDecisionKind::Accepted,
+            },
+            reason: format!(
+                "wake-signal queue is at or above the configured limit ({})",
+                config.background.wake_signals.max_pending_signals
+            ),
+        };
+    }
+
+    WakeSignalDecision {
+        signal_id: signal.signal_id,
+        decision: WakeSignalDecisionKind::Accepted,
+        reason: "wake signal satisfies configured foreground conversion policy".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use contracts::{ChannelKind, IngressEventKind, NormalizedIngress};
+    use contracts::{
+        ChannelKind, IngressEventKind, NormalizedIngress, WakeSignal, WakeSignalDecisionKind,
+        WakeSignalPriority, WakeSignalReason,
+    };
 
     use crate::config::{
         AppConfig, BackgroundConfig, BackgroundExecutionConfig, BackgroundSchedulerConfig,
@@ -426,5 +494,93 @@ mod tests {
             approval_payload: None,
             raw_payload_ref: None,
         }
+    }
+
+    fn wake_signal(priority: WakeSignalPriority) -> WakeSignal {
+        WakeSignal {
+            signal_id: uuid::Uuid::now_v7(),
+            reason: WakeSignalReason::MaintenanceInsightReady,
+            priority,
+            reason_code: "maintenance_insight_ready".to_string(),
+            summary: "Background maintenance produced a user-relevant insight.".to_string(),
+            payload_ref: Some("background_job:123".to_string()),
+        }
+    }
+
+    #[test]
+    fn wake_signal_policy_accepts_nominal_signal() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
+    }
+
+    #[test]
+    fn wake_signal_policy_rejects_when_no_foreground_channel_is_available() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: false,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Rejected);
+        assert!(
+            decision
+                .reason
+                .contains("no foreground conversation binding")
+        );
+    }
+
+    #[test]
+    fn wake_signal_policy_defers_when_cooldown_is_active_for_non_high_priority() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: true,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Deferred);
+        assert!(decision.reason.contains("cooldown"));
+    }
+
+    #[test]
+    fn wake_signal_policy_allows_high_priority_signal_through_cooldown() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::High),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: true,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
+    }
+
+    #[test]
+    fn wake_signal_policy_suppresses_low_priority_signal_when_queue_is_full() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Low),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 8,
+                cooldown_active: false,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Suppressed);
+        assert!(decision.reason.contains("configured limit"));
     }
 }

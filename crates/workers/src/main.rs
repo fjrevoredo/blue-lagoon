@@ -628,6 +628,12 @@ fn build_unconscious_worker_response(
     payload: &UnconsciousWorkerRequest,
     model_response: ModelCallResponse,
 ) -> WorkerResponse {
+    let model_text = model_response.output.text;
+    let canonical_proposals = build_unconscious_canonical_proposals(&payload.context, &model_text);
+    let retrieval_updates =
+        build_unconscious_retrieval_updates(&payload.context, &model_text, &canonical_proposals);
+    let diagnostics = build_unconscious_diagnostics(&payload.context, &model_text);
+
     WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
@@ -641,36 +647,240 @@ fn build_unconscious_worker_response(
                 unconscious_task_class(payload.context.job_kind)
             ),
             maintenance_outputs: UnconsciousMaintenanceOutputs {
-                canonical_proposals: Vec::new(),
-                retrieval_updates: vec![RetrievalUpdateProposal {
-                    update_id: uuid::Uuid::now_v7(),
-                    operation: RetrievalUpdateOperation::Upsert,
-                    source_ref: format!("background_job:{}", payload.context.job_id),
-                    lexical_document: model_response.output.text,
-                    relevance_timestamp: chrono::Utc::now(),
-                    internal_conversation_ref: None,
-                    rationale: Some(format!(
-                        "scoped {} completed without canonical proposal changes",
-                        unconscious_task_class(payload.context.job_kind)
-                    )),
-                }],
-                diagnostics: vec![DiagnosticAlert {
-                    alert_id: uuid::Uuid::now_v7(),
-                    code: format!(
-                        "{}_completed",
-                        unconscious_task_class(payload.context.job_kind)
-                    ),
-                    severity: DiagnosticSeverity::Info,
-                    summary: format!(
-                        "{} completed under bounded background execution",
-                        unconscious_task_class(payload.context.job_kind)
-                    ),
-                    details: None,
-                }],
+                canonical_proposals,
+                retrieval_updates,
+                diagnostics,
                 wake_signals: build_default_wake_signals(&payload.context),
             },
         }),
     }
+}
+
+fn build_unconscious_canonical_proposals(
+    context: &UnconsciousContext,
+    model_text: &str,
+) -> Vec<CanonicalProposal> {
+    match context.job_kind {
+        UnconsciousJobKind::MemoryConsolidation => {
+            build_memory_consolidation_proposals(context, model_text)
+        }
+        UnconsciousJobKind::SelfModelReflection => {
+            build_self_model_reflection_proposals(context, model_text)
+        }
+        UnconsciousJobKind::RetrievalMaintenance
+        | UnconsciousJobKind::ContradictionAndDriftScan => Vec::new(),
+    }
+}
+
+fn build_memory_consolidation_proposals(
+    context: &UnconsciousContext,
+    model_text: &str,
+) -> Vec<CanonicalProposal> {
+    let content_text = model_text.trim();
+    if content_text.is_empty() || context.scope.episode_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(subject_ref) = context
+        .scope
+        .internal_principal_ref
+        .clone()
+        .or_else(|| context.scope.internal_conversation_ref.clone())
+    else {
+        return Vec::new();
+    };
+
+    vec![CanonicalProposal {
+        proposal_id: uuid::Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::MemoryArtifact,
+        canonical_target: CanonicalTargetKind::MemoryArtifacts,
+        confidence_pct: 72,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref,
+        rationale: Some(
+            "Bounded background memory consolidation over the scoped recent episodes.".to_string(),
+        ),
+        valid_from: None,
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: Vec::new(),
+            source_episode_id: context.scope.episode_ids.first().copied(),
+        },
+        payload: CanonicalProposalPayload::MemoryArtifact(MemoryArtifactProposal {
+            artifact_kind: "background_summary".to_string(),
+            content_text: content_text.to_string(),
+        }),
+    }]
+}
+
+fn build_self_model_reflection_proposals(
+    context: &UnconsciousContext,
+    model_text: &str,
+) -> Vec<CanonicalProposal> {
+    let content_text = model_text.trim();
+    if content_text.is_empty() {
+        return Vec::new();
+    }
+
+    vec![CanonicalProposal {
+        proposal_id: uuid::Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::SelfModelObservation,
+        canonical_target: CanonicalTargetKind::SelfModelArtifacts,
+        confidence_pct: 68,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref: "self".to_string(),
+        rationale: Some(
+            "Bounded background self-model reflection over the canonical self-model state."
+                .to_string(),
+        ),
+        valid_from: None,
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::SelfModelReflection,
+            source_ingress_ids: Vec::new(),
+            source_episode_id: context.scope.episode_ids.first().copied(),
+        },
+        payload: CanonicalProposalPayload::SelfModelObservation(SelfModelObservationProposal {
+            observation_kind: classify_self_model_observation_kind(content_text).to_string(),
+            content_text: content_text.to_string(),
+        }),
+    }]
+}
+
+fn build_unconscious_retrieval_updates(
+    context: &UnconsciousContext,
+    model_text: &str,
+    canonical_proposals: &[CanonicalProposal],
+) -> Vec<RetrievalUpdateProposal> {
+    match context.job_kind {
+        UnconsciousJobKind::MemoryConsolidation | UnconsciousJobKind::RetrievalMaintenance => {
+            let retrieval_rationale = if canonical_proposals.is_empty() {
+                format!(
+                    "scoped {} completed without canonical proposal changes",
+                    unconscious_task_class(context.job_kind)
+                )
+            } else {
+                format!(
+                    "scoped {} produced {} canonical proposal(s)",
+                    unconscious_task_class(context.job_kind),
+                    canonical_proposals.len()
+                )
+            };
+
+            vec![RetrievalUpdateProposal {
+                update_id: uuid::Uuid::now_v7(),
+                operation: RetrievalUpdateOperation::Upsert,
+                source_ref: format!("background_job:{}", context.job_id),
+                lexical_document: model_text.to_string(),
+                relevance_timestamp: chrono::Utc::now(),
+                internal_conversation_ref: context.scope.internal_conversation_ref.clone(),
+                rationale: Some(retrieval_rationale),
+            }]
+        }
+        UnconsciousJobKind::ContradictionAndDriftScan | UnconsciousJobKind::SelfModelReflection => {
+            Vec::new()
+        }
+    }
+}
+
+fn build_unconscious_diagnostics(
+    context: &UnconsciousContext,
+    model_text: &str,
+) -> Vec<DiagnosticAlert> {
+    match context.job_kind {
+        UnconsciousJobKind::ContradictionAndDriftScan => {
+            vec![classify_contradiction_and_drift(context, model_text)]
+        }
+        UnconsciousJobKind::MemoryConsolidation
+        | UnconsciousJobKind::RetrievalMaintenance
+        | UnconsciousJobKind::SelfModelReflection => vec![DiagnosticAlert {
+            alert_id: uuid::Uuid::now_v7(),
+            code: format!("{}_completed", unconscious_task_class(context.job_kind)),
+            severity: DiagnosticSeverity::Info,
+            summary: format!(
+                "{} completed under bounded background execution",
+                unconscious_task_class(context.job_kind)
+            ),
+            details: None,
+        }],
+    }
+}
+
+fn classify_contradiction_and_drift(
+    context: &UnconsciousContext,
+    model_text: &str,
+) -> DiagnosticAlert {
+    let normalized = model_text.trim();
+    let lowered = normalized.to_ascii_lowercase();
+
+    let (code, severity, summary) =
+        if lowered.contains("contradiction") || lowered.contains("conflict") {
+            (
+                "contradiction_detected",
+                DiagnosticSeverity::Critical,
+                format!(
+                    "Potential contradiction detected in {}.",
+                    contradiction_scope_label(context)
+                ),
+            )
+        } else if lowered.contains("drift")
+            || lowered.contains("inconsistent")
+            || lowered.contains("divergence")
+        {
+            (
+                "drift_signal_detected",
+                DiagnosticSeverity::Warning,
+                format!(
+                    "Potential continuity drift detected in {}.",
+                    contradiction_scope_label(context)
+                ),
+            )
+        } else {
+            (
+                "drift_scan_clear",
+                DiagnosticSeverity::Info,
+                format!(
+                    "No contradiction or drift indicators detected in {}.",
+                    contradiction_scope_label(context)
+                ),
+            )
+        };
+
+    DiagnosticAlert {
+        alert_id: uuid::Uuid::now_v7(),
+        code: code.to_string(),
+        severity,
+        summary,
+        details: (!normalized.is_empty()).then(|| normalized.to_string()),
+    }
+}
+
+fn contradiction_scope_label(context: &UnconsciousContext) -> String {
+    context
+        .scope
+        .internal_conversation_ref
+        .clone()
+        .or_else(|| context.scope.internal_principal_ref.clone())
+        .unwrap_or_else(|| "the scoped continuity window".to_string())
+}
+
+fn classify_self_model_observation_kind(model_text: &str) -> &'static str {
+    let lowered = model_text.to_ascii_lowercase();
+    if lowered.contains("goal") || lowered.contains("subgoal") {
+        return "subgoal";
+    }
+    if lowered.contains("style")
+        || lowered.contains("tone")
+        || lowered.contains("concise")
+        || lowered.contains("direct")
+        || lowered.contains("communication")
+    {
+        return "interaction_style";
+    }
+    "preference"
 }
 
 fn history_message_count(context: &ConsciousContext) -> u32 {
@@ -1174,10 +1384,154 @@ mod tests {
             WorkerResult::Unconscious(result) => {
                 assert_eq!(result.status, UnconsciousWorkerStatus::Completed);
                 assert!(result.summary.contains("memory_consolidation"));
-                assert!(result.maintenance_outputs.canonical_proposals.is_empty());
+                assert_eq!(result.maintenance_outputs.canonical_proposals.len(), 1);
+                let proposal = &result.maintenance_outputs.canonical_proposals[0];
+                assert_eq!(
+                    proposal.proposal_kind,
+                    CanonicalProposalKind::MemoryArtifact
+                );
+                assert_eq!(proposal.subject_ref, "primary-user");
+                assert_eq!(
+                    proposal.provenance.source_episode_id,
+                    payload.context.scope.episode_ids.first().copied()
+                );
                 assert_eq!(result.maintenance_outputs.retrieval_updates.len(), 1);
                 assert_eq!(result.maintenance_outputs.diagnostics.len(), 1);
                 assert!(result.maintenance_outputs.wake_signals.is_empty());
+            }
+            WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
+            WorkerResult::Conscious(_) => panic!("unexpected conscious response"),
+            WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
+        }
+    }
+
+    #[test]
+    fn contradiction_scan_classifies_conflict_as_critical_without_mutating_outputs() {
+        let mut context = sample_unconscious_context();
+        context.job_kind = UnconsciousJobKind::ContradictionAndDriftScan;
+        context.scope.summary = "Scan recent continuity for contradictions.".to_string();
+
+        let request =
+            WorkerRequest::unconscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Unconscious(payload) = &request.payload else {
+            panic!("expected unconscious payload");
+        };
+        let model_request = build_unconscious_model_call_request(&request, payload.as_ref());
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-background".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: "Potential contradiction detected between recent memory snapshots."
+                    .to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 8,
+            },
+        };
+
+        let response =
+            build_unconscious_worker_response(&request, payload.as_ref(), model_response);
+        match response.result {
+            WorkerResult::Unconscious(result) => {
+                assert!(result.maintenance_outputs.canonical_proposals.is_empty());
+                assert!(result.maintenance_outputs.retrieval_updates.is_empty());
+                assert!(result.maintenance_outputs.wake_signals.is_empty());
+                assert_eq!(result.maintenance_outputs.diagnostics.len(), 1);
+                let diagnostic = &result.maintenance_outputs.diagnostics[0];
+                assert_eq!(diagnostic.code, "contradiction_detected");
+                assert_eq!(diagnostic.severity, DiagnosticSeverity::Critical);
+            }
+            WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
+            WorkerResult::Conscious(_) => panic!("unexpected conscious response"),
+            WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
+        }
+    }
+
+    #[test]
+    fn contradiction_scan_classifies_clear_scope_as_info() {
+        let mut context = sample_unconscious_context();
+        context.job_kind = UnconsciousJobKind::ContradictionAndDriftScan;
+
+        let diagnostics = build_unconscious_diagnostics(
+            &context,
+            "Continuity remains aligned and no notable drift was found.",
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "drift_signal_detected");
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+
+        let diagnostics = build_unconscious_diagnostics(
+            &context,
+            "Continuity remains aligned and stable across the scoped review.",
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "drift_scan_clear");
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Info);
+    }
+
+    #[test]
+    fn self_model_reflection_emits_a_self_model_observation_proposal() {
+        let mut context = sample_unconscious_context();
+        context.job_kind = UnconsciousJobKind::SelfModelReflection;
+
+        let request =
+            WorkerRequest::unconscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Unconscious(payload) = &request.payload else {
+            panic!("expected unconscious payload");
+        };
+        let model_request = build_unconscious_model_call_request(&request, payload.as_ref());
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-background".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: "Prefer concise progress updates during long maintenance runs.".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 18,
+                output_tokens: 7,
+            },
+        };
+
+        let response =
+            build_unconscious_worker_response(&request, payload.as_ref(), model_response);
+        match response.result {
+            WorkerResult::Unconscious(result) => {
+                assert_eq!(result.maintenance_outputs.canonical_proposals.len(), 1);
+                assert!(result.maintenance_outputs.retrieval_updates.is_empty());
+                assert_eq!(result.maintenance_outputs.diagnostics.len(), 1);
+                assert_eq!(result.maintenance_outputs.wake_signals.len(), 1);
+                let proposal = &result.maintenance_outputs.canonical_proposals[0];
+                assert_eq!(
+                    proposal.proposal_kind,
+                    CanonicalProposalKind::SelfModelObservation
+                );
+                assert_eq!(
+                    proposal.canonical_target,
+                    CanonicalTargetKind::SelfModelArtifacts
+                );
+                assert_eq!(
+                    proposal.provenance.provenance_kind,
+                    ProposalProvenanceKind::SelfModelReflection
+                );
+                let CanonicalProposalPayload::SelfModelObservation(payload) = &proposal.payload
+                else {
+                    panic!("expected a self-model observation payload");
+                };
+                assert_eq!(payload.observation_kind, "interaction_style");
             }
             WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
             WorkerResult::Conscious(_) => panic!("unexpected conscious response"),
@@ -1272,6 +1626,8 @@ mod tests {
                 memory_artifact_ids: vec![uuid::Uuid::now_v7()],
                 retrieval_artifact_ids: vec![uuid::Uuid::now_v7()],
                 self_model_artifact_id: None,
+                internal_principal_ref: Some("primary-user".to_string()),
+                internal_conversation_ref: Some("telegram-primary".to_string()),
                 summary: "Consolidate recent episodes into long-term memory.".to_string(),
             },
             budget: BackgroundExecutionBudget {

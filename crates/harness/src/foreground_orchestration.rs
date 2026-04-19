@@ -7,9 +7,8 @@ use crate::{
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
-    memory,
     model_gateway::ModelProviderTransport,
-    policy, proposal, self_model,
+    policy, proposal,
     telegram::{TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
@@ -76,16 +75,19 @@ where
         }
     };
 
-    let user_messages = trigger
-        .ingress
-        .text_body
-        .clone()
-        .into_iter()
-        .map(|text_body| UserEpisodeMessage {
-            text_body,
-            external_message_id: trigger.ingress.external_message_id.clone(),
-        })
-        .collect::<Vec<_>>();
+    let user_messages = build_trigger_user_messages(
+        trigger.trigger_kind,
+        trigger
+            .ingress
+            .text_body
+            .clone()
+            .into_iter()
+            .map(|text_body| UserEpisodeMessage {
+                text_body,
+                external_message_id: trigger.ingress.external_message_id.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
 
     orchestrate_telegram_foreground_trigger(
         pool,
@@ -123,19 +125,21 @@ where
         execution.execution_id,
         primary_ingress,
     )?;
-    let user_messages = plan
-        .ordered_ingress
-        .iter()
-        .filter_map(|ingress| {
-            ingress
-                .text_body
-                .clone()
-                .map(|text_body| UserEpisodeMessage {
-                    text_body,
-                    external_message_id: ingress.external_message_id.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
+    let user_messages = build_trigger_user_messages(
+        trigger.trigger_kind,
+        plan.ordered_ingress
+            .iter()
+            .filter_map(|ingress| {
+                ingress
+                    .text_body
+                    .clone()
+                    .map(|text_body| UserEpisodeMessage {
+                        text_body,
+                        external_message_id: ingress.external_message_id.clone(),
+                    })
+            })
+            .collect::<Vec<_>>(),
+    );
 
     orchestrate_telegram_foreground_trigger(
         pool,
@@ -174,6 +178,8 @@ where
     } = execution_input;
 
     let episode_id = Uuid::now_v7();
+    let (episode_trigger_kind, episode_trigger_source) =
+        episode_trigger_metadata(trigger.trigger_kind);
     let mut recorded_episode_id = None;
     if let Err(error) = foreground::insert_episode(
         pool,
@@ -184,8 +190,8 @@ where
             ingress_id: Some(trigger.ingress.ingress_id),
             internal_principal_ref: trigger.ingress.internal_principal_ref.clone(),
             internal_conversation_ref: trigger.ingress.internal_conversation_ref.clone(),
-            trigger_kind: "user_ingress".to_string(),
-            trigger_source: "telegram".to_string(),
+            trigger_kind: episode_trigger_kind.to_string(),
+            trigger_source: episode_trigger_source.to_string(),
             status: "started".to_string(),
             started_at: trigger.received_at,
         },
@@ -440,7 +446,7 @@ where
         .await;
     }
 
-    let proposal_summary = match apply_foreground_candidate_proposals(
+    let proposal_summary = match proposal::apply_candidate_proposals(
         pool,
         config,
         &proposal::ProposalProcessingContext {
@@ -450,6 +456,8 @@ where
             source_ingress_id: Some(trigger.ingress.ingress_id),
             source_loop_kind: "conscious".to_string(),
         },
+        "foreground_orchestration",
+        None,
         &result.candidate_proposals,
     )
     .await
@@ -672,6 +680,27 @@ async fn record_and_return_failure<T>(
     Err(error)
 }
 
+fn build_trigger_user_messages(
+    trigger_kind: contracts::ForegroundTriggerKind,
+    candidate_messages: Vec<UserEpisodeMessage>,
+) -> Vec<UserEpisodeMessage> {
+    match trigger_kind {
+        contracts::ForegroundTriggerKind::UserIngress => candidate_messages,
+        contracts::ForegroundTriggerKind::ApprovedWakeSignal => Vec::new(),
+    }
+}
+
+fn episode_trigger_metadata(
+    trigger_kind: contracts::ForegroundTriggerKind,
+) -> (&'static str, &'static str) {
+    match trigger_kind {
+        contracts::ForegroundTriggerKind::UserIngress => ("user_ingress", "telegram"),
+        contracts::ForegroundTriggerKind::ApprovedWakeSignal => {
+            ("approved_wake_signal", "wake_signal")
+        }
+    }
+}
+
 fn format_error_chain(error: &Error) -> String {
     error
         .chain()
@@ -716,78 +745,6 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     }
 
     ForegroundFailureKind::WorkerProtocolFailure
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ProposalApplicationSummary {
-    evaluated_count: usize,
-    accepted_count: usize,
-    rejected_count: usize,
-    canonical_write_count: usize,
-}
-
-async fn apply_foreground_candidate_proposals(
-    pool: &sqlx::PgPool,
-    config: &RuntimeConfig,
-    context: &proposal::ProposalProcessingContext,
-    proposals: &[contracts::CanonicalProposal],
-) -> Result<ProposalApplicationSummary> {
-    let mut summary = ProposalApplicationSummary::default();
-
-    for candidate in proposals {
-        summary.evaluated_count += 1;
-        let validation = proposal::validate_and_record_proposal(pool, context, candidate).await?;
-        match validation.outcome {
-            contracts::ProposalEvaluationOutcome::Rejected => {
-                summary.rejected_count += 1;
-            }
-            contracts::ProposalEvaluationOutcome::Accepted => {
-                let merge_outcome = match candidate.proposal_kind {
-                    contracts::CanonicalProposalKind::MemoryArtifact => {
-                        memory::apply_memory_proposal_merge(pool, context, candidate).await?
-                    }
-                    contracts::CanonicalProposalKind::SelfModelObservation => {
-                        self_model::apply_self_model_proposal_merge(
-                            pool, config, context, candidate,
-                        )
-                        .await?
-                    }
-                };
-
-                match merge_outcome.outcome {
-                    contracts::ProposalEvaluationOutcome::Accepted => {
-                        summary.accepted_count += 1;
-                        if merge_outcome.target.is_some() {
-                            summary.canonical_write_count += 1;
-                            audit::insert(
-                                pool,
-                                &NewAuditEvent {
-                                    loop_kind: context.source_loop_kind.clone(),
-                                    subsystem: "foreground_orchestration".to_string(),
-                                    event_kind: "canonical_write_applied".to_string(),
-                                    severity: "info".to_string(),
-                                    trace_id: context.trace_id,
-                                    execution_id: Some(context.execution_id),
-                                    worker_pid: None,
-                                    payload: json!({
-                                        "proposal_id": candidate.proposal_id,
-                                        "outcome": "accepted",
-                                        "target": merge_outcome.target,
-                                    }),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                    contracts::ProposalEvaluationOutcome::Rejected => {
-                        summary.rejected_count += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(summary)
 }
 
 fn parse_telegram_chat_id(ingress: &contracts::NormalizedIngress) -> Result<i64> {

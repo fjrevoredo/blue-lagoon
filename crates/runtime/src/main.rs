@@ -25,8 +25,10 @@ enum Command {
 struct HarnessCommand {
     #[arg(long)]
     once: bool,
-    #[arg(long, default_value_t = false, conflicts_with = "synthetic_trigger")]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["background_once", "synthetic_trigger"])]
     idle: bool,
+    #[arg(long, default_value_t = false, conflicts_with_all = ["idle", "synthetic_trigger"])]
+    background_once: bool,
     #[arg(long, value_enum)]
     synthetic_trigger: Option<SyntheticTriggerArg>,
 }
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
                 HarnessOptions {
                     once: command.once,
                     idle: command.idle,
+                    background_once: command.background_once,
                     synthetic_trigger: command.synthetic_trigger.map(|trigger| match trigger {
                         SyntheticTriggerArg::Smoke => SyntheticTrigger::Smoke,
                     }),
