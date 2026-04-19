@@ -342,11 +342,11 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone A`
-- Current active task: `P4-03`
-- Completed tasks: `4/18`
-- Milestone A status: `IN PROGRESS`
-- Milestone B status: `TODO`
+- Current milestone: `Milestone B`
+- Current active task: `P4-08`
+- Completed tasks: `7/18`
+- Milestone A status: `DONE`
+- Milestone B status: `IN PROGRESS`
 - Milestone C status: `TODO`
 - Milestone D status: `TODO`
 
@@ -525,7 +525,7 @@ Milestone D is green only if:
 
 ### Task P4-03: Add reviewed SQL migration for background scheduling state
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-01`
 - Parallel-safe: no
 - Deliverables:
@@ -542,11 +542,17 @@ Milestone D is green only if:
   - reuse `execution_records` and `audit_events` where possible rather than
     introducing duplicate orchestration history stores
 - Evidence:
-  - not started
+  - added `migrations/0005__unconscious_loop.sql`
+  - updated `crates/harness/tests/foundation_component.rs` and
+    `crates/harness/tests/unconscious_component.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --test foundation_component -- --nocapture`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-04: Implement harness persistence services for scheduler and wake state
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-03`
 - Parallel-safe: no
 - Deliverables:
@@ -562,7 +568,12 @@ Milestone D is green only if:
   - likely split point if scheduler persistence and wake-signal persistence stop
     fitting one coherent storage pass
 - Evidence:
-  - not started
+  - added `crates/harness/src/background.rs`
+  - updated `crates/harness/src/lib.rs` and
+    `crates/harness/tests/unconscious_component.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-05: Define canonical Phase 4 contracts
 
@@ -610,7 +621,7 @@ Milestone D is green only if:
 
 ### Task P4-07: Implement harness-side background trigger validation and job planning
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P4-02`, `P4-05`
 - Parallel-safe: no
 - Deliverables:
@@ -626,7 +637,16 @@ Milestone D is green only if:
   - unit tests for trigger validation, deduplication, and budget planning
   - component tests proving planned jobs are durably recorded
 - Evidence:
-  - not started
+  - added `crates/harness/src/background_planning.rs`
+  - updated `crates/harness/src/background.rs`,
+    `crates/harness/src/policy.rs`,
+    `crates/harness/src/migration.rs`,
+    `crates/harness/src/lib.rs`, and
+    `crates/harness/tests/unconscious_component.rs`
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --lib -- --nocapture`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
+  - `cargo check --workspace`
 
 ### Task P4-08: Implement due-job selection, leasing, and bounded execution coordination
 

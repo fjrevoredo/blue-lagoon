@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use contracts::{ForegroundBudget, IngressEventKind, NormalizedIngress};
+use contracts::{BackgroundExecutionBudget, ForegroundBudget, IngressEventKind, NormalizedIngress};
 
 use crate::config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig};
 
@@ -21,6 +21,14 @@ pub fn default_foreground_budget(config: &RuntimeConfig) -> ForegroundBudget {
         iteration_budget: config.harness.default_foreground_iteration_budget,
         wall_clock_budget_ms: config.harness.default_wall_clock_budget_ms,
         token_budget: config.harness.default_foreground_token_budget,
+    }
+}
+
+pub fn default_background_budget(config: &RuntimeConfig) -> BackgroundExecutionBudget {
+    BackgroundExecutionBudget {
+        iteration_budget: config.background.execution.default_iteration_budget,
+        wall_clock_budget_ms: config.background.execution.default_wall_clock_budget_ms,
+        token_budget: config.background.execution.default_token_budget,
     }
 }
 
@@ -63,6 +71,19 @@ pub fn validate_foreground_budget(budget: &ForegroundBudget) -> Result<()> {
     }
     if budget.token_budget == 0 {
         bail!("foreground token budget must be greater than zero");
+    }
+    Ok(())
+}
+
+pub fn validate_background_budget(budget: &BackgroundExecutionBudget) -> Result<()> {
+    if budget.iteration_budget == 0 {
+        bail!("background iteration budget must be greater than zero");
+    }
+    if budget.wall_clock_budget_ms == 0 {
+        bail!("background wall-clock budget must be greater than zero");
+    }
+    if budget.token_budget == 0 {
+        bail!("background token budget must be greater than zero");
     }
     Ok(())
 }
@@ -240,6 +261,14 @@ mod tests {
     }
 
     #[test]
+    fn background_budget_uses_explicit_iteration_wall_clock_and_token_limits() {
+        let budget = default_background_budget(&config(true));
+        assert_eq!(budget.iteration_budget, 2);
+        assert_eq!(budget.wall_clock_budget_ms, 120_000);
+        assert_eq!(budget.token_budget, 6_000);
+    }
+
+    #[test]
     fn foreground_budget_validation_rejects_zero_fields() {
         let error = validate_foreground_budget(&ForegroundBudget {
             iteration_budget: 0,
@@ -263,6 +292,33 @@ mod tests {
             token_budget: 0,
         })
         .expect_err("zero token budget should be rejected");
+        assert!(error.to_string().contains("token"));
+    }
+
+    #[test]
+    fn background_budget_validation_rejects_zero_fields() {
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 0,
+            wall_clock_budget_ms: 120_000,
+            token_budget: 6_000,
+        })
+        .expect_err("zero background iteration budget should be rejected");
+        assert!(error.to_string().contains("iteration"));
+
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 2,
+            wall_clock_budget_ms: 0,
+            token_budget: 6_000,
+        })
+        .expect_err("zero background wall-clock budget should be rejected");
+        assert!(error.to_string().contains("wall-clock"));
+
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 2,
+            wall_clock_budget_ms: 120_000,
+            token_budget: 0,
+        })
+        .expect_err("zero background token budget should be rejected");
         assert!(error.to_string().contains("token"));
     }
 
