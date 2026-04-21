@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, Phase 2, and Phase 3 completed; Phase 4 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, Phase 3, and Phase 4 completed; Phase 4.5 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -101,7 +101,8 @@ The plan should be interpreted with the following testing rules:
 
 The implementation should proceed through six major product-capability phases,
 with one bridging Phase 1.1 dedicated to establishing the minimum repository
-CI/CD baseline before Phase 2 broadens the runtime surface.
+CI/CD baseline and one bridging Phase 4.5 dedicated to the initial management
+CLI surface before Phase 5 broadens the governed action surface.
 
 ## Current status
 
@@ -109,6 +110,8 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 - Phase 1.1 status: `COMPLETE`
 - Phase 2 status: `COMPLETE`
 - Phase 3 status: `COMPLETE`
+- Phase 4 status: `COMPLETE`
+- Phase 4.5 status: `TBD`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -117,7 +120,7 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning and execution evidence for Phase 3 lives in
   `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
-- Detailed planning for Phase 4 now lives in
+- Detailed planning and execution evidence for Phase 4 now lives in
   `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
@@ -126,7 +129,10 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   minimum repository-hosted CI baseline for Phase 1.1
 - The current repository state now includes a completed Telegram-first
   foreground slice plus canonical continuity, retrieval, self-model, and
-  backlog-aware recovery coverage, so Phase 3 is complete and Phase 4 is now
+  backlog-aware recovery coverage, so Phase 3 is complete
+- The current repository state now includes the bounded unconscious loop,
+  background maintenance persistence, wake-signal handling, and the associated
+  automated verification coverage, so Phase 4 is complete and Phase 4.5 is now
   the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
@@ -344,6 +350,44 @@ memory and self-model in the background without breaking isolation or control.
 - Repository CI covers the required unconscious-loop regression suites for the
   implemented maintenance paths.
 
+### Phase 4.5: Management CLI
+
+#### Phase 4.5 goal
+
+Introduce the first durable management CLI surface so inspection,
+verification, and safe local control of the runtime become easier before Phase
+5 adds more complexity and governed action-taking paths.
+
+#### Phase 4.5 primary outcomes
+
+- Define a small management CLI surface under the existing runtime entrypoint
+  rather than introducing a separate control plane.
+- Replace the current ad hoc SQL-heavy verification steps with explicit CLI
+  commands for common inspection and safe operator actions.
+- Add commands for status inspection across schema, worker resolution, Telegram
+  binding state, foreground backlog state, background job state, and wake
+  signals.
+- Add a safe explicit path to create and inspect background-maintenance jobs for
+  local verification without raw SQL seeding.
+- Prefer machine-readable and concise human-readable output modes so the same
+  commands work for both operators and scripted local checks.
+- Keep the Phase 4.5 scope intentionally narrow: no interactive TUI, no broad
+  arbitrary database console, and no expansion into full Phase 5 governed tool
+  execution.
+- Add automated coverage for CLI parsing, command routing, and the first
+  persistence-backed management flows that the operator surface exposes.
+
+#### Phase 4.5 exit criteria
+
+- The runtime exposes a coherent management CLI for the minimum required local
+  inspection and verification tasks.
+- Background job creation and inspection for local verification no longer depend
+  on raw SQL edits.
+- The new CLI surface is covered by automated tests appropriate to its parsing
+  and persistence-backed behavior.
+- The management surface remains clearly separated from canonical runtime
+  behavior and does not bypass harness-owned validation and policy boundaries.
+
 ### Phase 5: Tool execution, workspace, and approval model
 
 #### Phase 5 goal
@@ -488,6 +532,10 @@ With Phase 3 complete, detailed planning for Phase 4 now lives in
 loop, bounded background maintenance, and wake-signal production and
 evaluation.
 
-Once Phase 4 is complete, the next planning step should be the detailed
+With Phase 4 complete, the next planning step should be a temporary design note
+and then a detailed implementation plan for Phase 4.5, focused on the narrow
+management CLI surface needed before broader runtime complexity expands again.
+
+Once Phase 4.5 is complete, the next planning step should be the detailed
 implementation plan for Phase 5, focused on governed tool execution, workspace
 boundaries, approvals, and policy re-check behavior.

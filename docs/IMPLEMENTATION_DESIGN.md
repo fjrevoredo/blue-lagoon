@@ -1133,7 +1133,12 @@ The v1 approval flow should be:
 #### Minimal operator surface
 
 - Operator diagnostics remain distinct from the main end-user conversation surface.
-- V1 operator support should include a CLI status view.
+- V1 operator support should center on a management CLI rather than on ad hoc debug commands.
+- That CLI should be treated as a durable product interface, not as a temporary testing shell.
+- Management commands should be harness-mediated and capability-oriented rather than exposing raw storage internals as the primary operator workflow.
+- The initial command set may stay small, but the interface shape should be stable enough for later phases to add inspection and explicit control flows without structural redesign.
+- Read-oriented commands should support concise human-readable output and structured machine-readable output where that materially improves automation or verification.
+- Mutating commands must preserve the same audit, policy, approval, and canonical-write guarantees as the rest of the runtime.
 - A small read-only local status page may exist if useful.
 - A full browser-based admin control plane is out of v1 scope.
 

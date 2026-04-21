@@ -267,9 +267,6 @@ cargo run -p runtime -- harness --once --synthetic-trigger smoke
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
-For the remaining operator-only local validation surface, use
-[`docs/remaining-manual-verification.md`](/mnt/d/Repos/blue-lagoon/docs/remaining-manual-verification.md).
-
 Repository-hosted CI lives in `.github/workflows/ci.yml` and exposes the stable
 jobs `workspace-verification`, `foreground-runtime`, and
 `canonical-persistence`. Live-network Telegram and provider checks remain
