@@ -890,6 +890,9 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
 -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
         config.self_model = Some(SelfModelConfig {
             seed_path: PathBuf::from("config/self_model_seed.toml"),
         });
@@ -1018,6 +1021,9 @@ async fn background_execution_rejects_wake_signal_when_no_foreground_binding_is_
 -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
         config.self_model = Some(SelfModelConfig {
             seed_path: PathBuf::from("config/self_model_seed.toml"),
         });

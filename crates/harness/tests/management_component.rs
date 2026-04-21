@@ -8,6 +8,7 @@ use harness::{
         self, BackgroundJobRunStatus, BackgroundJobStatus, NewBackgroundJob, NewBackgroundJobRun,
         NewWakeSignalRecord, WakeSignalStatus,
     },
+    execution::{self, NewExecutionRecord},
     foreground::{self, NewIngressEvent},
     management,
 };
@@ -76,6 +77,7 @@ async fn background_and_wake_signal_lists_surface_recent_operator_state() -> Res
         let trace_id = Uuid::now_v7();
         let job_id = Uuid::now_v7();
         let run_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
         let now = Utc::now();
 
         background::insert_job(
@@ -107,7 +109,7 @@ async fn background_and_wake_signal_lists_surface_recent_operator_state() -> Res
                 background_job_run_id: run_id,
                 background_job_id: job_id,
                 trace_id,
-                execution_id: Some(Uuid::now_v7()),
+                execution_id: Some(execution_id),
                 lease_token: Uuid::now_v7(),
                 status: BackgroundJobRunStatus::Completed,
                 worker_pid: Some(4242),
@@ -203,4 +205,25 @@ fn sample_budget() -> contracts::BackgroundExecutionBudget {
         wall_clock_budget_ms: 120_000,
         token_budget: 6_000,
     }
+}
+
+async fn seed_execution(pool: &sqlx::PgPool, trace_id: Uuid) -> Result<Uuid> {
+    let execution_id = Uuid::now_v7();
+    execution::insert(
+        pool,
+        &NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "management_test".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: json!({
+                "request_id": Uuid::now_v7(),
+                "sent_at": Utc::now(),
+                "kind": "management_test"
+            }),
+        },
+    )
+    .await?;
+    Ok(execution_id)
 }
