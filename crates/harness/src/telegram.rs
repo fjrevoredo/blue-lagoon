@@ -1,12 +1,15 @@
 use std::{fs, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use contracts::GovernedActionRiskTier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::config::ResolvedTelegramConfig;
+use crate::config::{ApprovalPromptMode, ResolvedTelegramConfig};
 
 const DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS: u64 = 10_000;
+const TELEGRAM_MAX_CALLBACK_DATA_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TelegramUpdate {
@@ -94,12 +97,40 @@ pub struct TelegramOutboundMessage {
     pub chat_id: i64,
     pub text: String,
     pub reply_to_message_id: Option<i64>,
+    pub reply_markup: Option<TelegramReplyMarkup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramDeliveryReceipt {
     pub chat_id: i64,
     pub message_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramApprovalPrompt {
+    pub token: String,
+    pub title: String,
+    pub consequence_summary: String,
+    pub action_fingerprint: String,
+    pub risk_tier: GovernedActionRiskTier,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum TelegramReplyMarkup {
+    InlineKeyboard(TelegramInlineKeyboardMarkup),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelegramInlineKeyboardMarkup {
+    pub inline_keyboard: Vec<Vec<TelegramInlineKeyboardButton>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelegramInlineKeyboardButton {
+    pub text: String,
+    pub callback_data: String,
 }
 
 #[allow(async_fn_in_trait)]
@@ -149,6 +180,7 @@ where
                 chat_id,
                 text: text.into(),
                 reply_to_message_id,
+                reply_markup: None,
             })
             .await
     }
@@ -279,14 +311,29 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt> {
+        let request_body = {
+            let mut body = serde_json::Map::new();
+            body.insert("chat_id".to_string(), json!(message.chat_id));
+            body.insert("text".to_string(), json!(message.text));
+            if let Some(reply_to_message_id) = message.reply_to_message_id {
+                body.insert(
+                    "reply_to_message_id".to_string(),
+                    json!(reply_to_message_id),
+                );
+            }
+            if let Some(reply_markup) = &message.reply_markup {
+                body.insert(
+                    "reply_markup".to_string(),
+                    serde_json::to_value(reply_markup)
+                        .context("failed to encode Telegram reply markup")?,
+                );
+            }
+            serde_json::Value::Object(body)
+        };
         let response = self
             .client
             .post(telegram_api_url(&self.config, "sendMessage"))
-            .json(&json!({
-                "chat_id": message.chat_id,
-                "text": message.text,
-                "reply_to_message_id": message.reply_to_message_id,
-            }))
+            .json(&request_body)
             .send()
             .await
             .context("failed to call Telegram sendMessage")?;
@@ -343,6 +390,67 @@ pub async fn fetch_updates_once(config: ResolvedTelegramConfig) -> Result<Vec<Te
         .await
 }
 
+pub fn build_approval_prompt_message(
+    prompt_mode: ApprovalPromptMode,
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
+    prompt: &TelegramApprovalPrompt,
+) -> Result<TelegramOutboundMessage> {
+    let approve_callback = format!("approve:{}", prompt.token);
+    let reject_callback = format!("reject:{}", prompt.token);
+    let callbacks_fit = approve_callback.len() <= TELEGRAM_MAX_CALLBACK_DATA_BYTES
+        && reject_callback.len() <= TELEGRAM_MAX_CALLBACK_DATA_BYTES;
+
+    let reply_markup = if callbacks_fit {
+        Some(TelegramReplyMarkup::InlineKeyboard(
+            TelegramInlineKeyboardMarkup {
+                inline_keyboard: vec![vec![
+                    TelegramInlineKeyboardButton {
+                        text: "Approve".to_string(),
+                        callback_data: approve_callback,
+                    },
+                    TelegramInlineKeyboardButton {
+                        text: "Reject".to_string(),
+                        callback_data: reject_callback,
+                    },
+                ]],
+            },
+        ))
+    } else {
+        match prompt_mode {
+            ApprovalPromptMode::InlineKeyboard => {
+                bail!("approval token is too long for Telegram inline callback data");
+            }
+            ApprovalPromptMode::InlineKeyboardWithFallback => None,
+        }
+    };
+
+    let mut lines = vec![
+        "Approval required".to_string(),
+        format!("Action: {}", prompt.title),
+        format!(
+            "Risk: {}",
+            governed_action_risk_tier_label(prompt.risk_tier)
+        ),
+        format!("Fingerprint: {}", prompt.action_fingerprint),
+        format!("Expires: {}", prompt.expires_at.to_rfc3339()),
+        format!("Impact: {}", prompt.consequence_summary),
+    ];
+    if prompt_mode == ApprovalPromptMode::InlineKeyboardWithFallback {
+        lines.push(format!(
+            "Fallback: send `/approve {}` or `/reject {}` if needed.",
+            prompt.token, prompt.token
+        ));
+    }
+
+    Ok(TelegramOutboundMessage {
+        chat_id,
+        text: lines.join("\n"),
+        reply_to_message_id,
+        reply_markup,
+    })
+}
+
 fn telegram_api_url(config: &ResolvedTelegramConfig, method: &str) -> String {
     format!(
         "{}/bot{}/{}",
@@ -350,6 +458,15 @@ fn telegram_api_url(config: &ResolvedTelegramConfig, method: &str) -> String {
         config.bot_token,
         method
     )
+}
+
+fn governed_action_risk_tier_label(risk_tier: GovernedActionRiskTier) -> &'static str {
+    match risk_tier {
+        GovernedActionRiskTier::Tier0 => "tier_0",
+        GovernedActionRiskTier::Tier1 => "tier_1",
+        GovernedActionRiskTier::Tier2 => "tier_2",
+        GovernedActionRiskTier::Tier3 => "tier_3",
+    }
 }
 
 pub fn load_fixture_updates(path: &Path) -> Result<Vec<TelegramUpdate>> {
@@ -461,6 +578,68 @@ mod tests {
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(delivery.sent_messages()[0].text, "reply");
         assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(7));
+        assert_eq!(delivery.sent_messages()[0].reply_markup, None);
+    }
+
+    #[test]
+    fn approval_prompt_message_renders_inline_buttons_and_fallback_text() {
+        let prompt = TelegramApprovalPrompt {
+            token: "approval-token-42".to_string(),
+            title: "Run scoped subprocess".to_string(),
+            consequence_summary: "Writes a bounded file inside the workspace.".to_string(),
+            action_fingerprint: "sha256:abc123".to_string(),
+            risk_tier: GovernedActionRiskTier::Tier2,
+            expires_at: Utc::now(),
+        };
+
+        let message = build_approval_prompt_message(
+            ApprovalPromptMode::InlineKeyboardWithFallback,
+            42,
+            Some(7),
+            &prompt,
+        )
+        .expect("approval prompt should build");
+
+        assert!(message.text.contains("Approval required"));
+        assert!(message.text.contains("Action: Run scoped subprocess"));
+        assert!(message.text.contains("Fingerprint: sha256:abc123"));
+        assert!(message.text.contains("/approve approval-token-42"));
+        let Some(TelegramReplyMarkup::InlineKeyboard(markup)) = message.reply_markup else {
+            panic!("approval prompt should include inline keyboard markup");
+        };
+        assert_eq!(markup.inline_keyboard.len(), 1);
+        assert_eq!(
+            markup.inline_keyboard[0][0].callback_data,
+            "approve:approval-token-42"
+        );
+        assert_eq!(
+            markup.inline_keyboard[0][1].callback_data,
+            "reject:approval-token-42"
+        );
+    }
+
+    #[test]
+    fn approval_prompt_message_falls_back_when_token_exceeds_callback_limit() {
+        let long_token = "x".repeat(128);
+        let prompt = TelegramApprovalPrompt {
+            token: long_token.clone(),
+            title: "Run scoped subprocess".to_string(),
+            consequence_summary: "Writes a bounded file inside the workspace.".to_string(),
+            action_fingerprint: "sha256:abc123".to_string(),
+            risk_tier: GovernedActionRiskTier::Tier2,
+            expires_at: Utc::now(),
+        };
+
+        let message = build_approval_prompt_message(
+            ApprovalPromptMode::InlineKeyboardWithFallback,
+            42,
+            None,
+            &prompt,
+        )
+        .expect("fallback prompt should build");
+        assert_eq!(message.reply_markup, None);
+        assert!(message.text.contains("/approve"));
+        assert!(message.text.contains(&long_token));
     }
 
     #[tokio::test]
@@ -533,6 +712,14 @@ mod tests {
                 chat_id: 42,
                 text: "reply".to_string(),
                 reply_to_message_id: Some(7),
+                reply_markup: Some(TelegramReplyMarkup::InlineKeyboard(
+                    TelegramInlineKeyboardMarkup {
+                        inline_keyboard: vec![vec![TelegramInlineKeyboardButton {
+                            text: "Approve".to_string(),
+                            callback_data: "approve:42".to_string(),
+                        }]],
+                    },
+                )),
             })
             .await
             .expect("send should succeed");
@@ -544,6 +731,9 @@ mod tests {
         assert!(request.contains("\"chat_id\":42"));
         assert!(request.contains("\"reply_to_message_id\":7"));
         assert!(request.contains("\"text\":\"reply\""));
+        assert!(request.contains("\"reply_markup\""));
+        assert!(request.contains("\"inline_keyboard\""));
+        assert!(request.contains("\"callback_data\":\"approve:42\""));
         assert_eq!(receipt.chat_id, 42);
         assert_eq!(receipt.message_id, 99);
     }

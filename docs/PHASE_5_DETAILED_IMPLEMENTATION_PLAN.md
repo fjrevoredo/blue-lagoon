@@ -3,7 +3,7 @@
 ## Phase 5 Detailed Implementation Plan
 
 Date: 2026-04-21
-Status: Draft; ready for implementation review
+Status: In progress; Milestone A and Milestone B completed and Milestone C active
 Scope: High-level plan Phase 5 only
 Audience: LLM-assisted implementation work and human review
 
@@ -407,12 +407,12 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone A`
-- Current active task: `none`
-- Completed tasks: `0/20`
-- Milestone A status: `TODO`
-- Milestone B status: `TODO`
-- Milestone C status: `TODO`
+- Current milestone: `Milestone C`
+- Current active task: `P5-10`
+- Completed tasks: `9/20`
+- Milestone A status: `DONE`
+- Milestone B status: `DONE`
+- Milestone C status: `IN PROGRESS`
 - Milestone D status: `TODO`
 
 Repository sequencing note:
@@ -536,7 +536,7 @@ Milestone D is green only if:
 
 ### Task P5-01: Lock the Phase 5 governed-action slice boundary
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
@@ -551,11 +551,16 @@ Milestone D is green only if:
     `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
     `docs/LOOP_ARCHITECTURE.md`
 - Evidence:
-  - not started
+  - `docs/PHASE_5_DETAILED_IMPLEMENTATION_PLAN.md`
+  - confirmed the settled scope, exclusions, and CLI posture against
+    `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`,
+    `docs/IMPLEMENTATION_DESIGN.md`,
+    `docs/REQUIREMENTS.md`, and
+    `docs/LOOP_ARCHITECTURE.md` before implementation started
 
 ### Task P5-02: Define the Phase 5 runtime and harness architecture
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-01`
 - Parallel-safe: no
 - Deliverables:
@@ -569,11 +574,15 @@ Milestone D is green only if:
   - code review of the proposed module and command-tree shape
   - `cargo check --workspace`
 - Evidence:
-  - not started
+  - `crates/contracts/src/lib.rs`
+  - `crates/harness/src/config.rs`
+  - `crates/harness/src/policy.rs`
+  - `migrations/0006__workspace_and_governed_actions.sql`
+  - `cargo check --workspace`
 
 ### Task P5-03: Extend config and policy for approvals, capabilities, and budgets
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-01`
 - Parallel-safe: yes
 - Deliverables:
@@ -587,11 +596,16 @@ Milestone D is green only if:
   - unit tests for config parsing and validation
   - failed startup on invalid Phase 5 settings
 - Evidence:
-  - not started
+  - `crates/harness/src/config.rs`
+  - `crates/harness/src/policy.rs`
+  - `config/default.toml`
+  - `cargo test --workspace --lib -- --nocapture`
+  - added fail-closed validation for unsafe governed-action defaults such as
+    network-enabled default execution without Tier 2 approval gating
 
 ### Task P5-04: Add a reviewed SQL migration for workspace and governed-action state
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-01`
 - Parallel-safe: no
 - Deliverables:
@@ -608,11 +622,16 @@ Milestone D is green only if:
   - migration discovery and ordering behave correctly
   - migration applies cleanly to disposable PostgreSQL
 - Evidence:
-  - not started
+  - `migrations/0006__workspace_and_governed_actions.sql`
+  - `crates/harness/src/migration.rs`
+  - `crates/harness/tests/foundation_component.rs`
+  - `crates/harness/tests/unconscious_component.rs`
+  - `cargo test -p harness --test foundation_component -- --nocapture`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
 
 ### Task P5-05: Define canonical Phase 5 contracts
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-01`
 - Parallel-safe: yes
 - Deliverables:
@@ -631,11 +650,14 @@ Milestone D is green only if:
   - manual review that contract names are capability-based rather than
     phase-labeled
 - Evidence:
-  - not started
+  - `crates/contracts/src/lib.rs`
+  - `crates/workers/src/main.rs`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p workers -- --nocapture`
 
 ### Task P5-06: Implement harness workspace persistence and service layer
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-02`, `P5-04`, `P5-05`
 - Parallel-safe: no
 - Deliverables:
@@ -647,11 +669,19 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test governed_actions_component -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/workspace.rs`
+  - `crates/harness/src/lib.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - implemented typed workspace artifact, script, script version, and
+    script-run persistence services with public harness APIs and size-bound
+    validation for artifact and script content
+  - `cargo fmt --all --check`
+  - `cargo check --workspace`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
 
 ### Task P5-07: Implement canonical approval persistence and lifecycle services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-02`, `P5-04`, `P5-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -664,11 +694,20 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test governed_actions_component -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/approval.rs`
+  - `crates/harness/src/lib.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - implemented canonical approval creation, token and fingerprint lookup,
+    one-shot resolution, due-request expiry, mismatch invalidation, and
+    trace-linked audit events for creation, approval, rejection, expiry, and
+    invalidation
+  - `cargo fmt --all --check`
+  - `cargo check --workspace`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
 
 ### Task P5-08: Implement governed-action planning, classification, and fingerprinting
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-03`, `P5-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -682,11 +721,20 @@ Milestone D is green only if:
     planning
   - `cargo test --workspace --lib -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/governed_actions.rs`
+  - `crates/harness/src/lib.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - implemented harness-owned governed-action planning with deterministic
+    fingerprint derivation, capability-scope validation, approval-threshold
+    classification, blocked-action persistence, and trace-linked audit events
+  - `cargo fmt --all --check`
+  - `cargo check -p harness --tests`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
 
 ### Task P5-09: Implement Telegram approval rendering and canonical resolution routing
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-05`, `P5-07`
 - Parallel-safe: no
 - Deliverables:
@@ -701,7 +749,19 @@ Milestone D is green only if:
   - `cargo test -p harness --test foreground_component -- --nocapture`
   - `cargo test -p harness --test foreground_integration -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/telegram.rs`
+  - `crates/harness/src/foreground_orchestration.rs`
+  - `crates/harness/tests/foreground_component.rs`
+  - `crates/harness/tests/foreground_integration.rs`
+  - `crates/harness/tests/fixtures/telegram/approval_command_approve.json`
+  - implemented Telegram approval prompt rendering with inline-keyboard support
+    and typed fallback instructions, canonical approval-prompt delivery from
+    approval records plus ingress context, approval callback routing, and
+    `/approve` fallback resolution through the same approval lifecycle
+  - `cargo fmt --all --check`
+  - `cargo check -p harness --tests`
+  - `cargo test -p harness --test foreground_component -- --nocapture`
+  - `cargo test -p harness --test foreground_integration -- --nocapture`
 
 ### Task P5-10: Implement bounded subprocess execution with capability scoping
 

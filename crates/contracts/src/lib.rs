@@ -159,6 +159,8 @@ pub struct ConsciousWorkerResult {
     pub assistant_output: AssistantOutput,
     pub episode_summary: EpisodeSummary,
     pub candidate_proposals: Vec<CanonicalProposal>,
+    pub governed_action_proposals: Vec<GovernedActionProposal>,
+    pub governed_action_observations: Vec<GovernedActionObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,6 +641,237 @@ pub struct UnconsciousMaintenanceOutputs {
     pub wake_signals: Vec<WakeSignal>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub enum GovernedActionRiskTier {
+    #[serde(rename = "tier_0")]
+    Tier0,
+    #[default]
+    #[serde(rename = "tier_1")]
+    Tier1,
+    #[serde(rename = "tier_2")]
+    Tier2,
+    #[serde(rename = "tier_3")]
+    Tier3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAccessPosture {
+    #[default]
+    Disabled,
+    Allowlisted,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FilesystemCapabilityScope {
+    pub read_roots: Vec<String>,
+    pub write_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EnvironmentCapabilityScope {
+    pub allow_variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionCapabilityBudget {
+    pub timeout_ms: u64,
+    pub max_stdout_bytes: u64,
+    pub max_stderr_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityScope {
+    pub filesystem: FilesystemCapabilityScope,
+    pub network: NetworkAccessPosture,
+    pub environment: EnvironmentCapabilityScope,
+    pub execution: ExecutionCapabilityBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedActionKind {
+    InspectWorkspaceArtifact,
+    RunSubprocess,
+    RunWorkspaceScript,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedActionProposal {
+    pub proposal_id: Uuid,
+    pub title: String,
+    pub rationale: Option<String>,
+    pub action_kind: GovernedActionKind,
+    pub requested_risk_tier: Option<GovernedActionRiskTier>,
+    pub capability_scope: CapabilityScope,
+    pub payload: GovernedActionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectWorkspaceArtifactAction {
+    pub artifact_id: Uuid,
+    pub artifact_kind: WorkspaceArtifactKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubprocessAction {
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScriptAction {
+    pub script_id: Uuid,
+    pub script_version_id: Option<Uuid>,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum GovernedActionPayload {
+    InspectWorkspaceArtifact(InspectWorkspaceArtifactAction),
+    RunSubprocess(SubprocessAction),
+    RunWorkspaceScript(WorkspaceScriptAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedActionFingerprint {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedActionStatus {
+    Proposed,
+    AwaitingApproval,
+    Approved,
+    Rejected,
+    Expired,
+    Invalidated,
+    Blocked,
+    Executed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedActionExecutionOutcome {
+    pub status: GovernedActionStatus,
+    pub summary: String,
+    pub fingerprint: Option<GovernedActionFingerprint>,
+    pub output_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedActionObservation {
+    pub observation_id: Uuid,
+    pub action_kind: GovernedActionKind,
+    pub outcome: GovernedActionExecutionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolutionDecision {
+    Approved,
+    Rejected,
+    Expired,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub approval_request_id: Uuid,
+    pub action_proposal_id: Uuid,
+    pub action_fingerprint: GovernedActionFingerprint,
+    pub status: ApprovalRequestStatus,
+    pub risk_tier: GovernedActionRiskTier,
+    pub title: String,
+    pub consequence_summary: String,
+    pub capability_scope: CapabilityScope,
+    pub requested_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalResolutionEvent {
+    pub resolution_id: Uuid,
+    pub approval_request_id: Uuid,
+    pub decision: ApprovalResolutionDecision,
+    pub resolved_by: String,
+    pub resolved_at: DateTime<Utc>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceArtifactKind {
+    Note,
+    Runbook,
+    Scratchpad,
+    TaskList,
+    Script,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceArtifactSummary {
+    pub artifact_id: Uuid,
+    pub artifact_kind: WorkspaceArtifactKind,
+    pub title: String,
+    pub latest_version: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScriptSummary {
+    pub script_id: Uuid,
+    pub workspace_artifact_id: Uuid,
+    pub language: String,
+    pub latest_version: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScriptVersionSummary {
+    pub script_version_id: Uuid,
+    pub script_id: Uuid,
+    pub version: u32,
+    pub content_sha256: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceScriptRunStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    TimedOut,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScriptRunSummary {
+    pub script_run_id: Uuid,
+    pub script_id: Uuid,
+    pub script_version_id: Uuid,
+    pub status: WorkspaceScriptRunStatus,
+    pub risk_tier: GovernedActionRiskTier,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopKind {
@@ -916,6 +1149,31 @@ mod tests {
         assert_eq!(decoded.wake_signals.len(), 1);
     }
 
+    #[test]
+    fn governed_action_contracts_round_trip() {
+        let proposal = sample_governed_action_proposal();
+        let json = serde_json::to_string(&proposal).expect("proposal should serialize");
+        let decoded: GovernedActionProposal =
+            serde_json::from_str(&json).expect("proposal should deserialize");
+        assert_eq!(decoded, proposal);
+        assert_eq!(decoded.action_kind, GovernedActionKind::RunSubprocess);
+        assert_eq!(
+            decoded.requested_risk_tier,
+            Some(GovernedActionRiskTier::Tier2)
+        );
+    }
+
+    #[test]
+    fn approval_request_contracts_round_trip() {
+        let request = sample_approval_request();
+        let json = serde_json::to_string(&request).expect("request should serialize");
+        let decoded: ApprovalRequest =
+            serde_json::from_str(&json).expect("request should deserialize");
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.status, ApprovalRequestStatus::Pending);
+        assert_eq!(decoded.risk_tier, GovernedActionRiskTier::Tier2);
+    }
+
     fn sample_context() -> ConsciousContext {
         ConsciousContext {
             context_id: Uuid::now_v7(),
@@ -1172,6 +1430,60 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: 20,
                 output_tokens: 5,
+            },
+        }
+    }
+
+    fn sample_governed_action_proposal() -> GovernedActionProposal {
+        GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Run a bounded harness verification".to_string(),
+            rationale: Some(
+                "The current state should be checked through a scoped subprocess.".to_string(),
+            ),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: Some(GovernedActionRiskTier::Tier2),
+            capability_scope: sample_capability_scope(),
+            payload: GovernedActionPayload::RunSubprocess(SubprocessAction {
+                command: "cargo".to_string(),
+                args: vec!["test".to_string(), "-p".to_string(), "harness".to_string()],
+                working_directory: Some("D:/Repos/blue-lagoon".to_string()),
+            }),
+        }
+    }
+
+    fn sample_approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            approval_request_id: Uuid::now_v7(),
+            action_proposal_id: Uuid::now_v7(),
+            action_fingerprint: GovernedActionFingerprint {
+                value: "sha256:proposal-fingerprint".to_string(),
+            },
+            status: ApprovalRequestStatus::Pending,
+            risk_tier: GovernedActionRiskTier::Tier2,
+            title: "Run a scoped harness test".to_string(),
+            consequence_summary:
+                "Runs a bounded local subprocess inside the configured workspace scope.".to_string(),
+            capability_scope: sample_capability_scope(),
+            requested_at: Utc::now(),
+            expires_at: Utc::now(),
+        }
+    }
+
+    fn sample_capability_scope() -> CapabilityScope {
+        CapabilityScope {
+            filesystem: FilesystemCapabilityScope {
+                read_roots: vec!["D:/Repos/blue-lagoon".to_string()],
+                write_roots: vec!["D:/Repos/blue-lagoon/docs".to_string()],
+            },
+            network: NetworkAccessPosture::Disabled,
+            environment: EnvironmentCapabilityScope {
+                allow_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+            },
+            execution: ExecutionCapabilityBudget {
+                timeout_ms: 30_000,
+                max_stdout_bytes: 65_536,
+                max_stderr_bytes: 32_768,
             },
         }
     }

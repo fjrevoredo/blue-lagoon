@@ -619,6 +619,8 @@ fn build_conscious_worker_response(
                 message_count: history_message_count(&payload.context) + 2,
             },
             candidate_proposals,
+            governed_action_proposals: Vec::new(),
+            governed_action_observations: Vec::new(),
         }),
     })
 }
@@ -1310,6 +1312,8 @@ mod tests {
                 );
                 assert_eq!(result.episode_summary.outcome, "completed");
                 assert_eq!(result.candidate_proposals.len(), 2);
+                assert!(result.governed_action_proposals.is_empty());
+                assert!(result.governed_action_observations.is_empty());
             }
             WorkerResult::Smoke(_) => panic!("conscious worker should not emit a smoke result"),
             WorkerResult::Unconscious(_) => {

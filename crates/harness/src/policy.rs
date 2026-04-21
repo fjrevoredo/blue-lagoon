@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use contracts::{
-    BackgroundExecutionBudget, ForegroundBudget, IngressEventKind, NormalizedIngress, WakeSignal,
+    BackgroundExecutionBudget, ForegroundBudget, GovernedActionKind, GovernedActionProposal,
+    GovernedActionRiskTier, IngressEventKind, NetworkAccessPosture, NormalizedIngress, WakeSignal,
     WakeSignalDecision, WakeSignalDecisionKind, WakeSignalPriority,
 };
 
@@ -133,20 +134,24 @@ pub fn evaluate_telegram_foreground_trigger(
     }
 
     match ingress.event_kind {
-        IngressEventKind::MessageCreated | IngressEventKind::CommandIssued => {}
         IngressEventKind::ApprovalCallback => {
-            return PolicyDecision::Denied {
-                reason: "approval callbacks are not yet supported as foreground Telegram triggers"
-                    .to_string(),
-            };
+            if ingress.approval_payload.is_some() {
+                PolicyDecision::Allowed
+            } else {
+                PolicyDecision::Denied {
+                    reason: "approval callbacks require approval payload metadata".to_string(),
+                }
+            }
         }
-    }
-
-    match ingress.text_body.as_deref() {
-        Some(text) if !text.trim().is_empty() => PolicyDecision::Allowed,
-        _ => PolicyDecision::Denied {
-            reason: "foreground Telegram triggers require a non-empty text body".to_string(),
-        },
+        IngressEventKind::MessageCreated | IngressEventKind::CommandIssued => {
+            match ingress.text_body.as_deref() {
+                Some(text) if !text.trim().is_empty() => PolicyDecision::Allowed,
+                _ => PolicyDecision::Denied {
+                    reason: "foreground Telegram triggers require a non-empty text body"
+                        .to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -158,6 +163,40 @@ pub fn evaluate_synthetic_smoke(config: &RuntimeConfig) -> PolicyDecision {
             reason: "synthetic smoke trigger is disabled by policy".to_string(),
         }
     }
+}
+
+pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> GovernedActionRiskTier {
+    if let Some(requested) = proposal.requested_risk_tier {
+        return requested;
+    }
+
+    let has_write_scope = !proposal.capability_scope.filesystem.write_roots.is_empty();
+    let has_env_scope = !proposal
+        .capability_scope
+        .environment
+        .allow_variables
+        .is_empty();
+    let has_network = proposal.capability_scope.network != NetworkAccessPosture::Disabled;
+
+    match proposal.action_kind {
+        GovernedActionKind::InspectWorkspaceArtifact => GovernedActionRiskTier::Tier0,
+        GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
+            if has_network && has_write_scope {
+                GovernedActionRiskTier::Tier3
+            } else if has_network || has_write_scope || has_env_scope {
+                GovernedActionRiskTier::Tier2
+            } else {
+                GovernedActionRiskTier::Tier1
+            }
+        }
+    }
+}
+
+pub fn governed_action_requires_approval(
+    config: &RuntimeConfig,
+    risk_tier: GovernedActionRiskTier,
+) -> bool {
+    risk_tier >= config.governed_actions.approval_required_min_risk_tier
 }
 
 pub fn evaluate_wake_signal(
@@ -220,15 +259,18 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use contracts::{
-        ChannelKind, IngressEventKind, NormalizedIngress, WakeSignal, WakeSignalDecisionKind,
+        CapabilityScope, ChannelKind, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
+        FilesystemCapabilityScope, GovernedActionPayload, GovernedActionProposal, IngressEventKind,
+        NormalizedIngress, SubprocessAction, WakeSignal, WakeSignalDecisionKind,
         WakeSignalPriority, WakeSignalReason,
     };
 
     use crate::config::{
-        AppConfig, BackgroundConfig, BackgroundExecutionConfig, BackgroundSchedulerConfig,
-        BackgroundThresholdsConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig,
+        AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
+        BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
+        BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, GovernedActionsConfig,
         HarnessConfig, ResolvedTelegramConfig, RetrievalConfig, WakeSignalPolicyConfig,
-        WorkerConfig,
+        WorkerConfig, WorkspaceConfig,
     };
 
     fn config(allow_synthetic_smoke: bool) -> RuntimeConfig {
@@ -281,6 +323,27 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            workspace: WorkspaceConfig {
+                root_dir: ".".into(),
+                max_artifact_bytes: 1_048_576,
+                max_script_bytes: 262_144,
+            },
+            approvals: ApprovalsConfig {
+                default_ttl_seconds: 900,
+                max_pending_requests: 32,
+                allow_cli_resolution: true,
+                prompt_mode: ApprovalPromptMode::InlineKeyboardWithFallback,
+            },
+            governed_actions: GovernedActionsConfig {
+                approval_required_min_risk_tier: GovernedActionRiskTier::Tier2,
+                default_subprocess_timeout_ms: 30_000,
+                max_subprocess_timeout_ms: 120_000,
+                max_filesystem_roots_per_action: 4,
+                default_network_access: NetworkAccessPosture::Disabled,
+                allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+                max_environment_variables_per_action: 8,
+                max_captured_output_bytes: 65_536,
             },
             worker: WorkerConfig {
                 timeout_ms: 10_000,
@@ -424,15 +487,33 @@ mod tests {
     }
 
     #[test]
-    fn telegram_foreground_policy_rejects_approval_callbacks() {
+    fn telegram_foreground_policy_allows_approval_callbacks_with_payload() {
+        let mut ingress = telegram_ingress();
+        ingress.event_kind = IngressEventKind::ApprovalCallback;
+        ingress.text_body = None;
+        ingress.approval_payload = Some(contracts::ApprovalPayload {
+            token: "callback-query-id".to_string(),
+            callback_data: Some("approve:approval-token".to_string()),
+        });
+
+        match evaluate_telegram_foreground_trigger(&telegram_config(), &ingress) {
+            PolicyDecision::Allowed => {}
+            PolicyDecision::Denied { reason } => {
+                panic!("approval callbacks with payload should be allowed, got {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn telegram_foreground_policy_rejects_approval_callbacks_without_payload() {
         let mut ingress = telegram_ingress();
         ingress.event_kind = IngressEventKind::ApprovalCallback;
         ingress.text_body = None;
 
         match evaluate_telegram_foreground_trigger(&telegram_config(), &ingress) {
-            PolicyDecision::Allowed => panic!("approval callbacks should be rejected"),
+            PolicyDecision::Allowed => panic!("payload-less approval callbacks should be rejected"),
             PolicyDecision::Denied { reason } => {
-                assert!(reason.contains("approval callbacks"));
+                assert!(reason.contains("approval payload"));
             }
         }
     }
@@ -493,6 +574,36 @@ mod tests {
             command_hint: None,
             approval_payload: None,
             raw_payload_ref: None,
+        }
+    }
+
+    fn sample_governed_action_proposal() -> GovernedActionProposal {
+        GovernedActionProposal {
+            proposal_id: uuid::Uuid::now_v7(),
+            title: "Run scoped workspace command".to_string(),
+            rationale: None,
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: CapabilityScope {
+                filesystem: FilesystemCapabilityScope {
+                    read_roots: vec!["D:/Repos/blue-lagoon".to_string()],
+                    write_roots: Vec::new(),
+                },
+                network: NetworkAccessPosture::Disabled,
+                environment: EnvironmentCapabilityScope {
+                    allow_variables: Vec::new(),
+                },
+                execution: ExecutionCapabilityBudget {
+                    timeout_ms: 30_000,
+                    max_stdout_bytes: 65_536,
+                    max_stderr_bytes: 32_768,
+                },
+            },
+            payload: GovernedActionPayload::RunSubprocess(SubprocessAction {
+                command: "cargo".to_string(),
+                args: vec!["check".to_string()],
+                working_directory: Some("D:/Repos/blue-lagoon".to_string()),
+            }),
         }
     }
 
@@ -582,5 +693,49 @@ mod tests {
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Suppressed);
         assert!(decision.reason.contains("configured limit"));
+    }
+
+    #[test]
+    fn governed_action_risk_classification_escalates_with_write_and_network_scope() {
+        let proposal = sample_governed_action_proposal();
+        assert_eq!(
+            classify_governed_action_risk(&proposal),
+            GovernedActionRiskTier::Tier1
+        );
+
+        let mut write_scoped = sample_governed_action_proposal();
+        write_scoped
+            .capability_scope
+            .filesystem
+            .write_roots
+            .push("D:/Repos/blue-lagoon/docs".to_string());
+        assert_eq!(
+            classify_governed_action_risk(&write_scoped),
+            GovernedActionRiskTier::Tier2
+        );
+
+        let mut high_risk = write_scoped.clone();
+        high_risk.capability_scope.network = NetworkAccessPosture::Enabled;
+        assert_eq!(
+            classify_governed_action_risk(&high_risk),
+            GovernedActionRiskTier::Tier3
+        );
+    }
+
+    #[test]
+    fn governed_action_approval_requirement_follows_configured_threshold() {
+        let config = config(true);
+        assert!(!governed_action_requires_approval(
+            &config,
+            GovernedActionRiskTier::Tier1
+        ));
+        assert!(governed_action_requires_approval(
+            &config,
+            GovernedActionRiskTier::Tier2
+        ));
+        assert!(governed_action_requires_approval(
+            &config,
+            GovernedActionRiskTier::Tier3
+        ));
     }
 }

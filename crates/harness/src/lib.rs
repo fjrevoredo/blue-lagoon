@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod audit;
 pub mod background;
 pub mod background_execution;
@@ -9,6 +10,7 @@ pub mod db;
 pub mod execution;
 pub mod foreground;
 pub mod foreground_orchestration;
+pub mod governed_actions;
 pub mod ingress;
 pub mod management;
 pub mod memory;
@@ -23,3 +25,4 @@ pub mod self_model;
 pub mod telegram;
 pub mod trace;
 pub mod worker;
+pub mod workspace;
