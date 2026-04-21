@@ -3,7 +3,7 @@
 ## Phase 4.5 Detailed Implementation Plan
 
 Date: 2026-04-21
-Status: Implemented; non-DB verification completed; DB-backed verification pending in CI or a Docker-enabled local environment
+Status: Complete
 Scope: High-level plan Phase 4.5 only
 Audience: LLM-assisted implementation work and human review
 
@@ -120,8 +120,8 @@ Implementation status note:
 
 - the `management-cli` gate now exists in `.github/workflows/ci.yml`
 - local non-DB verification is complete
-- DB-backed suite execution is still pending outside this Codex environment
-  because local Docker/PostgreSQL access is unavailable here
+- repository-hosted DB-backed verification is complete in GitHub Actions run
+  `24732298751`
 
 Phase 4.5 CI expansion should avoid duplicating the same expensive suites
 across multiple jobs unless a stricter later-stage gate intentionally reuses
@@ -355,8 +355,8 @@ The plan should be executed under the following rules:
 
 ## Progress tracking protocol
 
-This document becomes the progress ledger for Phase 4.5 once implementation
-starts.
+This document became the progress ledger for Phase 4.5 during implementation
+and now records the completed execution state.
 
 Each task contains:
 
@@ -387,12 +387,12 @@ When a task is completed:
 ## Progress snapshot
 
 - Current milestone: `Milestone D`
-- Current active task: `P45-15 (DB-backed verification blocked by local Docker/PostgreSQL access in this environment)`
-- Completed tasks: `14/16`
+- Current active task: `none`
+- Completed tasks: `16/16`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `DONE`
-- Milestone D status: `BLOCKED`
+- Milestone D status: `DONE`
 
 Repository sequencing note:
 
@@ -793,7 +793,7 @@ Milestone D is green only if:
 
 ### Task P45-15: Add PostgreSQL-backed component and integration coverage for management flows
 
-- Status: `BLOCKED`
+- Status: `DONE`
 - Depends on: `P45-11`, `P45-12`, `P45-13`, `P45-14`
 - Parallel-safe: no
 - Deliverables:
@@ -808,17 +808,16 @@ Milestone D is green only if:
 - Evidence:
   - added `crates/harness/tests/management_component.rs` and
     `crates/harness/tests/management_integration.rs`
-  - local execution attempted with:
-    `cargo test -p harness --test management_component -- --nocapture`,
+  - local execution in this Codex environment remained limited by unavailable
+    Docker/PostgreSQL access, but repository-hosted DB-backed verification is
+    now complete
+  - verification completed in GitHub Actions run `24732298751` for:
+    `cargo test -p harness --test management_component -- --nocapture` and
     `cargo test -p harness --test management_integration -- --nocapture`
-  - blocked in this environment because test support could not access Docker to
-    start PostgreSQL (`permission denied while trying to connect to the docker
-    API`) and the runtime DB-backed CLI test could not connect to a local
-    PostgreSQL admin port without that service
 
 ### Task P45-16: Extend repository CI and operator docs for the Phase 4.5 gate
 
-- Status: `BLOCKED`
+- Status: `DONE`
 - Depends on: `P45-15`
 - Parallel-safe: no
 - Deliverables:
@@ -844,5 +843,6 @@ Milestone D is green only if:
   - retired the temporary pre-plan note at
     `docs/wip/phase-4-5-cli-design-note.md` after folding its decisions into
     this execution ledger
-  - remaining completion condition depends on `P45-15` running successfully in
-    CI or another Docker-enabled environment
+  - repository-hosted verification completed in GitHub Actions run
+    `24732298751`, where `management-cli` and `background-maintenance` both
+    passed with the intended PostgreSQL-backed suites
