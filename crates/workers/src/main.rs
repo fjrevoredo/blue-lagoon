@@ -757,6 +757,10 @@ fn build_unconscious_retrieval_updates(
 ) -> Vec<RetrievalUpdateProposal> {
     match context.job_kind {
         UnconsciousJobKind::MemoryConsolidation | UnconsciousJobKind::RetrievalMaintenance => {
+            if context.scope.episode_ids.is_empty() {
+                return Vec::new();
+            }
+
             let retrieval_rationale = if canonical_proposals.is_empty() {
                 format!(
                     "scoped {} completed without canonical proposal changes",
