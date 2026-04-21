@@ -3,7 +3,7 @@
 ## Phase 4.5 Detailed Implementation Plan
 
 Date: 2026-04-21
-Status: Ready for implementation
+Status: Implemented; non-DB verification completed; DB-backed verification pending in CI or a Docker-enabled local environment
 Scope: High-level plan Phase 4.5 only
 Audience: LLM-assisted implementation work and human review
 
@@ -65,18 +65,17 @@ No blocking contradiction was found between
 `docs/LOOP_ARCHITECTURE.md`, and
 `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`.
 
-The temporary note at `docs/wip/phase-4-5-cli-design-note.md` remains useful as
-draft context, but it is subordinate to this plan and must not override the
-canonical documents or the settled Phase 4.5 decisions recorded below. This
-document supersedes that note for implementation sequencing and progress
-tracking.
+The temporary note that originally lived at
+`docs/wip/phase-4-5-cli-design-note.md` has now been retired. Its useful
+planning decisions have been folded into this document, which remains the
+authoritative Phase 4.5 execution ledger.
 
 ## CI assessment for Phase 4.5
 
-The current repository-hosted CI posture is strong enough for foundation,
-foreground runtime, canonical continuity, and background maintenance, but it
-does not yet protect the new management CLI surface as a first-class product
-interface.
+At Phase 4.5 planning start, the repository-hosted CI posture was strong
+enough for foundation, foreground runtime, canonical continuity, and
+background maintenance, but it did not yet protect the management CLI surface
+as a first-class product interface.
 
 The current stable jobs remain useful:
 
@@ -117,6 +116,13 @@ The intended Phase 4.5 gate-to-suite mapping is:
   runtime admin CLI suite plus PostgreSQL-backed management component and
   integration suites.
 
+Implementation status note:
+
+- the `management-cli` gate now exists in `.github/workflows/ci.yml`
+- local non-DB verification is complete
+- DB-backed suite execution is still pending outside this Codex environment
+  because local Docker/PostgreSQL access is unavailable here
+
 Phase 4.5 CI expansion should avoid duplicating the same expensive suites
 across multiple jobs unless a stricter later-stage gate intentionally reuses
 them.
@@ -126,7 +132,7 @@ them.
 The current repository already contains the main boundaries that Phase 4.5
 should extend rather than replace.
 
-The default implementation starting points are:
+The implementation started from the following default starting points:
 
 - `crates/runtime/src/main.rs`
   for the current Clap entrypoint, which is still intentionally thin and
@@ -155,26 +161,26 @@ The default implementation starting points are:
   for trace-linked audit persistence that mutating management operations should
   continue to use
 - `crates/harness/src/lib.rs`
-  for the current public harness module surface, which does not yet include a
-  dedicated management module
+  for the public harness module surface that, at planning start, did not yet
+  include a dedicated management module
 - `crates/harness/tests/support/mod.rs`
   for disposable PostgreSQL test support and migration-backed test setup
 - `.github/workflows/ci.yml`
-  for the current stable capability-based CI gate layout
-- `docs/wip/phase-4-5-cli-design-note.md`
-  as the temporary pre-plan note to supersede with this implementation ledger
+  for the stable capability-based CI gate layout that Phase 4.5 needed to
+  extend with a management-specific gate
 
-The current repository state also makes several important constraints explicit:
+At implementation start, the repository state also made several important
+constraints explicit:
 
-- the runtime crate currently consists of a single `main.rs`, so the CLI
+- the runtime crate consisted of a single `main.rs`, so the CLI
   surface will become difficult to evolve cleanly if Phase 4.5 keeps adding
   commands without introducing internal structure
-- the current runtime command output is predominantly `Debug`-style rather than
+- the runtime command output was predominantly `Debug`-style rather than
   stable operator-facing output
-- the existing harness modules already hold most of the domain logic needed for
+- the existing harness modules already held most of the domain logic needed for
   Phase 4.5, but they do not yet expose a coherent management-oriented service
   layer or read models
-- there is no existing management CLI namespace, dedicated management test
+- there was no existing management CLI namespace, dedicated management test
   suite, or stable operator-facing formatter layer
 
 ## Phase 4.5 target
@@ -380,13 +386,13 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone A`
-- Current active task: `none (draft ready for implementation start)`
-- Completed tasks: `0/16`
-- Milestone A status: `TODO`
-- Milestone B status: `TODO`
-- Milestone C status: `TODO`
-- Milestone D status: `TODO`
+- Current milestone: `Milestone D`
+- Current active task: `P45-15 (DB-backed verification blocked by local Docker/PostgreSQL access in this environment)`
+- Completed tasks: `14/16`
+- Milestone A status: `DONE`
+- Milestone B status: `DONE`
+- Milestone C status: `DONE`
+- Milestone D status: `BLOCKED`
 
 Repository sequencing note:
 
@@ -515,7 +521,7 @@ Milestone D is green only if:
 
 ### Task P45-01: Lock the Phase 4.5 management CLI slice boundary
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: none
 - Parallel-safe: no
 - Deliverables:
@@ -530,11 +536,13 @@ Milestone D is green only if:
     `docs/IMPLEMENTATION_DESIGN.md`, `docs/REQUIREMENTS.md`, and
     `docs/LOOP_ARCHITECTURE.md`
 - Evidence:
-  - pending
+  - confirmed and implemented through the settled scope and deferral language
+    already recorded in this document plus the aligned forward-management
+    wording in `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md`
 
 ### Task P45-02: Define the runtime CLI architecture and output posture
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-01`
 - Parallel-safe: no
 - Deliverables:
@@ -548,11 +556,14 @@ Milestone D is green only if:
   - code review that the proposed file and module structure keeps runtime thin
   - `cargo check --workspace`
 - Evidence:
-  - pending
+  - added `crates/runtime/src/admin.rs` and updated
+    `crates/runtime/src/main.rs` so the runtime binary now exposes a structured
+    `admin` namespace with explicit text and `--json` output posture
+  - verification: `cargo check --workspace`
 
 ### Task P45-03: Add a dedicated harness-side management service layer
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-02`
 - Parallel-safe: no
 - Deliverables:
@@ -566,11 +577,13 @@ Milestone D is green only if:
   - `cargo check --workspace`
   - unit tests for management read-model encoding or validation as applicable
 - Evidence:
-  - pending
+  - added `crates/harness/src/management.rs` and exported it from
+    `crates/harness/src/lib.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-04: Implement runtime readiness and schema inspection services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-03`
 - Parallel-safe: no
 - Deliverables:
@@ -585,11 +598,15 @@ Milestone D is green only if:
   - unit tests for schema-status mapping and readiness summaries
   - `cargo test -p harness --test management_component -- --nocapture`
 - Evidence:
-  - pending
+  - implemented runtime status, schema compatibility inspection, worker
+    resolution reporting, optional subsystem readiness, and pending-work
+    summary logic in `crates/harness/src/management.rs`
+  - verification: `cargo check --workspace`,
+    `cargo test --workspace --lib -- --nocapture`
 
 ### Task P45-05: Implement foreground pending-work inspection services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-03`
 - Parallel-safe: yes
 - Deliverables:
@@ -601,11 +618,14 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test management_component -- --nocapture`
 - Evidence:
-  - pending
+  - implemented pending foreground conversation summaries and backlog-recovery
+    classification in `crates/harness/src/management.rs`
+  - verification: `cargo check --workspace`,
+    `cargo test --workspace --lib -- --nocapture`
 
 ### Task P45-06: Implement background job and job-run inspection services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-03`
 - Parallel-safe: yes
 - Deliverables:
@@ -617,11 +637,13 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test management_component -- --nocapture`
 - Evidence:
-  - pending
+  - implemented recent background job inspection with latest-run summaries in
+    `crates/harness/src/management.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-07: Implement wake-signal inspection services
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-03`
 - Parallel-safe: yes
 - Deliverables:
@@ -634,11 +656,13 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test management_component -- --nocapture`
 - Evidence:
-  - pending
+  - implemented recent wake-signal inspection in
+    `crates/harness/src/management.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-08: Implement `runtime admin status`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-04`
 - Parallel-safe: no
 - Deliverables:
@@ -650,11 +674,12 @@ Milestone D is green only if:
   - `cargo run -p runtime -- admin status`
   - `cargo run -p runtime -- admin status --json`
 - Evidence:
-  - pending
+  - implemented `runtime admin status` in `crates/runtime/src/admin.rs`
+  - verification: `cargo run -p runtime -- admin --help`
 
 ### Task P45-09: Implement `runtime admin foreground pending`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -665,11 +690,13 @@ Milestone D is green only if:
   - `cargo test -p runtime --test admin_cli -- --nocapture`
   - `cargo run -p runtime -- admin foreground pending`
 - Evidence:
-  - pending
+  - implemented `runtime admin foreground pending` in
+    `crates/runtime/src/admin.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-10: Implement `runtime admin background list`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-06`
 - Parallel-safe: yes
 - Deliverables:
@@ -680,11 +707,13 @@ Milestone D is green only if:
   - `cargo test -p runtime --test admin_cli -- --nocapture`
   - `cargo run -p runtime -- admin background list`
 - Evidence:
-  - pending
+  - implemented `runtime admin background list` in
+    `crates/runtime/src/admin.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-11: Implement safe `runtime admin background enqueue`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-03`
 - Parallel-safe: no
 - Deliverables:
@@ -699,11 +728,14 @@ Milestone D is green only if:
   - `cargo test -p harness --test management_integration -- --nocapture`
   - `cargo run -p runtime -- admin background enqueue ...`
 - Evidence:
-  - pending
+  - implemented typed enqueue routing through the harness-owned background
+    planning path in `crates/harness/src/management.rs` and
+    `crates/runtime/src/admin.rs`
+  - verification: `cargo test -p runtime --test admin_cli admin_background_enqueue_help_lists_operator_arguments -- --nocapture`
 
 ### Task P45-12: Implement `runtime admin background run-next`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-11`
 - Parallel-safe: no
 - Deliverables:
@@ -716,11 +748,13 @@ Milestone D is green only if:
   - `cargo test -p harness --test management_integration -- --nocapture`
   - `cargo run -p runtime -- admin background run-next`
 - Evidence:
-  - pending
+  - implemented focused one-shot due-job execution in
+    `crates/harness/src/management.rs` and `crates/runtime/src/admin.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-13: Implement `runtime admin wake-signals list`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-07`
 - Parallel-safe: yes
 - Deliverables:
@@ -732,11 +766,13 @@ Milestone D is green only if:
   - `cargo test -p runtime --test admin_cli -- --nocapture`
   - `cargo run -p runtime -- admin wake-signals list`
 - Evidence:
-  - pending
+  - implemented `runtime admin wake-signals list` in
+    `crates/runtime/src/admin.rs`
+  - verification: `cargo check --workspace`
 
 ### Task P45-14: Add unit coverage for parsing, status evaluation, and formatters
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P45-08`, `P45-09`, `P45-10`, `P45-11`, `P45-12`, `P45-13`
 - Parallel-safe: no
 - Deliverables:
@@ -749,11 +785,15 @@ Milestone D is green only if:
   - `cargo test -p runtime --test admin_cli -- --nocapture`
   - `cargo test --workspace --lib -- --nocapture`
 - Evidence:
-  - pending
+  - added runtime CLI surface tests in `crates/runtime/tests/admin_cli.rs`
+  - added management unit coverage in `crates/harness/src/management.rs`
+  - verification: `cargo test --workspace --lib -- --nocapture`,
+    `cargo test -p runtime --test admin_cli admin_help_lists_management_subcommands -- --nocapture`,
+    `cargo test -p runtime --test admin_cli admin_background_enqueue_help_lists_operator_arguments -- --nocapture`
 
 ### Task P45-15: Add PostgreSQL-backed component and integration coverage for management flows
 
-- Status: `TODO`
+- Status: `BLOCKED`
 - Depends on: `P45-11`, `P45-12`, `P45-13`, `P45-14`
 - Parallel-safe: no
 - Deliverables:
@@ -766,11 +806,19 @@ Milestone D is green only if:
   - `cargo test -p harness --test management_component -- --nocapture`
   - `cargo test -p harness --test management_integration -- --nocapture`
 - Evidence:
-  - pending
+  - added `crates/harness/tests/management_component.rs` and
+    `crates/harness/tests/management_integration.rs`
+  - local execution attempted with:
+    `cargo test -p harness --test management_component -- --nocapture`,
+    `cargo test -p harness --test management_integration -- --nocapture`
+  - blocked in this environment because test support could not access Docker to
+    start PostgreSQL (`permission denied while trying to connect to the docker
+    API`) and the runtime DB-backed CLI test could not connect to a local
+    PostgreSQL admin port without that service
 
 ### Task P45-16: Extend repository CI and operator docs for the Phase 4.5 gate
 
-- Status: `TODO`
+- Status: `BLOCKED`
 - Depends on: `P45-15`
 - Parallel-safe: no
 - Deliverables:
@@ -790,4 +838,11 @@ Milestone D is green only if:
   - manual review that updated operator docs match the implemented command
     surface
 - Evidence:
-  - pending
+  - added the `management-cli` job to `.github/workflows/ci.yml`
+  - updated operator-facing workflow guidance in `AGENTS.md`
+  - updated repository command guidance in `README.md`
+  - retired the temporary pre-plan note at
+    `docs/wip/phase-4-5-cli-design-note.md` after folding its decisions into
+    this execution ledger
+  - remaining completion condition depends on `P45-15` running successfully in
+    CI or another Docker-enabled environment

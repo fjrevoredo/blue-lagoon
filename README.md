@@ -64,6 +64,48 @@ Run one due background-maintenance job through the harness one-shot path:
 cargo run -p runtime -- harness --once --background-once
 ```
 
+Inspect the management CLI surface:
+
+```bash
+cargo run -p runtime -- admin --help
+```
+
+Inspect runtime readiness and pending work without raw SQL:
+
+```bash
+cargo run -p runtime -- admin status
+```
+
+Inspect pending foreground work:
+
+```bash
+cargo run -p runtime -- admin foreground pending
+```
+
+Inspect recent background jobs:
+
+```bash
+cargo run -p runtime -- admin background list
+```
+
+Enqueue one background-maintenance job through the management surface:
+
+```bash
+cargo run -p runtime -- admin background enqueue --job-kind memory-consolidation
+```
+
+Execute one due background-maintenance job through the management surface:
+
+```bash
+cargo run -p runtime -- admin background run-next
+```
+
+Inspect recent wake signals:
+
+```bash
+cargo run -p runtime -- admin wake-signals list
+```
+
 Replay one stored Telegram update through the foreground path:
 
 ```bash
@@ -121,6 +163,14 @@ Background-maintenance regression suites:
 ```bash
 cargo test -p harness --test unconscious_component -- --nocapture
 cargo test -p harness --test unconscious_integration -- --nocapture
+```
+
+Management CLI regression suites:
+
+```bash
+cargo test -p runtime --test admin_cli -- --nocapture
+cargo test -p harness --test management_component -- --nocapture
+cargo test -p harness --test management_integration -- --nocapture
 ```
 
 ## Local Development

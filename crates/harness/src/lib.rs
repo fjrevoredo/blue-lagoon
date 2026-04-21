@@ -10,6 +10,7 @@ pub mod execution;
 pub mod foreground;
 pub mod foreground_orchestration;
 pub mod ingress;
+pub mod management;
 pub mod memory;
 pub mod migration;
 pub mod model_gateway;

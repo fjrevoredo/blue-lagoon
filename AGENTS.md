@@ -59,6 +59,12 @@ Typical implementation workflow is:
   the PostgreSQL-backed background-maintenance component suite.
 - `cargo test -p harness --test unconscious_integration -- --nocapture` to run
   the architecture-critical background-maintenance integration suite.
+- `cargo test -p runtime --test admin_cli -- --nocapture` to run the runtime
+  management CLI surface tests.
+- `cargo test -p harness --test management_component -- --nocapture` to run
+  the PostgreSQL-backed management CLI component suite.
+- `cargo test -p harness --test management_integration -- --nocapture` to run
+  the architecture-critical management CLI integration suite.
 - `cargo test --workspace` to run the full repository test surface when a
   broader local check is warranted.
 - `docker compose config` to verify the local runtime topology.
@@ -82,6 +88,21 @@ Typical implementation workflow is:
   stored Telegram update through the foreground path.
 - `cargo run -p runtime -- telegram --poll-once` to perform one live Telegram
   poll cycle.
+- `cargo run -p runtime -- admin --help` to inspect the durable management CLI
+  surface.
+- `cargo run -p runtime -- admin status` to inspect runtime readiness and
+  pending-work state without raw SQL.
+- `cargo run -p runtime -- admin foreground pending` to inspect pending or
+  recoverable foreground work.
+- `cargo run -p runtime -- admin background list` to inspect recent background
+  job state and latest run outcomes.
+- `cargo run -p runtime -- admin background enqueue --job-kind <job-kind>` to
+  enqueue one background-maintenance job through the harness-owned planning
+  path.
+- `cargo run -p runtime -- admin background run-next` to execute one due
+  background-maintenance job through the focused management surface.
+- `cargo run -p runtime -- admin wake-signals list` to inspect recent
+  wake-signal state.
 - `cp config/local.example.toml config/local.toml` to prepare local Telegram
   binding overrides.
 - `cp .env.example .env` to prepare local runtime secrets and env overrides.

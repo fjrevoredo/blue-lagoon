@@ -16,6 +16,31 @@ use crate::{
     model_gateway::{self, ModelProviderTransport},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerResolutionKind {
+    ExplicitCommand,
+    SiblingBinary,
+    Unresolved,
+}
+
+impl WorkerResolutionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitCommand => "explicit_command",
+            Self::SiblingBinary => "sibling_binary",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerResolutionSummary {
+    pub resolution_kind: WorkerResolutionKind,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub notes: String,
+}
+
 pub async fn launch_smoke_worker(
     config: &RuntimeConfig,
     request: &WorkerRequest,
@@ -366,6 +391,39 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         bail!("unconscious worker returned a non-unconscious result payload");
     }
     Ok(response)
+}
+
+pub fn inspect_resolution(config: &RuntimeConfig) -> WorkerResolutionSummary {
+    if !config.worker.command.trim().is_empty() {
+        return WorkerResolutionSummary {
+            resolution_kind: WorkerResolutionKind::ExplicitCommand,
+            command: Some(config.worker.command.clone()),
+            args: config.worker.args.clone(),
+            notes: "worker subprocesses use the configured command directly".to_string(),
+        };
+    }
+
+    if let Some(path) = sibling_worker_binary() {
+        return WorkerResolutionSummary {
+            resolution_kind: WorkerResolutionKind::SiblingBinary,
+            command: Some(path.display().to_string()),
+            args: vec![
+                "smoke-worker".to_string(),
+                "conscious-worker".to_string(),
+                "unconscious-worker".to_string(),
+            ],
+            notes: "worker subprocesses use the sibling workers binary with per-worker subcommands"
+                .to_string(),
+        };
+    }
+
+    WorkerResolutionSummary {
+        resolution_kind: WorkerResolutionKind::Unresolved,
+        command: None,
+        args: Vec::new(),
+        notes: "worker command is not configured and no sibling workers binary is available"
+            .to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, Phase 2, Phase 3, and Phase 4 completed; Phase 4.5 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, Phase 3, and Phase 4 completed; Phase 4.5 is in progress
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -129,7 +129,7 @@ CLI surface before Phase 5 broadens the governed action surface.
 - Phase 2 status: `COMPLETE`
 - Phase 3 status: `COMPLETE`
 - Phase 4 status: `COMPLETE`
-- Phase 4.5 status: `TBD`
+- Phase 4.5 status: `IN PROGRESS`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -152,6 +152,10 @@ CLI surface before Phase 5 broadens the governed action surface.
   background maintenance persistence, wake-signal handling, and the associated
   automated verification coverage, so Phase 4 is complete and Phase 4.5 is now
   the active next phase
+- The current repository state now also includes the initial management CLI
+  surface, harness-side management services, management CLI docs, and the
+  dedicated `management-cli` CI gate, while DB-backed Phase 4.5 verification
+  remains pending in CI or another Docker-enabled environment
 
 ### Phase 1: Runtime foundation and authority boundaries
 

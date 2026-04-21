@@ -1,3 +1,5 @@
+mod admin;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use harness::{
@@ -19,6 +21,7 @@ enum Command {
     Migrate,
     Harness(HarnessCommand),
     Telegram(TelegramCommand),
+    Admin(admin::AdminCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -88,6 +91,11 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{outcome:?}");
+        }
+        Command::Admin(command) => {
+            let config = RuntimeConfig::load()?;
+            trace::init(&config.app.log_filter)?;
+            admin::run_admin_command(&config, command).await?;
         }
     }
     Ok(())
