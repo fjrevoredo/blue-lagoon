@@ -75,6 +75,12 @@ Every phase should preserve the following project posture:
 - Treat tests as deliverables for every phase, not as final hardening cleanup.
 - Treat no core architectural code path as complete until it has appropriate
   automated tests.
+- Treat the management CLI as the default operator surface from Phase 4.5
+  onward, extending it deliberately when later phases introduce operator-facing
+  inspection or safe explicit control needs.
+- Prefer stable management CLI workflows over raw SQL, log archaeology, or ad
+  hoc verification scripts whenever the operator task fits the product's
+  durable management surface.
 
 ## Testing posture
 
@@ -96,6 +102,18 @@ The plan should be interpreted with the following testing rules:
 - Recovery, approvals, policy enforcement, canonical writes, and migration
   safety must accumulate regression tests as they are implemented.
 - Release readiness depends on explicit test gates, not on informal confidence.
+
+The plan should also be interpreted with the following operator-surface rules
+from Phase 4.5 onward:
+
+- Each later phase must explicitly assess whether the capability it introduces
+  requires management CLI inspection, safe explicit control, or both.
+- If a repeated operator workflow is needed for local verification, diagnosis,
+  or bounded runtime control, the default assumption should be that it belongs
+  in the management CLI unless there is a clear reason to defer it.
+- Raw SQL, one-off scripts, or temporary verification documents may still exist
+  as narrow implementation aids, but they should not remain the primary
+  operator workflow when the behavior belongs in the durable product surface.
 
 ## Phase structure
 
@@ -408,6 +426,9 @@ the safety model.
   exposure, and execution budgets.
 - Establish clear boundaries between script creation or editing permission and
   script execution permission.
+- Extend the management CLI where needed so approvals, governed-action state,
+  workspace inspection, and blocked-action diagnostics do not depend on raw SQL
+  or ad hoc operator-only workflows.
 - Add automated coverage for tool-risk classification, approval validation,
   policy re-checks, capability scoping, and blocked execution paths.
 - Extend CI/CD so approval, policy, and blocked-action regressions are exercised
@@ -420,6 +441,9 @@ the safety model.
 - Workspace artifacts are stored separately from autobiographical memory.
 - Sensitive or side-effecting actions are provably blocked unless policy and
   approval conditions are satisfied.
+- Operator inspection and the minimum required explicit control flows for the
+  Phase 5 governed-action surface are available through the management CLI
+  rather than depending on raw SQL or temporary operator scripts.
 - High-risk action paths have regression tests that prove policy and approval
   failures block execution.
 - Repository CI automatically runs the required approval and safety suites before
@@ -441,6 +465,9 @@ fault-handling, migration discipline, and release-grade verification.
   use one coherent recovery checkpoint and continuation model.
 - Implement health surfaces, operator diagnostics, and operational metrics that
   feed both humans and internal-state modeling.
+- Extend the management CLI where needed so recovery state, health status,
+  diagnostics, and other durable operator workflows are exposed through the
+  established operator surface before considering heavier auxiliary surfaces.
 - Complete migration operational conventions, upgrade-path validation, and
   compatibility handling for persisted cross-process artifacts.
 - Expand the automated test suite to cover the architecture-critical paths
@@ -458,6 +485,9 @@ fault-handling, migration discipline, and release-grade verification.
 - The runtime can recover safely from crash, restart, timeout, and interrupted
   execution scenarios without violating canonical write or side-effect safety
   rules.
+- The minimum required recovery, health, and diagnostics workflows are
+  accessible through the management CLI rather than depending on raw SQL,
+  manual database inspection, or one-off operator procedures.
 - Required automated gates are green at the unit, component, integration, and
   release-critical layers.
 - The project has a coherent first runnable implementation that matches the
@@ -483,6 +513,8 @@ begin in the first phase and deepen throughout the plan:
 - Clear contracts for cross-process types.
 - Minimal fail-closed recovery posture for interrupted execution.
 - Deployment simplicity aligned with the agreed single-node v1 topology.
+- Ongoing assessment of what each new capability should expose through the
+  management CLI for durable operator inspection or safe explicit control.
 - Clear mapping between local verification commands and GitHub Actions workflows.
 - Documentation updates when implementation changes clarify or constrain the
   design.
@@ -538,4 +570,5 @@ management CLI surface needed before broader runtime complexity expands again.
 
 Once Phase 4.5 is complete, the next planning step should be the detailed
 implementation plan for Phase 5, focused on governed tool execution, workspace
-boundaries, approvals, and policy re-check behavior.
+boundaries, approvals, policy re-check behavior, and the required extensions to
+the management CLI for those new operator-facing workflows.
