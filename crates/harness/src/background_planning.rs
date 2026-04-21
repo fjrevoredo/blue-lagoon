@@ -201,11 +201,11 @@ pub fn validate_background_trigger(trigger: &BackgroundTrigger) -> std::result::
         | BackgroundTriggerKind::ForegroundDelegation
         | BackgroundTriggerKind::MaintenanceTrigger => Ok(()),
         BackgroundTriggerKind::DriftOrAnomalySignal => Err(
-            "drift_or_anomaly_signal is recognized but not yet schedulable in the initial Phase 4 trigger slice"
+            "drift_or_anomaly_signal is recognized but not yet schedulable in the current trigger policy slice"
                 .to_string(),
         ),
         BackgroundTriggerKind::ExternalPassiveEvent => Err(
-            "external_passive_event is recognized but not yet schedulable in the initial Phase 4 trigger slice"
+            "external_passive_event is recognized but not yet schedulable in the current trigger policy slice"
                 .to_string(),
         ),
     }
