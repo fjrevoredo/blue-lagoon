@@ -357,13 +357,36 @@ Each meaningful episodic record SHOULD capture:
 ### 18.3 Maintenance
 - The harness SHOULD support maintenance flows such as checkpoint compaction, index rebuild, failed-merge retry, and stalled-worker cleanup.
 
-## 19. Extensibility constraints
+## 19. Management interface requirements
 
-### 19.1 Baseline boundaries
+### 19.1 Product role
+- Blue Lagoon MUST expose a stable management interface for operator inspection and explicit control.
+- The management interface MUST remain distinct from the main end-user conversation surface.
+- The first version SHOULD provide this management interface primarily as a CLI.
+
+### 19.2 Architectural posture
+- The management interface MUST be harness-mediated.
+- The management interface MUST NOT bypass canonical write ownership, proposal validation, policy checks, approval requirements, or execution budgets.
+- The management interface MUST be capability-oriented rather than storage-oriented.
+- The management interface SHOULD minimize coupling to database schema, process layout, and other replaceable implementation detail.
+
+### 19.3 Extensibility and automation
+- The management interface MUST be extensible by capability so future product phases can add management operations without reshaping the full surface.
+- The management interface SHOULD support structured machine-readable output where that materially improves automation, verification, or operational tooling.
+- Mutating management operations MUST be traceable and auditable.
+- The management interface MUST remain compatible with future management needs including workspace inspection, approval operations, tool-governance visibility, recovery operations, and richer observability.
+
+### 19.4 Non-goals
+- The management interface MUST NOT become a general arbitrary admin shell.
+- The management interface SHOULD avoid exposing raw storage mutation as the primary operator workflow.
+
+## 20. Extensibility constraints
+
+### 20.1 Baseline boundaries
 - The first version MUST optimize for personal-assistant coherence and safety rather than enterprise breadth.
 - The first version SHOULD avoid premature multi-tenant complexity where it does not improve the single-user product.
 
-### 19.2 Forward compatibility
+### 20.2 Forward compatibility
 The architecture SHOULD remain compatible with future additions including:
 - multi-tenant policy domains
 - stronger secret isolation
@@ -372,7 +395,7 @@ The architecture SHOULD remain compatible with future additions including:
 - fleet management
 - additional channel gateways
 
-## 20. Acceptance criteria
+## 21. Acceptance criteria
 
 Blue Lagoon satisfies this baseline specification only if all of the following are true:
 
@@ -390,8 +413,9 @@ Blue Lagoon satisfies this baseline specification only if all of the following a
 12. The assistant operates as an always-on persistent runtime with reactive and policy-gated proactive behavior.
 13. Identity is operationally relevant and not cosmetic only.
 14. The memory layer includes drift monitoring and contradiction monitoring.
+15. The product exposes a harness-mediated management interface that is distinct from the end-user conversation surface.
 
-## 21. Design Carryover
+## 22. Design Carryover
 
 The following decisions are fixed by this specification and MUST be treated as design inputs:
 - always-on personal assistant runtime

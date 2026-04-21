@@ -58,6 +58,54 @@ Run the synthetic harness smoke path:
 cargo run -p runtime -- harness --once --synthetic-trigger smoke
 ```
 
+Run one due background-maintenance job through the harness one-shot path:
+
+```bash
+cargo run -p runtime -- harness --once --background-once
+```
+
+Inspect the management CLI surface:
+
+```bash
+cargo run -p runtime -- admin --help
+```
+
+Inspect runtime readiness and pending work without raw SQL:
+
+```bash
+cargo run -p runtime -- admin status
+```
+
+Inspect pending foreground work:
+
+```bash
+cargo run -p runtime -- admin foreground pending
+```
+
+Inspect recent background jobs:
+
+```bash
+cargo run -p runtime -- admin background list
+```
+
+Enqueue one background-maintenance job through the management surface:
+
+```bash
+cargo run -p runtime -- admin background enqueue --job-kind memory-consolidation
+```
+
+Execute one due background-maintenance job through the management surface:
+
+```bash
+cargo run -p runtime -- admin background run-next
+```
+
+Inspect recent wake signals:
+
+```bash
+cargo run -p runtime -- admin wake-signals list
+```
+
 Replay one stored Telegram update through the foreground path:
 
 ```bash
@@ -89,6 +137,41 @@ cargo build -p runtime -p workers
 
 If you are not using a sibling `workers` binary in `target/debug`, set an
 explicit `BLUE_LAGOON_WORKER_COMMAND` instead.
+
+## Test Commands
+
+Fast workspace verification:
+
+```bash
+cargo fmt --all --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --lib -- --nocapture
+```
+
+Foreground and continuity regression suites:
+
+```bash
+cargo test -p harness --test foreground_component -- --nocapture
+cargo test -p harness --test foreground_integration -- --nocapture
+cargo test -p harness --test continuity_component -- --nocapture
+cargo test -p harness --test continuity_integration -- --nocapture
+```
+
+Background-maintenance regression suites:
+
+```bash
+cargo test -p harness --test unconscious_component -- --nocapture
+cargo test -p harness --test unconscious_integration -- --nocapture
+```
+
+Management CLI regression suites:
+
+```bash
+cargo test -p runtime --test admin_cli -- --nocapture
+cargo test -p harness --test management_component -- --nocapture
+cargo test -p harness --test management_integration -- --nocapture
+```
 
 ## Local Development
 
@@ -233,10 +316,6 @@ cargo run -p runtime -- harness --once --idle
 cargo run -p runtime -- harness --once --synthetic-trigger smoke
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
-
-For operator-driven local validation of continuity, retrieval, canonical
-proposals and backlog recovery, use
-[`docs/continuity-manual-verification.md`](/mnt/d/Repos/blue-lagoon/docs/continuity-manual-verification.md).
 
 Repository-hosted CI lives in `.github/workflows/ci.yml` and exposes the stable
 jobs `workspace-verification`, `foreground-runtime`, and

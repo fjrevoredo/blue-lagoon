@@ -23,7 +23,7 @@ async fn migration_application_creates_foundation_and_foreground_tables() -> Res
         let summary =
             migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
 
-        assert_eq!(summary.discovered_versions, vec![1, 2, 3, 4]);
+        assert_eq!(summary.discovered_versions, vec![1, 2, 3, 4, 5]);
         let tables = sqlx::query(
             r#"
             SELECT table_name
@@ -66,11 +66,11 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 4,
+                expected_version: 5,
             },
         )
         .await?;
-        assert_eq!(supported, 4);
+        assert_eq!(supported, 5);
         Ok(())
     })
     .await?;
@@ -92,7 +92,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 4,
+                expected_version: 5,
             },
         )
         .await
@@ -108,7 +108,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             INSERT INTO schema_migrations
                 (version, name, checksum, applied_at, app_version, applied_by, execution_ms)
             VALUES
-                (5, 'future_schema', 'future', NOW(), 'test', 'test', 1)
+                (6, 'future_schema', 'future', NOW(), 'test', 'test', 1)
             "#,
         )
         .execute(&ctx.pool)
@@ -118,7 +118,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 4,
+                expected_version: 5,
             },
         )
         .await
@@ -143,7 +143,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 4,
+                expected_version: 5,
             },
         )
         .await
@@ -197,6 +197,7 @@ async fn migrate_normalizes_schema_migration_names_to_capability_labels() -> Res
                 (2, "foreground_loop".to_string()),
                 (3, "migration_metadata_normalization".to_string()),
                 (4, "canonical_continuity".to_string()),
+                (5, "unconscious_loop".to_string()),
             ]
         );
         Ok(())

@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, Phase 2, and Phase 3 completed; Phase 4 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, Phase 3, and Phase 4 completed; Phase 4.5 is in progress
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -75,6 +75,12 @@ Every phase should preserve the following project posture:
 - Treat tests as deliverables for every phase, not as final hardening cleanup.
 - Treat no core architectural code path as complete until it has appropriate
   automated tests.
+- Treat the management CLI as the default operator surface from Phase 4.5
+  onward, extending it deliberately when later phases introduce operator-facing
+  inspection or safe explicit control needs.
+- Prefer stable management CLI workflows over raw SQL, log archaeology, or ad
+  hoc verification scripts whenever the operator task fits the product's
+  durable management surface.
 
 ## Testing posture
 
@@ -97,11 +103,24 @@ The plan should be interpreted with the following testing rules:
   safety must accumulate regression tests as they are implemented.
 - Release readiness depends on explicit test gates, not on informal confidence.
 
+The plan should also be interpreted with the following operator-surface rules
+from Phase 4.5 onward:
+
+- Each later phase must explicitly assess whether the capability it introduces
+  requires management CLI inspection, safe explicit control, or both.
+- If a repeated operator workflow is needed for local verification, diagnosis,
+  or bounded runtime control, the default assumption should be that it belongs
+  in the management CLI unless there is a clear reason to defer it.
+- Raw SQL, one-off scripts, or temporary verification documents may still exist
+  as narrow implementation aids, but they should not remain the primary
+  operator workflow when the behavior belongs in the durable product surface.
+
 ## Phase structure
 
 The implementation should proceed through six major product-capability phases,
 with one bridging Phase 1.1 dedicated to establishing the minimum repository
-CI/CD baseline before Phase 2 broadens the runtime surface.
+CI/CD baseline and one bridging Phase 4.5 dedicated to the initial management
+CLI surface before Phase 5 broadens the governed action surface.
 
 ## Current status
 
@@ -109,6 +128,8 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
 - Phase 1.1 status: `COMPLETE`
 - Phase 2 status: `COMPLETE`
 - Phase 3 status: `COMPLETE`
+- Phase 4 status: `COMPLETE`
+- Phase 4.5 status: `IN PROGRESS`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -117,7 +138,7 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning and execution evidence for Phase 3 lives in
   `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
-- Detailed planning for Phase 4 now lives in
+- Detailed planning and execution evidence for Phase 4 now lives in
   `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
@@ -126,8 +147,15 @@ CI/CD baseline before Phase 2 broadens the runtime surface.
   minimum repository-hosted CI baseline for Phase 1.1
 - The current repository state now includes a completed Telegram-first
   foreground slice plus canonical continuity, retrieval, self-model, and
-  backlog-aware recovery coverage, so Phase 3 is complete and Phase 4 is now
+  backlog-aware recovery coverage, so Phase 3 is complete
+- The current repository state now includes the bounded unconscious loop,
+  background maintenance persistence, wake-signal handling, and the associated
+  automated verification coverage, so Phase 4 is complete and Phase 4.5 is now
   the active next phase
+- The current repository state now also includes the initial management CLI
+  surface, harness-side management services, management CLI docs, and the
+  dedicated `management-cli` CI gate, while DB-backed Phase 4.5 verification
+  remains pending in CI or another Docker-enabled environment
 
 ### Phase 1: Runtime foundation and authority boundaries
 
@@ -344,6 +372,44 @@ memory and self-model in the background without breaking isolation or control.
 - Repository CI covers the required unconscious-loop regression suites for the
   implemented maintenance paths.
 
+### Phase 4.5: Management CLI
+
+#### Phase 4.5 goal
+
+Introduce the first durable management CLI surface so inspection,
+verification, and safe local control of the runtime become easier before Phase
+5 adds more complexity and governed action-taking paths.
+
+#### Phase 4.5 primary outcomes
+
+- Define a small management CLI surface under the existing runtime entrypoint
+  rather than introducing a separate control plane.
+- Replace the current ad hoc SQL-heavy verification steps with explicit CLI
+  commands for common inspection and safe operator actions.
+- Add commands for status inspection across schema, worker resolution, Telegram
+  binding state, foreground backlog state, background job state, and wake
+  signals.
+- Add a safe explicit path to create and inspect background-maintenance jobs for
+  local verification without raw SQL seeding.
+- Prefer machine-readable and concise human-readable output modes so the same
+  commands work for both operators and scripted local checks.
+- Keep the Phase 4.5 scope intentionally narrow: no interactive TUI, no broad
+  arbitrary database console, and no expansion into full Phase 5 governed tool
+  execution.
+- Add automated coverage for CLI parsing, command routing, and the first
+  persistence-backed management flows that the operator surface exposes.
+
+#### Phase 4.5 exit criteria
+
+- The runtime exposes a coherent management CLI for the minimum required local
+  inspection and verification tasks.
+- Background job creation and inspection for local verification no longer depend
+  on raw SQL edits.
+- The new CLI surface is covered by automated tests appropriate to its parsing
+  and persistence-backed behavior.
+- The management surface remains clearly separated from canonical runtime
+  behavior and does not bypass harness-owned validation and policy boundaries.
+
 ### Phase 5: Tool execution, workspace, and approval model
 
 #### Phase 5 goal
@@ -364,6 +430,9 @@ the safety model.
   exposure, and execution budgets.
 - Establish clear boundaries between script creation or editing permission and
   script execution permission.
+- Extend the management CLI where needed so approvals, governed-action state,
+  workspace inspection, and blocked-action diagnostics do not depend on raw SQL
+  or ad hoc operator-only workflows.
 - Add automated coverage for tool-risk classification, approval validation,
   policy re-checks, capability scoping, and blocked execution paths.
 - Extend CI/CD so approval, policy, and blocked-action regressions are exercised
@@ -376,6 +445,9 @@ the safety model.
 - Workspace artifacts are stored separately from autobiographical memory.
 - Sensitive or side-effecting actions are provably blocked unless policy and
   approval conditions are satisfied.
+- Operator inspection and the minimum required explicit control flows for the
+  Phase 5 governed-action surface are available through the management CLI
+  rather than depending on raw SQL or temporary operator scripts.
 - High-risk action paths have regression tests that prove policy and approval
   failures block execution.
 - Repository CI automatically runs the required approval and safety suites before
@@ -397,6 +469,9 @@ fault-handling, migration discipline, and release-grade verification.
   use one coherent recovery checkpoint and continuation model.
 - Implement health surfaces, operator diagnostics, and operational metrics that
   feed both humans and internal-state modeling.
+- Extend the management CLI where needed so recovery state, health status,
+  diagnostics, and other durable operator workflows are exposed through the
+  established operator surface before considering heavier auxiliary surfaces.
 - Complete migration operational conventions, upgrade-path validation, and
   compatibility handling for persisted cross-process artifacts.
 - Expand the automated test suite to cover the architecture-critical paths
@@ -414,6 +489,9 @@ fault-handling, migration discipline, and release-grade verification.
 - The runtime can recover safely from crash, restart, timeout, and interrupted
   execution scenarios without violating canonical write or side-effect safety
   rules.
+- The minimum required recovery, health, and diagnostics workflows are
+  accessible through the management CLI rather than depending on raw SQL,
+  manual database inspection, or one-off operator procedures.
 - Required automated gates are green at the unit, component, integration, and
   release-critical layers.
 - The project has a coherent first runnable implementation that matches the
@@ -439,6 +517,8 @@ begin in the first phase and deepen throughout the plan:
 - Clear contracts for cross-process types.
 - Minimal fail-closed recovery posture for interrupted execution.
 - Deployment simplicity aligned with the agreed single-node v1 topology.
+- Ongoing assessment of what each new capability should expose through the
+  management CLI for durable operator inspection or safe explicit control.
 - Clear mapping between local verification commands and GitHub Actions workflows.
 - Documentation updates when implementation changes clarify or constrain the
   design.
@@ -488,6 +568,11 @@ With Phase 3 complete, detailed planning for Phase 4 now lives in
 loop, bounded background maintenance, and wake-signal production and
 evaluation.
 
-Once Phase 4 is complete, the next planning step should be the detailed
+With Phase 4 complete, the next planning step should be a temporary design note
+and then a detailed implementation plan for Phase 4.5, focused on the narrow
+management CLI surface needed before broader runtime complexity expands again.
+
+Once Phase 4.5 is complete, the next planning step should be the detailed
 implementation plan for Phase 5, focused on governed tool execution, workspace
-boundaries, approvals, and policy re-check behavior.
+boundaries, approvals, policy re-check behavior, and the required extensions to
+the management CLI for those new operator-facing workflows.

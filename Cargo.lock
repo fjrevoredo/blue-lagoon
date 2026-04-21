@@ -1580,10 +1580,18 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "clap",
+ "contracts",
  "harness",
+ "predicates",
+ "serde",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

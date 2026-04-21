@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use contracts::{WorkerRequest, WorkerResult};
 use serde_json::json;
 use sqlx::PgPool;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     audit::{self, NewAuditEvent},
+    background, background_execution,
     config::RuntimeConfig,
     db,
     execution::{self, NewExecutionRecord},
@@ -44,13 +46,24 @@ impl SyntheticTrigger {
 pub struct HarnessOptions {
     pub once: bool,
     pub idle: bool,
+    pub background_once: bool,
     pub synthetic_trigger: Option<SyntheticTrigger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessOutcome {
     IdleVerified,
-    SyntheticCompleted { execution_id: Uuid, trace_id: Uuid },
+    SyntheticCompleted {
+        execution_id: Uuid,
+        trace_id: Uuid,
+    },
+    BackgroundNoDueJob,
+    BackgroundCompleted {
+        background_job_id: Uuid,
+        execution_id: Uuid,
+        trace_id: Uuid,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,11 +98,23 @@ pub async fn run_harness_once(
     config: &RuntimeConfig,
     options: HarnessOptions,
 ) -> Result<HarnessOutcome> {
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    run_harness_once_with_transport(config, options, &transport).await
+}
+
+pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
+    config: &RuntimeConfig,
+    options: HarnessOptions,
+    transport: &T,
+) -> Result<HarnessOutcome> {
     if !options.once {
         bail!("current harness mode supports one-shot execution only");
     }
-    if options.idle == options.synthetic_trigger.is_some() {
-        bail!("choose exactly one of --idle or --synthetic-trigger");
+    let selected_mode_count = u8::from(options.idle)
+        + u8::from(options.background_once)
+        + u8::from(options.synthetic_trigger.is_some());
+    if selected_mode_count != 1 {
+        bail!("choose exactly one of --idle, --background-once, or --synthetic-trigger");
     }
 
     let pool = db::connect(config).await?;
@@ -99,10 +124,40 @@ pub async fn run_harness_once(
         info!("harness boot verified and returned to idle");
         return Ok(HarnessOutcome::IdleVerified);
     }
+    if options.background_once {
+        return run_background_once_with(&pool, config, transport).await;
+    }
 
     match options.synthetic_trigger {
         Some(SyntheticTrigger::Smoke) => run_smoke_trigger(&pool, config).await,
         None => bail!("missing harness mode"),
+    }
+}
+
+pub async fn run_background_once_with<T: ModelProviderTransport>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    transport: &T,
+) -> Result<HarnessOutcome> {
+    let now = Utc::now();
+    if background::list_due_jobs(pool, now, 1).await?.is_empty() {
+        record_background_no_due_job(pool, now).await?;
+        return Ok(HarnessOutcome::BackgroundNoDueJob);
+    }
+
+    let gateway = config.require_model_gateway_config()?;
+    match background_execution::execute_next_due_job(pool, config, &gateway, transport, now).await?
+    {
+        Some(outcome) => Ok(HarnessOutcome::BackgroundCompleted {
+            background_job_id: outcome.background_job_id,
+            execution_id: outcome.execution_id,
+            trace_id: outcome.trace_id,
+            summary: outcome.summary,
+        }),
+        None => {
+            record_background_no_due_job(pool, now).await?;
+            Ok(HarnessOutcome::BackgroundNoDueJob)
+        }
     }
 }
 
@@ -283,6 +338,7 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
     let result_summary = match &response.result {
         WorkerResult::Smoke(result) => result.summary.clone(),
         WorkerResult::Conscious(result) => result.episode_summary.summary.clone(),
+        WorkerResult::Unconscious(result) => result.summary.clone(),
         WorkerResult::Error(error) => error.message.clone(),
     };
 
@@ -309,6 +365,30 @@ async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<Harn
         execution_id,
         trace_id: trace.trace_id,
     })
+}
+
+async fn record_background_no_due_job(
+    pool: &PgPool,
+    checked_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let trace = TraceContext::root();
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "unconscious".to_string(),
+            subsystem: "harness".to_string(),
+            event_kind: "background_maintenance_no_due_job".to_string(),
+            severity: "info".to_string(),
+            trace_id: trace.trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "checked_at": checked_at,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 struct TelegramProcessingContext<'a, T> {

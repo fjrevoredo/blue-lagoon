@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub enum WorkerKind {
     Smoke,
     Conscious,
+    Unconscious,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,10 +55,30 @@ impl WorkerRequest {
         }
     }
 
+    pub fn unconscious(trace_id: Uuid, execution_id: Uuid, context: UnconsciousContext) -> Self {
+        let request_id = Uuid::now_v7();
+        let sent_at = Utc::now();
+        Self {
+            request_id,
+            trace_id,
+            execution_id,
+            sent_at,
+            worker_kind: WorkerKind::Unconscious,
+            payload: WorkerPayload::Unconscious(Box::new(UnconsciousWorkerRequest {
+                request_id,
+                trace_id,
+                execution_id,
+                sent_at,
+                context,
+            })),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         match (&self.worker_kind, &self.payload) {
             (WorkerKind::Smoke, WorkerPayload::Smoke(_))
-            | (WorkerKind::Conscious, WorkerPayload::Conscious(_)) => Ok(()),
+            | (WorkerKind::Conscious, WorkerPayload::Conscious(_))
+            | (WorkerKind::Unconscious, WorkerPayload::Unconscious(_)) => Ok(()),
             _ => Err(ContractError::WorkerPayloadMismatch),
         }
     }
@@ -68,6 +89,7 @@ impl WorkerRequest {
 pub enum WorkerPayload {
     Smoke(SmokeWorkerRequest),
     Conscious(Box<ConsciousWorkerRequest>),
+    Unconscious(Box<UnconsciousWorkerRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +104,15 @@ pub struct ConsciousWorkerRequest {
     pub execution_id: Uuid,
     pub sent_at: DateTime<Utc>,
     pub context: ConsciousContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnconsciousWorkerRequest {
+    pub request_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub sent_at: DateTime<Utc>,
+    pub context: UnconsciousContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +143,7 @@ pub struct WorkerResponse {
 pub enum WorkerResult {
     Smoke(SmokeWorkerResult),
     Conscious(ConsciousWorkerResult),
+    Unconscious(UnconsciousWorkerResult),
     Error(WorkerFailure),
 }
 
@@ -129,9 +161,22 @@ pub struct ConsciousWorkerResult {
     pub candidate_proposals: Vec<CanonicalProposal>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnconsciousWorkerResult {
+    pub status: UnconsciousWorkerStatus,
+    pub summary: String,
+    pub maintenance_outputs: UnconsciousMaintenanceOutputs,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsciousWorkerStatus {
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnconsciousWorkerStatus {
     Completed,
 }
 
@@ -226,6 +271,7 @@ pub struct ApprovalPayload {
 #[serde(rename_all = "snake_case")]
 pub enum ForegroundTriggerKind {
     UserIngress,
+    ApprovedWakeSignal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +298,64 @@ pub struct ForegroundTrigger {
     pub received_at: DateTime<Utc>,
     pub deduplication_key: String,
     pub budget: ForegroundBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTriggerKind {
+    TimeSchedule,
+    VolumeThreshold,
+    DriftOrAnomalySignal,
+    ForegroundDelegation,
+    ExternalPassiveEvent,
+    MaintenanceTrigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnconsciousJobKind {
+    MemoryConsolidation,
+    RetrievalMaintenance,
+    ContradictionAndDriftScan,
+    SelfModelReflection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundExecutionBudget {
+    pub iteration_budget: u32,
+    pub wall_clock_budget_ms: u64,
+    pub token_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTrigger {
+    pub trigger_id: Uuid,
+    pub trigger_kind: BackgroundTriggerKind,
+    pub requested_at: DateTime<Utc>,
+    pub reason_summary: String,
+    pub payload_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UnconsciousScope {
+    pub episode_ids: Vec<Uuid>,
+    pub memory_artifact_ids: Vec<Uuid>,
+    pub retrieval_artifact_ids: Vec<Uuid>,
+    pub self_model_artifact_id: Option<Uuid>,
+    pub internal_principal_ref: Option<String>,
+    pub internal_conversation_ref: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnconsciousContext {
+    pub context_id: Uuid,
+    pub assembled_at: DateTime<Utc>,
+    pub job_id: Uuid,
+    pub job_kind: UnconsciousJobKind,
+    pub trigger: BackgroundTrigger,
+    pub scope: UnconsciousScope,
+    pub budget: BackgroundExecutionBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +555,92 @@ pub struct ProposalEvaluation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RetrievalUpdateOperation {
+    Upsert,
+    Archive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalUpdateProposal {
+    pub update_id: Uuid,
+    pub operation: RetrievalUpdateOperation,
+    pub source_ref: String,
+    pub lexical_document: String,
+    pub relevance_timestamp: DateTime<Utc>,
+    pub internal_conversation_ref: Option<String>,
+    pub rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticAlert {
+    pub alert_id: Uuid,
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub summary: String,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeSignalReason {
+    CriticalConflict,
+    ProactiveBriefingReady,
+    SelfStateAnomaly,
+    MaintenanceInsightReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeSignalPriority {
+    Low,
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeSignal {
+    pub signal_id: Uuid,
+    pub reason: WakeSignalReason,
+    pub priority: WakeSignalPriority,
+    pub reason_code: String,
+    pub summary: String,
+    pub payload_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeSignalDecisionKind {
+    Accepted,
+    Rejected,
+    Suppressed,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeSignalDecision {
+    pub signal_id: Uuid,
+    pub decision: WakeSignalDecisionKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UnconsciousMaintenanceOutputs {
+    pub canonical_proposals: Vec<CanonicalProposal>,
+    pub retrieval_updates: Vec<RetrievalUpdateProposal>,
+    pub diagnostics: Vec<DiagnosticAlert>,
+    pub wake_signals: Vec<WakeSignal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoopKind {
     Conscious,
     Unconscious,
@@ -595,6 +785,25 @@ mod tests {
     }
 
     #[test]
+    fn unconscious_worker_request_round_trips() {
+        let request = WorkerRequest::unconscious(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            sample_unconscious_context(),
+        );
+        let WorkerPayload::Unconscious(payload) = &request.payload else {
+            panic!("expected unconscious payload");
+        };
+        assert_eq!(payload.request_id, request.request_id);
+        assert_eq!(payload.sent_at, request.sent_at);
+        let json = serde_json::to_string(&request).expect("request should serialize");
+        let decoded: WorkerRequest =
+            serde_json::from_str(&json).expect("request should deserialize");
+        assert_eq!(request, decoded);
+        decoded.validate().expect("request should be valid");
+    }
+
+    #[test]
     fn normalized_ingress_round_trips_transport_fields() {
         let ingress = sample_ingress();
         let json = serde_json::to_string(&ingress).expect("ingress should serialize");
@@ -684,6 +893,29 @@ mod tests {
         assert_eq!(decoded.retrieved_context.items.len(), 2);
     }
 
+    #[test]
+    fn unconscious_contracts_round_trip() {
+        let context = sample_unconscious_context();
+        let outputs = sample_unconscious_outputs();
+        let json = serde_json::to_string(&context).expect("context should serialize");
+        let decoded: UnconsciousContext =
+            serde_json::from_str(&json).expect("context should deserialize");
+        assert_eq!(decoded.job_kind, UnconsciousJobKind::MemoryConsolidation);
+        assert_eq!(
+            decoded.trigger.trigger_kind,
+            BackgroundTriggerKind::ForegroundDelegation
+        );
+        assert_eq!(decoded.scope.episode_ids.len(), 2);
+
+        let json = serde_json::to_string(&outputs).expect("outputs should serialize");
+        let decoded: UnconsciousMaintenanceOutputs =
+            serde_json::from_str(&json).expect("outputs should deserialize");
+        assert_eq!(decoded.canonical_proposals.len(), 1);
+        assert_eq!(decoded.retrieval_updates.len(), 1);
+        assert_eq!(decoded.diagnostics.len(), 1);
+        assert_eq!(decoded.wake_signals.len(), 1);
+    }
+
     fn sample_context() -> ConsciousContext {
         ConsciousContext {
             context_id: Uuid::now_v7(),
@@ -766,6 +998,66 @@ mod tests {
                     },
                 ],
             },
+        }
+    }
+
+    fn sample_unconscious_context() -> UnconsciousContext {
+        UnconsciousContext {
+            context_id: Uuid::now_v7(),
+            assembled_at: Utc::now(),
+            job_id: Uuid::now_v7(),
+            job_kind: UnconsciousJobKind::MemoryConsolidation,
+            trigger: BackgroundTrigger {
+                trigger_id: Uuid::now_v7(),
+                trigger_kind: BackgroundTriggerKind::ForegroundDelegation,
+                requested_at: Utc::now(),
+                reason_summary: "foreground requested memory consolidation".to_string(),
+                payload_ref: Some("execution:latest".to_string()),
+            },
+            scope: UnconsciousScope {
+                episode_ids: vec![Uuid::now_v7(), Uuid::now_v7()],
+                memory_artifact_ids: vec![Uuid::now_v7()],
+                retrieval_artifact_ids: vec![Uuid::now_v7()],
+                self_model_artifact_id: Some(Uuid::now_v7()),
+                internal_principal_ref: Some("primary-user".to_string()),
+                internal_conversation_ref: Some("telegram-primary".to_string()),
+                summary: "Consolidate recent episodes into stable memory.".to_string(),
+            },
+            budget: BackgroundExecutionBudget {
+                iteration_budget: 2,
+                wall_clock_budget_ms: 120_000,
+                token_budget: 6_000,
+            },
+        }
+    }
+
+    fn sample_unconscious_outputs() -> UnconsciousMaintenanceOutputs {
+        UnconsciousMaintenanceOutputs {
+            canonical_proposals: vec![sample_memory_proposal()],
+            retrieval_updates: vec![RetrievalUpdateProposal {
+                update_id: Uuid::now_v7(),
+                operation: RetrievalUpdateOperation::Upsert,
+                source_ref: "memory_artifact:latest".to_string(),
+                lexical_document: "Prefers direct answers".to_string(),
+                relevance_timestamp: Utc::now(),
+                internal_conversation_ref: Some("telegram-primary".to_string()),
+                rationale: Some("maintain retrieval freshness".to_string()),
+            }],
+            diagnostics: vec![DiagnosticAlert {
+                alert_id: Uuid::now_v7(),
+                code: "contradiction_scan_clean".to_string(),
+                severity: DiagnosticSeverity::Info,
+                summary: "No contradictions detected in scoped memory.".to_string(),
+                details: None,
+            }],
+            wake_signals: vec![WakeSignal {
+                signal_id: Uuid::now_v7(),
+                reason: WakeSignalReason::MaintenanceInsightReady,
+                priority: WakeSignalPriority::Low,
+                reason_code: "maintenance_insight_ready".to_string(),
+                summary: "Background maintenance found a useful summary.".to_string(),
+                payload_ref: Some("background_job_run:latest".to_string()),
+            }],
         }
     }
 

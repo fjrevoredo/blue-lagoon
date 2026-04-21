@@ -1319,8 +1319,8 @@ async fn context_assembly_retrieves_semantic_match_from_prior_memory() -> Result
 
 #[tokio::test]
 async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result<()> {
-    support::with_clean_database(|ctx| async move {
-        let mut config = ctx.config.clone();
+    support::with_clean_database(|_ctx| async move {
+        let mut config = _ctx.config.clone();
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
         config.worker.args = vec!["conscious-worker".to_string()];
@@ -1363,6 +1363,9 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
                 assert_eq!(result.episode_summary.outcome, "completed");
             }
             contracts::WorkerResult::Smoke(_) => panic!("expected conscious worker result"),
+            contracts::WorkerResult::Unconscious(_) => {
+                panic!("expected conscious worker result")
+            }
             contracts::WorkerResult::Error(error) => {
                 panic!("unexpected worker error: {}", error.message)
             }

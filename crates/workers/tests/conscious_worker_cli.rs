@@ -96,6 +96,7 @@ fn conscious_worker_cli_emits_model_request_and_final_response() {
             assert_eq!(result.candidate_proposals.len(), 1);
         }
         WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
+        WorkerResult::Unconscious(_) => panic!("unexpected unconscious response"),
         WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
     }
 

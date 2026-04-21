@@ -1,5 +1,8 @@
 use anyhow::{Result, bail};
-use contracts::{ForegroundBudget, IngressEventKind, NormalizedIngress};
+use contracts::{
+    BackgroundExecutionBudget, ForegroundBudget, IngressEventKind, NormalizedIngress, WakeSignal,
+    WakeSignalDecision, WakeSignalDecisionKind, WakeSignalPriority,
+};
 
 use crate::config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig};
 
@@ -16,11 +19,26 @@ pub enum PolicyDecision {
     Denied { reason: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeSignalEvaluationContext {
+    pub pending_signal_count: u32,
+    pub cooldown_active: bool,
+    pub foreground_channel_available: bool,
+}
+
 pub fn default_foreground_budget(config: &RuntimeConfig) -> ForegroundBudget {
     ForegroundBudget {
         iteration_budget: config.harness.default_foreground_iteration_budget,
         wall_clock_budget_ms: config.harness.default_wall_clock_budget_ms,
         token_budget: config.harness.default_foreground_token_budget,
+    }
+}
+
+pub fn default_background_budget(config: &RuntimeConfig) -> BackgroundExecutionBudget {
+    BackgroundExecutionBudget {
+        iteration_budget: config.background.execution.default_iteration_budget,
+        wall_clock_budget_ms: config.background.execution.default_wall_clock_budget_ms,
+        token_budget: config.background.execution.default_token_budget,
     }
 }
 
@@ -63,6 +81,19 @@ pub fn validate_foreground_budget(budget: &ForegroundBudget) -> Result<()> {
     }
     if budget.token_budget == 0 {
         bail!("foreground token budget must be greater than zero");
+    }
+    Ok(())
+}
+
+pub fn validate_background_budget(budget: &BackgroundExecutionBudget) -> Result<()> {
+    if budget.iteration_budget == 0 {
+        bail!("background iteration budget must be greater than zero");
+    }
+    if budget.wall_clock_budget_ms == 0 {
+        bail!("background wall-clock budget must be greater than zero");
+    }
+    if budget.token_budget == 0 {
+        bail!("background token budget must be greater than zero");
     }
     Ok(())
 }
@@ -129,15 +160,75 @@ pub fn evaluate_synthetic_smoke(config: &RuntimeConfig) -> PolicyDecision {
     }
 }
 
+pub fn evaluate_wake_signal(
+    config: &RuntimeConfig,
+    signal: &WakeSignal,
+    context: WakeSignalEvaluationContext,
+) -> WakeSignalDecision {
+    if !context.foreground_channel_available {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Rejected,
+            reason: "no foreground conversation binding is configured for wake-signal conversion"
+                .to_string(),
+        };
+    }
+
+    if !config.background.wake_signals.allow_foreground_conversion {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: "wake-signal foreground conversion is disabled by policy".to_string(),
+        };
+    }
+
+    if context.cooldown_active && signal.priority != WakeSignalPriority::High {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: format!(
+                "wake signal '{}' remains within the active cooldown window",
+                signal.reason_code
+            ),
+        };
+    }
+
+    if context.pending_signal_count >= config.background.wake_signals.max_pending_signals {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: match signal.priority {
+                WakeSignalPriority::Low => WakeSignalDecisionKind::Suppressed,
+                WakeSignalPriority::Normal => WakeSignalDecisionKind::Deferred,
+                WakeSignalPriority::High => WakeSignalDecisionKind::Accepted,
+            },
+            reason: format!(
+                "wake-signal queue is at or above the configured limit ({})",
+                config.background.wake_signals.max_pending_signals
+            ),
+        };
+    }
+
+    WakeSignalDecision {
+        signal_id: signal.signal_id,
+        decision: WakeSignalDecisionKind::Accepted,
+        reason: "wake signal satisfies configured foreground conversion policy".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use contracts::{ChannelKind, IngressEventKind, NormalizedIngress};
+    use contracts::{
+        ChannelKind, IngressEventKind, NormalizedIngress, WakeSignal, WakeSignalDecisionKind,
+        WakeSignalPriority, WakeSignalReason,
+    };
 
     use crate::config::{
-        AppConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, HarnessConfig,
-        ResolvedTelegramConfig, RetrievalConfig, WorkerConfig,
+        AppConfig, BackgroundConfig, BackgroundExecutionConfig, BackgroundSchedulerConfig,
+        BackgroundThresholdsConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig,
+        HarnessConfig, ResolvedTelegramConfig, RetrievalConfig, WakeSignalPolicyConfig,
+        WorkerConfig,
     };
 
     fn config(allow_synthetic_smoke: bool) -> RuntimeConfig {
@@ -155,6 +246,28 @@ mod tests {
                 default_foreground_iteration_budget: 1,
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
+            },
+            background: BackgroundConfig {
+                scheduler: BackgroundSchedulerConfig {
+                    poll_interval_seconds: 300,
+                    max_due_jobs_per_iteration: 4,
+                    lease_timeout_ms: 300_000,
+                },
+                thresholds: BackgroundThresholdsConfig {
+                    episode_backlog_threshold: 25,
+                    candidate_memory_threshold: 10,
+                    contradiction_alert_threshold: 3,
+                },
+                execution: BackgroundExecutionConfig {
+                    default_iteration_budget: 2,
+                    default_wall_clock_budget_ms: 120_000,
+                    default_token_budget: 6_000,
+                },
+                wake_signals: WakeSignalPolicyConfig {
+                    allow_foreground_conversion: true,
+                    max_pending_signals: 8,
+                    cooldown_seconds: 900,
+                },
             },
             continuity: ContinuityConfig {
                 retrieval: RetrievalConfig {
@@ -216,6 +329,14 @@ mod tests {
     }
 
     #[test]
+    fn background_budget_uses_explicit_iteration_wall_clock_and_token_limits() {
+        let budget = default_background_budget(&config(true));
+        assert_eq!(budget.iteration_budget, 2);
+        assert_eq!(budget.wall_clock_budget_ms, 120_000);
+        assert_eq!(budget.token_budget, 6_000);
+    }
+
+    #[test]
     fn foreground_budget_validation_rejects_zero_fields() {
         let error = validate_foreground_budget(&ForegroundBudget {
             iteration_budget: 0,
@@ -239,6 +360,33 @@ mod tests {
             token_budget: 0,
         })
         .expect_err("zero token budget should be rejected");
+        assert!(error.to_string().contains("token"));
+    }
+
+    #[test]
+    fn background_budget_validation_rejects_zero_fields() {
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 0,
+            wall_clock_budget_ms: 120_000,
+            token_budget: 6_000,
+        })
+        .expect_err("zero background iteration budget should be rejected");
+        assert!(error.to_string().contains("iteration"));
+
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 2,
+            wall_clock_budget_ms: 0,
+            token_budget: 6_000,
+        })
+        .expect_err("zero background wall-clock budget should be rejected");
+        assert!(error.to_string().contains("wall-clock"));
+
+        let error = validate_background_budget(&BackgroundExecutionBudget {
+            iteration_budget: 2,
+            wall_clock_budget_ms: 120_000,
+            token_budget: 0,
+        })
+        .expect_err("zero background token budget should be rejected");
         assert!(error.to_string().contains("token"));
     }
 
@@ -346,5 +494,93 @@ mod tests {
             approval_payload: None,
             raw_payload_ref: None,
         }
+    }
+
+    fn wake_signal(priority: WakeSignalPriority) -> WakeSignal {
+        WakeSignal {
+            signal_id: uuid::Uuid::now_v7(),
+            reason: WakeSignalReason::MaintenanceInsightReady,
+            priority,
+            reason_code: "maintenance_insight_ready".to_string(),
+            summary: "Background maintenance produced a user-relevant insight.".to_string(),
+            payload_ref: Some("background_job:123".to_string()),
+        }
+    }
+
+    #[test]
+    fn wake_signal_policy_accepts_nominal_signal() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
+    }
+
+    #[test]
+    fn wake_signal_policy_rejects_when_no_foreground_channel_is_available() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: false,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Rejected);
+        assert!(
+            decision
+                .reason
+                .contains("no foreground conversation binding")
+        );
+    }
+
+    #[test]
+    fn wake_signal_policy_defers_when_cooldown_is_active_for_non_high_priority() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: true,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Deferred);
+        assert!(decision.reason.contains("cooldown"));
+    }
+
+    #[test]
+    fn wake_signal_policy_allows_high_priority_signal_through_cooldown() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::High),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: true,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
+    }
+
+    #[test]
+    fn wake_signal_policy_suppresses_low_priority_signal_when_queue_is_full() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Low),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 8,
+                cooldown_active: false,
+                foreground_channel_available: true,
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Suppressed);
+        assert!(decision.reason.contains("configured limit"));
     }
 }
