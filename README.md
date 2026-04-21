@@ -267,9 +267,8 @@ cargo run -p runtime -- harness --once --synthetic-trigger smoke
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
-For operator-driven local validation of continuity, retrieval, canonical
-proposals and backlog recovery, use
-[`docs/continuity-manual-verification.md`](/mnt/d/Repos/blue-lagoon/docs/continuity-manual-verification.md).
+For the remaining operator-only local validation surface, use
+[`docs/remaining-manual-verification.md`](/mnt/d/Repos/blue-lagoon/docs/remaining-manual-verification.md).
 
 Repository-hosted CI lives in `.github/workflows/ci.yml` and exposes the stable
 jobs `workspace-verification`, `foreground-runtime`, and

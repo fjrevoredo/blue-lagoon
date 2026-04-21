@@ -91,9 +91,9 @@ Typical implementation workflow is:
   changes before commit.
 - `git log --oneline` to match existing commit style.
 - `markdownlint "**/*.md"` if available locally, to catch heading and spacing issues.
-- `docs/continuity-manual-verification.md` for the operator-facing local manual
-  verification checklist covering continuity, retrieval, canonical writes, and
-  backlog recovery.
+- `docs/remaining-manual-verification.md` for the operator-facing local manual
+  verification checklist that now captures only the residual live Telegram
+  round-trip check left outside automated coverage.
 
 Git environment rule:
 
