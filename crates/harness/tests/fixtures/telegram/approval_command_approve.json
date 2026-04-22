@@ -1,0 +1,17 @@
+{
+  "update_id": 2002,
+  "message": {
+    "message_id": 47,
+    "date": 1710000000,
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Blue"
+    },
+    "text": "/approve 42"
+  }
+}

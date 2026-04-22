@@ -386,10 +386,11 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AppConfig, BackgroundConfig, BackgroundExecutionConfig, BackgroundSchedulerConfig,
-        BackgroundThresholdsConfig, BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig,
+        AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
+        BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
+        BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, GovernedActionsConfig,
         HarnessConfig, RetrievalConfig, SelfModelConfig, TelegramConfig, WakeSignalPolicyConfig,
-        WorkerConfig,
+        WorkerConfig, WorkspaceConfig,
     };
     use uuid::Uuid;
 
@@ -443,6 +444,27 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            workspace: WorkspaceConfig {
+                root_dir: ".".into(),
+                max_artifact_bytes: 1_048_576,
+                max_script_bytes: 262_144,
+            },
+            approvals: ApprovalsConfig {
+                default_ttl_seconds: 900,
+                max_pending_requests: 32,
+                allow_cli_resolution: true,
+                prompt_mode: ApprovalPromptMode::InlineKeyboardWithFallback,
+            },
+            governed_actions: GovernedActionsConfig {
+                approval_required_min_risk_tier: contracts::GovernedActionRiskTier::Tier2,
+                default_subprocess_timeout_ms: 30_000,
+                max_subprocess_timeout_ms: 120_000,
+                max_filesystem_roots_per_action: 4,
+                default_network_access: contracts::NetworkAccessPosture::Disabled,
+                allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+                max_environment_variables_per_action: 8,
+                max_captured_output_bytes: 65_536,
             },
             worker: WorkerConfig {
                 timeout_ms: 5_000,

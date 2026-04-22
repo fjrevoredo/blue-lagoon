@@ -998,6 +998,27 @@ mod tests {
                     max_recovery_batch_size: 8,
                 },
             },
+            workspace: crate::config::WorkspaceConfig {
+                root_dir: ".".into(),
+                max_artifact_bytes: 1_048_576,
+                max_script_bytes: 262_144,
+            },
+            approvals: crate::config::ApprovalsConfig {
+                default_ttl_seconds: 900,
+                max_pending_requests: 32,
+                allow_cli_resolution: true,
+                prompt_mode: crate::config::ApprovalPromptMode::InlineKeyboardWithFallback,
+            },
+            governed_actions: crate::config::GovernedActionsConfig {
+                approval_required_min_risk_tier: contracts::GovernedActionRiskTier::Tier2,
+                default_subprocess_timeout_ms: 30_000,
+                max_subprocess_timeout_ms: 120_000,
+                max_filesystem_roots_per_action: 4,
+                default_network_access: contracts::NetworkAccessPosture::Disabled,
+                allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+                max_environment_variables_per_action: 8,
+                max_captured_output_bytes: 65_536,
+            },
             worker: crate::config::WorkerConfig {
                 timeout_ms: 20_000,
                 command: String::new(),

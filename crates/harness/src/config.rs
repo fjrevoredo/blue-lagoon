@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use contracts::ModelProviderKind;
+use contracts::{GovernedActionRiskTier, ModelProviderKind, NetworkAccessPosture};
 use serde::Deserialize;
 use toml::Value as TomlValue;
 
@@ -19,6 +19,9 @@ pub struct RuntimeConfig {
     pub harness: HarnessConfig,
     pub background: BackgroundConfig,
     pub continuity: ContinuityConfig,
+    pub workspace: WorkspaceConfig,
+    pub approvals: ApprovalsConfig,
+    pub governed_actions: GovernedActionsConfig,
     pub worker: WorkerConfig,
     pub telegram: Option<TelegramConfig>,
     pub model_gateway: Option<ModelGatewayConfig>,
@@ -100,6 +103,40 @@ pub struct BacklogRecoveryConfig {
     pub pending_message_span_seconds_threshold: u64,
     pub stale_pending_ingress_age_seconds_threshold: u64,
     pub max_recovery_batch_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkspaceConfig {
+    pub root_dir: PathBuf,
+    pub max_artifact_bytes: u64,
+    pub max_script_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApprovalsConfig {
+    pub default_ttl_seconds: u64,
+    pub max_pending_requests: u32,
+    pub allow_cli_resolution: bool,
+    pub prompt_mode: ApprovalPromptMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPromptMode {
+    InlineKeyboard,
+    InlineKeyboardWithFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GovernedActionsConfig {
+    pub approval_required_min_risk_tier: GovernedActionRiskTier,
+    pub default_subprocess_timeout_ms: u64,
+    pub max_subprocess_timeout_ms: u64,
+    pub max_filesystem_roots_per_action: u32,
+    pub default_network_access: NetworkAccessPosture,
+    pub allowlisted_environment_variables: Vec<String>,
+    pub max_environment_variables_per_action: u32,
+    pub max_captured_output_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -200,6 +237,9 @@ struct FileConfig {
     harness: HarnessConfig,
     background: BackgroundConfig,
     continuity: ContinuityConfig,
+    workspace: WorkspaceConfig,
+    approvals: ApprovalsConfig,
+    governed_actions: GovernedActionsConfig,
     worker: WorkerConfig,
     #[serde(default)]
     telegram: Option<TelegramConfig>,
@@ -275,6 +315,9 @@ impl RuntimeConfig {
             harness: file_config.harness,
             background: file_config.background,
             continuity: file_config.continuity,
+            workspace: file_config.workspace,
+            approvals: file_config.approvals,
+            governed_actions: file_config.governed_actions,
             worker: WorkerConfig {
                 timeout_ms: worker_timeout_ms,
                 command: worker_command,
@@ -310,6 +353,9 @@ impl RuntimeConfig {
         }
         self.background.validate()?;
         self.continuity.validate()?;
+        self.workspace.validate()?;
+        self.approvals.validate()?;
+        self.governed_actions.validate()?;
         if self.worker.timeout_ms == 0 {
             bail!("worker.timeout_ms must be greater than zero");
         }
@@ -497,6 +543,92 @@ fn parse_foreground_route_override(raw: &str) -> Result<(ModelProviderKind, Stri
         bail!("BLUE_LAGOON_FOREGROUND_ROUTE model segment must not be empty");
     }
     Ok((provider, model.to_string()))
+}
+
+impl WorkspaceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.root_dir.as_os_str().is_empty() {
+            bail!("workspace.root_dir must not be empty");
+        }
+        if self.max_artifact_bytes == 0 {
+            bail!("workspace.max_artifact_bytes must be greater than zero");
+        }
+        if self.max_script_bytes == 0 {
+            bail!("workspace.max_script_bytes must be greater than zero");
+        }
+        if self.max_script_bytes > self.max_artifact_bytes {
+            bail!("workspace.max_script_bytes must not exceed workspace.max_artifact_bytes");
+        }
+        Ok(())
+    }
+}
+
+impl ApprovalsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.default_ttl_seconds == 0 {
+            bail!("approvals.default_ttl_seconds must be greater than zero");
+        }
+        if self.max_pending_requests == 0 {
+            bail!("approvals.max_pending_requests must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+impl GovernedActionsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.default_subprocess_timeout_ms == 0 {
+            bail!("governed_actions.default_subprocess_timeout_ms must be greater than zero");
+        }
+        if self.max_subprocess_timeout_ms == 0 {
+            bail!("governed_actions.max_subprocess_timeout_ms must be greater than zero");
+        }
+        if self.default_subprocess_timeout_ms > self.max_subprocess_timeout_ms {
+            bail!(
+                "governed_actions.default_subprocess_timeout_ms must not exceed governed_actions.max_subprocess_timeout_ms"
+            );
+        }
+        if self.max_filesystem_roots_per_action == 0 {
+            bail!("governed_actions.max_filesystem_roots_per_action must be greater than zero");
+        }
+        if self.max_environment_variables_per_action == 0 {
+            bail!(
+                "governed_actions.max_environment_variables_per_action must be greater than zero"
+            );
+        }
+        if self.max_captured_output_bytes == 0 {
+            bail!("governed_actions.max_captured_output_bytes must be greater than zero");
+        }
+        if self.allowlisted_environment_variables.len()
+            > self.max_environment_variables_per_action as usize
+        {
+            bail!(
+                "governed_actions.allowlisted_environment_variables exceeds governed_actions.max_environment_variables_per_action"
+            );
+        }
+        for variable in &self.allowlisted_environment_variables {
+            if !is_valid_env_var_name(variable) {
+                bail!(
+                    "governed_actions.allowlisted_environment_variables contains an invalid variable name: {variable}"
+                );
+            }
+        }
+        if self.default_network_access == NetworkAccessPosture::Enabled
+            && self.approval_required_min_risk_tier < GovernedActionRiskTier::Tier2
+        {
+            bail!(
+                "governed_actions.default_network_access=enabled requires approval_required_min_risk_tier to be at least tier_2"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_valid_env_var_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 impl TelegramConfig {
@@ -846,6 +978,27 @@ mod tests {
                     max_recovery_batch_size: 8,
                 },
             },
+            workspace: WorkspaceConfig {
+                root_dir: ".".into(),
+                max_artifact_bytes: 1_048_576,
+                max_script_bytes: 262_144,
+            },
+            approvals: ApprovalsConfig {
+                default_ttl_seconds: 900,
+                max_pending_requests: 32,
+                allow_cli_resolution: true,
+                prompt_mode: ApprovalPromptMode::InlineKeyboardWithFallback,
+            },
+            governed_actions: GovernedActionsConfig {
+                approval_required_min_risk_tier: GovernedActionRiskTier::Tier2,
+                default_subprocess_timeout_ms: 30_000,
+                max_subprocess_timeout_ms: 120_000,
+                max_filesystem_roots_per_action: 4,
+                default_network_access: NetworkAccessPosture::Disabled,
+                allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+                max_environment_variables_per_action: 8,
+                max_captured_output_bytes: 65_536,
+            },
             worker: WorkerConfig {
                 timeout_ms: 5_000,
                 command: String::new(),
@@ -928,6 +1081,27 @@ pending_message_span_seconds_threshold = 120
 stale_pending_ingress_age_seconds_threshold = 300
 max_recovery_batch_size = 8
 
+[workspace]
+root_dir = "."
+max_artifact_bytes = 1048576
+max_script_bytes = 262144
+
+[approvals]
+default_ttl_seconds = 900
+max_pending_requests = 32
+allow_cli_resolution = true
+prompt_mode = "inline_keyboard_with_fallback"
+
+[governed_actions]
+approval_required_min_risk_tier = "tier_2"
+default_subprocess_timeout_ms = 30000
+max_subprocess_timeout_ms = 120000
+max_filesystem_roots_per_action = 4
+default_network_access = "disabled"
+allowlisted_environment_variables = ["BLUE_LAGOON_DATABASE_URL"]
+max_environment_variables_per_action = 8
+max_captured_output_bytes = 65536
+
 [worker]
 timeout_ms = 10000
 command = ""
@@ -975,6 +1149,27 @@ args = []
             error
                 .to_string()
                 .contains("minimum_supported_schema_version")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_approval_ttl() {
+        let mut config = sample_config();
+        config.approvals.default_ttl_seconds = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("approvals.default_ttl_seconds"));
+    }
+
+    #[test]
+    fn validate_rejects_dangerous_governed_action_defaults() {
+        let mut config = sample_config();
+        config.governed_actions.default_network_access = NetworkAccessPosture::Enabled;
+        config.governed_actions.approval_required_min_risk_tier = GovernedActionRiskTier::Tier1;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("approval_required_min_risk_tier")
         );
     }
 

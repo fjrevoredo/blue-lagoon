@@ -194,6 +194,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: cargo test -p runtime --bin runtime -- --nocapture
+        run: cargo test -p runtime --bin runtime -- --nocapture
+
       - name: cargo test -p runtime --test admin_cli -- --nocapture
         run: cargo test -p runtime --test admin_cli -- --nocapture
 
@@ -202,3 +205,43 @@ jobs:
 
       - name: cargo test -p harness --test management_integration -- --nocapture
         run: cargo test -p harness --test management_integration -- --nocapture
+
+  governed-actions:
+    name: governed-actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - workspace-verification
+    env:
+      BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@localhost:5432/blue_lagoon
+      BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL: postgres://blue_lagoon:blue_lagoon@localhost:5432/postgres
+      CARGO_TERM_COLOR: always
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: blue_lagoon
+          POSTGRES_USER: blue_lagoon
+          POSTGRES_PASSWORD: blue_lagoon
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blue_lagoon -d blue_lagoon"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -p harness --test governed_actions_component -- --nocapture
+        run: cargo test -p harness --test governed_actions_component -- --nocapture
+
+      - name: cargo test -p harness --test governed_actions_integration -- --nocapture
+        run: cargo test -p harness --test governed_actions_integration -- --nocapture

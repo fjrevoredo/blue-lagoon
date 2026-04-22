@@ -150,6 +150,7 @@ pub async fn assemble_foreground_context(
             internal_state,
             recent_history,
             retrieved_context,
+            governed_action_observations: Vec::new(),
             recovery_context: options.recovery_context,
         },
         metadata,

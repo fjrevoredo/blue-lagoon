@@ -1,11 +1,14 @@
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness::{
     config::RuntimeConfig,
     management::{
-        self, BackgroundEnqueueOutcome, BackgroundJobSummary, BackgroundRunNextOutcome,
-        EnqueueBackgroundJobRequest, PendingForegroundConversationSummary, RuntimeStatusReport,
-        WakeSignalSummary,
+        self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
+        BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
+        GovernedActionSummary, PendingForegroundConversationSummary, ResolveApprovalRequest,
+        RuntimeStatusReport, WakeSignalSummary, WorkspaceScriptRunSummary,
     },
 };
 
@@ -20,6 +23,9 @@ pub enum AdminSubcommand {
     Status(StatusCommand),
     Foreground(ForegroundCommand),
     Background(BackgroundCommand),
+    Approvals(ApprovalsCommand),
+    Actions(ActionsCommand),
+    Workspace(WorkspaceCommand),
     #[command(name = "wake-signals")]
     WakeSignals(WakeSignalsCommand),
 }
@@ -89,6 +95,119 @@ pub struct WakeSignalsCommand {
     pub command: WakeSignalsSubcommand,
 }
 
+#[derive(Debug, Parser)]
+pub struct ApprovalsCommand {
+    #[command(subcommand)]
+    pub command: ApprovalsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApprovalsSubcommand {
+    List(ApprovalsListCommand),
+    Resolve(ApprovalResolveCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ApprovalsListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<ApprovalStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ApprovalResolveCommand {
+    #[arg(long)]
+    pub approval_request_id: String,
+    #[arg(long, value_enum)]
+    pub decision: ApprovalDecisionArg,
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ActionsCommand {
+    #[command(subcommand)]
+    pub command: ActionsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ActionsSubcommand {
+    List(ActionsListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ActionsListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceCommand {
+    #[command(subcommand)]
+    pub command: WorkspaceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceSubcommand {
+    Artifacts(WorkspaceArtifactsCommand),
+    Scripts(WorkspaceScriptsCommand),
+    Runs(WorkspaceRunsCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceArtifactsCommand {
+    #[command(subcommand)]
+    pub command: WorkspaceArtifactsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceArtifactsSubcommand {
+    List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceScriptsCommand {
+    #[command(subcommand)]
+    pub command: WorkspaceScriptsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceScriptsSubcommand {
+    List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceRunsCommand {
+    #[command(subcommand)]
+    pub command: WorkspaceRunsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceRunsSubcommand {
+    List(WorkspaceRunsListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceRunsListCommand {
+    #[arg(long)]
+    pub script_id: Option<String>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum WakeSignalsSubcommand {
     List(ListCommand),
@@ -112,6 +231,34 @@ pub enum TriggerKindArg {
     MaintenanceTrigger,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ApprovalStatusArg {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ApprovalDecisionArg {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GovernedActionStatusArg {
+    Proposed,
+    AwaitingApproval,
+    Approved,
+    Rejected,
+    Expired,
+    Invalidated,
+    Blocked,
+    Executed,
+    Failed,
+}
+
 impl From<JobKindArg> for contracts::UnconsciousJobKind {
     fn from(value: JobKindArg) -> Self {
         match value {
@@ -132,6 +279,43 @@ impl From<TriggerKindArg> for contracts::BackgroundTriggerKind {
             TriggerKindArg::ForegroundDelegation => Self::ForegroundDelegation,
             TriggerKindArg::ExternalPassiveEvent => Self::ExternalPassiveEvent,
             TriggerKindArg::MaintenanceTrigger => Self::MaintenanceTrigger,
+        }
+    }
+}
+
+impl From<ApprovalStatusArg> for contracts::ApprovalRequestStatus {
+    fn from(value: ApprovalStatusArg) -> Self {
+        match value {
+            ApprovalStatusArg::Pending => Self::Pending,
+            ApprovalStatusArg::Approved => Self::Approved,
+            ApprovalStatusArg::Rejected => Self::Rejected,
+            ApprovalStatusArg::Expired => Self::Expired,
+            ApprovalStatusArg::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
+impl From<ApprovalDecisionArg> for contracts::ApprovalResolutionDecision {
+    fn from(value: ApprovalDecisionArg) -> Self {
+        match value {
+            ApprovalDecisionArg::Approve => Self::Approved,
+            ApprovalDecisionArg::Reject => Self::Rejected,
+        }
+    }
+}
+
+impl From<GovernedActionStatusArg> for contracts::GovernedActionStatus {
+    fn from(value: GovernedActionStatusArg) -> Self {
+        match value {
+            GovernedActionStatusArg::Proposed => Self::Proposed,
+            GovernedActionStatusArg::AwaitingApproval => Self::AwaitingApproval,
+            GovernedActionStatusArg::Approved => Self::Approved,
+            GovernedActionStatusArg::Rejected => Self::Rejected,
+            GovernedActionStatusArg::Expired => Self::Expired,
+            GovernedActionStatusArg::Invalidated => Self::Invalidated,
+            GovernedActionStatusArg::Blocked => Self::Blocked,
+            GovernedActionStatusArg::Executed => Self::Executed,
+            GovernedActionStatusArg::Failed => Self::Failed,
         }
     }
 }
@@ -172,6 +356,66 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 let outcome = management::run_next_background_job(config).await?;
                 print_background_run_next(outcome, command.json)?;
             }
+        },
+        AdminSubcommand::Approvals(command) => match command.command {
+            ApprovalsSubcommand::List(command) => {
+                let approvals = management::list_approval_requests(
+                    config,
+                    command.status.map(Into::into),
+                    command.limit,
+                )
+                .await?;
+                print_approval_requests(approvals, command.json)?;
+            }
+            ApprovalsSubcommand::Resolve(command) => {
+                let outcome = management::resolve_approval_request(
+                    config,
+                    ResolveApprovalRequest {
+                        approval_request_id: command.approval_request_id.parse()?,
+                        decision: command.decision.into(),
+                        actor_ref: command.actor_ref,
+                        reason: command.reason,
+                    },
+                )
+                .await?;
+                print_approval_resolution(outcome, command.json)?;
+            }
+        },
+        AdminSubcommand::Actions(command) => match command.command {
+            ActionsSubcommand::List(command) => {
+                let actions = management::list_governed_actions(
+                    config,
+                    command.status.map(Into::into),
+                    command.limit,
+                )
+                .await?;
+                print_governed_actions(actions, command.json)?;
+            }
+        },
+        AdminSubcommand::Workspace(command) => match command.command {
+            WorkspaceSubcommand::Artifacts(command) => match command.command {
+                WorkspaceArtifactsSubcommand::List(command) => {
+                    let artifacts =
+                        management::list_workspace_artifact_summaries(config, command.limit)
+                            .await?;
+                    print_workspace_artifacts(artifacts, command.json)?;
+                }
+            },
+            WorkspaceSubcommand::Scripts(command) => match command.command {
+                WorkspaceScriptsSubcommand::List(command) => {
+                    let scripts = management::list_workspace_scripts(config, command.limit).await?;
+                    print_workspace_scripts(scripts, command.json)?;
+                }
+            },
+            WorkspaceSubcommand::Runs(command) => match command.command {
+                WorkspaceRunsSubcommand::List(command) => {
+                    let script_id = command.script_id.map(|value| value.parse()).transpose()?;
+                    let runs =
+                        management::list_workspace_script_runs(config, script_id, command.limit)
+                            .await?;
+                    print_workspace_runs(runs, command.json)?;
+                }
+            },
         },
         AdminSubcommand::WakeSignals(command) => match command.command {
             WakeSignalsSubcommand::List(command) => {
@@ -296,6 +540,18 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
         "  pending wake signals: {}",
         report.pending_work.pending_wake_signal_count
     );
+    println!(
+        "  pending approval requests: {}",
+        report.pending_work.pending_approval_request_count
+    );
+    println!(
+        "  awaiting approval governed actions: {}",
+        report.pending_work.awaiting_approval_governed_action_count
+    );
+    println!(
+        "  blocked governed actions: {}",
+        report.pending_work.blocked_governed_action_count
+    );
 
     Ok(())
 }
@@ -327,6 +583,269 @@ fn print_pending_foreground(
         );
     }
     Ok(())
+}
+
+fn print_approval_requests(summaries: Vec<ApprovalRequestSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+
+    println!("{}", render_approval_requests_text(&summaries));
+    Ok(())
+}
+
+fn print_approval_resolution(summary: ApprovalResolutionSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", render_approval_resolution_text(&summary));
+    Ok(())
+}
+
+fn print_governed_actions(actions: Vec<GovernedActionSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&actions)?);
+        return Ok(());
+    }
+
+    println!("{}", render_governed_actions_text(&actions));
+    Ok(())
+}
+
+fn print_workspace_artifacts(
+    artifacts: Vec<contracts::WorkspaceArtifactSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&artifacts)?);
+        return Ok(());
+    }
+
+    println!("{}", render_workspace_artifacts_text(&artifacts));
+    Ok(())
+}
+
+fn print_workspace_scripts(
+    scripts: Vec<contracts::WorkspaceScriptSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&scripts)?);
+        return Ok(());
+    }
+
+    println!("{}", render_workspace_scripts_text(&scripts));
+    Ok(())
+}
+
+fn print_workspace_runs(runs: Vec<WorkspaceScriptRunSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_workspace_runs_text(&runs));
+    Ok(())
+}
+
+fn render_approval_requests_text(summaries: &[ApprovalRequestSummary]) -> String {
+    if summaries.is_empty() {
+        return "No approval requests.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | requested_by={} | requested_at={} | expires_at={} | title={}",
+            summary.approval_request_id,
+            summary.status,
+            summary.risk_tier,
+            summary.action_kind,
+            summary.requested_by,
+            summary.requested_at,
+            summary.expires_at,
+            summary.title
+        );
+        if let Some(resolution_kind) = summary.resolution_kind.as_deref() {
+            let _ = writeln!(
+                output,
+                "  resolved={} by={} at={} reason={}",
+                resolution_kind,
+                summary.resolved_by.as_deref().unwrap_or("unknown"),
+                summary
+                    .resolved_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                summary.resolution_reason.as_deref().unwrap_or("none")
+            );
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_approval_resolution_text(summary: &ApprovalResolutionSummary) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Approval {} resolved as {}",
+        summary.approval_request.approval_request_id, summary.approval_request.status
+    );
+    let _ = writeln!(output, "  title: {}", summary.approval_request.title);
+    let _ = writeln!(
+        output,
+        "  resolved_by: {}",
+        summary
+            .approval_request
+            .resolved_by
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    let _ = writeln!(
+        output,
+        "  reason: {}",
+        summary
+            .approval_request
+            .resolution_reason
+            .as_deref()
+            .unwrap_or("none")
+    );
+    if let Some(action) = &summary.governed_action {
+        let _ = writeln!(
+            output,
+            "  governed action: {} status={} output_ref={}",
+            action.governed_action_execution_id,
+            action.status,
+            action.output_ref.as_deref().unwrap_or("none")
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_governed_actions_text(actions: &[GovernedActionSummary]) -> String {
+    if actions.is_empty() {
+        return "No governed actions.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, action) in actions.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | approval_request_id={} | started={} | completed={}",
+            action.governed_action_execution_id,
+            action.status,
+            action.risk_tier,
+            action.action_kind,
+            action
+                .approval_request_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            action
+                .started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            action
+                .completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        if let Some(blocked_reason) = action.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = action.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_workspace_artifacts_text(artifacts: &[contracts::WorkspaceArtifactSummary]) -> String {
+    if artifacts.is_empty() {
+        return "No workspace artifacts.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | kind={:?} | latest_version={} | updated_at={} | title={}",
+            artifact.artifact_id,
+            artifact.artifact_kind,
+            artifact.latest_version,
+            artifact.updated_at,
+            artifact.title
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_workspace_scripts_text(scripts: &[contracts::WorkspaceScriptSummary]) -> String {
+    if scripts.is_empty() {
+        return "No workspace scripts.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, script) in scripts.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | artifact_id={} | language={} | latest_version={} | updated_at={}",
+            script.script_id,
+            script.workspace_artifact_id,
+            script.language,
+            script.latest_version,
+            script.updated_at
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_workspace_runs_text(runs: &[WorkspaceScriptRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No workspace script runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | script_id={} | status={} | risk={} | started={} | completed={}",
+            run.workspace_script_run_id,
+            run.workspace_script_id,
+            run.status,
+            run.risk_tier,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        if let Some(output_ref) = run.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+        if let Some(failure_summary) = run.failure_summary.as_deref() {
+            let _ = writeln!(output, "  failure_summary: {failure_summary}");
+        }
+    }
+    output.trim_end().to_string()
 }
 
 fn print_background_jobs(jobs: Vec<BackgroundJobSummary>, json: bool) -> Result<()> {
@@ -446,4 +965,226 @@ fn yes_no(value: bool) -> &'static str {
 
 fn presence_label(present: bool) -> &'static str {
     if present { "present" } else { "missing" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_approval_request_summary() -> ApprovalRequestSummary {
+        serde_json::from_value(json!({
+            "approval_request_id": "00000000-0000-0000-0000-000000000001",
+            "trace_id": "00000000-0000-0000-0000-000000000002",
+            "execution_id": null,
+            "action_proposal_id": "00000000-0000-0000-0000-000000000003",
+            "action_fingerprint": "sha256:test",
+            "action_kind": "run_subprocess",
+            "risk_tier": "tier_2",
+            "capability_scope": {
+                "filesystem": {
+                    "read_roots": ["D:/Repos/blue-lagoon"],
+                    "write_roots": ["D:/Repos/blue-lagoon/docs"]
+                },
+                "network": "disabled",
+                "environment": {
+                    "allow_variables": []
+                },
+                "execution": {
+                    "timeout_ms": 30000,
+                    "max_stdout_bytes": 65536,
+                    "max_stderr_bytes": 32768
+                }
+            },
+            "status": "approved",
+            "title": "Run bounded subprocess",
+            "consequence_summary": "Executes a scoped subprocess.",
+            "requested_by": "telegram:primary-user",
+            "requested_at": "2026-04-22T10:00:00Z",
+            "expires_at": "2026-04-22T10:15:00Z",
+            "resolved_at": "2026-04-22T10:05:00Z",
+            "resolution_kind": "approved",
+            "resolved_by": "cli:primary-user",
+            "resolution_reason": "manual verification"
+        }))
+        .expect("sample approval request summary should deserialize")
+    }
+
+    fn sample_governed_action_summary() -> GovernedActionSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000011",
+            "trace_id": "00000000-0000-0000-0000-000000000012",
+            "execution_id": null,
+            "approval_request_id": "00000000-0000-0000-0000-000000000001",
+            "action_proposal_id": "00000000-0000-0000-0000-000000000013",
+            "action_fingerprint": "sha256:test-action",
+            "action_kind": "run_subprocess",
+            "risk_tier": "tier_2",
+            "status": "blocked",
+            "workspace_script_id": null,
+            "workspace_script_version_id": null,
+            "blocked_reason": "scope invalid",
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000099",
+            "started_at": null,
+            "completed_at": "2026-04-22T10:06:00Z"
+        }))
+        .expect("sample governed action should deserialize")
+    }
+
+    fn sample_workspace_run_summary() -> WorkspaceScriptRunSummary {
+        serde_json::from_value(json!({
+            "workspace_script_run_id": "00000000-0000-0000-0000-000000000021",
+            "workspace_script_id": "00000000-0000-0000-0000-000000000022",
+            "workspace_script_version_id": "00000000-0000-0000-0000-000000000023",
+            "trace_id": "00000000-0000-0000-0000-000000000024",
+            "execution_id": null,
+            "governed_action_execution_id": null,
+            "approval_request_id": null,
+            "status": "failed",
+            "risk_tier": "tier_1",
+            "args": ["--check"],
+            "output_ref": null,
+            "failure_summary": "script returned non-zero exit status",
+            "started_at": "2026-04-22T10:07:00Z",
+            "completed_at": "2026-04-22T10:08:00Z"
+        }))
+        .expect("sample workspace run should deserialize")
+    }
+
+    fn sample_workspace_artifact() -> contracts::WorkspaceArtifactSummary {
+        serde_json::from_value(json!({
+            "artifact_id": "00000000-0000-0000-0000-000000000031",
+            "artifact_kind": "note",
+            "title": "Operator note",
+            "latest_version": 2,
+            "updated_at": "2026-04-22T10:09:00Z"
+        }))
+        .expect("sample workspace artifact should deserialize")
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_approval_resolution_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "approvals",
+            "resolve",
+            "--approval-request-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--decision",
+            "approve",
+            "--actor-ref",
+            "cli:primary-user",
+            "--reason",
+            "manual verification",
+        ])
+        .expect("approval resolution command should parse");
+
+        match command.command {
+            AdminSubcommand::Approvals(ApprovalsCommand {
+                command: ApprovalsSubcommand::Resolve(command),
+            }) => {
+                assert_eq!(
+                    command.approval_request_id,
+                    "00000000-0000-0000-0000-000000000001"
+                );
+                assert!(matches!(command.decision, ApprovalDecisionArg::Approve));
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:primary-user"));
+            }
+            other => panic!("expected approval resolution command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_workspace_run_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "workspace",
+            "runs",
+            "list",
+            "--script-id",
+            "00000000-0000-0000-0000-000000000022",
+            "--limit",
+            "5",
+        ])
+        .expect("workspace runs command should parse");
+
+        match command.command {
+            AdminSubcommand::Workspace(WorkspaceCommand {
+                command:
+                    WorkspaceSubcommand::Runs(WorkspaceRunsCommand {
+                        command: WorkspaceRunsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(
+                    command.script_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000022")
+                );
+                assert_eq!(command.limit, 5);
+            }
+            other => panic!("expected workspace runs command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_action_status_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime", "actions", "list", "--status", "blocked", "--limit", "3",
+        ])
+        .expect("actions list command should parse");
+
+        match command.command {
+            AdminSubcommand::Actions(ActionsCommand {
+                command: ActionsSubcommand::List(command),
+            }) => {
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Blocked)
+                ));
+                assert_eq!(command.limit, 3);
+            }
+            other => panic!("expected actions list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_approval_requests_text_includes_resolution_metadata() {
+        let rendered = render_approval_requests_text(&[sample_approval_request_summary()]);
+        assert!(rendered.contains("status=approved"));
+        assert!(rendered.contains("resolved=approved by=cli:primary-user"));
+        assert!(rendered.contains("reason=manual verification"));
+    }
+
+    #[test]
+    fn render_governed_actions_text_includes_blocked_reason_and_output_ref() {
+        let rendered = render_governed_actions_text(&[sample_governed_action_summary()]);
+        assert!(rendered.contains("status=blocked"));
+        assert!(rendered.contains("blocked_reason: scope invalid"));
+        assert!(rendered.contains("output_ref: execution_record:"));
+    }
+
+    #[test]
+    fn render_workspace_artifacts_and_runs_text_include_phase_five_details() {
+        let artifact_output = render_workspace_artifacts_text(&[sample_workspace_artifact()]);
+        assert!(artifact_output.contains("kind=Note"));
+        assert!(artifact_output.contains("latest_version=2"));
+
+        let run_output = render_workspace_runs_text(&[sample_workspace_run_summary()]);
+        assert!(run_output.contains("status=failed"));
+        assert!(run_output.contains("failure_summary: script returned non-zero exit status"));
+    }
+
+    #[test]
+    fn render_approval_resolution_text_includes_governed_action_summary() {
+        let rendered = render_approval_resolution_text(&ApprovalResolutionSummary {
+            approval_request: sample_approval_request_summary(),
+            governed_action: Some(sample_governed_action_summary()),
+        });
+        assert!(
+            rendered.contains("Approval 00000000-0000-0000-0000-000000000001 resolved as approved")
+        );
+        assert!(
+            rendered
+                .contains("governed action: 00000000-0000-0000-0000-000000000011 status=blocked")
+        );
+    }
 }

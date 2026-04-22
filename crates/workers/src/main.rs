@@ -9,16 +9,19 @@ use contracts::{
     CanonicalProposalPayload, CanonicalTargetKind, ConsciousContext, ConsciousWorkerInboundMessage,
     ConsciousWorkerOutboundMessage, ConsciousWorkerRequest, ConsciousWorkerResult,
     ConsciousWorkerStatus, DiagnosticAlert, DiagnosticSeverity, EpisodeSummary,
-    ForegroundExecutionMode, LoopKind, MemoryArtifactProposal, ModelBudget, ModelCallPurpose,
-    ModelCallRequest, ModelCallResponse, ModelInput, ModelInputMessage, ModelMessageRole,
-    ModelOutputMode, ProposalConflictPosture, ProposalProvenance, ProposalProvenanceKind,
-    RetrievalUpdateOperation, RetrievalUpdateProposal, SelfModelObservationProposal,
-    SmokeWorkerResult, ToolPolicy, UnconsciousContext, UnconsciousJobKind,
-    UnconsciousMaintenanceOutputs, UnconsciousWorkerRequest, UnconsciousWorkerResult,
-    UnconsciousWorkerStatus, WakeSignal, WakeSignalPriority, WakeSignalReason, WorkerErrorCode,
-    WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult,
+    ForegroundExecutionMode, GovernedActionObservation, GovernedActionProposal, LoopKind,
+    MemoryArtifactProposal, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelCallResponse,
+    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, ProposalConflictPosture,
+    ProposalProvenance, ProposalProvenanceKind, RetrievalUpdateOperation, RetrievalUpdateProposal,
+    SelfModelObservationProposal, SmokeWorkerResult, ToolPolicy, UnconsciousContext,
+    UnconsciousJobKind, UnconsciousMaintenanceOutputs, UnconsciousWorkerRequest,
+    UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal, WakeSignalPriority,
+    WakeSignalReason, WorkerErrorCode, WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse,
+    WorkerResult,
 };
 use serde::Serialize;
+
+const GOVERNED_ACTIONS_BLOCK_TAG: &str = "blue-lagoon-governed-actions";
 
 #[derive(Debug, Parser)]
 #[command(name = "workers", about = "Blue Lagoon worker runtime")]
@@ -435,7 +438,7 @@ fn build_model_call_request(
         output_mode: ModelOutputMode::PlainText,
         schema_name: None,
         schema_json: None,
-        tool_policy: ToolPolicy::NoTools,
+        tool_policy: ToolPolicy::ProposalOnly,
         provider_hint: None,
     }
 }
@@ -527,6 +530,24 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         });
     }
 
+    if !context.governed_action_observations.is_empty() {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: format!(
+                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. Do not repeat the same action proposal unless the previous action failed and a materially different retry is required.",
+                governed_action_observation_summary(&context.governed_action_observations)
+            ),
+        });
+    } else {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: format!(
+                "If you need a governed action, append exactly one fenced ```{} block containing JSON with an 'actions' array of governed-action proposals. Keep all user-facing text outside that block. If no governed action is needed, do not emit the block.",
+                GOVERNED_ACTIONS_BLOCK_TAG
+            ),
+        });
+    }
+
     ModelInput {
         system_prompt: format!(
             "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}. Execution mode: {}.",
@@ -548,6 +569,85 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
             foreground_execution_mode_as_str(context.recovery_context.mode),
         ),
         messages,
+    }
+}
+
+fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
+    observations
+        .iter()
+        .map(|observation| {
+            format!(
+                "{}:{}:{}",
+                governed_action_kind_as_str(observation.action_kind),
+                governed_action_status_as_str(observation.outcome.status),
+                observation.outcome.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn build_governed_action_proposals(
+    model_text: &str,
+) -> std::result::Result<Vec<GovernedActionProposal>, String> {
+    let Some(block_json) = extract_governed_action_block(model_text) else {
+        return Ok(Vec::new());
+    };
+
+    #[derive(serde::Deserialize)]
+    struct GovernedActionEnvelope {
+        actions: Vec<GovernedActionProposal>,
+    }
+
+    let envelope: GovernedActionEnvelope = serde_json::from_str(block_json)
+        .map_err(|error| format!("invalid governed-action proposal block: {error}"))?;
+    Ok(envelope.actions)
+}
+
+fn strip_governed_action_block(model_text: &str) -> String {
+    match governed_action_block_bounds(model_text) {
+        Some((start, _json_start, _json_end, _end)) => model_text[..start].trim_end().to_string(),
+        None => model_text.to_string(),
+    }
+}
+
+fn extract_governed_action_block(model_text: &str) -> Option<&str> {
+    governed_action_block_bounds(model_text)
+        .map(|(_start, json_start, json_end, _end)| model_text[json_start..json_end].trim())
+}
+
+fn governed_action_block_bounds(model_text: &str) -> Option<(usize, usize, usize, usize)> {
+    let marker = format!("```{GOVERNED_ACTIONS_BLOCK_TAG}");
+    let start = model_text.rfind(&marker)?;
+    let after_marker = &model_text[start + marker.len()..];
+    let newline_offset = after_marker.find('\n')?;
+    let json_start = start + marker.len() + newline_offset + 1;
+    let after_json = &model_text[json_start..];
+    let fence_offset = after_json.find("\n```")?;
+    let json_end = json_start + fence_offset;
+    let end = json_end + "\n```".len();
+    Some((start, json_start, json_end, end))
+}
+
+fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static str {
+    match kind {
+        contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
+        contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+    }
+}
+
+fn governed_action_status_as_str(status: contracts::GovernedActionStatus) -> &'static str {
+    match status {
+        contracts::GovernedActionStatus::Proposed => "proposed",
+        contracts::GovernedActionStatus::AwaitingApproval => "awaiting_approval",
+        contracts::GovernedActionStatus::Approved => "approved",
+        contracts::GovernedActionStatus::Rejected => "rejected",
+        contracts::GovernedActionStatus::Expired => "expired",
+        contracts::GovernedActionStatus::Invalidated => "invalidated",
+        contracts::GovernedActionStatus::Blocked => "blocked",
+        contracts::GovernedActionStatus::Executed => "executed",
+        contracts::GovernedActionStatus::Failed => "failed",
     }
 }
 
@@ -592,6 +692,8 @@ fn build_conscious_worker_response(
     model_response: ModelCallResponse,
 ) -> std::result::Result<WorkerResponse, String> {
     let candidate_proposals = build_candidate_proposals(&payload.context)?;
+    let governed_action_proposals = build_governed_action_proposals(&model_response.output.text)?;
+    let assistant_text = strip_governed_action_block(&model_response.output.text);
     Ok(WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
@@ -608,7 +710,7 @@ fn build_conscious_worker_response(
                     .ingress
                     .internal_conversation_ref
                     .clone(),
-                text: model_response.output.text,
+                text: assistant_text,
             },
             episode_summary: EpisodeSummary {
                 summary: format!(
@@ -619,6 +721,8 @@ fn build_conscious_worker_response(
                 message_count: history_message_count(&payload.context) + 2,
             },
             candidate_proposals,
+            governed_action_proposals,
+            governed_action_observations: Vec::new(),
         }),
     })
 }
@@ -1240,7 +1344,7 @@ mod tests {
         assert_eq!(model_request.purpose, ModelCallPurpose::ForegroundResponse);
         assert_eq!(model_request.budget.timeout_ms, 30_000);
         assert_eq!(model_request.output_mode, ModelOutputMode::PlainText);
-        assert_eq!(model_request.tool_policy, ToolPolicy::NoTools);
+        assert_eq!(model_request.tool_policy, ToolPolicy::ProposalOnly);
         assert!(model_request.input.system_prompt.contains("blue-lagoon"));
         assert!(model_request.input.system_prompt.contains("conversation"));
         assert!(
@@ -1262,13 +1366,15 @@ mod tests {
                 .system_prompt
                 .contains("confidence_pct=80")
         );
-        assert_eq!(
+        assert!(model_request.input.messages.iter().any(|message| {
+            message.content == "remember that I prefer concise replies and be direct"
+        }));
+        assert!(
             model_request
                 .input
                 .messages
-                .last()
-                .map(|message| message.content.as_str()),
-            Some("remember that I prefer concise replies and be direct")
+                .iter()
+                .any(|message| { message.content.contains(GOVERNED_ACTIONS_BLOCK_TAG) })
         );
     }
 
@@ -1310,12 +1416,98 @@ mod tests {
                 );
                 assert_eq!(result.episode_summary.outcome, "completed");
                 assert_eq!(result.candidate_proposals.len(), 2);
+                assert!(result.governed_action_proposals.is_empty());
+                assert!(result.governed_action_observations.is_empty());
             }
             WorkerResult::Smoke(_) => panic!("conscious worker should not emit a smoke result"),
             WorkerResult::Unconscious(_) => {
                 panic!("conscious worker should not emit an unconscious result")
             }
             WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
+        }
+    }
+
+    #[test]
+    fn conscious_worker_response_extracts_governed_action_block() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let workspace_root = std::env::current_dir()
+            .expect("current dir should resolve")
+            .display()
+            .to_string();
+        let action_block = serde_json::json!({
+            "actions": [{
+                "proposal_id": uuid::Uuid::now_v7(),
+                "title": "Echo test",
+                "rationale": "Need a bounded workspace check",
+                "action_kind": "run_subprocess",
+                "requested_risk_tier": serde_json::Value::Null,
+                "capability_scope": {
+                    "filesystem": {
+                        "read_roots": [workspace_root.clone()],
+                        "write_roots": [],
+                    },
+                    "network": "disabled",
+                    "environment": {
+                        "allow_variables": [],
+                    },
+                    "execution": {
+                        "timeout_ms": 30_000,
+                        "max_stdout_bytes": 4_096,
+                        "max_stderr_bytes": 4_096,
+                    },
+                },
+                "payload": {
+                    "kind": "run_subprocess",
+                    "value": {
+                        "command": if cfg!(windows) { "powershell" } else { "sh" },
+                        "args": if cfg!(windows) {
+                            serde_json::json!(["-NoProfile", "-Command", "Write-Output 'ok'"])
+                        } else {
+                            serde_json::json!(["-c", "printf 'ok\\n'"])
+                        },
+                        "working_directory": workspace_root.clone(),
+                    },
+                },
+            }],
+        });
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: format!(
+                    "I will run a bounded check.\n```{GOVERNED_ACTIONS_BLOCK_TAG}\n{}\n```",
+                    action_block
+                ),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 12,
+            },
+        };
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("worker response should be valid");
+        match response.result {
+            WorkerResult::Conscious(result) => {
+                assert_eq!(result.assistant_output.text, "I will run a bounded check.");
+                assert_eq!(result.governed_action_proposals.len(), 1);
+                assert_eq!(
+                    result.governed_action_proposals[0].action_kind,
+                    contracts::GovernedActionKind::RunSubprocess
+                );
+            }
+            other => panic!("expected conscious worker result, got {other:?}"),
         }
     }
 
@@ -1608,6 +1800,7 @@ mod tests {
                 outcome: "completed".to_string(),
             }],
             retrieved_context: contracts::RetrievedContext::default(),
+            governed_action_observations: Vec::new(),
             recovery_context: contracts::ForegroundRecoveryContext::default(),
         }
     }

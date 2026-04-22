@@ -3,10 +3,14 @@ mod support;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
-    ChannelKind, LoopKind, ModelCallPurpose, ModelCallRequest, ModelInput, ModelInputMessage,
-    ModelMessageRole, ModelOutputMode, ToolPolicy,
+    ApprovalRequestStatus, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
+    ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
+    GovernedActionKind, GovernedActionRiskTier, LoopKind, ModelCallPurpose, ModelCallRequest,
+    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, NetworkAccessPosture,
+    ToolPolicy,
 };
 use harness::{
+    approval::{self, NewApprovalRequestRecord},
     audit,
     config::{
         ForegroundModelRouteConfig, ModelGatewayConfig, ResolvedForegroundModelRouteConfig,
@@ -500,7 +504,7 @@ async fn accepted_foreground_trigger_persists_execution_budget_and_audit() -> Re
 
 #[tokio::test]
 #[serial]
-async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()> {
+async fn approval_callback_intake_accepts_and_persists_execution() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let update = telegram::load_fixture_updates(&telegram_fixture("approval_callback.json"))?
             .into_iter()
@@ -525,28 +529,320 @@ async fn rejected_foreground_trigger_persists_rejection_and_audit() -> Result<()
         )
         .await?;
 
-        let rejected = match outcome {
-            foreground::ForegroundTriggerIntakeOutcome::Rejected(rejected) => rejected,
-            other => panic!("expected rejected trigger, got {other:?}"),
+        let accepted = match outcome {
+            foreground::ForegroundTriggerIntakeOutcome::Accepted(accepted) => accepted,
+            other => panic!("expected accepted trigger, got {other:?}"),
         };
 
-        let stored_ingress = foreground::get_ingress_event(&ctx.pool, rejected.ingress_id).await?;
-        assert_eq!(stored_ingress.status, "rejected");
-        assert_eq!(stored_ingress.foreground_status, "rejected");
-        assert!(
-            stored_ingress
-                .rejection_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("approval callbacks"))
+        let stored_ingress =
+            foreground::get_ingress_event(&ctx.pool, accepted.ingress.ingress_id).await?;
+        assert_eq!(stored_ingress.status, "accepted");
+        assert_eq!(stored_ingress.foreground_status, "processing");
+        assert_eq!(stored_ingress.execution_id, Some(accepted.execution_id));
+        assert_eq!(
+            stored_ingress.approval_callback_data.as_deref(),
+            Some("approve:42")
         );
-        assert_eq!(stored_ingress.execution_id, None);
 
-        let audit_events = audit::list_for_trace(&ctx.pool, rejected.trace_id).await?;
+        let execution = execution::get(&ctx.pool, accepted.execution_id).await?;
+        assert_eq!(execution.status, "started");
+        assert_eq!(execution.trace_id, accepted.trace_id);
+
+        let audit_events = audit::list_for_trace(&ctx.pool, accepted.trace_id).await?;
         assert_eq!(audit_events.len(), 1);
-        assert_eq!(audit_events[0].event_kind, "foreground_trigger_rejected");
+        assert_eq!(audit_events[0].event_kind, "foreground_trigger_accepted");
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+#[serial]
+async fn approval_callback_orchestration_resolves_request_and_replies() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let created = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-callback".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Run scoped callback action".to_string(),
+                consequence_summary: "Used to verify Telegram callback routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        assert_eq!(created.status, ApprovalRequestStatus::Pending);
+
+        let update = telegram::load_fixture_updates(&telegram_fixture("approval_callback.json"))?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/approval_callback.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => {
+                panic!("callback fixture should normalize into accepted ingress, got {other:?}")
+            }
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                completed,
+            ) => completed,
+            other => panic!("expected approval-resolution orchestration, got {other:?}"),
+        };
+
+        let resolved_request =
+            approval::get_approval_request(&ctx.pool, completed.approval_request_id).await?;
+        assert_eq!(resolved_request.status, ApprovalRequestStatus::Approved);
+
+        let execution = execution::get(&ctx.pool, completed.execution_id).await?;
+        assert_eq!(execution.status, "completed");
+
+        let stored_ingress = foreground::get_ingress_event(&ctx.pool, completed.ingress_id).await?;
+        assert_eq!(stored_ingress.foreground_status, "processed");
+        assert_eq!(stored_ingress.execution_id, Some(completed.execution_id));
+
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Run scoped callback action"
+        );
+        assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(46));
+
+        let audit_events = audit::list_for_trace(&ctx.pool, completed.trace_id).await?;
+        let event_kinds = audit_events
+            .into_iter()
+            .map(|event| event.event_kind)
+            .collect::<Vec<_>>();
+        assert!(event_kinds.contains(&"foreground_trigger_accepted".to_string()));
+        assert!(event_kinds.contains(&"approval_resolution_resolved".to_string()));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn approval_command_orchestration_resolves_request_and_replies() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-command".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Run scoped command action".to_string(),
+                consequence_summary: "Used to verify Telegram command fallback routing."
+                    .to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("approval_command_approve.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/approval_command_approve.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => {
+                panic!("command fixture should normalize into accepted ingress, got {other:?}")
+            }
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                completed,
+            ) => completed,
+            other => panic!("expected approval-resolution orchestration, got {other:?}"),
+        };
+
+        let resolved_request =
+            approval::get_approval_request(&ctx.pool, completed.approval_request_id).await?;
+        assert_eq!(resolved_request.status, ApprovalRequestStatus::Approved);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Run scoped command action"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_approval_prompt_delivery_renders_and_sends_prompt() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let approval_request = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-prompt".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Prompt delivery action".to_string(),
+                consequence_summary: "Used to verify Telegram approval prompt delivery."
+                    .to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => {
+                panic!("message fixture should normalize into accepted ingress, got {other:?}")
+            }
+        };
+
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let prompt_delivery = foreground_orchestration::deliver_telegram_approval_prompt(
+            harness::config::ApprovalPromptMode::InlineKeyboardWithFallback,
+            &ingress,
+            &approval_request,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(prompt_delivery.chat_id, 42);
+        assert_eq!(
+            prompt_delivery.approval_request_id,
+            approval_request.approval_request_id
+        );
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert!(
+            delivery.sent_messages()[0]
+                .text
+                .contains("Approval required")
+        );
+        assert!(delivery.sent_messages()[0].reply_markup.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_approval_prompt_builder_renders_inline_keyboard() -> Result<()> {
+    let prompt = telegram::TelegramApprovalPrompt {
+        token: "42".to_string(),
+        title: "Run scoped subprocess".to_string(),
+        consequence_summary: "Writes a bounded file inside the workspace.".to_string(),
+        action_fingerprint: "sha256:abc123".to_string(),
+        risk_tier: GovernedActionRiskTier::Tier2,
+        expires_at: Utc::now() + Duration::minutes(15),
+    };
+    let message = telegram::build_approval_prompt_message(
+        harness::config::ApprovalPromptMode::InlineKeyboardWithFallback,
+        42,
+        Some(7),
+        &prompt,
+    )?;
+    assert!(message.text.contains("Approval required"));
+    assert!(message.reply_markup.is_some());
+    assert_eq!(message.reply_to_message_id, Some(7));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_approval_prompt_builder_falls_back_for_long_tokens() -> Result<()> {
+    let prompt = telegram::TelegramApprovalPrompt {
+        token: "x".repeat(128),
+        title: "Run scoped subprocess".to_string(),
+        consequence_summary: "Writes a bounded file inside the workspace.".to_string(),
+        action_fingerprint: "sha256:abc123".to_string(),
+        risk_tier: GovernedActionRiskTier::Tier2,
+        expires_at: Utc::now() + Duration::minutes(15),
+    };
+    let message = telegram::build_approval_prompt_message(
+        harness::config::ApprovalPromptMode::InlineKeyboardWithFallback,
+        42,
+        None,
+        &prompt,
+    )?;
+    assert_eq!(message.reply_markup, None);
+    assert!(message.text.contains("/approve"));
+    assert!(message.text.contains("/reject"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -2305,6 +2601,7 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
             outcome: "completed".to_string(),
         }],
         retrieved_context: contracts::RetrievedContext::default(),
+        governed_action_observations: Vec::new(),
         recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }
@@ -2489,6 +2786,24 @@ async fn insert_active_memory_artifact(
     .await?;
 
     Ok(())
+}
+
+fn sample_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 30_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 32_768,
+        },
+    }
 }
 
 async fn insert_pending_ingress(

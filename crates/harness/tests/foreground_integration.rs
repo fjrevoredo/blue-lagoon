@@ -1,8 +1,13 @@
 mod support;
 
 use anyhow::Result;
-use contracts::ModelProviderKind;
+use contracts::{
+    ApprovalRequestStatus, CapabilityScope, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
+    FilesystemCapabilityScope, GovernedActionFingerprint, GovernedActionKind,
+    GovernedActionRiskTier, ModelProviderKind, NetworkAccessPosture,
+};
 use harness::{
+    approval::{self, NewApprovalRequestRecord},
     audit,
     config::{
         ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, ResolvedTelegramConfig,
@@ -116,6 +121,124 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
                 .iter()
                 .any(|event| event.event_kind == "foreground_execution_completed")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_callback_fixture_runtime_run_resolves_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-callback".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime callback approval".to_string(),
+                consequence_summary: "Used to verify runtime callback routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_callback.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Runtime callback approval"
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_command_fixture_runtime_run_resolves_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-command".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime command approval".to_string(),
+                consequence_summary: "Used to verify runtime command approval routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_command_approve.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Runtime command approval"
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
         Ok(())
     })
     .await
@@ -433,6 +556,24 @@ async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() 
         Ok(())
     })
     .await
+}
+
+fn sample_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 30_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 32_768,
+        },
+    }
 }
 
 fn sample_telegram_config() -> ResolvedTelegramConfig {

@@ -424,6 +424,32 @@ where
 
         match normalization {
             TelegramNormalizationOutcome::Accepted(ingress) => {
+                if ingress.event_kind == contracts::IngressEventKind::ApprovalCallback {
+                    match foreground_orchestration::orchestrate_telegram_foreground_ingress(
+                        context.pool,
+                        context.config,
+                        context.telegram_config,
+                        context.model_gateway_config,
+                        *ingress,
+                        context.transport,
+                        delivery,
+                    )
+                    .await?
+                    {
+                        TelegramForegroundOrchestrationOutcome::Completed(_)
+                        | TelegramForegroundOrchestrationOutcome::ApprovalResolved(_) => {
+                            summary.completed_count += 1;
+                        }
+                        TelegramForegroundOrchestrationOutcome::Duplicate(_) => {
+                            summary.duplicate_count += 1;
+                        }
+                        TelegramForegroundOrchestrationOutcome::Rejected(_) => {
+                            summary.trigger_rejected_count += 1;
+                        }
+                    }
+                    continue;
+                }
+
                 match foreground::stage_telegram_foreground_ingress(
                     context.pool,
                     context.telegram_config,
@@ -526,7 +552,8 @@ where
         )
         .await?
         {
-            TelegramForegroundOrchestrationOutcome::Completed(_) => {
+            TelegramForegroundOrchestrationOutcome::Completed(_)
+            | TelegramForegroundOrchestrationOutcome::ApprovalResolved(_) => {
                 summary.completed_count += 1;
                 if is_backlog_recovery {
                     summary.backlog_recovery_count += 1;

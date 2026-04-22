@@ -61,10 +61,19 @@ Typical implementation workflow is:
   the architecture-critical background-maintenance integration suite.
 - `cargo test -p runtime --test admin_cli -- --nocapture` to run the runtime
   management CLI surface tests.
+- `cargo test -p runtime --bin runtime -- --nocapture` to run the runtime
+  command-surface unit tests, including the Phase 5 management admin parsers
+  and text formatters.
 - `cargo test -p harness --test management_component -- --nocapture` to run
   the PostgreSQL-backed management CLI component suite.
 - `cargo test -p harness --test management_integration -- --nocapture` to run
   the architecture-critical management CLI integration suite.
+- `cargo test -p harness --test governed_actions_component -- --nocapture` to
+  run the PostgreSQL-backed governed-action component suite for workspace,
+  approvals, capability scoping, and blocked-action diagnostics.
+- `cargo test -p harness --test governed_actions_integration -- --nocapture`
+  to run the governed-action integration suite for proposal, approval,
+  execution, and blocked-action foreground flows.
 - `cargo test --workspace` to run the full repository test surface when a
   broader local check is warranted.
 - `docker compose config` to verify the local runtime topology.
@@ -103,6 +112,19 @@ Typical implementation workflow is:
   background-maintenance job through the focused management surface.
 - `cargo run -p runtime -- admin wake-signals list` to inspect recent
   wake-signal state.
+- `cargo run -p runtime -- admin approvals list` to inspect approval request
+  state without raw SQL.
+- `cargo run -p runtime -- admin approvals resolve --approval-request-id <uuid> --decision <approve|reject>` to
+  resolve one approval request through the canonical approval path when bounded
+  operator intervention is required.
+- `cargo run -p runtime -- admin actions list` to inspect recent governed
+  action execution state, including blocked and approval-gated actions.
+- `cargo run -p runtime -- admin workspace artifacts list` to inspect recent
+  workspace artifact summaries.
+- `cargo run -p runtime -- admin workspace scripts list` to inspect recent
+  workspace script summaries.
+- `cargo run -p runtime -- admin workspace runs list` to inspect recent
+  workspace script run history, optionally filtered by script.
 - `cp config/local.example.toml config/local.toml` to prepare local Telegram
   binding overrides.
 - `cp .env.example .env` to prepare local runtime secrets and env overrides.
