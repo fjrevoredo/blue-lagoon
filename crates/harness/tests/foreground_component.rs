@@ -2601,6 +2601,7 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
             outcome: "completed".to_string(),
         }],
         retrieved_context: contracts::RetrievedContext::default(),
+        governed_action_observations: Vec::new(),
         recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }

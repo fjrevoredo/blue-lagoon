@@ -571,11 +571,214 @@ async fn approval_service_invalidates_mismatched_fingerprint_and_expires_due_req
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn governed_action_execution_runs_bounded_subprocess_and_persists_outcome() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Immediate subprocess".to_string(),
+            rationale: Some("Used to verify bounded subprocess execution.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: execution_capability_scope(),
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action(
+                "phase5",
+            )),
+        };
+
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal,
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned governed action, got {other:?}"),
+        };
+        assert!(!planned.requires_approval);
+
+        let executed =
+            governed_actions::execute_governed_action(&ctx.config, &ctx.pool, &planned.record)
+                .await?;
+        assert_eq!(
+            executed.record.status,
+            contracts::GovernedActionStatus::Executed
+        );
+        assert_eq!(
+            executed.outcome.status,
+            contracts::GovernedActionStatus::Executed
+        );
+        assert!(executed.record.execution_id.is_some());
+        assert!(executed.record.output_ref.is_some());
+
+        let execution_record = harness::execution::get(
+            &ctx.pool,
+            executed
+                .record
+                .execution_id
+                .expect("governed action execution id should be set"),
+        )
+        .await?;
+        assert_eq!(execution_record.status, "completed");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_action_execution_records_workspace_script_runs() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let script_language = if cfg!(windows) { "powershell" } else { "sh" };
+        let script_content = if cfg!(windows) {
+            "Write-Output 'workspace script ok'\n"
+        } else {
+            "printf 'workspace script ok\\n'\n"
+        };
+        let created_script = workspace::create_workspace_script(
+            &ctx.config,
+            &ctx.pool,
+            &NewWorkspaceScript {
+                workspace_script_id: Uuid::now_v7(),
+                workspace_artifact_id: Uuid::now_v7(),
+                workspace_script_version_id: Uuid::now_v7(),
+                trace_id: Some(Uuid::now_v7()),
+                execution_id: None,
+                title: "Governed workspace script".to_string(),
+                metadata: json!({ "source": "component_test" }),
+                language: script_language.to_string(),
+                entrypoint: None,
+                content_text: script_content.to_string(),
+                change_summary: Some("initial".to_string()),
+            },
+        )
+        .await?;
+
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Run workspace script".to_string(),
+            rationale: Some("Used to verify script run history.".to_string()),
+            action_kind: GovernedActionKind::RunWorkspaceScript,
+            requested_risk_tier: None,
+            capability_scope: execution_capability_scope(),
+            payload: contracts::GovernedActionPayload::RunWorkspaceScript(
+                contracts::WorkspaceScriptAction {
+                    script_id: created_script.script.workspace_script_id,
+                    script_version_id: Some(
+                        created_script.initial_version.workspace_script_version_id,
+                    ),
+                    args: Vec::new(),
+                },
+            ),
+        };
+
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal,
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned governed action, got {other:?}"),
+        };
+        assert!(!planned.requires_approval);
+
+        let executed =
+            governed_actions::execute_governed_action(&ctx.config, &ctx.pool, &planned.record)
+                .await?;
+        assert_eq!(
+            executed.record.status,
+            contracts::GovernedActionStatus::Executed
+        );
+        let script_run = executed
+            .script_run
+            .expect("workspace script execution should record a run");
+        assert_eq!(script_run.status, WorkspaceScriptRunStatus::Completed);
+
+        let run_summaries = workspace::list_workspace_script_runs(
+            &ctx.pool,
+            created_script.script.workspace_script_id,
+            10,
+        )
+        .await?;
+        assert_eq!(run_summaries.len(), 1);
+        assert_eq!(run_summaries[0].status, WorkspaceScriptRunStatus::Completed);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_action_execution_blocks_unsupported_network_enabled_backend() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut scope = execution_capability_scope();
+        scope.network = NetworkAccessPosture::Enabled;
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Network subprocess".to_string(),
+            rationale: Some("Used to verify fail-closed backend blocking.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: Some(GovernedActionRiskTier::Tier2),
+            capability_scope: scope,
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action(
+                "phase5",
+            )),
+        };
+
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal,
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected approval-gated governed action, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+
+        let blocked =
+            governed_actions::execute_governed_action(&ctx.config, &ctx.pool, &planned.record)
+                .await?;
+        assert_eq!(
+            blocked.record.status,
+            contracts::GovernedActionStatus::Blocked
+        );
+        assert!(
+            blocked
+                .outcome
+                .summary
+                .contains("network-enabled execution")
+        );
+        Ok(())
+    })
+    .await
+}
+
 fn sample_capability_scope() -> CapabilityScope {
     CapabilityScope {
         filesystem: FilesystemCapabilityScope {
-            read_roots: vec!["D:/Repos/blue-lagoon".to_string()],
-            write_roots: vec!["D:/Repos/blue-lagoon/docs".to_string()],
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: vec![support::workspace_root().join("docs").display().to_string()],
         },
         network: NetworkAccessPosture::Disabled,
         environment: EnvironmentCapabilityScope {
@@ -586,5 +789,46 @@ fn sample_capability_scope() -> CapabilityScope {
             max_stdout_bytes: 65_536,
             max_stderr_bytes: 32_768,
         },
+    }
+}
+
+fn execution_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 30_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 32_768,
+        },
+    }
+}
+
+fn platform_echo_action(message: &str) -> contracts::SubprocessAction {
+    if cfg!(windows) {
+        contracts::SubprocessAction {
+            command: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("Write-Output '{}'", message.replace('\'', "''")),
+            ],
+            working_directory: Some(support::workspace_root().display().to_string()),
+        }
+    } else {
+        contracts::SubprocessAction {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("printf '%s\\n' '{}'", message.replace('\'', "'\\''")),
+            ],
+            working_directory: Some(support::workspace_root().display().to_string()),
+        }
     }
 }

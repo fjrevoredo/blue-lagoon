@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use contracts::{
     CapabilityScope, GovernedActionExecutionOutcome, GovernedActionFingerprint, GovernedActionKind,
-    GovernedActionPayload, GovernedActionProposal, GovernedActionRiskTier, GovernedActionStatus,
-    InspectWorkspaceArtifactAction, NetworkAccessPosture, SubprocessAction, WorkspaceScriptAction,
+    GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
+    GovernedActionRiskTier, GovernedActionStatus, InspectWorkspaceArtifactAction,
+    NetworkAccessPosture, SubprocessAction, WorkspaceScriptAction, WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -15,7 +17,10 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     config::RuntimeConfig,
-    policy,
+    execution, policy, tool_execution,
+    workspace::{
+        self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +70,14 @@ pub struct BlockedGovernedAction {
 pub enum GovernedActionPlanningOutcome {
     Planned(PlannedGovernedAction),
     Blocked(BlockedGovernedAction),
+}
+
+#[derive(Debug, Clone)]
+pub struct GovernedActionExecutionResult {
+    pub record: GovernedActionExecutionRecord,
+    pub outcome: GovernedActionExecutionOutcome,
+    pub observation: GovernedActionObservation,
+    pub script_run: Option<WorkspaceScriptRunRecord>,
 }
 
 pub async fn plan_governed_action(
@@ -232,6 +245,237 @@ pub async fn get_latest_governed_action_execution_by_fingerprint(
     row.map(decode_governed_action_execution_row).transpose()
 }
 
+pub async fn get_governed_action_execution_by_approval_request_id(
+    pool: &PgPool,
+    approval_request_id: Uuid,
+) -> Result<Option<GovernedActionExecutionRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_proposal_id,
+            action_fingerprint,
+            action_kind,
+            risk_tier,
+            status,
+            capability_scope_json,
+            payload_json,
+            workspace_script_id,
+            workspace_script_version_id,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at,
+            created_at,
+            updated_at
+        FROM governed_action_executions
+        WHERE approval_request_id = $1
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(approval_request_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to fetch governed action execution by approval request")?;
+
+    row.map(decode_governed_action_execution_row).transpose()
+}
+
+pub async fn attach_approval_request(
+    pool: &PgPool,
+    governed_action_execution_id: Uuid,
+    approval_request_id: Uuid,
+) -> Result<GovernedActionExecutionRecord> {
+    sqlx::query(
+        r#"
+        UPDATE governed_action_executions
+        SET
+            approval_request_id = $2,
+            updated_at = NOW()
+        WHERE governed_action_execution_id = $1
+        "#,
+    )
+    .bind(governed_action_execution_id)
+    .bind(approval_request_id)
+    .execute(pool)
+    .await
+    .context("failed to attach approval request to governed action execution")?;
+
+    get_governed_action_execution(pool, governed_action_execution_id).await
+}
+
+pub async fn sync_status_from_approval_resolution(
+    pool: &PgPool,
+    governed_action_execution_id: Uuid,
+    decision: contracts::ApprovalResolutionDecision,
+    execution_id: Option<Uuid>,
+    reason: Option<&str>,
+) -> Result<GovernedActionExecutionRecord> {
+    let status = match decision {
+        contracts::ApprovalResolutionDecision::Approved => GovernedActionStatus::Approved,
+        contracts::ApprovalResolutionDecision::Rejected => GovernedActionStatus::Rejected,
+        contracts::ApprovalResolutionDecision::Expired => GovernedActionStatus::Expired,
+        contracts::ApprovalResolutionDecision::Invalidated => GovernedActionStatus::Invalidated,
+    };
+
+    update_governed_action_execution(
+        pool,
+        governed_action_execution_id,
+        status,
+        execution_id,
+        None,
+        reason,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_governed_action(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+) -> Result<GovernedActionExecutionResult> {
+    let proposal = proposal_from_record(record);
+    if let Err(error) = validate_capability_scope(config, &proposal) {
+        let summary = error.to_string();
+        let record = update_governed_action_execution(
+            pool,
+            record.governed_action_execution_id,
+            GovernedActionStatus::Blocked,
+            None,
+            None,
+            Some(&summary),
+            None,
+            None,
+            Some(Utc::now()),
+        )
+        .await?;
+        write_governed_action_audit_event(
+            pool,
+            &record,
+            "governed_action_execution_blocked",
+            "warn",
+            json!({
+                "reason": summary,
+                "phase": "policy_recheck",
+            }),
+        )
+        .await?;
+        let outcome = GovernedActionExecutionOutcome {
+            status: GovernedActionStatus::Blocked,
+            summary,
+            fingerprint: Some(record.action_fingerprint.clone()),
+            output_ref: record.output_ref.clone(),
+        };
+        return Ok(governed_action_execution_result(record, outcome, None));
+    }
+
+    let execution_id = Uuid::now_v7();
+    execution::insert(
+        pool,
+        &execution::NewExecutionRecord {
+            execution_id,
+            trace_id: record.trace_id,
+            trigger_kind: "governed_action".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: json!({
+                "governed_action_execution_id": record.governed_action_execution_id,
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+            }),
+        },
+    )
+    .await?;
+
+    let started_at = Utc::now();
+    let started_record = update_governed_action_execution(
+        pool,
+        record.governed_action_execution_id,
+        record.status,
+        Some(execution_id),
+        None,
+        None,
+        None,
+        Some(started_at),
+        None,
+    )
+    .await?;
+    write_governed_action_audit_event(
+        pool,
+        &started_record,
+        "governed_action_execution_started",
+        "info",
+        json!({
+            "execution_id": execution_id,
+        }),
+    )
+    .await?;
+
+    match &started_record.payload {
+        GovernedActionPayload::RunSubprocess(action) => {
+            execute_subprocess_governed_action(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::RunWorkspaceScript(action) => {
+            execute_workspace_script_governed_action(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::InspectWorkspaceArtifact(_) => {
+            let summary =
+                "workspace inspection execution is not implemented in the first governed backend"
+                    .to_string();
+            let failed_record = update_governed_action_execution(
+                pool,
+                started_record.governed_action_execution_id,
+                GovernedActionStatus::Blocked,
+                Some(execution_id),
+                None,
+                Some(&summary),
+                None,
+                Some(started_at),
+                Some(Utc::now()),
+            )
+            .await?;
+            execution::mark_failed(
+                pool,
+                execution_id,
+                &json!({
+                    "status": "blocked",
+                    "summary": summary,
+                }),
+            )
+            .await?;
+            write_governed_action_audit_event(
+                pool,
+                &failed_record,
+                "governed_action_execution_blocked",
+                "warn",
+                json!({
+                    "reason": summary,
+                    "phase": "backend",
+                }),
+            )
+            .await?;
+            let outcome = GovernedActionExecutionOutcome {
+                status: GovernedActionStatus::Blocked,
+                summary,
+                fingerprint: Some(failed_record.action_fingerprint.clone()),
+                output_ref: failed_record.output_ref.clone(),
+            };
+            Ok(governed_action_execution_result(
+                failed_record,
+                outcome,
+                None,
+            ))
+        }
+    }
+}
+
 pub fn fingerprint_governed_action(
     proposal: &GovernedActionProposal,
 ) -> Result<GovernedActionFingerprint> {
@@ -397,6 +641,646 @@ fn validate_workspace_script_action(action: &WorkspaceScriptAction) -> Result<()
         bail!("workspace script arguments must not be empty");
     }
     Ok(())
+}
+
+async fn execute_subprocess_governed_action(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &SubprocessAction,
+) -> Result<GovernedActionExecutionResult> {
+    let Some(execution_id) = record.execution_id else {
+        bail!("governed subprocess execution requires an attached execution record");
+    };
+    let started_at = record.started_at.unwrap_or_else(Utc::now);
+    let outcome =
+        match tool_execution::execute_bounded_subprocess(config, &record.capability_scope, action)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let summary = error.to_string();
+                execution::mark_failed(
+                    pool,
+                    execution_id,
+                    &json!({
+                        "status": "blocked",
+                        "summary": summary,
+                    }),
+                )
+                .await?;
+                let blocked_record = update_governed_action_execution(
+                    pool,
+                    record.governed_action_execution_id,
+                    GovernedActionStatus::Blocked,
+                    Some(execution_id),
+                    Some(&format!("execution_record:{execution_id}")),
+                    Some(&summary),
+                    None,
+                    Some(started_at),
+                    Some(Utc::now()),
+                )
+                .await?;
+                write_governed_action_audit_event(
+                    pool,
+                    &blocked_record,
+                    "governed_action_execution_blocked",
+                    "warn",
+                    json!({
+                        "reason": summary,
+                        "phase": "backend",
+                    }),
+                )
+                .await?;
+                let execution_outcome = GovernedActionExecutionOutcome {
+                    status: GovernedActionStatus::Blocked,
+                    summary,
+                    fingerprint: Some(blocked_record.action_fingerprint.clone()),
+                    output_ref: blocked_record.output_ref.clone(),
+                };
+                return Ok(governed_action_execution_result(
+                    blocked_record,
+                    execution_outcome,
+                    None,
+                ));
+            }
+        };
+    let completed_at = Utc::now();
+    let output_ref = format!("execution_record:{execution_id}");
+
+    if outcome.timed_out {
+        let summary = format!(
+            "bounded subprocess timed out after {} ms",
+            record.capability_scope.execution.timeout_ms
+        );
+        execution::mark_failed(
+            pool,
+            execution_id,
+            &json!({
+                "status": "timed_out",
+                "summary": summary,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+            }),
+        )
+        .await?;
+        let updated_record = update_governed_action_execution(
+            pool,
+            record.governed_action_execution_id,
+            GovernedActionStatus::Failed,
+            Some(execution_id),
+            Some(&output_ref),
+            Some(&summary),
+            None,
+            Some(started_at),
+            Some(completed_at),
+        )
+        .await?;
+        write_governed_action_audit_event(
+            pool,
+            &updated_record,
+            "governed_action_execution_timed_out",
+            "warn",
+            json!({
+                "stdout_bytes": updated_record.capability_scope.execution.max_stdout_bytes,
+                "stderr_bytes": updated_record.capability_scope.execution.max_stderr_bytes,
+            }),
+        )
+        .await?;
+        let execution_outcome = GovernedActionExecutionOutcome {
+            status: GovernedActionStatus::Failed,
+            summary,
+            fingerprint: Some(updated_record.action_fingerprint.clone()),
+            output_ref: Some(output_ref),
+        };
+        return Ok(governed_action_execution_result(
+            updated_record,
+            execution_outcome,
+            None,
+        ));
+    }
+
+    let success = outcome.exit_code == Some(0);
+    let status = if success {
+        GovernedActionStatus::Executed
+    } else {
+        GovernedActionStatus::Failed
+    };
+    let summary = if success {
+        "bounded subprocess completed successfully".to_string()
+    } else {
+        format!(
+            "bounded subprocess exited with status {}",
+            outcome
+                .exit_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    };
+
+    let response_payload = json!({
+        "status": if success { "completed" } else { "failed" },
+        "summary": summary,
+        "exit_code": outcome.exit_code,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+    });
+    if success {
+        execution::mark_succeeded(pool, execution_id, "governed_action", 0, &response_payload)
+            .await?;
+    } else {
+        execution::mark_failed(pool, execution_id, &response_payload).await?;
+    }
+
+    let updated_record = update_governed_action_execution(
+        pool,
+        record.governed_action_execution_id,
+        status,
+        Some(execution_id),
+        Some(&output_ref),
+        if success { None } else { Some(&summary) },
+        None,
+        Some(started_at),
+        Some(completed_at),
+    )
+    .await?;
+    write_governed_action_audit_event(
+        pool,
+        &updated_record,
+        if success {
+            "governed_action_execution_completed"
+        } else {
+            "governed_action_execution_failed"
+        },
+        if success { "info" } else { "warn" },
+        json!({
+            "exit_code": outcome.exit_code,
+            "stdout_excerpt": outcome.stdout,
+            "stderr_excerpt": outcome.stderr,
+        }),
+    )
+    .await?;
+
+    let execution_outcome = GovernedActionExecutionOutcome {
+        status,
+        summary,
+        fingerprint: Some(updated_record.action_fingerprint.clone()),
+        output_ref: Some(output_ref),
+    };
+    Ok(governed_action_execution_result(
+        updated_record,
+        execution_outcome,
+        None,
+    ))
+}
+
+async fn execute_workspace_script_governed_action(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &WorkspaceScriptAction,
+) -> Result<GovernedActionExecutionResult> {
+    let Some(execution_id) = record.execution_id else {
+        bail!("governed workspace-script execution requires an attached execution record");
+    };
+    let script = workspace::get_workspace_script(pool, action.script_id).await?;
+    let version = match action.script_version_id {
+        Some(version_id) => workspace::get_workspace_script_version(pool, version_id).await?,
+        None => workspace::get_latest_workspace_script_version(pool, action.script_id)
+            .await?
+            .context("workspace script has no canonical versions")?,
+    };
+    if version.workspace_script_id != action.script_id {
+        bail!("workspace script version does not belong to the requested script");
+    }
+
+    let subprocess_action =
+        build_workspace_script_subprocess_action(config, &script, &version, action)?;
+    let script_run_id = Uuid::now_v7();
+    let pending_run = workspace::record_workspace_script_run(
+        pool,
+        &NewWorkspaceScriptRun {
+            workspace_script_run_id: script_run_id,
+            workspace_script_id: script.workspace_script_id,
+            workspace_script_version_id: version.workspace_script_version_id,
+            trace_id: record.trace_id,
+            execution_id: Some(execution_id),
+            governed_action_execution_id: Some(record.governed_action_execution_id),
+            approval_request_id: record.approval_request_id,
+            status: WorkspaceScriptRunStatus::Pending,
+            risk_tier: record.risk_tier,
+            args: action.args.clone(),
+            output_ref: None,
+            failure_summary: None,
+            started_at: None,
+            completed_at: None,
+        },
+    )
+    .await?;
+
+    let started_at = Utc::now();
+    let output_ref = format!("execution_record:{execution_id}");
+    let running_run = workspace::update_workspace_script_run_status(
+        pool,
+        &UpdateWorkspaceScriptRunStatus {
+            workspace_script_run_id: pending_run.workspace_script_run_id,
+            status: WorkspaceScriptRunStatus::Running,
+            output_ref: None,
+            failure_summary: None,
+            started_at: Some(started_at),
+            completed_at: None,
+        },
+    )
+    .await?;
+
+    let subprocess_outcome = match tool_execution::execute_bounded_subprocess(
+        config,
+        &record.capability_scope,
+        &subprocess_action,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let summary = error.to_string();
+            execution::mark_failed(
+                pool,
+                execution_id,
+                &json!({
+                    "status": "blocked",
+                    "summary": summary,
+                    "workspace_script_id": script.workspace_script_id,
+                    "workspace_script_version_id": version.workspace_script_version_id,
+                }),
+            )
+            .await?;
+            let blocked_run = workspace::update_workspace_script_run_status(
+                pool,
+                &UpdateWorkspaceScriptRunStatus {
+                    workspace_script_run_id: running_run.workspace_script_run_id,
+                    status: WorkspaceScriptRunStatus::Blocked,
+                    output_ref: Some(output_ref.clone()),
+                    failure_summary: Some(summary.clone()),
+                    started_at: Some(started_at),
+                    completed_at: Some(Utc::now()),
+                },
+            )
+            .await?;
+            let blocked_record = update_governed_action_execution(
+                pool,
+                record.governed_action_execution_id,
+                GovernedActionStatus::Blocked,
+                Some(execution_id),
+                Some(&output_ref),
+                Some(&summary),
+                None,
+                Some(started_at),
+                Some(Utc::now()),
+            )
+            .await?;
+            write_governed_action_audit_event(
+                pool,
+                &blocked_record,
+                "governed_action_execution_blocked",
+                "warn",
+                json!({
+                    "workspace_script_run_id": blocked_run.workspace_script_run_id,
+                    "reason": summary,
+                    "phase": "backend",
+                }),
+            )
+            .await?;
+            let execution_outcome = GovernedActionExecutionOutcome {
+                status: GovernedActionStatus::Blocked,
+                summary,
+                fingerprint: Some(blocked_record.action_fingerprint.clone()),
+                output_ref: Some(output_ref),
+            };
+            return Ok(governed_action_execution_result(
+                blocked_record,
+                execution_outcome,
+                Some(blocked_run),
+            ));
+        }
+    };
+    let completed_at = Utc::now();
+
+    if subprocess_outcome.timed_out {
+        let summary = format!(
+            "workspace script '{}' timed out after {} ms",
+            script.workspace_script_id, record.capability_scope.execution.timeout_ms
+        );
+        execution::mark_failed(
+            pool,
+            execution_id,
+            &json!({
+                "status": "timed_out",
+                "summary": summary,
+                "workspace_script_id": script.workspace_script_id,
+                "workspace_script_version_id": version.workspace_script_version_id,
+                "stdout": subprocess_outcome.stdout,
+                "stderr": subprocess_outcome.stderr,
+            }),
+        )
+        .await?;
+        let updated_run = workspace::update_workspace_script_run_status(
+            pool,
+            &UpdateWorkspaceScriptRunStatus {
+                workspace_script_run_id: running_run.workspace_script_run_id,
+                status: WorkspaceScriptRunStatus::TimedOut,
+                output_ref: Some(output_ref.clone()),
+                failure_summary: Some(summary.clone()),
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+            },
+        )
+        .await?;
+        let updated_record = update_governed_action_execution(
+            pool,
+            record.governed_action_execution_id,
+            GovernedActionStatus::Failed,
+            Some(execution_id),
+            Some(&output_ref),
+            Some(&summary),
+            None,
+            Some(started_at),
+            Some(completed_at),
+        )
+        .await?;
+        write_governed_action_audit_event(
+            pool,
+            &updated_record,
+            "governed_action_execution_timed_out",
+            "warn",
+            json!({
+                "workspace_script_run_id": updated_run.workspace_script_run_id,
+            }),
+        )
+        .await?;
+        let execution_outcome = GovernedActionExecutionOutcome {
+            status: GovernedActionStatus::Failed,
+            summary,
+            fingerprint: Some(updated_record.action_fingerprint.clone()),
+            output_ref: Some(output_ref),
+        };
+        return Ok(governed_action_execution_result(
+            updated_record,
+            execution_outcome,
+            Some(updated_run),
+        ));
+    }
+
+    let success = subprocess_outcome.exit_code == Some(0);
+    let governed_status = if success {
+        GovernedActionStatus::Executed
+    } else {
+        GovernedActionStatus::Failed
+    };
+    let run_status = if success {
+        WorkspaceScriptRunStatus::Completed
+    } else {
+        WorkspaceScriptRunStatus::Failed
+    };
+    let summary = if success {
+        format!(
+            "workspace script '{}' completed successfully",
+            script.workspace_script_id
+        )
+    } else {
+        format!(
+            "workspace script '{}' exited with status {}",
+            script.workspace_script_id,
+            subprocess_outcome
+                .exit_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    };
+
+    let response_payload = json!({
+        "status": if success { "completed" } else { "failed" },
+        "summary": summary,
+        "workspace_script_id": script.workspace_script_id,
+        "workspace_script_version_id": version.workspace_script_version_id,
+        "exit_code": subprocess_outcome.exit_code,
+        "stdout": subprocess_outcome.stdout,
+        "stderr": subprocess_outcome.stderr,
+    });
+    if success {
+        execution::mark_succeeded(pool, execution_id, "governed_action", 0, &response_payload)
+            .await?;
+    } else {
+        execution::mark_failed(pool, execution_id, &response_payload).await?;
+    }
+
+    let updated_run = workspace::update_workspace_script_run_status(
+        pool,
+        &UpdateWorkspaceScriptRunStatus {
+            workspace_script_run_id: running_run.workspace_script_run_id,
+            status: run_status,
+            output_ref: Some(output_ref.clone()),
+            failure_summary: if success { None } else { Some(summary.clone()) },
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+        },
+    )
+    .await?;
+    let updated_record = update_governed_action_execution(
+        pool,
+        record.governed_action_execution_id,
+        governed_status,
+        Some(execution_id),
+        Some(&output_ref),
+        if success { None } else { Some(&summary) },
+        None,
+        Some(started_at),
+        Some(completed_at),
+    )
+    .await?;
+    write_governed_action_audit_event(
+        pool,
+        &updated_record,
+        if success {
+            "governed_action_execution_completed"
+        } else {
+            "governed_action_execution_failed"
+        },
+        if success { "info" } else { "warn" },
+        json!({
+            "workspace_script_run_id": updated_run.workspace_script_run_id,
+            "workspace_script_id": script.workspace_script_id,
+            "workspace_script_version_id": version.workspace_script_version_id,
+            "exit_code": subprocess_outcome.exit_code,
+        }),
+    )
+    .await?;
+
+    let execution_outcome = GovernedActionExecutionOutcome {
+        status: governed_status,
+        summary,
+        fingerprint: Some(updated_record.action_fingerprint.clone()),
+        output_ref: Some(output_ref),
+    };
+    Ok(governed_action_execution_result(
+        updated_record,
+        execution_outcome,
+        Some(updated_run),
+    ))
+}
+
+fn build_workspace_script_subprocess_action(
+    config: &RuntimeConfig,
+    script: &workspace::WorkspaceScriptRecord,
+    version: &workspace::WorkspaceScriptVersionRecord,
+    action: &WorkspaceScriptAction,
+) -> Result<SubprocessAction> {
+    let workspace_root = config.workspace.root_dir.display().to_string();
+    match script.language.to_ascii_lowercase().as_str() {
+        "powershell" | "pwsh" => Ok(SubprocessAction {
+            command: if script.language.eq_ignore_ascii_case("pwsh") {
+                "pwsh".to_string()
+            } else {
+                "powershell".to_string()
+            },
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                version.content_text.clone(),
+            ]
+            .into_iter()
+            .chain(action.args.iter().cloned())
+            .collect(),
+            working_directory: Some(workspace_root),
+        }),
+        "sh" | "bash" => Ok(SubprocessAction {
+            command: if script.language.eq_ignore_ascii_case("bash") {
+                "bash".to_string()
+            } else {
+                "sh".to_string()
+            },
+            args: vec!["-c".to_string(), version.content_text.clone()]
+                .into_iter()
+                .chain(action.args.iter().cloned())
+                .collect(),
+            working_directory: Some(workspace_root),
+        }),
+        "python" => Ok(SubprocessAction {
+            command: "python".to_string(),
+            args: vec!["-c".to_string(), version.content_text.clone()]
+                .into_iter()
+                .chain(action.args.iter().cloned())
+                .collect(),
+            working_directory: Some(workspace_root),
+        }),
+        other => bail!(
+            "workspace script language '{other}' is not supported by the first governed backend"
+        ),
+    }
+}
+
+fn proposal_from_record(record: &GovernedActionExecutionRecord) -> GovernedActionProposal {
+    GovernedActionProposal {
+        proposal_id: record.action_proposal_id,
+        title: format!(
+            "{}:{}",
+            governed_action_kind_as_str(record.action_kind),
+            record.governed_action_execution_id
+        ),
+        rationale: record.blocked_reason.clone(),
+        action_kind: record.action_kind,
+        requested_risk_tier: Some(record.risk_tier),
+        capability_scope: record.capability_scope.clone(),
+        payload: record.payload.clone(),
+    }
+}
+
+fn governed_action_execution_result(
+    record: GovernedActionExecutionRecord,
+    outcome: GovernedActionExecutionOutcome,
+    script_run: Option<WorkspaceScriptRunRecord>,
+) -> GovernedActionExecutionResult {
+    GovernedActionExecutionResult {
+        observation: GovernedActionObservation {
+            observation_id: Uuid::now_v7(),
+            action_kind: record.action_kind,
+            outcome: outcome.clone(),
+        },
+        record,
+        outcome,
+        script_run,
+    }
+}
+
+async fn update_governed_action_execution(
+    pool: &PgPool,
+    governed_action_execution_id: Uuid,
+    status: GovernedActionStatus,
+    execution_id: Option<Uuid>,
+    output_ref: Option<&str>,
+    blocked_reason: Option<&str>,
+    approval_request_id: Option<Uuid>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<GovernedActionExecutionRecord> {
+    sqlx::query(
+        r#"
+        UPDATE governed_action_executions
+        SET
+            status = $2,
+            execution_id = COALESCE($3, execution_id),
+            approval_request_id = COALESCE($4, approval_request_id),
+            output_ref = COALESCE($5, output_ref),
+            blocked_reason = $6,
+            started_at = COALESCE($7, started_at),
+            completed_at = $8,
+            updated_at = NOW()
+        WHERE governed_action_execution_id = $1
+        "#,
+    )
+    .bind(governed_action_execution_id)
+    .bind(governed_action_status_as_str(status))
+    .bind(execution_id)
+    .bind(approval_request_id)
+    .bind(output_ref)
+    .bind(blocked_reason)
+    .bind(started_at)
+    .bind(completed_at)
+    .execute(pool)
+    .await
+    .context("failed to update governed action execution")?;
+
+    get_governed_action_execution(pool, governed_action_execution_id).await
+}
+
+async fn write_governed_action_audit_event(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    event_kind: &str,
+    severity: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "governed_actions".to_string(),
+            event_kind: event_kind.to_string(),
+            severity: severity.to_string(),
+            trace_id: record.trace_id,
+            execution_id: record.execution_id,
+            worker_pid: None,
+            payload: json!({
+                "governed_action_execution_id": record.governed_action_execution_id,
+                "action_fingerprint": record.action_fingerprint.value,
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+                "status": governed_action_status_as_str(record.status),
+                "details": payload,
+            }),
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn persist_governed_action_execution(

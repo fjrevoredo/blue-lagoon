@@ -178,7 +178,7 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
             },
         },
         workspace: harness::config::WorkspaceConfig {
-            root_dir: ".".into(),
+            root_dir: workspace_root(),
             max_artifact_bytes: 1_048_576,
             max_script_bytes: 262_144,
         },

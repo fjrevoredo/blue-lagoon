@@ -23,6 +23,7 @@ pub mod runtime;
 pub mod schema;
 pub mod self_model;
 pub mod telegram;
+pub mod tool_execution;
 pub mod trace;
 pub mod worker;
 pub mod workspace;

@@ -369,6 +369,7 @@ pub struct ConsciousContext {
     pub internal_state: InternalStateSnapshot,
     pub recent_history: Vec<EpisodeExcerpt>,
     pub retrieved_context: RetrievedContext,
+    pub governed_action_observations: Vec<GovernedActionObservation>,
     pub recovery_context: ForegroundRecoveryContext,
 }
 
@@ -1239,6 +1240,7 @@ mod tests {
                     }),
                 ],
             },
+            governed_action_observations: Vec::new(),
             recovery_context: ForegroundRecoveryContext {
                 mode: ForegroundExecutionMode::BacklogRecovery,
                 ordered_ingress: vec![

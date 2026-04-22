@@ -3,7 +3,7 @@
 ## Phase 5 Detailed Implementation Plan
 
 Date: 2026-04-21
-Status: In progress; Milestone A and Milestone B completed and Milestone C active
+Status: In progress; Milestone A, Milestone B, and Milestone C completed and Milestone D active
 Scope: High-level plan Phase 5 only
 Audience: LLM-assisted implementation work and human review
 
@@ -407,13 +407,13 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone C`
-- Current active task: `P5-10`
-- Completed tasks: `9/20`
+- Current milestone: `Milestone D`
+- Current active task: `P5-15`
+- Completed tasks: `14/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
-- Milestone C status: `IN PROGRESS`
-- Milestone D status: `TODO`
+- Milestone C status: `DONE`
+- Milestone D status: `IN PROGRESS`
 
 Repository sequencing note:
 
@@ -765,7 +765,7 @@ Milestone D is green only if:
 
 ### Task P5-10: Implement bounded subprocess execution with capability scoping
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-03`, `P5-05`, `P5-08`
 - Parallel-safe: no
 - Deliverables:
@@ -779,11 +779,21 @@ Milestone D is green only if:
   - targeted unit tests for capability validation and timeout handling
   - `cargo test -p harness --test governed_actions_component -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/tool_execution.rs`
+  - `crates/harness/src/governed_actions.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - implemented harness-owned bounded subprocess execution with canonical
+    workspace-root enforcement, filesystem-scope validation, fail-closed
+    network rejection, scoped environment handling, timeout termination, and
+    bounded stdout/stderr capture
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
 
 ### Task P5-11: Integrate conscious-loop tool proposals with harness-owned execution orchestration
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-08`, `P5-09`, `P5-10`
 - Parallel-safe: no
 - Deliverables:
@@ -798,11 +808,25 @@ Milestone D is green only if:
   - `cargo test -p workers -- --nocapture`
   - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/contracts/src/lib.rs`
+  - `crates/harness/src/context.rs`
+  - `crates/harness/src/foreground_orchestration.rs`
+  - `crates/workers/src/main.rs`
+  - `crates/workers/tests/conscious_worker_cli.rs`
+  - `crates/harness/tests/governed_actions_integration.rs`
+  - implemented conscious-worker governed-action proposal parsing, stripped
+    proposal-block handling, observation feedback into follow-up turns, and
+    harness orchestration that routes actions into immediate execution,
+    approval-gated execution, or blocked observations
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p workers -- --nocapture`
+  - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 
 ### Task P5-12: Implement workspace script artifact creation, versioning, and retrieval
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-06`, `P5-05`
 - Parallel-safe: yes
 - Deliverables:
@@ -814,11 +838,19 @@ Milestone D is green only if:
 - Verification:
   - `cargo test -p harness --test governed_actions_component -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/workspace.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - implemented canonical workspace script artifacts, script version
+    append/read flows, latest-version resolution, and operator-readable script
+    version summaries used by governed execution
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
 
 ### Task P5-13: Implement governed script execution and run history
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-10`, `P5-12`
 - Parallel-safe: no
 - Deliverables:
@@ -831,11 +863,21 @@ Milestone D is green only if:
   - `cargo test -p harness --test governed_actions_component -- --nocapture`
   - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/governed_actions.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - `crates/harness/tests/governed_actions_integration.rs`
+  - implemented governed workspace-script execution via the same bounded
+    subprocess path, durable `workspace_script_runs` state transitions, and
+    script-run linkage to governed-action execution records
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
+  - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 
 ### Task P5-14: Implement policy re-check, invalidation, and blocked-execution outcomes
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-07`, `P5-08`, `P5-10`
 - Parallel-safe: no
 - Deliverables:
@@ -848,7 +890,18 @@ Milestone D is green only if:
   - unit tests for policy re-check failures and invalidation cases
   - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 - Evidence:
-  - not started
+  - `crates/harness/src/governed_actions.rs`
+  - `crates/harness/src/tool_execution.rs`
+  - `crates/harness/tests/governed_actions_component.rs`
+  - `crates/harness/tests/governed_actions_integration.rs`
+  - implemented immediate policy re-check before execution, approval-linked
+    status synchronization, blocked-outcome persistence for unsupported or
+    denied execution contexts, and trace-linked execution audit events
+  - `cargo fmt --all`
+  - `cargo check --workspace`
+  - `cargo test --workspace --lib -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
+  - `cargo test -p harness --test governed_actions_integration -- --nocapture`
 
 ### Task P5-15: Extend harness management services for workspace, approvals, and governed actions
 
