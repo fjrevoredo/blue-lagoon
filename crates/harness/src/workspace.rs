@@ -883,6 +883,78 @@ pub async fn list_workspace_script_runs(
         .collect()
 }
 
+pub async fn list_workspace_script_run_records(
+    pool: &PgPool,
+    workspace_script_id: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<WorkspaceScriptRunRecord>> {
+    let rows = if let Some(workspace_script_id) = workspace_script_id {
+        sqlx::query(
+            r#"
+            SELECT
+                workspace_script_run_id,
+                workspace_script_id,
+                workspace_script_version_id,
+                trace_id,
+                execution_id,
+                governed_action_execution_id,
+                approval_request_id,
+                status,
+                risk_tier,
+                args_json,
+                output_ref,
+                failure_summary,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM workspace_script_runs
+            WHERE workspace_script_id = $1
+            ORDER BY created_at DESC, workspace_script_run_id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(workspace_script_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("failed to list workspace script run records for script")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT
+                workspace_script_run_id,
+                workspace_script_id,
+                workspace_script_version_id,
+                trace_id,
+                execution_id,
+                governed_action_execution_id,
+                approval_request_id,
+                status,
+                risk_tier,
+                args_json,
+                output_ref,
+                failure_summary,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM workspace_script_runs
+            ORDER BY created_at DESC, workspace_script_run_id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("failed to list workspace script run records")?
+    };
+
+    rows.into_iter()
+        .map(decode_workspace_script_run_row)
+        .collect()
+}
+
 fn decode_workspace_artifact_row(row: sqlx::postgres::PgRow) -> Result<WorkspaceArtifactRecord> {
     Ok(WorkspaceArtifactRecord {
         workspace_artifact_id: row.get("workspace_artifact_id"),

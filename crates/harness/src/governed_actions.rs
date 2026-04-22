@@ -285,6 +285,84 @@ pub async fn get_governed_action_execution_by_approval_request_id(
     row.map(decode_governed_action_execution_row).transpose()
 }
 
+pub async fn list_governed_action_executions(
+    pool: &PgPool,
+    status: Option<GovernedActionStatus>,
+    limit: i64,
+) -> Result<Vec<GovernedActionExecutionRecord>> {
+    let rows = if let Some(status) = status {
+        sqlx::query(
+            r#"
+            SELECT
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM governed_action_executions
+            WHERE status = $1
+            ORDER BY created_at DESC, governed_action_execution_id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(governed_action_status_as_str(status))
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("failed to list governed action executions by status")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at,
+                created_at,
+                updated_at
+            FROM governed_action_executions
+            ORDER BY created_at DESC, governed_action_execution_id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("failed to list governed action executions")?
+    };
+
+    rows.into_iter()
+        .map(decode_governed_action_execution_row)
+        .collect()
+}
+
 pub async fn attach_approval_request(
     pool: &PgPool,
     governed_action_execution_id: Uuid,

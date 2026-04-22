@@ -20,6 +20,9 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("foreground"))
         .stdout(predicate::str::contains("background"))
+        .stdout(predicate::str::contains("approvals"))
+        .stdout(predicate::str::contains("actions"))
+        .stdout(predicate::str::contains("workspace"))
         .stdout(predicate::str::contains("wake-signals"));
     Ok(())
 }
@@ -38,6 +41,43 @@ fn admin_background_enqueue_help_lists_operator_arguments() -> Result<()> {
         .stdout(predicate::str::contains("--job-kind"))
         .stdout(predicate::str::contains("--trigger-kind"))
         .stdout(predicate::str::contains("--conversation-ref"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_approvals_resolve_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("approvals")
+        .arg("resolve")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--approval-request-id"))
+        .stdout(predicate::str::contains("--decision"))
+        .stdout(predicate::str::contains("--actor-ref"))
+        .stdout(predicate::str::contains("--reason"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_workspace_runs_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("workspace")
+        .arg("runs")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--script-id"))
+        .stdout(predicate::str::contains("--limit"))
         .stdout(predicate::str::contains("--json"));
     Ok(())
 }

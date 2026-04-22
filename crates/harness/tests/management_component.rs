@@ -2,15 +2,21 @@ mod support;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use contracts::{ChannelKind, IngressEventKind, NormalizedIngress};
+use contracts::{
+    CapabilityScope, ChannelKind, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
+    FilesystemCapabilityScope, GovernedActionKind, GovernedActionRiskTier, IngressEventKind,
+    NetworkAccessPosture, NormalizedIngress, WorkspaceArtifactKind, WorkspaceScriptRunStatus,
+};
 use harness::{
+    approval::{self, NewApprovalRequestRecord},
     background::{
         self, BackgroundJobRunStatus, BackgroundJobStatus, NewBackgroundJob, NewBackgroundJobRun,
         NewWakeSignalRecord, WakeSignalStatus,
     },
     execution::{self, NewExecutionRecord},
     foreground::{self, NewIngressEvent},
-    management,
+    governed_actions, management,
+    workspace::{self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun},
 };
 use serde_json::json;
 use serial_test::serial;
@@ -164,6 +170,200 @@ async fn background_and_wake_signal_lists_surface_recent_operator_state() -> Res
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn phase_five_management_surfaces_workspace_approvals_and_actions() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let note_id = Uuid::now_v7();
+        workspace::create_workspace_artifact(
+            &ctx.config,
+            &ctx.pool,
+            &NewWorkspaceArtifact {
+                workspace_artifact_id: note_id,
+                trace_id: Some(Uuid::now_v7()),
+                execution_id: None,
+                artifact_kind: WorkspaceArtifactKind::Note,
+                title: "Operator note".to_string(),
+                content_text: Some("Phase 5 management coverage".to_string()),
+                metadata: json!({ "source": "management_component" }),
+            },
+        )
+        .await?;
+
+        let script_artifact_id = Uuid::now_v7();
+        let script_id = Uuid::now_v7();
+        let script_version_id = Uuid::now_v7();
+        workspace::create_workspace_script(
+            &ctx.config,
+            &ctx.pool,
+            &NewWorkspaceScript {
+                workspace_script_id: script_id,
+                workspace_artifact_id: script_artifact_id,
+                workspace_script_version_id: script_version_id,
+                trace_id: Some(Uuid::now_v7()),
+                execution_id: None,
+                title: "Management verification script".to_string(),
+                metadata: json!({ "source": "management_component" }),
+                language: "python".to_string(),
+                entrypoint: Some("main.py".to_string()),
+                content_text: "print('ok')\n".to_string(),
+                change_summary: Some("initial version".to_string()),
+            },
+        )
+        .await?;
+
+        workspace::record_workspace_script_run(
+            &ctx.pool,
+            &NewWorkspaceScriptRun {
+                workspace_script_run_id: Uuid::now_v7(),
+                workspace_script_id: script_id,
+                workspace_script_version_id: script_version_id,
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                status: WorkspaceScriptRunStatus::Completed,
+                risk_tier: GovernedActionRiskTier::Tier1,
+                args: vec!["--check".to_string()],
+                output_ref: Some("workspace://runs/check-1".to_string()),
+                failure_summary: None,
+                started_at: Some(Utc::now() - Duration::seconds(3)),
+                completed_at: Some(Utc::now()),
+            },
+        )
+        .await?;
+
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Approval-gated subprocess".to_string(),
+            rationale: Some("Used to verify management listings.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: approval_required_scope(),
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("ok")),
+        };
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: proposal.clone(),
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected approval-gated action, got {other:?}"),
+        };
+        let approval_request = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: proposal.title,
+                consequence_summary: "Used to verify pending approval management surfaces."
+                    .to_string(),
+                capability_scope: proposal.capability_scope,
+                requested_by: "telegram:primary-user".to_string(),
+                token: "management-approval".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+
+        let blocked = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Blocked subprocess".to_string(),
+                    rationale: Some("Used to verify blocked management listings.".to_string()),
+                    action_kind: GovernedActionKind::RunSubprocess,
+                    requested_risk_tier: None,
+                    capability_scope: blocked_scope(),
+                    payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action(
+                        "blocked",
+                    )),
+                },
+            },
+        )
+        .await?;
+        assert!(matches!(
+            blocked,
+            governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+        ));
+
+        let status = management::load_runtime_status(&ctx.config).await?;
+        assert_eq!(status.pending_work.pending_approval_request_count, 1);
+        assert_eq!(
+            status.pending_work.awaiting_approval_governed_action_count,
+            1
+        );
+        assert_eq!(status.pending_work.blocked_governed_action_count, 1);
+
+        let approvals = management::list_approval_requests(&ctx.config, None, 10).await?;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(
+            approvals[0].approval_request_id,
+            approval_request.approval_request_id
+        );
+        assert_eq!(approvals[0].status, "pending");
+
+        let actions = management::list_governed_actions(&ctx.config, None, 10).await?;
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.status == "awaiting_approval")
+        );
+        assert!(actions.iter().any(|action| action.status == "blocked"));
+
+        let artifacts = management::list_workspace_artifact_summaries(&ctx.config, 10).await?;
+        assert_eq!(artifacts.len(), 2);
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == note_id)
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == script_artifact_id)
+        );
+
+        let scripts = management::list_workspace_scripts(&ctx.config, 10).await?;
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].script_id, script_id);
+
+        let runs = management::list_workspace_script_runs(&ctx.config, None, 10).await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workspace_script_id, script_id);
+        assert_eq!(runs[0].status, "completed");
+
+        Ok(())
+    })
+    .await
+}
+
 fn sample_ingress(
     external_event_id: String,
     internal_conversation_ref: &str,
@@ -226,4 +426,64 @@ async fn seed_execution(pool: &sqlx::PgPool, trace_id: Uuid) -> Result<Uuid> {
     )
     .await?;
     Ok(execution_id)
+}
+
+fn immediate_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 30_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 32_768,
+        },
+    }
+}
+
+fn approval_required_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![support::workspace_root().display().to_string()],
+            write_roots: vec![support::workspace_root().join("docs").display().to_string()],
+        },
+        ..immediate_scope()
+    }
+}
+
+fn blocked_scope() -> CapabilityScope {
+    CapabilityScope {
+        environment: EnvironmentCapabilityScope {
+            allow_variables: vec!["HOME".to_string()],
+        },
+        ..approval_required_scope()
+    }
+}
+
+fn platform_echo_action(message: &str) -> contracts::SubprocessAction {
+    if cfg!(windows) {
+        contracts::SubprocessAction {
+            command: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("Write-Output '{}'", message.replace('\'', "''")),
+            ],
+            working_directory: Some(support::workspace_root().display().to_string()),
+        }
+    } else {
+        contracts::SubprocessAction {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("printf '%s\\n' '{}'", message.replace('\'', "'\\''")),
+            ],
+            working_directory: Some(support::workspace_root().display().to_string()),
+        }
+    }
 }

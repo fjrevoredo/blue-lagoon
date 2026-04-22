@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{BackgroundTrigger, BackgroundTriggerKind, UnconsciousJobKind};
 use serde::Serialize;
@@ -8,12 +8,12 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    background_execution,
+    approval, background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     config::RuntimeConfig,
-    db, migration, model_gateway,
+    db, governed_actions, migration, model_gateway,
     schema::{self, SchemaCompatibility, SchemaPolicy},
-    worker,
+    worker, workspace,
 };
 
 const DEFAULT_LIST_LIMIT: u32 = 20;
@@ -83,6 +83,9 @@ pub struct PendingWorkSummary {
     pub pending_background_job_count: u32,
     pub due_background_job_count: u32,
     pub pending_wake_signal_count: u32,
+    pub pending_approval_request_count: u32,
+    pub awaiting_approval_governed_action_count: u32,
+    pub blocked_governed_action_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +129,79 @@ pub struct WakeSignalSummary {
     pub decision_kind: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub reviewed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalRequestSummary {
+    pub approval_request_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub action_proposal_id: Uuid,
+    pub action_fingerprint: String,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub capability_scope: contracts::CapabilityScope,
+    pub status: String,
+    pub title: String,
+    pub consequence_summary: String,
+    pub requested_by: String,
+    pub requested_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution_kind: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GovernedActionSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_proposal_id: Uuid,
+    pub action_fingerprint: String,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub workspace_script_id: Option<Uuid>,
+    pub workspace_script_version_id: Option<Uuid>,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceScriptRunSummary {
+    pub workspace_script_run_id: Uuid,
+    pub workspace_script_id: Uuid,
+    pub workspace_script_version_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub governed_action_execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub status: String,
+    pub risk_tier: String,
+    pub args: Vec<String>,
+    pub output_ref: Option<String>,
+    pub failure_summary: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveApprovalRequest {
+    pub approval_request_id: Uuid,
+    pub decision: contracts::ApprovalResolutionDecision,
+    pub actor_ref: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalResolutionSummary {
+    pub approval_request: ApprovalRequestSummary,
+    pub governed_action: Option<GovernedActionSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +515,127 @@ pub async fn list_wake_signals(
         .collect())
 }
 
+pub async fn list_approval_requests(
+    config: &RuntimeConfig,
+    status: Option<contracts::ApprovalRequestStatus>,
+    limit: u32,
+) -> Result<Vec<ApprovalRequestSummary>> {
+    let pool = db::connect(config).await?;
+    approval::list_approval_requests(&pool, status, i64::from(limit))
+        .await?
+        .into_iter()
+        .map(|record| Ok(approval_request_summary(&record)))
+        .collect()
+}
+
+pub async fn resolve_approval_request(
+    config: &RuntimeConfig,
+    request: ResolveApprovalRequest,
+) -> Result<ApprovalResolutionSummary> {
+    if !config.approvals.allow_cli_resolution {
+        bail!("CLI approval resolution is disabled by configuration");
+    }
+
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let approval_request =
+        approval::get_approval_request(&pool, request.approval_request_id).await?;
+    let actor_ref = request
+        .actor_ref
+        .unwrap_or_else(|| default_cli_actor_ref(&approval_request.requested_by));
+    let resolution = approval::resolve_approval_request(
+        &pool,
+        &approval::ApprovalResolutionAttempt {
+            token: approval_request.token.clone(),
+            actor_ref,
+            expected_action_fingerprint: approval_request.action_fingerprint.clone(),
+            decision: request.decision,
+            reason: request.reason,
+            resolved_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    let governed_action =
+        match governed_actions::get_governed_action_execution_by_approval_request_id(
+            &pool,
+            resolution.request.approval_request_id,
+        )
+        .await?
+        {
+            Some(record) => {
+                let synced = governed_actions::sync_status_from_approval_resolution(
+                    &pool,
+                    record.governed_action_execution_id,
+                    resolution.event.decision,
+                    resolution.request.execution_id,
+                    resolution.event.reason.as_deref(),
+                )
+                .await?;
+
+                let record = if resolution.event.decision
+                    == contracts::ApprovalResolutionDecision::Approved
+                {
+                    governed_actions::execute_governed_action(config, &pool, &synced)
+                        .await?
+                        .record
+                } else {
+                    synced
+                };
+                Some(governed_action_summary(&record))
+            }
+            None => None,
+        };
+
+    Ok(ApprovalResolutionSummary {
+        approval_request: approval_request_summary(&resolution.request),
+        governed_action,
+    })
+}
+
+pub async fn list_governed_actions(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<GovernedActionSummary>> {
+    let pool = db::connect(config).await?;
+    governed_actions::list_governed_action_executions(&pool, status, i64::from(limit))
+        .await?
+        .into_iter()
+        .map(|record| Ok(governed_action_summary(&record)))
+        .collect()
+}
+
+pub async fn list_workspace_artifact_summaries(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<contracts::WorkspaceArtifactSummary>> {
+    let pool = db::connect(config).await?;
+    workspace::list_workspace_artifact_summaries(&pool, i64::from(limit)).await
+}
+
+pub async fn list_workspace_scripts(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<contracts::WorkspaceScriptSummary>> {
+    let pool = db::connect(config).await?;
+    workspace::list_workspace_scripts(&pool, i64::from(limit)).await
+}
+
+pub async fn list_workspace_script_runs(
+    config: &RuntimeConfig,
+    workspace_script_id: Option<Uuid>,
+    limit: u32,
+) -> Result<Vec<WorkspaceScriptRunSummary>> {
+    let pool = db::connect(config).await?;
+    workspace::list_workspace_script_run_records(&pool, workspace_script_id, i64::from(limit))
+        .await?
+        .into_iter()
+        .map(|record| Ok(workspace_script_run_summary(&record)))
+        .collect()
+}
+
 pub fn default_list_limit() -> u32 {
     DEFAULT_LIST_LIMIT
 }
@@ -647,13 +844,188 @@ async fn load_pending_work_summary(
     .fetch_one(pool)
     .await
     .context("failed to count pending wake signals")?;
+    let pending_approval_request_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM approval_requests
+        WHERE status = 'pending'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count pending approval requests")?;
+    let awaiting_approval_governed_action_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM governed_action_executions
+        WHERE status = 'awaiting_approval'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count awaiting approval governed actions")?;
+    let blocked_governed_action_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM governed_action_executions
+        WHERE status = 'blocked'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count blocked governed actions")?;
 
     Ok(PendingWorkSummary {
         pending_foreground_conversation_count: pending_foreground_conversation_count as usize,
         pending_background_job_count: pending_background_job_count as u32,
         due_background_job_count: due_background_job_count as u32,
         pending_wake_signal_count: pending_wake_signal_count as u32,
+        pending_approval_request_count: pending_approval_request_count as u32,
+        awaiting_approval_governed_action_count: awaiting_approval_governed_action_count as u32,
+        blocked_governed_action_count: blocked_governed_action_count as u32,
     })
+}
+
+fn approval_request_summary(record: &approval::ApprovalRequestRecord) -> ApprovalRequestSummary {
+    ApprovalRequestSummary {
+        approval_request_id: record.approval_request_id,
+        trace_id: record.trace_id,
+        execution_id: record.execution_id,
+        action_proposal_id: record.action_proposal_id,
+        action_fingerprint: record.action_fingerprint.value.clone(),
+        action_kind: governed_action_kind_label(record.action_kind),
+        risk_tier: governed_action_risk_tier_label(record.risk_tier),
+        capability_scope: record.capability_scope.clone(),
+        status: approval_request_status_label(record.status),
+        title: record.title.clone(),
+        consequence_summary: record.consequence_summary.clone(),
+        requested_by: record.requested_by.clone(),
+        requested_at: record.requested_at,
+        expires_at: record.expires_at,
+        resolved_at: record.resolved_at,
+        resolution_kind: record
+            .resolution_kind
+            .map(approval_resolution_decision_label),
+        resolved_by: record.resolved_by.clone(),
+        resolution_reason: record.resolution_reason.clone(),
+    }
+}
+
+fn governed_action_summary(
+    record: &governed_actions::GovernedActionExecutionRecord,
+) -> GovernedActionSummary {
+    GovernedActionSummary {
+        governed_action_execution_id: record.governed_action_execution_id,
+        trace_id: record.trace_id,
+        execution_id: record.execution_id,
+        approval_request_id: record.approval_request_id,
+        action_proposal_id: record.action_proposal_id,
+        action_fingerprint: record.action_fingerprint.value.clone(),
+        action_kind: governed_action_kind_label(record.action_kind),
+        risk_tier: governed_action_risk_tier_label(record.risk_tier),
+        status: governed_action_status_label(record.status),
+        workspace_script_id: record.workspace_script_id,
+        workspace_script_version_id: record.workspace_script_version_id,
+        blocked_reason: record.blocked_reason.clone(),
+        output_ref: record.output_ref.clone(),
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    }
+}
+
+fn workspace_script_run_summary(
+    record: &workspace::WorkspaceScriptRunRecord,
+) -> WorkspaceScriptRunSummary {
+    WorkspaceScriptRunSummary {
+        workspace_script_run_id: record.workspace_script_run_id,
+        workspace_script_id: record.workspace_script_id,
+        workspace_script_version_id: record.workspace_script_version_id,
+        trace_id: record.trace_id,
+        execution_id: record.execution_id,
+        governed_action_execution_id: record.governed_action_execution_id,
+        approval_request_id: record.approval_request_id,
+        status: workspace_script_run_status_label(record.status),
+        risk_tier: governed_action_risk_tier_label(record.risk_tier),
+        args: record.args.clone(),
+        output_ref: record.output_ref.clone(),
+        failure_summary: record.failure_summary.clone(),
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    }
+}
+
+fn default_cli_actor_ref(requested_by: &str) -> String {
+    match requested_by.split_once(':') {
+        Some((_, principal)) if !principal.trim().is_empty() => format!("cli:{principal}"),
+        _ => "cli:operator".to_string(),
+    }
+}
+
+fn approval_request_status_label(status: contracts::ApprovalRequestStatus) -> String {
+    match status {
+        contracts::ApprovalRequestStatus::Pending => "pending",
+        contracts::ApprovalRequestStatus::Approved => "approved",
+        contracts::ApprovalRequestStatus::Rejected => "rejected",
+        contracts::ApprovalRequestStatus::Expired => "expired",
+        contracts::ApprovalRequestStatus::Invalidated => "invalidated",
+    }
+    .to_string()
+}
+
+fn approval_resolution_decision_label(decision: contracts::ApprovalResolutionDecision) -> String {
+    match decision {
+        contracts::ApprovalResolutionDecision::Approved => "approved",
+        contracts::ApprovalResolutionDecision::Rejected => "rejected",
+        contracts::ApprovalResolutionDecision::Expired => "expired",
+        contracts::ApprovalResolutionDecision::Invalidated => "invalidated",
+    }
+    .to_string()
+}
+
+fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
+    match kind {
+        contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
+        contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+    }
+    .to_string()
+}
+
+fn governed_action_risk_tier_label(risk_tier: contracts::GovernedActionRiskTier) -> String {
+    match risk_tier {
+        contracts::GovernedActionRiskTier::Tier0 => "tier_0",
+        contracts::GovernedActionRiskTier::Tier1 => "tier_1",
+        contracts::GovernedActionRiskTier::Tier2 => "tier_2",
+        contracts::GovernedActionRiskTier::Tier3 => "tier_3",
+    }
+    .to_string()
+}
+
+fn governed_action_status_label(status: contracts::GovernedActionStatus) -> String {
+    match status {
+        contracts::GovernedActionStatus::Proposed => "proposed",
+        contracts::GovernedActionStatus::AwaitingApproval => "awaiting_approval",
+        contracts::GovernedActionStatus::Approved => "approved",
+        contracts::GovernedActionStatus::Rejected => "rejected",
+        contracts::GovernedActionStatus::Expired => "expired",
+        contracts::GovernedActionStatus::Invalidated => "invalidated",
+        contracts::GovernedActionStatus::Blocked => "blocked",
+        contracts::GovernedActionStatus::Executed => "executed",
+        contracts::GovernedActionStatus::Failed => "failed",
+    }
+    .to_string()
+}
+
+fn workspace_script_run_status_label(status: contracts::WorkspaceScriptRunStatus) -> String {
+    match status {
+        contracts::WorkspaceScriptRunStatus::Pending => "pending",
+        contracts::WorkspaceScriptRunStatus::Running => "running",
+        contracts::WorkspaceScriptRunStatus::Completed => "completed",
+        contracts::WorkspaceScriptRunStatus::Failed => "failed",
+        contracts::WorkspaceScriptRunStatus::TimedOut => "timed_out",
+        contracts::WorkspaceScriptRunStatus::Blocked => "blocked",
+    }
+    .to_string()
 }
 
 fn classify_pending_foreground_summary(

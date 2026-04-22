@@ -408,8 +408,8 @@ When a task is completed:
 ## Progress snapshot
 
 - Current milestone: `Milestone D`
-- Current active task: `P5-15`
-- Completed tasks: `14/20`
+- Current active task: `P5-18`
+- Completed tasks: `17/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `DONE`
@@ -905,7 +905,7 @@ Milestone D is green only if:
 
 ### Task P5-15: Extend harness management services for workspace, approvals, and governed actions
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-06`, `P5-07`, `P5-11`, `P5-13`, `P5-14`
 - Parallel-safe: no
 - Deliverables:
@@ -923,7 +923,7 @@ Milestone D is green only if:
 
 ### Task P5-16: Implement `runtime admin approvals ...`
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-15`
 - Parallel-safe: no
 - Deliverables:
@@ -941,7 +941,7 @@ Milestone D is green only if:
 
 ### Task P5-17: Implement Phase 5 workspace and governed-action admin commands
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-15`
 - Parallel-safe: yes
 - Deliverables:
