@@ -275,14 +275,99 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
+        BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
+        BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, GovernedActionsConfig,
+        HarnessConfig, RetrievalConfig, RuntimeConfig, WakeSignalPolicyConfig, WorkerConfig,
+        WorkspaceConfig,
+    };
     use contracts::{
         EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
+        GovernedActionRiskTier,
     };
 
     fn sample_config() -> RuntimeConfig {
-        let mut config = RuntimeConfig::load().expect("runtime config should load for tests");
-        config.workspace.root_dir = env::current_dir().expect("current dir should resolve");
-        config
+        RuntimeConfig {
+            app: AppConfig {
+                name: "blue-lagoon".to_string(),
+                log_filter: "info".to_string(),
+            },
+            database: DatabaseConfig {
+                database_url: "postgres://example".to_string(),
+                minimum_supported_schema_version: 1,
+            },
+            harness: HarnessConfig {
+                allow_synthetic_smoke: true,
+                default_foreground_iteration_budget: 1,
+                default_wall_clock_budget_ms: 30_000,
+                default_foreground_token_budget: 4_000,
+            },
+            background: BackgroundConfig {
+                scheduler: BackgroundSchedulerConfig {
+                    poll_interval_seconds: 300,
+                    max_due_jobs_per_iteration: 4,
+                    lease_timeout_ms: 300_000,
+                },
+                thresholds: BackgroundThresholdsConfig {
+                    episode_backlog_threshold: 25,
+                    candidate_memory_threshold: 10,
+                    contradiction_alert_threshold: 3,
+                },
+                execution: BackgroundExecutionConfig {
+                    default_iteration_budget: 2,
+                    default_wall_clock_budget_ms: 120_000,
+                    default_token_budget: 6_000,
+                },
+                wake_signals: WakeSignalPolicyConfig {
+                    allow_foreground_conversion: true,
+                    max_pending_signals: 8,
+                    cooldown_seconds: 900,
+                },
+            },
+            continuity: ContinuityConfig {
+                retrieval: RetrievalConfig {
+                    max_recent_episode_candidates: 3,
+                    max_memory_artifact_candidates: 5,
+                    max_context_items: 6,
+                },
+                backlog_recovery: BacklogRecoveryConfig {
+                    pending_message_count_threshold: 3,
+                    pending_message_span_seconds_threshold: 120,
+                    stale_pending_ingress_age_seconds_threshold: 300,
+                    max_recovery_batch_size: 8,
+                },
+            },
+            workspace: WorkspaceConfig {
+                root_dir: env::current_dir().expect("current dir should resolve"),
+                max_artifact_bytes: 1_048_576,
+                max_script_bytes: 262_144,
+            },
+            approvals: ApprovalsConfig {
+                default_ttl_seconds: 900,
+                max_pending_requests: 32,
+                allow_cli_resolution: true,
+                prompt_mode: ApprovalPromptMode::InlineKeyboardWithFallback,
+            },
+            governed_actions: GovernedActionsConfig {
+                approval_required_min_risk_tier: GovernedActionRiskTier::Tier2,
+                default_subprocess_timeout_ms: 30_000,
+                max_subprocess_timeout_ms: 120_000,
+                max_filesystem_roots_per_action: 4,
+                default_network_access: NetworkAccessPosture::Disabled,
+                allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
+                max_environment_variables_per_action: 8,
+                max_captured_output_bytes: 65_536,
+            },
+            worker: WorkerConfig {
+                timeout_ms: 20_000,
+                command: String::new(),
+                args: Vec::new(),
+            },
+            telegram: None,
+            model_gateway: None,
+            self_model: None,
+        }
     }
 
     fn sample_scope() -> CapabilityScope {
