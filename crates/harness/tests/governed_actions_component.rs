@@ -152,7 +152,7 @@ async fn workspace_service_persists_artifacts_scripts_versions_and_runs() -> Res
                 execution_id: None,
                 artifact_kind: WorkspaceArtifactKind::Note,
                 title: "Operator note".to_string(),
-                content_text: Some("Phase 5 workspace service smoke".to_string()),
+                content_text: Some("Workspace service smoke".to_string()),
                 metadata: json!({ "source": "component_test" }),
             },
         )
@@ -167,7 +167,7 @@ async fn workspace_service_persists_artifacts_scripts_versions_and_runs() -> Res
             &UpdateWorkspaceArtifact {
                 workspace_artifact_id: note_id,
                 title: "Operator note updated".to_string(),
-                content_text: Some("Updated Phase 5 workspace note".to_string()),
+                content_text: Some("Updated workspace note".to_string()),
                 status: WorkspaceArtifactStatus::Archived,
                 metadata: json!({ "source": "component_test", "revision": 2 }),
             },
@@ -189,7 +189,7 @@ async fn workspace_service_persists_artifacts_scripts_versions_and_runs() -> Res
                 trace_id: Some(Uuid::now_v7()),
                 execution_id: None,
                 title: "Verification script".to_string(),
-                metadata: json!({ "purpose": "phase5_component_test" }),
+                metadata: json!({ "purpose": "governed_action_component_test" }),
                 language: "python".to_string(),
                 entrypoint: Some("main.py".to_string()),
                 content_text: "print('v1')\n".to_string(),
@@ -583,7 +583,7 @@ async fn governed_action_execution_runs_bounded_subprocess_and_persists_outcome(
             requested_risk_tier: None,
             capability_scope: execution_capability_scope(),
             payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action(
-                "phase5",
+                "governed-subprocess",
             )),
         };
 
@@ -735,7 +735,7 @@ async fn governed_action_execution_blocks_unsupported_network_enabled_backend() 
             requested_risk_tier: Some(GovernedActionRiskTier::Tier2),
             capability_scope: scope,
             payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action(
-                "phase5",
+                "network-subprocess",
             )),
         };
 

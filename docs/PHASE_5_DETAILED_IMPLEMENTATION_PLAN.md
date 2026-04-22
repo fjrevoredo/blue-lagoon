@@ -3,7 +3,7 @@
 ## Phase 5 Detailed Implementation Plan
 
 Date: 2026-04-21
-Status: In progress; Milestone A, Milestone B, and Milestone C completed and Milestone D active
+Status: Complete; Milestone A, Milestone B, Milestone C, and Milestone D completed
 Scope: High-level plan Phase 5 only
 Audience: LLM-assisted implementation work and human review
 
@@ -407,13 +407,13 @@ When a task is completed:
 
 ## Progress snapshot
 
-- Current milestone: `Milestone D`
-- Current active task: `P5-18`
-- Completed tasks: `17/20`
+- Current milestone: `Complete`
+- Current active task: `None`
+- Completed tasks: `20/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `DONE`
-- Milestone D status: `IN PROGRESS`
+- Milestone D status: `DONE`
 
 Repository sequencing note:
 
@@ -959,7 +959,7 @@ Milestone D is green only if:
 
 ### Task P5-18: Add unit coverage for risk classification, approvals, capabilities, and formatters
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-10`, `P5-14`, `P5-16`, `P5-17`
 - Parallel-safe: no
 - Deliverables:
@@ -975,7 +975,7 @@ Milestone D is green only if:
 
 ### Task P5-19: Add PostgreSQL-backed component and integration coverage for Phase 5 flows
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-11`, `P5-13`, `P5-14`, `P5-18`
 - Parallel-safe: no
 - Deliverables:
@@ -993,7 +993,7 @@ Milestone D is green only if:
 
 ### Task P5-20: Extend repository CI and docs for the Phase 5 governed-action gate
 
-- Status: `TODO`
+- Status: `DONE`
 - Depends on: `P5-19`
 - Parallel-safe: no
 - Deliverables:

@@ -235,6 +235,109 @@ async fn approval_resolution_executes_linked_governed_action_after_approval() ->
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_surfaces_blocked_governed_action_into_follow_up_turn()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(provider_response(&blocked_action_model_output())));
+        transport.push_response(Ok(provider_response(
+            "The requested action was blocked by policy, so I did not execute it.",
+        )));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(_) => {}
+            other => panic!("expected completed foreground outcome, got {other:?}"),
+        }
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "The requested action was blocked by policy, so I did not execute it."
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 2);
+        assert!(
+            seen_requests[1]
+                .body
+                .to_string()
+                .contains("Harness governed-action observations")
+        );
+
+        let blocked_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT status, blocked_reason
+            FROM governed_action_executions
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_all(&ctx.pool)
+        .await?;
+        assert_eq!(blocked_rows.len(), 1);
+        assert_eq!(blocked_rows[0].0, "blocked");
+        assert!(
+            blocked_rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not allowlisted")
+        );
+        Ok(())
+    })
+    .await
+}
+
 fn provider_response(message: &str) -> ProviderHttpResponse {
     ProviderHttpResponse {
         status: 200,
@@ -280,9 +383,9 @@ fn immediate_action_model_output() -> String {
                 "value": {
                     "command": if cfg!(windows) { "powershell" } else { "sh" },
                     "args": if cfg!(windows) {
-                        serde_json::json!(["-NoProfile", "-Command", "Write-Output 'phase5 immediate'"])
+                        serde_json::json!(["-NoProfile", "-Command", "Write-Output 'immediate bounded check'"])
                     } else {
-                        serde_json::json!(["-c", "printf 'phase5 immediate\\n'"])
+                        serde_json::json!(["-c", "printf 'immediate bounded check\\n'"])
                     },
                     "working_directory": workspace_root.clone(),
                 },
@@ -291,6 +394,50 @@ fn immediate_action_model_output() -> String {
     });
     format!(
         "I will run a bounded workspace check.\n```blue-lagoon-governed-actions\n{}\n```",
+        action_block,
+    )
+}
+
+fn blocked_action_model_output() -> String {
+    let workspace_root = support::workspace_root().display().to_string();
+    let action_block = serde_json::json!({
+        "actions": [{
+            "proposal_id": Uuid::now_v7(),
+            "title": "Blocked bounded check",
+            "rationale": "Need one local check, but request is intentionally invalid for integration coverage.",
+            "action_kind": "run_subprocess",
+            "requested_risk_tier": serde_json::Value::Null,
+            "capability_scope": {
+                "filesystem": {
+                    "read_roots": [workspace_root.clone()],
+                    "write_roots": [],
+                },
+                "network": "disabled",
+                "environment": {
+                    "allow_variables": ["HOME"],
+                },
+                "execution": {
+                    "timeout_ms": 30_000,
+                    "max_stdout_bytes": 65_536,
+                    "max_stderr_bytes": 32_768,
+                },
+            },
+            "payload": {
+                "kind": "run_subprocess",
+                "value": {
+                    "command": if cfg!(windows) { "powershell" } else { "sh" },
+                    "args": if cfg!(windows) {
+                        serde_json::json!(["-NoProfile", "-Command", "Write-Output 'blocked integration'"])
+                    } else {
+                        serde_json::json!(["-c", "printf 'blocked integration\\n'"])
+                    },
+                    "working_directory": workspace_root.clone(),
+                },
+            },
+        }],
+    });
+    format!(
+        "I want to run a local check.\n```blue-lagoon-governed-actions\n{}\n```",
         action_block,
     )
 }

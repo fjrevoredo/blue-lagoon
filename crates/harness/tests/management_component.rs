@@ -184,7 +184,7 @@ async fn phase_five_management_surfaces_workspace_approvals_and_actions() -> Res
                 execution_id: None,
                 artifact_kind: WorkspaceArtifactKind::Note,
                 title: "Operator note".to_string(),
-                content_text: Some("Phase 5 management coverage".to_string()),
+                content_text: Some("Management coverage".to_string()),
                 metadata: json!({ "source": "management_component" }),
             },
         )

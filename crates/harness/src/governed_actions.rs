@@ -1884,4 +1884,43 @@ mod tests {
             .expect_err("non-allowlisted variables should be rejected");
         assert!(error.to_string().contains("not allowlisted"));
     }
+
+    #[test]
+    fn subprocess_scope_requires_at_least_one_filesystem_root() {
+        let mut proposal = sample_subprocess_proposal();
+        proposal.capability_scope.filesystem.read_roots.clear();
+        proposal.capability_scope.filesystem.write_roots.clear();
+
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("subprocess without any filesystem scope should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must request at least one filesystem root")
+        );
+    }
+
+    #[test]
+    fn subprocess_scope_rejects_timeout_above_configured_limit() {
+        let mut proposal = sample_subprocess_proposal();
+        proposal.capability_scope.execution.timeout_ms = 120_001;
+
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("timeout above configured limit should be rejected");
+        assert!(error.to_string().contains("exceeds the configured maximum"));
+    }
+
+    #[test]
+    fn subprocess_scope_rejects_captured_output_above_configured_limit() {
+        let mut proposal = sample_subprocess_proposal();
+        proposal.capability_scope.execution.max_stdout_bytes = 70_000;
+
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("captured output above configured limit should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("captured output exceeds the configured maximum")
+        );
+    }
 }

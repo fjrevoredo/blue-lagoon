@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, Phase 2, Phase 3, Phase 4, and Phase 4.5 completed; Phase 5 is the active next phase
+Status: Phase 1, Phase 1.1, Phase 2, Phase 3, Phase 4, Phase 4.5, and Phase 5 completed; Phase 6 is the active next phase
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -130,6 +130,7 @@ CLI surface before Phase 5 broadens the governed action surface.
 - Phase 3 status: `COMPLETE`
 - Phase 4 status: `COMPLETE`
 - Phase 4.5 status: `COMPLETE`
+- Phase 5 status: `COMPLETE`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -140,7 +141,7 @@ CLI surface before Phase 5 broadens the governed action surface.
   `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning and execution evidence for Phase 4 now lives in
   `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
-- Detailed planning for Phase 5 now lives in
+- Detailed planning and execution evidence for Phase 5 now lives in
   `docs/PHASE_5_DETAILED_IMPLEMENTATION_PLAN.md`
 - The current repository state includes a runnable Rust workspace under
   `crates/`, reviewed SQL migrations, PostgreSQL-backed persistence, schema
@@ -156,8 +157,12 @@ CLI surface before Phase 5 broadens the governed action surface.
 - The current repository state now also includes the initial management CLI
   surface, harness-side management services, management CLI docs, and the
   dedicated `management-cli` CI gate, and the Phase 4.5 DB-backed verification
-  surface has now passed in repository-hosted CI, so Phase 5 is now the active
-  next phase
+  surface has now passed in repository-hosted CI, so Phase 5 was able to start
+- The current repository state now includes governed action planning, bounded
+  subprocess and workspace-script execution, canonical approval handling,
+  Phase 5 management CLI inspection and bounded resolution commands, and the
+  dedicated `governed-actions` CI gate, so Phase 5 is complete and Phase 6 is
+  now the active next phase
 
 ### Phase 1: Runtime foundation and authority boundaries
 

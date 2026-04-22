@@ -910,3 +910,167 @@ struct ResolutionTransition {
     event_kind: &'static str,
     severity: &'static str,
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use contracts::{
+        EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
+        NetworkAccessPosture,
+    };
+
+    use super::*;
+
+    fn sample_scope() -> CapabilityScope {
+        CapabilityScope {
+            filesystem: FilesystemCapabilityScope {
+                read_roots: vec!["D:/Repos/blue-lagoon".to_string()],
+                write_roots: vec!["D:/Repos/blue-lagoon/docs".to_string()],
+            },
+            network: NetworkAccessPosture::Disabled,
+            environment: EnvironmentCapabilityScope {
+                allow_variables: Vec::new(),
+            },
+            execution: ExecutionCapabilityBudget {
+                timeout_ms: 30_000,
+                max_stdout_bytes: 65_536,
+                max_stderr_bytes: 32_768,
+            },
+        }
+    }
+
+    fn sample_new_request() -> NewApprovalRequestRecord {
+        let requested_at = Utc::now();
+        NewApprovalRequestRecord {
+            approval_request_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            action_proposal_id: Uuid::now_v7(),
+            action_fingerprint: GovernedActionFingerprint {
+                value: "sha256:test".to_string(),
+            },
+            action_kind: GovernedActionKind::RunSubprocess,
+            risk_tier: GovernedActionRiskTier::Tier2,
+            title: "Run bounded subprocess".to_string(),
+            consequence_summary: "Executes a scoped subprocess.".to_string(),
+            capability_scope: sample_scope(),
+            requested_by: "telegram:primary-user".to_string(),
+            token: "approval-token".to_string(),
+            requested_at,
+            expires_at: requested_at + Duration::minutes(15),
+        }
+    }
+
+    fn sample_resolution_attempt() -> ApprovalResolutionAttempt {
+        ApprovalResolutionAttempt {
+            token: "approval-token".to_string(),
+            actor_ref: "cli:primary-user".to_string(),
+            expected_action_fingerprint: GovernedActionFingerprint {
+                value: "sha256:test".to_string(),
+            },
+            decision: ApprovalResolutionDecision::Approved,
+            reason: Some("manual verification".to_string()),
+            resolved_at: Utc::now(),
+        }
+    }
+
+    fn sample_pending_record() -> ApprovalRequestRecord {
+        let requested_at = Utc::now();
+        ApprovalRequestRecord {
+            approval_request_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            action_proposal_id: Uuid::now_v7(),
+            action_fingerprint: GovernedActionFingerprint {
+                value: "sha256:test".to_string(),
+            },
+            action_kind: GovernedActionKind::RunSubprocess,
+            risk_tier: GovernedActionRiskTier::Tier2,
+            title: "Run bounded subprocess".to_string(),
+            consequence_summary: "Executes a scoped subprocess.".to_string(),
+            capability_scope: sample_scope(),
+            status: ApprovalRequestStatus::Pending,
+            requested_by: "telegram:primary-user".to_string(),
+            token: "approval-token".to_string(),
+            requested_at,
+            expires_at: requested_at + Duration::minutes(15),
+            resolved_at: None,
+            resolution_kind: None,
+            resolved_by: None,
+            resolution_reason: None,
+            created_at: requested_at,
+            updated_at: requested_at,
+        }
+    }
+
+    #[test]
+    fn validate_new_approval_request_rejects_empty_requested_by() {
+        let mut request = sample_new_request();
+        request.requested_by = "   ".to_string();
+
+        let error = validate_new_approval_request(&request)
+            .expect_err("blank requested_by should be rejected");
+        assert!(error.to_string().contains("requested_by must not be empty"));
+    }
+
+    #[test]
+    fn validate_new_approval_request_rejects_non_increasing_expiry() {
+        let mut request = sample_new_request();
+        request.expires_at = request.requested_at;
+
+        let error = validate_new_approval_request(&request)
+            .expect_err("non-increasing expiry should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("expires_at must be greater than requested_at")
+        );
+    }
+
+    #[test]
+    fn validate_resolution_attempt_rejects_reserved_system_surface() {
+        let mut attempt = sample_resolution_attempt();
+        attempt.actor_ref = "system:primary-user".to_string();
+
+        let error = validate_resolution_attempt(&attempt)
+            .expect_err("system actor surface should be rejected");
+        assert!(error.to_string().contains("reserved system surface"));
+    }
+
+    #[test]
+    fn validate_resolution_attempt_rejects_internal_transition_decisions() {
+        let mut attempt = sample_resolution_attempt();
+        attempt.decision = ApprovalResolutionDecision::Expired;
+
+        let error = validate_resolution_attempt(&attempt)
+            .expect_err("expired decision should be rejected for external resolution");
+        assert!(
+            error
+                .to_string()
+                .contains("must come from an external approve/reject action")
+        );
+    }
+
+    #[test]
+    fn validate_resolution_actor_accepts_matching_principal_across_surfaces() {
+        let record = sample_pending_record();
+        let attempt = sample_resolution_attempt();
+        validate_resolution_actor(&record, &attempt)
+            .expect("matching principal across surfaces should be accepted");
+    }
+
+    #[test]
+    fn validate_resolution_actor_rejects_mismatched_principal() {
+        let record = sample_pending_record();
+        let mut attempt = sample_resolution_attempt();
+        attempt.actor_ref = "cli:someone-else".to_string();
+
+        let error = validate_resolution_actor(&record, &attempt)
+            .expect_err("mismatched principal should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the requested principal")
+        );
+    }
+}

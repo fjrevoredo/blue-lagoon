@@ -3,7 +3,7 @@ use std::{env, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{BackgroundTrigger, BackgroundTriggerKind, UnconsciousJobKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ use crate::{
 
 const DEFAULT_LIST_LIMIT: u32 = 20;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatusReport {
     pub schema: SchemaStatusReport,
     pub worker: WorkerStatusReport,
@@ -28,7 +28,7 @@ pub struct RuntimeStatusReport {
     pub pending_work: PendingWorkSummary,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaStatusReport {
     pub compatibility: String,
     pub current_version: Option<i64>,
@@ -39,7 +39,7 @@ pub struct SchemaStatusReport {
     pub details: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatusReport {
     pub resolution_kind: String,
     pub command: Option<String>,
@@ -48,7 +48,7 @@ pub struct WorkerStatusReport {
     pub notes: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramStatusReport {
     pub configured: bool,
     pub binding_present: bool,
@@ -59,7 +59,7 @@ pub struct TelegramStatusReport {
     pub poll_limit: Option<u16>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelGatewayStatusReport {
     pub configured: bool,
     pub provider: Option<String>,
@@ -70,14 +70,14 @@ pub struct ModelGatewayStatusReport {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfModelStatusReport {
     pub configured: bool,
     pub seed_path: Option<String>,
     pub seed_exists: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingWorkSummary {
     pub pending_foreground_conversation_count: usize,
     pub pending_background_job_count: u32,
@@ -88,7 +88,7 @@ pub struct PendingWorkSummary {
     pub blocked_governed_action_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingForegroundConversationSummary {
     pub internal_conversation_ref: String,
     pub pending_count: u32,
@@ -102,7 +102,7 @@ pub struct PendingForegroundConversationSummary {
     pub decision_reason: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundJobSummary {
     pub background_job_id: Uuid,
     pub trace_id: Uuid,
@@ -118,7 +118,7 @@ pub struct BackgroundJobSummary {
     pub latest_run_completed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeSignalSummary {
     pub wake_signal_id: Uuid,
     pub background_job_id: Uuid,
@@ -131,7 +131,7 @@ pub struct WakeSignalSummary {
     pub reviewed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequestSummary {
     pub approval_request_id: Uuid,
     pub trace_id: Uuid,
@@ -153,7 +153,7 @@ pub struct ApprovalRequestSummary {
     pub resolution_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernedActionSummary {
     pub governed_action_execution_id: Uuid,
     pub trace_id: Uuid,
@@ -172,7 +172,7 @@ pub struct GovernedActionSummary {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceScriptRunSummary {
     pub workspace_script_run_id: Uuid,
     pub workspace_script_id: Uuid,
@@ -198,7 +198,7 @@ pub struct ResolveApprovalRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResolutionSummary {
     pub approval_request: ApprovalRequestSummary,
     pub governed_action: Option<GovernedActionSummary>,
@@ -1228,5 +1228,18 @@ mod tests {
         let (mode, reason) = classify_pending_foreground_summary(&config, 1, 0, 0, false);
         assert_eq!(mode, "single_ingress");
         assert_eq!(reason, "single_ingress");
+    }
+
+    #[test]
+    fn default_cli_actor_ref_reuses_requested_principal() {
+        assert_eq!(
+            default_cli_actor_ref("telegram:primary-user"),
+            "cli:primary-user"
+        );
+    }
+
+    #[test]
+    fn default_cli_actor_ref_falls_back_when_requested_by_is_malformed() {
+        assert_eq!(default_cli_actor_ref("primary-user"), "cli:operator");
     }
 }
