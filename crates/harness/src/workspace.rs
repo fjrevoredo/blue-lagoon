@@ -952,7 +952,7 @@ fn validate_artifact_title(title: &str) -> Result<()> {
 
 fn validate_artifact_content(config: &RuntimeConfig, content_text: Option<&str>) -> Result<()> {
     if let Some(content_text) = content_text {
-        let size_bytes = content_text.as_bytes().len() as u64;
+        let size_bytes = content_text.len() as u64;
         if size_bytes > config.workspace.max_artifact_bytes {
             bail!(
                 "workspace artifact content exceeds configured limit of {} bytes",
@@ -964,7 +964,7 @@ fn validate_artifact_content(config: &RuntimeConfig, content_text: Option<&str>)
 }
 
 fn validate_script_content(config: &RuntimeConfig, content_text: &str) -> Result<()> {
-    let size_bytes = content_text.as_bytes().len() as u64;
+    let size_bytes = content_text.len() as u64;
     if size_bytes > config.workspace.max_script_bytes {
         bail!(
             "workspace script content exceeds configured limit of {} bytes",

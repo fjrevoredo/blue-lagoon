@@ -324,14 +324,16 @@ pub async fn sync_status_from_approval_resolution(
 
     update_governed_action_execution(
         pool,
-        governed_action_execution_id,
-        status,
-        execution_id,
-        None,
-        reason,
-        None,
-        None,
-        None,
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id,
+            status,
+            execution_id,
+            output_ref: None,
+            blocked_reason: reason,
+            approval_request_id: None,
+            started_at: None,
+            completed_at: None,
+        },
     )
     .await
 }
@@ -346,14 +348,16 @@ pub async fn execute_governed_action(
         let summary = error.to_string();
         let record = update_governed_action_execution(
             pool,
-            record.governed_action_execution_id,
-            GovernedActionStatus::Blocked,
-            None,
-            None,
-            Some(&summary),
-            None,
-            None,
-            Some(Utc::now()),
+            GovernedActionExecutionUpdate {
+                governed_action_execution_id: record.governed_action_execution_id,
+                status: GovernedActionStatus::Blocked,
+                execution_id: None,
+                output_ref: None,
+                blocked_reason: Some(&summary),
+                approval_request_id: None,
+                started_at: None,
+                completed_at: Some(Utc::now()),
+            },
         )
         .await?;
         write_governed_action_audit_event(
@@ -397,14 +401,16 @@ pub async fn execute_governed_action(
     let started_at = Utc::now();
     let started_record = update_governed_action_execution(
         pool,
-        record.governed_action_execution_id,
-        record.status,
-        Some(execution_id),
-        None,
-        None,
-        None,
-        Some(started_at),
-        None,
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id: record.governed_action_execution_id,
+            status: record.status,
+            execution_id: Some(execution_id),
+            output_ref: None,
+            blocked_reason: None,
+            approval_request_id: None,
+            started_at: Some(started_at),
+            completed_at: None,
+        },
     )
     .await?;
     write_governed_action_audit_event(
@@ -431,14 +437,16 @@ pub async fn execute_governed_action(
                     .to_string();
             let failed_record = update_governed_action_execution(
                 pool,
-                started_record.governed_action_execution_id,
-                GovernedActionStatus::Blocked,
-                Some(execution_id),
-                None,
-                Some(&summary),
-                None,
-                Some(started_at),
-                Some(Utc::now()),
+                GovernedActionExecutionUpdate {
+                    governed_action_execution_id: started_record.governed_action_execution_id,
+                    status: GovernedActionStatus::Blocked,
+                    execution_id: Some(execution_id),
+                    output_ref: None,
+                    blocked_reason: Some(&summary),
+                    approval_request_id: None,
+                    started_at: Some(started_at),
+                    completed_at: Some(Utc::now()),
+                },
             )
             .await?;
             execution::mark_failed(
@@ -671,14 +679,16 @@ async fn execute_subprocess_governed_action(
                 .await?;
                 let blocked_record = update_governed_action_execution(
                     pool,
-                    record.governed_action_execution_id,
-                    GovernedActionStatus::Blocked,
-                    Some(execution_id),
-                    Some(&format!("execution_record:{execution_id}")),
-                    Some(&summary),
-                    None,
-                    Some(started_at),
-                    Some(Utc::now()),
+                    GovernedActionExecutionUpdate {
+                        governed_action_execution_id: record.governed_action_execution_id,
+                        status: GovernedActionStatus::Blocked,
+                        execution_id: Some(execution_id),
+                        output_ref: Some(&format!("execution_record:{execution_id}")),
+                        blocked_reason: Some(&summary),
+                        approval_request_id: None,
+                        started_at: Some(started_at),
+                        completed_at: Some(Utc::now()),
+                    },
                 )
                 .await?;
                 write_governed_action_audit_event(
@@ -726,14 +736,16 @@ async fn execute_subprocess_governed_action(
         .await?;
         let updated_record = update_governed_action_execution(
             pool,
-            record.governed_action_execution_id,
-            GovernedActionStatus::Failed,
-            Some(execution_id),
-            Some(&output_ref),
-            Some(&summary),
-            None,
-            Some(started_at),
-            Some(completed_at),
+            GovernedActionExecutionUpdate {
+                governed_action_execution_id: record.governed_action_execution_id,
+                status: GovernedActionStatus::Failed,
+                execution_id: Some(execution_id),
+                output_ref: Some(&output_ref),
+                blocked_reason: Some(&summary),
+                approval_request_id: None,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+            },
         )
         .await?;
         write_governed_action_audit_event(
@@ -794,14 +806,16 @@ async fn execute_subprocess_governed_action(
 
     let updated_record = update_governed_action_execution(
         pool,
-        record.governed_action_execution_id,
-        status,
-        Some(execution_id),
-        Some(&output_ref),
-        if success { None } else { Some(&summary) },
-        None,
-        Some(started_at),
-        Some(completed_at),
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id: record.governed_action_execution_id,
+            status,
+            execution_id: Some(execution_id),
+            output_ref: Some(&output_ref),
+            blocked_reason: if success { None } else { Some(&summary) },
+            approval_request_id: None,
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+        },
     )
     .await?;
     write_governed_action_audit_event(
@@ -928,14 +942,16 @@ async fn execute_workspace_script_governed_action(
             .await?;
             let blocked_record = update_governed_action_execution(
                 pool,
-                record.governed_action_execution_id,
-                GovernedActionStatus::Blocked,
-                Some(execution_id),
-                Some(&output_ref),
-                Some(&summary),
-                None,
-                Some(started_at),
-                Some(Utc::now()),
+                GovernedActionExecutionUpdate {
+                    governed_action_execution_id: record.governed_action_execution_id,
+                    status: GovernedActionStatus::Blocked,
+                    execution_id: Some(execution_id),
+                    output_ref: Some(&output_ref),
+                    blocked_reason: Some(&summary),
+                    approval_request_id: None,
+                    started_at: Some(started_at),
+                    completed_at: Some(Utc::now()),
+                },
             )
             .await?;
             write_governed_action_audit_event(
@@ -997,14 +1013,16 @@ async fn execute_workspace_script_governed_action(
         .await?;
         let updated_record = update_governed_action_execution(
             pool,
-            record.governed_action_execution_id,
-            GovernedActionStatus::Failed,
-            Some(execution_id),
-            Some(&output_ref),
-            Some(&summary),
-            None,
-            Some(started_at),
-            Some(completed_at),
+            GovernedActionExecutionUpdate {
+                governed_action_execution_id: record.governed_action_execution_id,
+                status: GovernedActionStatus::Failed,
+                execution_id: Some(execution_id),
+                output_ref: Some(&output_ref),
+                blocked_reason: Some(&summary),
+                approval_request_id: None,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+            },
         )
         .await?;
         write_governed_action_audit_event(
@@ -1087,14 +1105,16 @@ async fn execute_workspace_script_governed_action(
     .await?;
     let updated_record = update_governed_action_execution(
         pool,
-        record.governed_action_execution_id,
-        governed_status,
-        Some(execution_id),
-        Some(&output_ref),
-        if success { None } else { Some(&summary) },
-        None,
-        Some(started_at),
-        Some(completed_at),
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id: record.governed_action_execution_id,
+            status: governed_status,
+            execution_id: Some(execution_id),
+            output_ref: Some(&output_ref),
+            blocked_reason: if success { None } else { Some(&summary) },
+            approval_request_id: None,
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+        },
     )
     .await?;
     write_governed_action_audit_event(
@@ -1211,16 +1231,20 @@ fn governed_action_execution_result(
     }
 }
 
-async fn update_governed_action_execution(
-    pool: &PgPool,
+struct GovernedActionExecutionUpdate<'a> {
     governed_action_execution_id: Uuid,
     status: GovernedActionStatus,
     execution_id: Option<Uuid>,
-    output_ref: Option<&str>,
-    blocked_reason: Option<&str>,
+    output_ref: Option<&'a str>,
+    blocked_reason: Option<&'a str>,
     approval_request_id: Option<Uuid>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+async fn update_governed_action_execution(
+    pool: &PgPool,
+    update: GovernedActionExecutionUpdate<'_>,
 ) -> Result<GovernedActionExecutionRecord> {
     sqlx::query(
         r#"
@@ -1237,19 +1261,19 @@ async fn update_governed_action_execution(
         WHERE governed_action_execution_id = $1
         "#,
     )
-    .bind(governed_action_execution_id)
-    .bind(governed_action_status_as_str(status))
-    .bind(execution_id)
-    .bind(approval_request_id)
-    .bind(output_ref)
-    .bind(blocked_reason)
-    .bind(started_at)
-    .bind(completed_at)
+    .bind(update.governed_action_execution_id)
+    .bind(governed_action_status_as_str(update.status))
+    .bind(update.execution_id)
+    .bind(update.approval_request_id)
+    .bind(update.output_ref)
+    .bind(update.blocked_reason)
+    .bind(update.started_at)
+    .bind(update.completed_at)
     .execute(pool)
     .await
     .context("failed to update governed action execution")?;
 
-    get_governed_action_execution(pool, governed_action_execution_id).await
+    get_governed_action_execution(pool, update.governed_action_execution_id).await
 }
 
 async fn write_governed_action_audit_event(
