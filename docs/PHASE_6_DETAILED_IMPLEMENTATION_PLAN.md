@@ -3,7 +3,7 @@
 ## Phase 6 Detailed Implementation Plan
 
 Date: 2026-04-23
-Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Task C3 completed
+Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Tasks C3-C4 completed
 Scope: High-level plan Phase 6 only
 Audience: LLM-assisted implementation work and human review
 
@@ -324,8 +324,8 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C4`
-- Completed tasks: `12/20`
+- Current active task: `C5`
+- Completed tasks: `13/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -793,7 +793,7 @@ Verification:
 
 ### Task C4: Implement fail-closed ambiguous-side-effect handling for governed actions
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 

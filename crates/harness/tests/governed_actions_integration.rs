@@ -4,7 +4,8 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
     ApprovalRequestStatus, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
-    ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionKind, NetworkAccessPosture,
+    ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionKind,
+    GovernedActionPayload, GovernedActionProposal, NetworkAccessPosture, SubprocessAction,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
@@ -14,6 +15,7 @@ use harness::{
     telegram,
 };
 use serial_test::serial;
+use sqlx::Row;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -333,6 +335,123 @@ async fn foreground_orchestration_surfaces_blocked_governed_action_into_follow_u
                 .unwrap_or_default()
                 .contains("not allowlisted")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn execute_governed_action_routes_policy_recheck_failure_through_recovery() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut planning_config = ctx.config.clone();
+        planning_config
+            .governed_actions
+            .allowlisted_environment_variables =
+            vec!["HOME".to_string(), "BLUE_LAGOON_DATABASE_URL".to_string()];
+
+        let proposal = GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Policy drift check".to_string(),
+            rationale: Some("Used to verify execution-time policy re-check recovery.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: CapabilityScope {
+                filesystem: FilesystemCapabilityScope {
+                    read_roots: vec![support::workspace_root().display().to_string()],
+                    write_roots: Vec::new(),
+                },
+                network: NetworkAccessPosture::Disabled,
+                environment: EnvironmentCapabilityScope {
+                    allow_variables: vec!["HOME".to_string()],
+                },
+                execution: ExecutionCapabilityBudget {
+                    timeout_ms: 30_000,
+                    max_stdout_bytes: 65_536,
+                    max_stderr_bytes: 32_768,
+                },
+            },
+            payload: GovernedActionPayload::RunSubprocess(SubprocessAction {
+                command: if cfg!(windows) {
+                    "powershell".to_string()
+                } else {
+                    "sh".to_string()
+                },
+                args: if cfg!(windows) {
+                    vec![
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        "Write-Output 'policy drift check'".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "-c".to_string(),
+                        "printf 'policy drift check\\n'".to_string(),
+                    ]
+                },
+                working_directory: Some(support::workspace_root().display().to_string()),
+            }),
+        };
+        let planned = governed_actions::plan_governed_action(
+            &planning_config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal,
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned governed action, got {other:?}"),
+        };
+
+        let outcome =
+            governed_actions::execute_governed_action(&ctx.config, &ctx.pool, &planned.record)
+                .await?;
+        assert_eq!(
+            outcome.outcome.status,
+            contracts::GovernedActionStatus::Blocked
+        );
+        assert!(
+            outcome
+                .outcome
+                .summary
+                .contains("environment variable 'HOME' is not allowlisted")
+        );
+
+        let checkpoint_row = sqlx::query(
+            r#"
+            SELECT recovery_reason_code, status, recovery_decision, checkpoint_payload_json
+            FROM recovery_checkpoints
+            WHERE governed_action_execution_id = $1
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(planned.record.governed_action_execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let payload: serde_json::Value = checkpoint_row.get("checkpoint_payload_json");
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_reason_code"),
+            "integrity_or_policy_block"
+        );
+        assert_eq!(checkpoint_row.get::<String, _>("status"), "abandoned");
+        assert_eq!(
+            checkpoint_row.get::<Option<String>, _>("recovery_decision"),
+            Some("abandon".to_string())
+        );
+        assert_eq!(payload["source"], serde_json::json!("policy_recheck"));
+
+        let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "governed_action_policy_recheck_failed"
+                && diagnostic.diagnostic_payload["governed_action_execution_id"]
+                    == serde_json::json!(planned.record.governed_action_execution_id)
+        }));
         Ok(())
     })
     .await

@@ -3,10 +3,12 @@ mod support;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
-    BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, CapabilityScope,
-    EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
-    GovernedActionFingerprint, GovernedActionKind, GovernedActionRiskTier, NetworkAccessPosture,
-    UnconsciousJobKind, UnconsciousScope, WakeSignal, WakeSignalPriority, WakeSignalReason,
+    ApprovalResolutionDecision, BackgroundExecutionBudget, BackgroundTrigger,
+    BackgroundTriggerKind, CapabilityScope, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
+    FilesystemCapabilityScope, GovernedActionFingerprint, GovernedActionKind,
+    GovernedActionPayload, GovernedActionProposal, GovernedActionRiskTier, NetworkAccessPosture,
+    SubprocessAction, UnconsciousJobKind, UnconsciousScope, WakeSignal, WakeSignalPriority,
+    WakeSignalReason,
 };
 use harness::recovery::{
     self, NewWorkerLease, RecoveryApprovalState, RecoveryCheckpointStatus, RecoveryDecision,
@@ -15,6 +17,7 @@ use harness::recovery::{
 use harness::{
     approval, background,
     execution::{self, NewExecutionRecord},
+    governed_actions,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -654,6 +657,282 @@ async fn foreground_recovery_scan_routes_through_supervisor_restart_recovery() -
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn governed_action_terminal_failure_evidence_continues_without_rerun() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let planned = plan_governed_action_for_recovery(&ctx.config, &ctx.pool, false).await?;
+        let started_at = Utc::now() - Duration::seconds(30);
+        let execution_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id,
+                trace_id: planned.record.trace_id,
+                trigger_kind: "governed_action_recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({ "test": "governed_action_terminal_failure_evidence_continues_without_rerun" }),
+            },
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE governed_action_executions
+            SET execution_id = $2, started_at = $3, updated_at = NOW()
+            WHERE governed_action_execution_id = $1
+            "#,
+        )
+        .bind(planned.record.governed_action_execution_id)
+        .bind(execution_id)
+        .bind(started_at)
+        .execute(&ctx.pool)
+        .await?;
+        execution::mark_failed(
+            &ctx.pool,
+            execution_id,
+            &json!({
+                "status": "timed_out",
+                "summary": "bounded subprocess timed out after 50 ms",
+            }),
+        )
+        .await?;
+        let lease_id = Uuid::now_v7();
+        recovery::create_worker_lease(
+            &ctx.pool,
+            &NewWorkerLease {
+                worker_lease_id: lease_id,
+                trace_id: planned.record.trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: Some(planned.record.governed_action_execution_id),
+                worker_kind: WorkerLeaseKind::GovernedAction,
+                lease_token: Uuid::now_v7(),
+                worker_pid: Some(4242),
+                lease_acquired_at: started_at,
+                lease_expires_at: started_at + Duration::minutes(5),
+                last_heartbeat_at: started_at,
+                metadata: json!({ "test": "governed_action_terminal_failure_evidence_continues_without_rerun" }),
+            },
+        )
+        .await?;
+
+        let outcome = recovery::recover_observed_worker_timeout(
+            &ctx.pool,
+            lease_id,
+            Utc::now(),
+            "governed_action_test_timeout",
+            "worker subprocess timed out after 50 ms and was terminated",
+        )
+        .await?;
+
+        assert_eq!(outcome.decision.decision, RecoveryDecision::Continue);
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["recovery_evidence_state"],
+            json!("durable_completed")
+        );
+        let record = governed_actions::get_governed_action_execution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+        )
+        .await?;
+        assert_eq!(record.status, contracts::GovernedActionStatus::Failed);
+        assert!(record.completed_at.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_action_stall_with_approved_side_effect_requires_reapproval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let planned = plan_governed_action_for_recovery(&ctx.config, &ctx.pool, true).await?;
+        let approval_request = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &approval::NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: "Approved governed action".to_string(),
+                consequence_summary: "Used to verify reapproval recovery.".to_string(),
+                capability_scope: approval_required_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: Uuid::now_v7().to_string(),
+                requested_at: Utc::now() - Duration::minutes(5),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+        approval::resolve_approval_request(
+            &ctx.pool,
+            &approval::ApprovalResolutionAttempt {
+                token: approval_request.token.clone(),
+                actor_ref: "telegram:primary-user".to_string(),
+                expected_action_fingerprint: approval_request.action_fingerprint.clone(),
+                decision: ApprovalResolutionDecision::Approved,
+                reason: Some("recovery integration".to_string()),
+                resolved_at: Utc::now() - Duration::minutes(2),
+            },
+        )
+        .await?;
+        let approved = governed_actions::sync_status_from_approval_resolution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            ApprovalResolutionDecision::Approved,
+            None,
+            Some("recovery integration"),
+        )
+        .await?;
+        let execution_id = Uuid::now_v7();
+        let started_at = Utc::now() - Duration::minutes(1);
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id,
+                trace_id: approved.trace_id,
+                trigger_kind: "governed_action_recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({ "test": "governed_action_stall_with_approved_side_effect_requires_reapproval" }),
+            },
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE governed_action_executions
+            SET execution_id = $2, started_at = $3, updated_at = NOW()
+            WHERE governed_action_execution_id = $1
+            "#,
+        )
+        .bind(approved.governed_action_execution_id)
+        .bind(execution_id)
+        .bind(started_at)
+        .execute(&ctx.pool)
+        .await?;
+        recovery::create_worker_lease(
+            &ctx.pool,
+            &NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id: approved.trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: Some(approved.governed_action_execution_id),
+                worker_kind: WorkerLeaseKind::GovernedAction,
+                lease_token: Uuid::now_v7(),
+                worker_pid: None,
+                lease_acquired_at: started_at,
+                lease_expires_at: started_at + Duration::seconds(5),
+                last_heartbeat_at: started_at,
+                metadata: json!({ "test": "governed_action_stall_with_approved_side_effect_requires_reapproval" }),
+            },
+        )
+        .await?;
+
+        let outcomes = recovery::recover_expired_worker_leases(&ctx.pool, Utc::now()).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].decision.decision, RecoveryDecision::Reapprove);
+        assert_eq!(
+            outcomes[0].checkpoint.checkpoint_payload["recovery_approval_state"],
+            json!("missing_required")
+        );
+        let record = governed_actions::get_governed_action_execution(
+            &ctx.pool,
+            approved.governed_action_execution_id,
+        )
+        .await?;
+        assert_eq!(record.status, contracts::GovernedActionStatus::Invalidated);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_action_stall_without_approval_routes_to_clarification() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let planned = plan_governed_action_for_recovery(&ctx.config, &ctx.pool, false).await?;
+        let execution_id = Uuid::now_v7();
+        let started_at = Utc::now() - Duration::minutes(1);
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id,
+                trace_id: planned.record.trace_id,
+                trigger_kind: "governed_action_recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({ "test": "governed_action_stall_without_approval_routes_to_clarification" }),
+            },
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE governed_action_executions
+            SET execution_id = $2, started_at = $3, updated_at = NOW()
+            WHERE governed_action_execution_id = $1
+            "#,
+        )
+        .bind(planned.record.governed_action_execution_id)
+        .bind(execution_id)
+        .bind(started_at)
+        .execute(&ctx.pool)
+        .await?;
+        recovery::create_worker_lease(
+            &ctx.pool,
+            &NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: Some(planned.record.governed_action_execution_id),
+                worker_kind: WorkerLeaseKind::GovernedAction,
+                lease_token: Uuid::now_v7(),
+                worker_pid: None,
+                lease_acquired_at: started_at,
+                lease_expires_at: started_at + Duration::seconds(5),
+                last_heartbeat_at: started_at,
+                metadata: json!({ "test": "governed_action_stall_without_approval_routes_to_clarification" }),
+            },
+        )
+        .await?;
+
+        let outcomes = recovery::recover_expired_worker_leases(&ctx.pool, Utc::now()).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].decision.decision, RecoveryDecision::Clarify);
+        assert_eq!(
+            outcomes[0].checkpoint.checkpoint_payload["recovery_approval_state"],
+            json!("not_required")
+        );
+        assert_eq!(
+            outcomes[0].checkpoint.checkpoint_payload["recovery_evidence_state"],
+            json!("ambiguous")
+        );
+        let record = governed_actions::get_governed_action_execution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+        )
+        .await?;
+        assert_eq!(record.status, contracts::GovernedActionStatus::Failed);
+        Ok(())
+    })
+    .await
+}
+
 fn sample_capability_scope() -> CapabilityScope {
     CapabilityScope {
         filesystem: FilesystemCapabilityScope {
@@ -669,5 +948,73 @@ fn sample_capability_scope() -> CapabilityScope {
             max_stdout_bytes: 16_384,
             max_stderr_bytes: 16_384,
         },
+    }
+}
+
+fn approval_required_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: vec![".".to_string()],
+            write_roots: vec!["./docs".to_string()],
+        },
+        ..sample_capability_scope()
+    }
+}
+
+async fn plan_governed_action_for_recovery(
+    config: &harness::config::RuntimeConfig,
+    pool: &sqlx::PgPool,
+    approval_required: bool,
+) -> Result<governed_actions::PlannedGovernedAction> {
+    let proposal = GovernedActionProposal {
+        proposal_id: Uuid::now_v7(),
+        title: if approval_required {
+            "Approval-scoped governed action".to_string()
+        } else {
+            "Immediate governed action".to_string()
+        },
+        rationale: Some("Used to verify governed-action recovery.".to_string()),
+        action_kind: GovernedActionKind::RunSubprocess,
+        requested_risk_tier: None,
+        capability_scope: if approval_required {
+            approval_required_capability_scope()
+        } else {
+            sample_capability_scope()
+        },
+        payload: GovernedActionPayload::RunSubprocess(SubprocessAction {
+            command: if cfg!(windows) {
+                "powershell".to_string()
+            } else {
+                "sh".to_string()
+            },
+            args: if cfg!(windows) {
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "Write-Output 'recovery integration'".to_string(),
+                ]
+            } else {
+                vec![
+                    "-c".to_string(),
+                    "printf 'recovery integration\\n'".to_string(),
+                ]
+            },
+            working_directory: Some(".".to_string()),
+        }),
+    };
+    let planned = governed_actions::plan_governed_action(
+        config,
+        pool,
+        &governed_actions::GovernedActionPlanningRequest {
+            governed_action_execution_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            proposal,
+        },
+    )
+    .await?;
+    match planned {
+        governed_actions::GovernedActionPlanningOutcome::Planned(planned) => Ok(planned),
+        other => panic!("expected planned governed action, got {other:?}"),
     }
 }

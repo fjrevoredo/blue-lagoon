@@ -424,6 +424,7 @@ pub async fn execute_governed_action(
     let proposal = proposal_from_record(record);
     if let Err(error) = validate_capability_scope(config, &proposal) {
         let summary = error.to_string();
+        let completed_at = Utc::now();
         let record = update_governed_action_execution(
             pool,
             GovernedActionExecutionUpdate {
@@ -433,8 +434,8 @@ pub async fn execute_governed_action(
                 output_ref: None,
                 blocked_reason: Some(&summary),
                 approval_request_id: None,
-                started_at: None,
-                completed_at: Some(Utc::now()),
+                started_at: Some(completed_at),
+                completed_at: Some(completed_at),
             },
         )
         .await?;
@@ -449,6 +450,14 @@ pub async fn execute_governed_action(
             }),
         )
         .await?;
+        recovery::recover_governed_action_policy_recheck_failure(
+            pool,
+            &record,
+            completed_at,
+            &summary,
+        )
+        .await
+        .context("failed to route governed-action policy re-check failure through recovery")?;
         let outcome = GovernedActionExecutionOutcome {
             status: GovernedActionStatus::Blocked,
             summary,
@@ -1383,18 +1392,18 @@ fn governed_action_execution_result(
     }
 }
 
-struct GovernedActionExecutionUpdate<'a> {
-    governed_action_execution_id: Uuid,
-    status: GovernedActionStatus,
-    execution_id: Option<Uuid>,
-    output_ref: Option<&'a str>,
-    blocked_reason: Option<&'a str>,
-    approval_request_id: Option<Uuid>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct GovernedActionExecutionUpdate<'a> {
+    pub(crate) governed_action_execution_id: Uuid,
+    pub(crate) status: GovernedActionStatus,
+    pub(crate) execution_id: Option<Uuid>,
+    pub(crate) output_ref: Option<&'a str>,
+    pub(crate) blocked_reason: Option<&'a str>,
+    pub(crate) approval_request_id: Option<Uuid>,
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn update_governed_action_execution(
+pub(crate) async fn update_governed_action_execution(
     pool: &PgPool,
     update: GovernedActionExecutionUpdate<'_>,
 ) -> Result<GovernedActionExecutionRecord> {
@@ -1428,7 +1437,7 @@ async fn update_governed_action_execution(
     get_governed_action_execution(pool, update.governed_action_execution_id).await
 }
 
-async fn write_governed_action_audit_event(
+pub(crate) async fn write_governed_action_audit_event(
     pool: &PgPool,
     record: &GovernedActionExecutionRecord,
     event_kind: &str,

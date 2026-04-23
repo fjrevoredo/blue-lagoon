@@ -841,6 +841,43 @@ pub async fn get_workspace_script_run(
     decode_workspace_script_run_row(row)
 }
 
+pub async fn get_latest_workspace_script_run_by_governed_action_execution_id(
+    pool: &PgPool,
+    governed_action_execution_id: Uuid,
+) -> Result<Option<WorkspaceScriptRunRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            workspace_script_run_id,
+            workspace_script_id,
+            workspace_script_version_id,
+            trace_id,
+            execution_id,
+            governed_action_execution_id,
+            approval_request_id,
+            status,
+            risk_tier,
+            args_json,
+            output_ref,
+            failure_summary,
+            started_at,
+            completed_at,
+            created_at,
+            updated_at
+        FROM workspace_script_runs
+        WHERE governed_action_execution_id = $1
+        ORDER BY created_at DESC, workspace_script_run_id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(governed_action_execution_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to fetch workspace script run by governed action execution")?;
+
+    row.map(decode_workspace_script_run_row).transpose()
+}
+
 pub async fn list_workspace_script_runs(
     pool: &PgPool,
     workspace_script_id: Uuid,

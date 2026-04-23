@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
+use contracts::{GovernedActionKind, GovernedActionStatus, WorkspaceScriptRunStatus};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -8,7 +9,7 @@ use crate::{
     approval::ApprovalRequestRecord,
     audit::{self, NewAuditEvent},
     background::{self, WakeSignalRecord},
-    execution, governed_actions,
+    execution, governed_actions, workspace,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +590,117 @@ pub async fn recover_wake_signal_policy_block(
     .await
 }
 
+pub async fn recover_governed_action_policy_recheck_failure(
+    pool: &PgPool,
+    record: &governed_actions::GovernedActionExecutionRecord,
+    now: DateTime<Utc>,
+    failure_summary: &str,
+) -> Result<RecoveryTriggerOutcome> {
+    if failure_summary.trim().is_empty() {
+        bail!("governed action policy re-check failure summary must not be empty");
+    }
+
+    let context = load_governed_action_recovery_context(
+        pool,
+        record.clone(),
+        RecoveryReasonCode::IntegrityOrPolicyBlock,
+        RecoveryPolicyState::RecheckFailed,
+    )
+    .await?;
+    let checkpoint_payload = governed_action_recovery_checkpoint_payload(
+        &context,
+        None,
+        "policy_recheck",
+        Some(failure_summary),
+    );
+    let decision = evaluate_recovery_decision(&RecoveryDecisionRequest {
+        checkpoint_kind: RecoveryCheckpointKind::GovernedAction,
+        reason_code: RecoveryReasonCode::IntegrityOrPolicyBlock,
+        action_classification: context.action_classification,
+        evidence_state: context.evidence_state,
+        approval_state: context.approval_state,
+        policy_state: RecoveryPolicyState::RecheckFailed,
+        recovery_budget_remaining: 1,
+        clarification_available: context.clarification_available,
+    })?;
+    let checkpoint = create_recovery_checkpoint(
+        pool,
+        &NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: record.trace_id,
+            execution_id: record.execution_id,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: Some(record.governed_action_execution_id),
+            approval_request_id: record.approval_request_id,
+            checkpoint_kind: RecoveryCheckpointKind::GovernedAction,
+            recovery_reason_code: RecoveryReasonCode::IntegrityOrPolicyBlock,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: checkpoint_payload.clone(),
+        },
+    )
+    .await?;
+    let checkpoint = resolve_recovery_checkpoint(
+        pool,
+        &RecoveryCheckpointResolution {
+            recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+            status: decision.checkpoint_status,
+            recovery_decision: decision.decision,
+            resolved_summary: Some(decision.summary.clone()),
+            resolved_at: now,
+        },
+    )
+    .await?;
+    let reconciled_record = reconcile_governed_action_recovery(
+        pool,
+        &context,
+        decision.decision,
+        RecoveryPolicyState::RecheckFailed,
+        now,
+        &decision.summary,
+    )
+    .await?;
+    governed_actions::write_governed_action_audit_event(
+        pool,
+        &reconciled_record,
+        "governed_action_recovery_resolved",
+        "warn",
+        json!({
+            "recovery_checkpoint_id": checkpoint.recovery_checkpoint_id,
+            "recovery_decision": decision.decision.as_str(),
+            "recovery_reason_code": RecoveryReasonCode::IntegrityOrPolicyBlock.as_str(),
+            "action_classification": recovery_action_classification_label(context.action_classification),
+            "evidence_state": recovery_evidence_state_label(context.evidence_state),
+            "approval_state": recovery_approval_state_label(context.approval_state),
+            "policy_state": recovery_policy_state_label(RecoveryPolicyState::RecheckFailed),
+        }),
+    )
+    .await?;
+    let diagnostic = insert_operational_diagnostic(
+        pool,
+        &NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(record.trace_id),
+            execution_id: record.execution_id,
+            subsystem: "governed_actions".to_string(),
+            severity: OperationalDiagnosticSeverity::Warn,
+            reason_code: "governed_action_policy_recheck_failed".to_string(),
+            summary: format!(
+                "governed action execution was blocked during policy re-check; recovery decision: {}",
+                decision.decision.as_str()
+            ),
+            diagnostic_payload: checkpoint_payload,
+        },
+    )
+    .await?;
+
+    Ok(RecoveryTriggerOutcome {
+        checkpoint,
+        decision,
+        diagnostic,
+    })
+}
+
 pub async fn recover_foreground_restart_trigger(
     pool: &PgPool,
     request: ForegroundRestartRecoveryRequest<'_>,
@@ -836,6 +948,19 @@ async fn recover_worker_lease_timeout(
     diagnostic_severity: OperationalDiagnosticSeverity,
     error_message: Option<&str>,
 ) -> Result<WorkerLeaseRecoveryOutcome> {
+    if lease.worker_kind == WorkerLeaseKind::GovernedAction {
+        return recover_governed_action_worker_lease_timeout(
+            pool,
+            lease,
+            now,
+            source,
+            diagnostic_reason_code,
+            diagnostic_severity,
+            error_message,
+        )
+        .await;
+    }
+
     let checkpoint = create_recovery_checkpoint(
         pool,
         &NewRecoveryCheckpoint {
@@ -918,6 +1043,533 @@ async fn recover_worker_lease_timeout(
         decision,
         diagnostic,
     })
+}
+
+#[derive(Debug, Clone)]
+struct GovernedActionRecoveryContext {
+    record: governed_actions::GovernedActionExecutionRecord,
+    execution_record: Option<execution::ExecutionRecord>,
+    workspace_script_run: Option<workspace::WorkspaceScriptRunRecord>,
+    action_classification: RecoveryActionClassification,
+    evidence_state: RecoveryEvidenceState,
+    approval_state: RecoveryApprovalState,
+    clarification_available: bool,
+}
+
+async fn recover_governed_action_worker_lease_timeout(
+    pool: &PgPool,
+    lease: WorkerLeaseRecord,
+    now: DateTime<Utc>,
+    source: &str,
+    diagnostic_reason_code: &str,
+    diagnostic_severity: OperationalDiagnosticSeverity,
+    error_message: Option<&str>,
+) -> Result<WorkerLeaseRecoveryOutcome> {
+    let governed_action_execution_id = lease
+        .governed_action_execution_id
+        .context("governed-action recovery requires a governed action execution id")?;
+    let record =
+        governed_actions::get_governed_action_execution(pool, governed_action_execution_id).await?;
+    let context = load_governed_action_recovery_context(
+        pool,
+        record,
+        RecoveryReasonCode::TimeoutOrStall,
+        RecoveryPolicyState::Valid,
+    )
+    .await?;
+    let checkpoint_payload =
+        governed_action_recovery_checkpoint_payload(&context, Some(&lease), source, error_message);
+    let checkpoint = create_recovery_checkpoint(
+        pool,
+        &NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: lease.trace_id,
+            execution_id: lease.execution_id,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: Some(governed_action_execution_id),
+            approval_request_id: context.record.approval_request_id,
+            checkpoint_kind: RecoveryCheckpointKind::GovernedAction,
+            recovery_reason_code: RecoveryReasonCode::TimeoutOrStall,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: checkpoint_payload.clone(),
+        },
+    )
+    .await?;
+    let decision = evaluate_recovery_decision(&RecoveryDecisionRequest {
+        checkpoint_kind: RecoveryCheckpointKind::GovernedAction,
+        reason_code: RecoveryReasonCode::TimeoutOrStall,
+        action_classification: context.action_classification,
+        evidence_state: context.evidence_state,
+        approval_state: context.approval_state,
+        policy_state: RecoveryPolicyState::Valid,
+        recovery_budget_remaining: checkpoint.recovery_budget_remaining,
+        clarification_available: context.clarification_available,
+    })?;
+    let checkpoint = resolve_recovery_checkpoint(
+        pool,
+        &RecoveryCheckpointResolution {
+            recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+            status: decision.checkpoint_status,
+            recovery_decision: decision.decision,
+            resolved_summary: Some(decision.summary.clone()),
+            resolved_at: now,
+        },
+    )
+    .await?;
+    let reconciled_record = reconcile_governed_action_recovery(
+        pool,
+        &context,
+        decision.decision,
+        RecoveryPolicyState::Valid,
+        now,
+        &decision.summary,
+    )
+    .await?;
+    governed_actions::write_governed_action_audit_event(
+        pool,
+        &reconciled_record,
+        "governed_action_recovery_resolved",
+        "warn",
+        json!({
+            "worker_lease_id": lease.worker_lease_id,
+            "recovery_checkpoint_id": checkpoint.recovery_checkpoint_id,
+            "recovery_decision": decision.decision.as_str(),
+            "recovery_reason_code": RecoveryReasonCode::TimeoutOrStall.as_str(),
+            "action_classification": recovery_action_classification_label(context.action_classification),
+            "evidence_state": recovery_evidence_state_label(context.evidence_state),
+            "approval_state": recovery_approval_state_label(context.approval_state),
+            "policy_state": recovery_policy_state_label(RecoveryPolicyState::Valid),
+            "source": source,
+        }),
+    )
+    .await?;
+    let diagnostic = insert_operational_diagnostic(
+        pool,
+        &NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(lease.trace_id),
+            execution_id: lease.execution_id,
+            subsystem: "governed_actions".to_string(),
+            severity: diagnostic_severity,
+            reason_code: diagnostic_reason_code.to_string(),
+            summary: format!(
+                "governed action execution interruption observed; recovery decision: {}",
+                decision.decision.as_str()
+            ),
+            diagnostic_payload: checkpoint_payload,
+        },
+    )
+    .await?;
+
+    Ok(WorkerLeaseRecoveryOutcome {
+        lease,
+        checkpoint,
+        decision,
+        diagnostic,
+    })
+}
+
+async fn load_governed_action_recovery_context(
+    pool: &PgPool,
+    record: governed_actions::GovernedActionExecutionRecord,
+    reason_code: RecoveryReasonCode,
+    policy_state: RecoveryPolicyState,
+) -> Result<GovernedActionRecoveryContext> {
+    let execution_record = match record.execution_id {
+        Some(execution_id) => Some(execution::get(pool, execution_id).await?),
+        None => None,
+    };
+    let workspace_script_run = match record.workspace_script_id {
+        Some(_) => {
+            workspace::get_latest_workspace_script_run_by_governed_action_execution_id(
+                pool,
+                record.governed_action_execution_id,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let action_classification = governed_action_recovery_action_classification(&record);
+    let evidence_state = determine_governed_action_evidence_state(
+        &record,
+        execution_record.as_ref(),
+        workspace_script_run.as_ref(),
+    );
+    let approval_state = determine_governed_action_approval_state(
+        pool,
+        &record,
+        action_classification,
+        evidence_state,
+        reason_code,
+        policy_state,
+    )
+    .await?;
+    let clarification_available = action_classification
+        == RecoveryActionClassification::AmbiguousOrNonrepeatable
+        && matches!(approval_state, RecoveryApprovalState::NotRequired);
+
+    Ok(GovernedActionRecoveryContext {
+        record,
+        execution_record,
+        workspace_script_run,
+        action_classification,
+        evidence_state,
+        approval_state,
+        clarification_available,
+    })
+}
+
+async fn determine_governed_action_approval_state(
+    pool: &PgPool,
+    record: &governed_actions::GovernedActionExecutionRecord,
+    action_classification: RecoveryActionClassification,
+    evidence_state: RecoveryEvidenceState,
+    reason_code: RecoveryReasonCode,
+    policy_state: RecoveryPolicyState,
+) -> Result<RecoveryApprovalState> {
+    let Some(approval_request_id) = record.approval_request_id else {
+        return Ok(RecoveryApprovalState::NotRequired);
+    };
+
+    let status: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT status
+        FROM approval_requests
+        WHERE approval_request_id = $1
+        "#,
+    )
+    .bind(approval_request_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load approval status for governed-action recovery")?;
+
+    let Some(status) = status else {
+        return Ok(RecoveryApprovalState::MissingRequired);
+    };
+
+    let mapped = match status.as_str() {
+        "pending" => RecoveryApprovalState::Pending,
+        "approved" => RecoveryApprovalState::ApprovedFresh,
+        "rejected" => RecoveryApprovalState::Rejected,
+        "expired" => RecoveryApprovalState::Expired,
+        "invalidated" => RecoveryApprovalState::Invalidated,
+        other => bail!("unrecognized approval request status '{other}'"),
+    };
+
+    if mapped == RecoveryApprovalState::ApprovedFresh
+        && action_classification == RecoveryActionClassification::AmbiguousOrNonrepeatable
+        && reason_code == RecoveryReasonCode::TimeoutOrStall
+        && policy_state == RecoveryPolicyState::Valid
+        && evidence_state != RecoveryEvidenceState::DurableCompleted
+    {
+        return Ok(RecoveryApprovalState::MissingRequired);
+    }
+
+    Ok(mapped)
+}
+
+fn determine_governed_action_evidence_state(
+    record: &governed_actions::GovernedActionExecutionRecord,
+    execution_record: Option<&execution::ExecutionRecord>,
+    workspace_script_run: Option<&workspace::WorkspaceScriptRunRecord>,
+) -> RecoveryEvidenceState {
+    if governed_action_has_terminal_evidence(record, execution_record) {
+        return RecoveryEvidenceState::DurableCompleted;
+    }
+
+    if let Some(script_run) = workspace_script_run {
+        if workspace_script_run_is_terminal(script_run.status) {
+            return RecoveryEvidenceState::DurableCompleted;
+        }
+    }
+
+    if record.started_at.is_some() {
+        if matches!(
+            record.action_kind,
+            GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript
+        ) {
+            RecoveryEvidenceState::Ambiguous
+        } else {
+            RecoveryEvidenceState::DurableIncomplete
+        }
+    } else {
+        RecoveryEvidenceState::NotStarted
+    }
+}
+
+fn governed_action_has_terminal_evidence(
+    record: &governed_actions::GovernedActionExecutionRecord,
+    execution_record: Option<&execution::ExecutionRecord>,
+) -> bool {
+    if record.completed_at.is_some() {
+        return true;
+    }
+
+    execution_record.is_some_and(|execution_record| {
+        execution_record.status == "completed" || execution_record.status == "failed"
+    })
+}
+
+fn governed_action_recovery_action_classification(
+    record: &governed_actions::GovernedActionExecutionRecord,
+) -> RecoveryActionClassification {
+    match record.action_kind {
+        GovernedActionKind::InspectWorkspaceArtifact => RecoveryActionClassification::SafeReplay,
+        GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
+            RecoveryActionClassification::AmbiguousOrNonrepeatable
+        }
+    }
+}
+
+fn workspace_script_run_is_terminal(status: WorkspaceScriptRunStatus) -> bool {
+    matches!(
+        status,
+        WorkspaceScriptRunStatus::Completed
+            | WorkspaceScriptRunStatus::Failed
+            | WorkspaceScriptRunStatus::TimedOut
+            | WorkspaceScriptRunStatus::Blocked
+    )
+}
+
+fn governed_action_recovery_checkpoint_payload(
+    context: &GovernedActionRecoveryContext,
+    lease: Option<&WorkerLeaseRecord>,
+    source: &str,
+    error_message: Option<&str>,
+) -> Value {
+    json!({
+        "source": source,
+        "error_message": error_message,
+        "governed_action_execution_id": context.record.governed_action_execution_id,
+        "approval_request_id": context.record.approval_request_id,
+        "action_proposal_id": context.record.action_proposal_id,
+        "action_fingerprint": context.record.action_fingerprint.value.clone(),
+        "action_kind": context.record.action_kind,
+        "risk_tier": context.record.risk_tier,
+        "governed_action_status": context.record.status,
+        "output_ref": context.record.output_ref.clone(),
+        "started_at": context.record.started_at,
+        "completed_at": context.record.completed_at,
+        "recovery_action_classification": recovery_action_classification_label(context.action_classification),
+        "recovery_evidence_state": recovery_evidence_state_label(context.evidence_state),
+        "recovery_approval_state": recovery_approval_state_label(context.approval_state),
+        "execution_record": context.execution_record.as_ref().map(|record| json!({
+            "execution_id": record.execution_id,
+            "status": record.status.clone(),
+            "completed_at": record.completed_at,
+            "response_payload": record.response_payload.clone(),
+        })),
+        "workspace_script_run": context.workspace_script_run.as_ref().map(|run| json!({
+            "workspace_script_run_id": run.workspace_script_run_id,
+            "status": run.status,
+            "output_ref": run.output_ref.clone(),
+            "failure_summary": run.failure_summary.clone(),
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+        })),
+        "worker_lease": lease.map(|lease| json!({
+            "worker_lease_id": lease.worker_lease_id,
+            "worker_kind": lease.worker_kind.as_str(),
+            "worker_lease_status": lease.status.as_str(),
+            "worker_pid": lease.worker_pid,
+            "lease_acquired_at": lease.lease_acquired_at,
+            "lease_expires_at": lease.lease_expires_at,
+            "last_heartbeat_at": lease.last_heartbeat_at,
+            "metadata": lease.metadata.clone(),
+        })),
+    })
+}
+
+async fn reconcile_governed_action_recovery(
+    pool: &PgPool,
+    context: &GovernedActionRecoveryContext,
+    decision: RecoveryDecision,
+    policy_state: RecoveryPolicyState,
+    now: DateTime<Utc>,
+    summary: &str,
+) -> Result<governed_actions::GovernedActionExecutionRecord> {
+    if decision == RecoveryDecision::Continue {
+        if let Some((status, blocked_reason, completed_at)) =
+            governed_action_terminal_state(context, now)
+        {
+            if let Some(script_run) = &context.workspace_script_run {
+                if !workspace_script_run_is_terminal(script_run.status) {
+                    if let Some(run_status) =
+                        workspace_script_run_status_from_governed_action_status(
+                            status,
+                            blocked_reason.is_some(),
+                        )
+                    {
+                        workspace::update_workspace_script_run_status(
+                            pool,
+                            &workspace::UpdateWorkspaceScriptRunStatus {
+                                workspace_script_run_id: script_run.workspace_script_run_id,
+                                status: run_status,
+                                output_ref: context
+                                    .record
+                                    .execution_id
+                                    .map(|execution_id| format!("execution_record:{execution_id}"))
+                                    .or_else(|| script_run.output_ref.clone()),
+                                failure_summary: blocked_reason.clone(),
+                                started_at: script_run.started_at.or(context.record.started_at),
+                                completed_at: Some(completed_at),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            let output_ref = context
+                .record
+                .execution_id
+                .map(|execution_id| format!("execution_record:{execution_id}"));
+            return governed_actions::update_governed_action_execution(
+                pool,
+                governed_actions::GovernedActionExecutionUpdate {
+                    governed_action_execution_id: context.record.governed_action_execution_id,
+                    status,
+                    execution_id: context.record.execution_id,
+                    output_ref: output_ref.as_deref(),
+                    blocked_reason: blocked_reason.as_deref(),
+                    approval_request_id: context.record.approval_request_id,
+                    started_at: context.record.started_at,
+                    completed_at: Some(completed_at),
+                },
+            )
+            .await;
+        }
+
+        return Ok(context.record.clone());
+    }
+
+    let status = match decision {
+        RecoveryDecision::Reapprove => GovernedActionStatus::Invalidated,
+        RecoveryDecision::Clarify | RecoveryDecision::Abandon => {
+            if policy_state == RecoveryPolicyState::RecheckFailed {
+                GovernedActionStatus::Blocked
+            } else {
+                GovernedActionStatus::Failed
+            }
+        }
+        RecoveryDecision::Retry => {
+            if context.record.approval_request_id.is_some() {
+                GovernedActionStatus::Approved
+            } else {
+                GovernedActionStatus::Proposed
+            }
+        }
+        RecoveryDecision::Defer => GovernedActionStatus::AwaitingApproval,
+        RecoveryDecision::Continue => unreachable!("continue branch returned earlier"),
+    };
+    let blocked_reason = match decision {
+        RecoveryDecision::Retry => None,
+        _ => Some(summary),
+    };
+    let output_ref = context
+        .record
+        .execution_id
+        .map(|execution_id| format!("execution_record:{execution_id}"));
+    governed_actions::update_governed_action_execution(
+        pool,
+        governed_actions::GovernedActionExecutionUpdate {
+            governed_action_execution_id: context.record.governed_action_execution_id,
+            status,
+            execution_id: context.record.execution_id,
+            output_ref: output_ref.as_deref(),
+            blocked_reason,
+            approval_request_id: context.record.approval_request_id,
+            started_at: context.record.started_at,
+            completed_at: Some(now),
+        },
+    )
+    .await
+}
+
+fn governed_action_terminal_state(
+    context: &GovernedActionRecoveryContext,
+    now: DateTime<Utc>,
+) -> Option<(GovernedActionStatus, Option<String>, DateTime<Utc>)> {
+    if let Some(execution_record) = &context.execution_record {
+        if execution_record.status == "completed" {
+            return Some((
+                GovernedActionStatus::Executed,
+                None,
+                execution_record.completed_at.unwrap_or(now),
+            ));
+        }
+        if execution_record.status == "failed" {
+            let payload = execution_record.response_payload.as_ref();
+            let summary = payload
+                .and_then(|payload| payload.get("summary"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let status = match payload
+                .and_then(|payload| payload.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("blocked") => GovernedActionStatus::Blocked,
+                Some("completed") => GovernedActionStatus::Executed,
+                Some("failed") | Some("timed_out") => GovernedActionStatus::Failed,
+                _ => GovernedActionStatus::Failed,
+            };
+            return Some((
+                status,
+                summary,
+                execution_record.completed_at.unwrap_or(now),
+            ));
+        }
+    }
+
+    if let Some(script_run) = &context.workspace_script_run {
+        let status = match script_run.status {
+            WorkspaceScriptRunStatus::Completed => GovernedActionStatus::Executed,
+            WorkspaceScriptRunStatus::Blocked => GovernedActionStatus::Blocked,
+            WorkspaceScriptRunStatus::Failed | WorkspaceScriptRunStatus::TimedOut => {
+                GovernedActionStatus::Failed
+            }
+            WorkspaceScriptRunStatus::Pending | WorkspaceScriptRunStatus::Running => {
+                return None;
+            }
+        };
+        return Some((
+            status,
+            script_run.failure_summary.clone(),
+            script_run.completed_at.unwrap_or(now),
+        ));
+    }
+
+    context.record.completed_at.map(|completed_at| {
+        (
+            context.record.status,
+            context.record.blocked_reason.clone(),
+            completed_at,
+        )
+    })
+}
+
+fn workspace_script_run_status_from_governed_action_status(
+    status: GovernedActionStatus,
+    has_failure_summary: bool,
+) -> Option<WorkspaceScriptRunStatus> {
+    match status {
+        GovernedActionStatus::Executed => Some(WorkspaceScriptRunStatus::Completed),
+        GovernedActionStatus::Blocked => Some(WorkspaceScriptRunStatus::Blocked),
+        GovernedActionStatus::Failed => {
+            if has_failure_summary {
+                Some(WorkspaceScriptRunStatus::Failed)
+            } else {
+                Some(WorkspaceScriptRunStatus::TimedOut)
+            }
+        }
+        GovernedActionStatus::Proposed
+        | GovernedActionStatus::AwaitingApproval
+        | GovernedActionStatus::Approved
+        | GovernedActionStatus::Rejected
+        | GovernedActionStatus::Expired
+        | GovernedActionStatus::Invalidated => None,
+    }
 }
 
 async fn issue_recovery_trigger(
@@ -1033,6 +1685,34 @@ fn recovery_approval_state_label(state: RecoveryApprovalState) -> &'static str {
         RecoveryApprovalState::Invalidated => "invalidated",
         RecoveryApprovalState::Rejected => "rejected",
         RecoveryApprovalState::MissingRequired => "missing_required",
+    }
+}
+
+fn recovery_action_classification_label(
+    classification: RecoveryActionClassification,
+) -> &'static str {
+    match classification {
+        RecoveryActionClassification::SafeReplay => "safe_replay",
+        RecoveryActionClassification::ProvablyIdempotentExternal => "provably_idempotent_external",
+        RecoveryActionClassification::AmbiguousOrNonrepeatable => "ambiguous_or_nonrepeatable",
+    }
+}
+
+fn recovery_evidence_state_label(state: RecoveryEvidenceState) -> &'static str {
+    match state {
+        RecoveryEvidenceState::NotStarted => "not_started",
+        RecoveryEvidenceState::DurableIncomplete => "durable_incomplete",
+        RecoveryEvidenceState::DurableCompleted => "durable_completed",
+        RecoveryEvidenceState::Ambiguous => "ambiguous",
+        RecoveryEvidenceState::Corrupted => "corrupted",
+    }
+}
+
+fn recovery_policy_state_label(state: RecoveryPolicyState) -> &'static str {
+    match state {
+        RecoveryPolicyState::Valid => "valid",
+        RecoveryPolicyState::RequiresRecheck => "requires_recheck",
+        RecoveryPolicyState::RecheckFailed => "recheck_failed",
     }
 }
 
