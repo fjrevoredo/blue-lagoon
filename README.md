@@ -30,6 +30,7 @@ project plan.
 - `migrations/`: reviewed SQL migrations
 - `config/default.toml`: versioned non-secret runtime configuration
 - `config/local.example.toml`: template for untracked local operator overrides
+- `config/self_model_seed.toml`: checked-in seed for the runtime self-model
 - `compose.yaml`: local PostgreSQL and a minimal runtime topology
 
 ## Runtime Commands
@@ -106,6 +107,23 @@ Inspect recent wake signals:
 cargo run -p runtime -- admin wake-signals list
 ```
 
+Inspect approval request state and resolve one request through the canonical
+approval path:
+
+```bash
+cargo run -p runtime -- admin approvals list
+cargo run -p runtime -- admin approvals resolve --approval-request-id <uuid> --decision approve
+```
+
+Inspect governed actions and governed workspace state:
+
+```bash
+cargo run -p runtime -- admin actions list
+cargo run -p runtime -- admin workspace artifacts list
+cargo run -p runtime -- admin workspace scripts list
+cargo run -p runtime -- admin workspace runs list
+```
+
 Replay one stored Telegram update through the foreground path:
 
 ```bash
@@ -165,12 +183,30 @@ cargo test -p harness --test unconscious_component -- --nocapture
 cargo test -p harness --test unconscious_integration -- --nocapture
 ```
 
+Foundation, migration, recovery, and naming regression suites:
+
+```bash
+cargo test -p harness --test foundation_component -- --nocapture
+cargo test -p harness --test foundation_integration -- --nocapture
+cargo test -p harness --test migration_component -- --nocapture
+cargo test -p harness --test recovery_component -- --nocapture
+cargo test -p harness --test recovery_integration -- --nocapture
+cargo test -p harness --test artifact_naming -- --nocapture
+```
+
 Management CLI regression suites:
 
 ```bash
 cargo test -p runtime --test admin_cli -- --nocapture
 cargo test -p harness --test management_component -- --nocapture
 cargo test -p harness --test management_integration -- --nocapture
+```
+
+Governed-action regression suites:
+
+```bash
+cargo test -p harness --test governed_actions_component -- --nocapture
+cargo test -p harness --test governed_actions_integration -- --nocapture
 ```
 
 ## Local Development
@@ -200,7 +236,8 @@ create and drop per-test databases.
 
 Default non-secret settings live in `config/default.toml`. Local operator
 overrides belong in untracked `config/local.toml`, typically created from
-`config/local.example.toml`. Runtime secrets are resolved through `.env` and
+`config/local.example.toml`. The default self-model seed lives in
+`config/self_model_seed.toml`. Runtime secrets are resolved through `.env` and
 process environment variables.
 
 Important runtime inputs include:
@@ -234,6 +271,9 @@ The normal local workflow is:
 - copy `.env.example` to `.env`
 - fill in runtime secrets in `.env`
 - run runtime commands directly without manually sourcing `.env`
+
+`cargo run -p runtime -- admin status` reports whether the self-model seed path
+is configured and whether the seed file exists.
 
 The Telegram foreground path also requires:
 
@@ -317,7 +357,8 @@ cargo run -p runtime -- harness --once --synthetic-trigger smoke
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
-Repository-hosted CI lives in `.github/workflows/ci.yml` and exposes the stable
-jobs `workspace-verification`, `foreground-runtime`, and
-`canonical-persistence`. Live-network Telegram and provider checks remain
+Repository-hosted CI lives in `.github/workflows/ci.yml` and currently exposes
+the stable jobs `workspace-verification`, `foreground-runtime`,
+`canonical-persistence`, `background-maintenance`, `management-cli`, and
+`governed-actions`. Live-network Telegram and provider checks remain
 intentionally outside repository-hosted CI.

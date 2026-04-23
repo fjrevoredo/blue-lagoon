@@ -27,6 +27,7 @@ Operational assets live at the repository root:
 - `migrations/`: reviewed SQL migrations
 - `config/default.toml`: versioned non-secret config
 - `config/local.example.toml`: template for untracked local operator overrides
+- `config/self_model_seed.toml`: checked-in seed for the runtime self-model
 - `compose.yaml`: local PostgreSQL plus runtime topology
 
 Use `docs/sources/` for research inputs and external references. Historical
@@ -55,10 +56,22 @@ Typical implementation workflow is:
   the canonical continuity component suite.
 - `cargo test -p harness --test continuity_integration -- --nocapture` to run
   the canonical continuity integration suite.
+- `cargo test -p harness --test foundation_component -- --nocapture` to run
+  the foundational PostgreSQL-backed component suite.
+- `cargo test -p harness --test foundation_integration -- --nocapture` to run
+  the foundational architecture integration suite.
+- `cargo test -p harness --test migration_component -- --nocapture` to run
+  the reviewed-migration component suite against disposable PostgreSQL.
+- `cargo test -p harness --test recovery_component -- --nocapture` to run
+  the checkpoint and recovery component suite.
+- `cargo test -p harness --test recovery_integration -- --nocapture` to run
+  the architecture-critical recovery integration suite.
 - `cargo test -p harness --test unconscious_component -- --nocapture` to run
   the PostgreSQL-backed background-maintenance component suite.
 - `cargo test -p harness --test unconscious_integration -- --nocapture` to run
   the architecture-critical background-maintenance integration suite.
+- `cargo test -p harness --test artifact_naming -- --nocapture` to run the
+  repository artifact-naming regression suite.
 - `cargo test -p runtime --test admin_cli -- --nocapture` to run the runtime
   management CLI surface tests.
 - `cargo test -p runtime --bin runtime -- --nocapture` to run the runtime
