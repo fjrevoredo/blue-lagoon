@@ -1246,18 +1246,16 @@ async fn load_recent_base_diagnostics(
         .map(|row| BaseDiagnosticRecord {
             operational_diagnostic_id: row.get("operational_diagnostic_id"),
             trace_id: row.get("trace_id"),
-                execution_id: row.get("execution_id"),
-                subsystem: row.get("subsystem"),
-                severity: row.get("severity"),
-                reason_code: row.get("reason_code"),
-                created_at: row.get("created_at"),
-            })
+            execution_id: row.get("execution_id"),
+            subsystem: row.get("subsystem"),
+            severity: row.get("severity"),
+            reason_code: row.get("reason_code"),
+            created_at: row.get("created_at"),
+        })
         .collect())
 }
 
-fn summarize_diagnostic_health(
-    diagnostics: &[BaseDiagnosticRecord],
-) -> DiagnosticHealthSummary {
+fn summarize_diagnostic_health(diagnostics: &[BaseDiagnosticRecord]) -> DiagnosticHealthSummary {
     let mut info_count = 0_u32;
     let mut warn_count = 0_u32;
     let mut error_count = 0_u32;
