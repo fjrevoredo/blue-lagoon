@@ -3,7 +3,7 @@
 ## Phase 6 Detailed Implementation Plan
 
 Date: 2026-04-23
-Status: In progress; Milestone A and Milestone B completed; Milestone C in progress
+Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Task C3 completed
 Scope: High-level plan Phase 6 only
 Audience: LLM-assisted implementation work and human review
 
@@ -324,8 +324,8 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C3`
-- Completed tasks: `11/20`
+- Current active task: `C4`
+- Completed tasks: `12/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -766,7 +766,7 @@ Completion evidence:
 
 ### Task C3: Generalize foreground and background recovery triggers
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 

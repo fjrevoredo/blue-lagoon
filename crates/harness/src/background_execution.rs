@@ -682,6 +682,18 @@ async fn persist_wake_signals(
         let mut persisted_decision = policy_decision.clone();
         let cooldown_until = cooldown_until(config, policy_decision.decision, requested_at);
 
+        if policy_decision.decision == WakeSignalDecisionKind::Rejected {
+            recovery::recover_wake_signal_policy_block(
+                pool,
+                &recorded_signal,
+                requested_at,
+                "wake_signal_routing_rejected",
+                &policy_decision.reason,
+            )
+            .await
+            .context("failed to route rejected wake-signal conversion through recovery")?;
+        }
+
         if policy_decision.decision == WakeSignalDecisionKind::Accepted {
             let binding = foreground_binding.context(
                 "accepted wake signal requires a configured Telegram foreground binding",

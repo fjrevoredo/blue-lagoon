@@ -664,6 +664,48 @@ pub async fn list_active_job_runs(
         .collect()
 }
 
+pub async fn list_active_job_run_pairs_without_worker_leases(
+    pool: &PgPool,
+    limit: u32,
+) -> Result<Vec<(Uuid, Uuid)>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            jobs.background_job_id,
+            runs.background_job_run_id
+        FROM background_job_runs runs
+        INNER JOIN background_jobs jobs
+            ON jobs.background_job_id = runs.background_job_id
+        WHERE jobs.status IN ('leased', 'running')
+          AND runs.status IN ('leased', 'running')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM worker_leases worker_leases
+              WHERE worker_leases.background_job_run_id = runs.background_job_run_id
+                AND worker_leases.status = 'active'
+          )
+        ORDER BY
+            COALESCE(runs.started_at, runs.lease_acquired_at) ASC,
+            runs.background_job_run_id ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .context("failed to list active background job runs without worker leases")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("background_job_id"),
+                row.get("background_job_run_id"),
+            )
+        })
+        .collect())
+}
+
 pub async fn list_completed_job_runs(
     pool: &PgPool,
     background_job_id: Uuid,

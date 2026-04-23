@@ -121,6 +121,7 @@ pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
     supervise_expired_worker_leases(&pool).await?;
+    supervise_background_supervisor_restart_recovery(&pool).await?;
 
     if options.idle {
         info!("harness boot verified and returned to idle");
@@ -280,6 +281,17 @@ async fn supervise_expired_worker_leases(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+async fn supervise_background_supervisor_restart_recovery(pool: &PgPool) -> Result<()> {
+    let recovered = recovery::recover_background_supervisor_restart(pool, Utc::now(), 40).await?;
+    if !recovered.is_empty() {
+        info!(
+            stranded_background_job_count = recovered.len(),
+            "stranded background runs were routed through supervisor restart recovery"
+        );
+    }
+    Ok(())
+}
+
 async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<HarnessOutcome> {
     match policy::evaluate_synthetic_smoke(config) {
         PolicyDecision::Allowed => {}
@@ -434,6 +446,8 @@ where
         ..TelegramProcessingSummary::default()
     };
     let mut staged_conversations = BTreeSet::new();
+    let mut newly_staged_conversations = BTreeSet::new();
+    let mut recovery_scan_conversations = BTreeSet::new();
 
     for update in updates {
         let normalization = ingress::normalize_telegram_update(
@@ -478,7 +492,8 @@ where
                 .await?
                 {
                     foreground::StagedForegroundIngressOutcome::Accepted(staged) => {
-                        staged_conversations.insert(staged.internal_conversation_ref);
+                        staged_conversations.insert(staged.internal_conversation_ref.clone());
+                        newly_staged_conversations.insert(staged.internal_conversation_ref);
                     }
                     foreground::StagedForegroundIngressOutcome::Duplicate(_) => {
                         summary.duplicate_count += 1;
@@ -522,7 +537,8 @@ where
     for internal_conversation_ref in
         foreground::list_recoverable_foreground_conversations(context.pool, context.config).await?
     {
-        staged_conversations.insert(internal_conversation_ref);
+        staged_conversations.insert(internal_conversation_ref.clone());
+        recovery_scan_conversations.insert(internal_conversation_ref);
     }
 
     for internal_conversation_ref in staged_conversations {
@@ -557,6 +573,54 @@ where
             continue;
         };
         let is_backlog_recovery = plan.mode == contracts::ForegroundExecutionMode::BacklogRecovery;
+        let selected_ingress_ids = plan
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect::<Vec<_>>();
+        let recovered_only_from_scan = recovery_scan_conversations
+            .contains(&internal_conversation_ref)
+            && !newly_staged_conversations.contains(&internal_conversation_ref);
+
+        if plan.decision_reason
+            == foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
+        {
+            recovery::recover_foreground_restart_trigger(
+                context.pool,
+                recovery::ForegroundRestartRecoveryRequest {
+                    trace_id,
+                    execution_id,
+                    internal_conversation_ref: &internal_conversation_ref,
+                    recovery_reason_code: recovery::RecoveryReasonCode::Crash,
+                    trigger_source: "telegram_foreground_processing_loop",
+                    decision_reason: plan.decision_reason.as_str(),
+                    selected_ingress_ids: &selected_ingress_ids,
+                    primary_ingress_id: plan.primary_ingress.ingress_id,
+                    recovery_mode: "backlog_recovery",
+                },
+                Utc::now(),
+            )
+            .await
+            .context("failed to route stale foreground processing through recovery")?;
+        } else if recovered_only_from_scan && is_backlog_recovery {
+            recovery::recover_foreground_restart_trigger(
+                context.pool,
+                recovery::ForegroundRestartRecoveryRequest {
+                    trace_id,
+                    execution_id,
+                    internal_conversation_ref: &internal_conversation_ref,
+                    recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
+                    trigger_source: "telegram_foreground_recovery_scan",
+                    decision_reason: plan.decision_reason.as_str(),
+                    selected_ingress_ids: &selected_ingress_ids,
+                    primary_ingress_id: plan.primary_ingress.ingress_id,
+                    recovery_mode: "backlog_recovery",
+                },
+                Utc::now(),
+            )
+            .await
+            .context("failed to route foreground supervisor restart through recovery")?;
+        }
 
         match foreground_orchestration::orchestrate_telegram_foreground_plan(
             context.pool,

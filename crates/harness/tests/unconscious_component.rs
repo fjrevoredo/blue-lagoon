@@ -1085,6 +1085,33 @@ async fn background_execution_rejects_wake_signal_when_no_foreground_binding_is_
                 .decision,
             WakeSignalDecisionKind::Rejected
         );
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "wake_signal_routing_rejected"
+                && diagnostic.diagnostic_payload["wake_signal_id"] == json!(wake_signal_id)
+        }));
+        let checkpoint_row = sqlx::query(
+            r#"
+            SELECT recovery_reason_code, recovery_decision
+            FROM recovery_checkpoints
+            WHERE background_job_id = $1
+              AND checkpoint_payload_json ->> 'wake_signal_id' = $2
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(background_job_id)
+        .bind(wake_signal_id.to_string())
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_reason_code"),
+            "integrity_or_policy_block".to_string()
+        );
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_decision"),
+            "abandon".to_string()
+        );
 
         let staged_count: i64 = sqlx::query_scalar(
             r#"

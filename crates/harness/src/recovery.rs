@@ -4,6 +4,13 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::{
+    approval::ApprovalRequestRecord,
+    audit::{self, NewAuditEvent},
+    background::{self, WakeSignalRecord},
+    execution, governed_actions,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryCheckpointKind {
     Foreground,
@@ -192,6 +199,26 @@ pub struct WorkerLeaseRecoveryOutcome {
     pub checkpoint: RecoveryCheckpointRecord,
     pub decision: RecoveryDecisionOutcome,
     pub diagnostic: OperationalDiagnosticRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryTriggerOutcome {
+    pub checkpoint: RecoveryCheckpointRecord,
+    pub decision: RecoveryDecisionOutcome,
+    pub diagnostic: OperationalDiagnosticRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForegroundRestartRecoveryRequest<'a> {
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub internal_conversation_ref: &'a str,
+    pub recovery_reason_code: RecoveryReasonCode,
+    pub trigger_source: &'a str,
+    pub decision_reason: &'a str,
+    pub selected_ingress_ids: &'a [Uuid],
+    pub primary_ingress_id: Uuid,
+    pub recovery_mode: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +430,403 @@ pub async fn recover_observed_worker_timeout(
     .await
 }
 
+pub async fn recover_approval_request_transition(
+    pool: &PgPool,
+    request: &ApprovalRequestRecord,
+    approval_state: RecoveryApprovalState,
+    now: DateTime<Utc>,
+    diagnostic_reason_code: &str,
+) -> Result<RecoveryTriggerOutcome> {
+    match approval_state {
+        RecoveryApprovalState::Pending
+        | RecoveryApprovalState::Expired
+        | RecoveryApprovalState::Invalidated
+        | RecoveryApprovalState::MissingRequired => {}
+        other => bail!("approval transition recovery does not support state {other:?}"),
+    }
+
+    let linked_execution = governed_actions::get_governed_action_execution_by_approval_request_id(
+        pool,
+        request.approval_request_id,
+    )
+    .await?;
+    let checkpoint_kind = if linked_execution.is_some() {
+        RecoveryCheckpointKind::GovernedAction
+    } else {
+        RecoveryCheckpointKind::Foreground
+    };
+    let governed_action_execution_id = linked_execution
+        .as_ref()
+        .map(|record| record.governed_action_execution_id);
+    let action_classification = if governed_action_execution_id.is_some() {
+        RecoveryActionClassification::AmbiguousOrNonrepeatable
+    } else {
+        RecoveryActionClassification::SafeReplay
+    };
+    let checkpoint_payload = json!({
+        "approval_request_id": request.approval_request_id,
+        "action_proposal_id": request.action_proposal_id,
+        "action_fingerprint": request.action_fingerprint.value,
+        "action_kind": request.action_kind,
+        "risk_tier": request.risk_tier,
+        "title": request.title,
+        "consequence_summary": request.consequence_summary,
+        "requested_by": request.requested_by,
+        "requested_at": request.requested_at,
+        "expires_at": request.expires_at,
+        "approval_state": recovery_approval_state_label(approval_state),
+        "governed_action_execution_id": governed_action_execution_id,
+    });
+    let diagnostic_summary = match approval_state {
+        RecoveryApprovalState::Pending => {
+            "governed action execution is deferred pending approval resolution"
+        }
+        RecoveryApprovalState::Expired => "approval request expired before resolution",
+        RecoveryApprovalState::Invalidated => {
+            "approval request was invalidated and requires explicit follow-up"
+        }
+        RecoveryApprovalState::MissingRequired => {
+            "required approval request is missing and must be recreated"
+        }
+        _ => unreachable!("unsupported approval transition state was rejected above"),
+    };
+
+    issue_recovery_trigger(
+        pool,
+        NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id,
+            approval_request_id: Some(request.approval_request_id),
+            checkpoint_kind,
+            recovery_reason_code: RecoveryReasonCode::ApprovalTransition,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: checkpoint_payload.clone(),
+        },
+        RecoveryDecisionRequest {
+            checkpoint_kind,
+            reason_code: RecoveryReasonCode::ApprovalTransition,
+            action_classification,
+            evidence_state: RecoveryEvidenceState::NotStarted,
+            approval_state,
+            policy_state: RecoveryPolicyState::Valid,
+            recovery_budget_remaining: 1,
+            clarification_available: false,
+        },
+        NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(request.trace_id),
+            execution_id: request.execution_id,
+            subsystem: "approval".to_string(),
+            severity: OperationalDiagnosticSeverity::Warn,
+            reason_code: diagnostic_reason_code.to_string(),
+            summary: diagnostic_summary.to_string(),
+            diagnostic_payload: checkpoint_payload,
+        },
+        now,
+    )
+    .await
+}
+
+pub async fn recover_wake_signal_policy_block(
+    pool: &PgPool,
+    wake_signal: &WakeSignalRecord,
+    now: DateTime<Utc>,
+    diagnostic_reason_code: &str,
+    diagnostic_summary: &str,
+) -> Result<RecoveryTriggerOutcome> {
+    let checkpoint_payload = json!({
+        "wake_signal_id": wake_signal.wake_signal_id,
+        "background_job_id": wake_signal.background_job_id,
+        "background_job_run_id": wake_signal.background_job_run_id,
+        "execution_id": wake_signal.execution_id,
+        "status": format!("{:?}", wake_signal.status).to_lowercase(),
+        "priority": wake_signal.signal.priority,
+        "reason_code": wake_signal.signal.reason_code,
+        "summary": wake_signal.signal.summary,
+        "requested_at": wake_signal.requested_at,
+    });
+    issue_recovery_trigger(
+        pool,
+        NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: wake_signal.trace_id,
+            execution_id: wake_signal.execution_id,
+            background_job_id: Some(wake_signal.background_job_id),
+            background_job_run_id: wake_signal.background_job_run_id,
+            governed_action_execution_id: None,
+            approval_request_id: None,
+            checkpoint_kind: RecoveryCheckpointKind::Background,
+            recovery_reason_code: RecoveryReasonCode::IntegrityOrPolicyBlock,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: checkpoint_payload.clone(),
+        },
+        RecoveryDecisionRequest {
+            checkpoint_kind: RecoveryCheckpointKind::Background,
+            reason_code: RecoveryReasonCode::IntegrityOrPolicyBlock,
+            action_classification: RecoveryActionClassification::SafeReplay,
+            evidence_state: RecoveryEvidenceState::NotStarted,
+            approval_state: RecoveryApprovalState::NotRequired,
+            policy_state: RecoveryPolicyState::Valid,
+            recovery_budget_remaining: 1,
+            clarification_available: false,
+        },
+        NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(wake_signal.trace_id),
+            execution_id: wake_signal.execution_id,
+            subsystem: "background_execution".to_string(),
+            severity: OperationalDiagnosticSeverity::Warn,
+            reason_code: diagnostic_reason_code.to_string(),
+            summary: diagnostic_summary.to_string(),
+            diagnostic_payload: checkpoint_payload,
+        },
+        now,
+    )
+    .await
+}
+
+pub async fn recover_foreground_restart_trigger(
+    pool: &PgPool,
+    request: ForegroundRestartRecoveryRequest<'_>,
+    now: DateTime<Utc>,
+) -> Result<RecoveryTriggerOutcome> {
+    if !matches!(
+        request.recovery_reason_code,
+        RecoveryReasonCode::Crash | RecoveryReasonCode::SupervisorRestart
+    ) {
+        bail!("foreground restart recovery requires crash or supervisor-restart reason code");
+    }
+    if request.internal_conversation_ref.trim().is_empty() {
+        bail!("foreground restart recovery requires an internal conversation reference");
+    }
+    if request.trigger_source.trim().is_empty() {
+        bail!("foreground restart recovery requires a trigger source");
+    }
+    if request.decision_reason.trim().is_empty() {
+        bail!("foreground restart recovery requires a decision reason");
+    }
+    if request.recovery_mode.trim().is_empty() {
+        bail!("foreground restart recovery requires a recovery mode");
+    }
+    if request.selected_ingress_ids.is_empty() {
+        bail!("foreground restart recovery requires at least one selected ingress");
+    }
+
+    let checkpoint_payload = json!({
+        "source": request.trigger_source,
+        "internal_conversation_ref": request.internal_conversation_ref,
+        "decision_reason": request.decision_reason,
+        "recovery_mode": request.recovery_mode,
+        "selected_ingress_ids": request.selected_ingress_ids,
+        "primary_ingress_id": request.primary_ingress_id,
+    });
+    let diagnostic_reason_code = match request.recovery_reason_code {
+        RecoveryReasonCode::Crash => "foreground_processing_crash_recovered",
+        RecoveryReasonCode::SupervisorRestart => "foreground_supervisor_restart_recovered",
+        _ => unreachable!("guarded above"),
+    };
+    let reason_summary = match request.recovery_reason_code {
+        RecoveryReasonCode::Crash => {
+            "foreground processing was resumed after a crash or interrupted execution"
+        }
+        RecoveryReasonCode::SupervisorRestart => {
+            "foreground backlog recovery was resumed during supervisor startup"
+        }
+        _ => unreachable!("guarded above"),
+    };
+
+    issue_recovery_trigger(
+        pool,
+        NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: request.trace_id,
+            execution_id: Some(request.execution_id),
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            approval_request_id: None,
+            checkpoint_kind: RecoveryCheckpointKind::Foreground,
+            recovery_reason_code: request.recovery_reason_code,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: checkpoint_payload.clone(),
+        },
+        RecoveryDecisionRequest {
+            checkpoint_kind: RecoveryCheckpointKind::Foreground,
+            reason_code: request.recovery_reason_code,
+            action_classification: RecoveryActionClassification::SafeReplay,
+            evidence_state: RecoveryEvidenceState::DurableIncomplete,
+            approval_state: RecoveryApprovalState::NotRequired,
+            policy_state: RecoveryPolicyState::Valid,
+            recovery_budget_remaining: 1,
+            clarification_available: false,
+        },
+        NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(request.trace_id),
+            execution_id: Some(request.execution_id),
+            subsystem: "recovery".to_string(),
+            severity: OperationalDiagnosticSeverity::Warn,
+            reason_code: diagnostic_reason_code.to_string(),
+            summary: format!(
+                "{reason_summary}; recovery decision: {}",
+                RecoveryDecision::Continue.as_str()
+            ),
+            diagnostic_payload: checkpoint_payload,
+        },
+        now,
+    )
+    .await
+}
+
+pub async fn recover_background_supervisor_restart(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<RecoveryTriggerOutcome>> {
+    let stranded_pairs =
+        background::list_active_job_run_pairs_without_worker_leases(pool, limit).await?;
+    let mut outcomes = Vec::with_capacity(stranded_pairs.len());
+
+    for (background_job_id, background_job_run_id) in stranded_pairs {
+        let job = background::get_job(pool, background_job_id).await?;
+        let run = background::get_job_run(pool, background_job_run_id).await?;
+        let evidence_state = if run.status == background::BackgroundJobRunStatus::Leased
+            && run.started_at.is_none()
+        {
+            RecoveryEvidenceState::NotStarted
+        } else {
+            RecoveryEvidenceState::DurableIncomplete
+        };
+        let checkpoint_payload = json!({
+            "source": "background_supervisor_startup",
+            "background_job_id": job.background_job_id,
+            "background_job_run_id": run.background_job_run_id,
+            "job_status": format!("{:?}", job.status).to_lowercase(),
+            "run_status": format!("{:?}", run.status).to_lowercase(),
+            "lease_acquired_at": run.lease_acquired_at,
+            "lease_expires_at": run.lease_expires_at,
+            "started_at": run.started_at,
+            "execution_id": run.execution_id,
+        });
+        let outcome = issue_recovery_trigger(
+            pool,
+            NewRecoveryCheckpoint {
+                recovery_checkpoint_id: Uuid::now_v7(),
+                trace_id: job.trace_id,
+                execution_id: run.execution_id,
+                background_job_id: Some(job.background_job_id),
+                background_job_run_id: Some(run.background_job_run_id),
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                checkpoint_kind: RecoveryCheckpointKind::Background,
+                recovery_reason_code: RecoveryReasonCode::SupervisorRestart,
+                recovery_budget_remaining: 1,
+                checkpoint_payload: checkpoint_payload.clone(),
+            },
+            RecoveryDecisionRequest {
+                checkpoint_kind: RecoveryCheckpointKind::Background,
+                reason_code: RecoveryReasonCode::SupervisorRestart,
+                action_classification: RecoveryActionClassification::SafeReplay,
+                evidence_state,
+                approval_state: RecoveryApprovalState::NotRequired,
+                policy_state: RecoveryPolicyState::Valid,
+                recovery_budget_remaining: 1,
+                clarification_available: false,
+            },
+            NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: Some(job.trace_id),
+                execution_id: run.execution_id,
+                subsystem: "recovery".to_string(),
+                severity: OperationalDiagnosticSeverity::Warn,
+                reason_code: "background_supervisor_restart_recovered".to_string(),
+                summary:
+                    "background execution was stranded across supervisor restart; recovery was evaluated"
+                        .to_string(),
+                diagnostic_payload: checkpoint_payload,
+            },
+            now,
+        )
+        .await?;
+
+        let failure_payload = json!({
+            "kind": "supervisor_restart_recovery",
+            "background_job_id": job.background_job_id,
+            "background_job_run_id": run.background_job_run_id,
+            "recovery_checkpoint_id": outcome.checkpoint.recovery_checkpoint_id,
+            "recovery_decision": outcome.decision.decision.as_str(),
+            "source": "background_supervisor_startup",
+        });
+
+        background::update_job_run_status(
+            pool,
+            run.background_job_run_id,
+            &background::UpdateBackgroundJobRunStatus {
+                status: background::BackgroundJobRunStatus::Failed,
+                worker_pid: run.worker_pid,
+                started_at: run.started_at,
+                completed_at: Some(now),
+                result_payload: None,
+                failure_payload: Some(failure_payload.clone()),
+            },
+        )
+        .await?;
+
+        let next_job_status = if matches!(
+            outcome.decision.decision,
+            RecoveryDecision::Retry | RecoveryDecision::Continue
+        ) {
+            background::BackgroundJobStatus::Planned
+        } else {
+            background::BackgroundJobStatus::Failed
+        };
+        background::update_job_status(
+            pool,
+            job.background_job_id,
+            &background::UpdateBackgroundJobStatus {
+                status: next_job_status,
+                lease_expires_at: None,
+                last_started_at: job.last_started_at.or(run.started_at),
+                last_completed_at: job.last_completed_at,
+            },
+        )
+        .await?;
+
+        if let Some(execution_id) = run.execution_id {
+            execution::mark_failed(pool, execution_id, &failure_payload).await?;
+        }
+
+        audit::insert(
+            pool,
+            &NewAuditEvent {
+                loop_kind: "unconscious".to_string(),
+                subsystem: "recovery".to_string(),
+                event_kind: "background_job_supervisor_restart_recovered".to_string(),
+                severity: "warn".to_string(),
+                trace_id: job.trace_id,
+                execution_id: run.execution_id,
+                worker_pid: run.worker_pid,
+                payload: json!({
+                    "background_job_id": job.background_job_id,
+                    "background_job_run_id": run.background_job_run_id,
+                    "recovery_checkpoint_id": outcome.checkpoint.recovery_checkpoint_id,
+                    "recovery_decision": outcome.decision.decision.as_str(),
+                    "next_job_status": format!("{:?}", next_job_status).to_lowercase(),
+                }),
+            },
+        )
+        .await?;
+
+        outcomes.push(outcome);
+    }
+
+    Ok(outcomes)
+}
+
 async fn recover_worker_lease_timeout(
     pool: &PgPool,
     lease: WorkerLeaseRecord,
@@ -496,6 +920,34 @@ async fn recover_worker_lease_timeout(
     })
 }
 
+async fn issue_recovery_trigger(
+    pool: &PgPool,
+    checkpoint: NewRecoveryCheckpoint,
+    request: RecoveryDecisionRequest,
+    diagnostic: NewOperationalDiagnostic,
+    now: DateTime<Utc>,
+) -> Result<RecoveryTriggerOutcome> {
+    let checkpoint = create_recovery_checkpoint(pool, &checkpoint).await?;
+    let decision = evaluate_recovery_decision(&request)?;
+    let checkpoint = resolve_recovery_checkpoint(
+        pool,
+        &RecoveryCheckpointResolution {
+            recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+            status: decision.checkpoint_status,
+            recovery_decision: decision.decision,
+            resolved_summary: Some(decision.summary.clone()),
+            resolved_at: now,
+        },
+    )
+    .await?;
+    let diagnostic = insert_operational_diagnostic(pool, &diagnostic).await?;
+    Ok(RecoveryTriggerOutcome {
+        checkpoint,
+        decision,
+        diagnostic,
+    })
+}
+
 pub async fn supervise_worker_leases(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -569,6 +1021,18 @@ fn recovery_action_classification_for_lease(
             RecoveryActionClassification::SafeReplay
         }
         WorkerLeaseKind::GovernedAction => RecoveryActionClassification::AmbiguousOrNonrepeatable,
+    }
+}
+
+fn recovery_approval_state_label(state: RecoveryApprovalState) -> &'static str {
+    match state {
+        RecoveryApprovalState::NotRequired => "not_required",
+        RecoveryApprovalState::Pending => "pending",
+        RecoveryApprovalState::ApprovedFresh => "approved_fresh",
+        RecoveryApprovalState::Expired => "expired",
+        RecoveryApprovalState::Invalidated => "invalidated",
+        RecoveryApprovalState::Rejected => "rejected",
+        RecoveryApprovalState::MissingRequired => "missing_required",
     }
 }
 

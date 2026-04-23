@@ -1155,6 +1155,15 @@ where
                         approval_request.approval_request_id,
                     )
                     .await?;
+                    recovery::recover_approval_request_transition(
+                        pool,
+                        &approval_request,
+                        recovery::RecoveryApprovalState::Pending,
+                        Utc::now(),
+                        "approval_transition_pending",
+                    )
+                    .await
+                    .context("failed to route pending approval transition through recovery")?;
                     deliver_telegram_approval_prompt(
                         config.approvals.prompt_mode,
                         &trigger.ingress,

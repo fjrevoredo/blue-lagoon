@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     config::RuntimeConfig,
+    recovery::{self, RecoveryApprovalState},
 };
 
 const APPROVAL_EXPIRY_ACTOR: &str = "system:approval-expiry";
@@ -579,10 +580,17 @@ pub async fn expire_due_approval_requests(
             .await
             .context("failed to commit approval expiry transaction")?;
 
-        results.push(ApprovalResolutionResult {
-            request: get_approval_request(pool, record.approval_request_id).await?,
-            event,
-        });
+        let request = get_approval_request(pool, record.approval_request_id).await?;
+        recovery::recover_approval_request_transition(
+            pool,
+            &request,
+            RecoveryApprovalState::Expired,
+            now,
+            "approval_request_expired",
+        )
+        .await?;
+
+        results.push(ApprovalResolutionResult { request, event });
     }
 
     Ok(results)
