@@ -3,7 +3,7 @@
 ## Phase 6 Detailed Implementation Plan
 
 Date: 2026-04-23
-Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Tasks C3-C4 completed
+Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Tasks C3-C5 completed
 Scope: High-level plan Phase 6 only
 Audience: LLM-assisted implementation work and human review
 
@@ -324,8 +324,8 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C5`
-- Completed tasks: `13/20`
+- Current active task: `C6`
+- Completed tasks: `14/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -815,7 +815,7 @@ Verification:
 
 ### Task C5: Implement health summaries, diagnostics, and operator-facing recovery visibility
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 

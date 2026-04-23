@@ -1,9 +1,10 @@
-use std::{env, path::PathBuf};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{BackgroundTrigger, BackgroundTriggerKind, UnconsciousJobKind};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -11,12 +12,19 @@ use crate::{
     approval, background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     config::RuntimeConfig,
-    db, governed_actions, migration, model_gateway,
+    db, governed_actions, migration, model_gateway, recovery,
     schema::{self, SchemaCompatibility, SchemaPolicy},
     worker, workspace,
 };
 
 const DEFAULT_LIST_LIMIT: u32 = 20;
+const HEALTH_RECENT_WINDOW_MINUTES: i64 = 60;
+const HEALTH_TOP_REASON_LIMIT: usize = 5;
+const HEALTH_RECENT_BASE_DIAGNOSTIC_LIMIT: i64 = 200;
+const ANOMALY_REPEAT_THRESHOLD: usize = 3;
+const ANOMALY_FAILURE_PRESSURE_THRESHOLD: usize = 2;
+const ANOMALY_DEDUPE_WINDOW_MINUTES: i64 = 15;
+const LEASE_AT_RISK_WINDOW_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatusReport {
@@ -26,6 +34,89 @@ pub struct RuntimeStatusReport {
     pub model_gateway: ModelGatewayStatusReport,
     pub self_model: SelfModelStatusReport,
     pub pending_work: PendingWorkSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalHealthSummary {
+    pub evaluated_at: DateTime<Utc>,
+    pub overall_status: String,
+    pub pending_work: PendingWorkSummary,
+    pub recovery: RecoveryHealthSummary,
+    pub diagnostics: DiagnosticHealthSummary,
+    pub anomalies: Vec<OperationalAnomalySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryHealthSummary {
+    pub open_checkpoint_count: u32,
+    pub open_foreground_checkpoint_count: u32,
+    pub open_background_checkpoint_count: u32,
+    pub open_governed_action_checkpoint_count: u32,
+    pub recent_resolved_checkpoint_count: u32,
+    pub recent_abandoned_checkpoint_count: u32,
+    pub active_worker_lease_count: u32,
+    pub overdue_active_worker_lease_count: u32,
+    pub at_risk_active_worker_lease_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticHealthSummary {
+    pub recent_window_minutes: u32,
+    pub observed_count: u32,
+    pub info_count: u32,
+    pub warn_count: u32,
+    pub error_count: u32,
+    pub critical_count: u32,
+    pub top_reason_codes: Vec<OperationalReasonRollup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalReasonRollup {
+    pub reason_code: String,
+    pub count: u32,
+    pub latest_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalAnomalySummary {
+    pub anomaly_kind: String,
+    pub severity: String,
+    pub reason_code: String,
+    pub summary: String,
+    pub occurrence_count: u32,
+    pub latest_trace_id: Option<Uuid>,
+    pub latest_execution_id: Option<Uuid>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalDiagnosticSummary {
+    pub operational_diagnostic_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    pub execution_id: Option<Uuid>,
+    pub subsystem: String,
+    pub severity: String,
+    pub reason_code: String,
+    pub summary: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCheckpointSummary {
+    pub recovery_checkpoint_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub background_job_id: Option<Uuid>,
+    pub background_job_run_id: Option<Uuid>,
+    pub governed_action_execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub checkpoint_kind: String,
+    pub recovery_reason_code: String,
+    pub status: String,
+    pub recovery_decision: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +345,151 @@ pub async fn load_runtime_status(config: &RuntimeConfig) -> Result<RuntimeStatus
         self_model: inspect_self_model_status(config),
         pending_work,
     })
+}
+
+pub async fn load_operational_health_summary(
+    config: &RuntimeConfig,
+) -> Result<OperationalHealthSummary> {
+    let pool = db::connect(config).await?;
+    let now = Utc::now();
+    let recent_window_start = now - Duration::minutes(HEALTH_RECENT_WINDOW_MINUTES);
+    let pending_work = load_pending_work_summary(&pool, config).await?;
+    let recovery = load_recovery_health_summary(&pool, now, recent_window_start).await?;
+    let base_diagnostics = load_recent_base_diagnostics(&pool, recent_window_start).await?;
+    record_operational_anomaly_rollups(&pool, now, &recovery, &base_diagnostics).await?;
+    let diagnostics = summarize_diagnostic_health(&base_diagnostics);
+    let anomalies = load_recent_operational_anomalies(&pool, recent_window_start).await?;
+
+    Ok(OperationalHealthSummary {
+        evaluated_at: now,
+        overall_status: classify_overall_health(&pending_work, &recovery, &diagnostics),
+        pending_work,
+        recovery,
+        diagnostics,
+        anomalies,
+    })
+}
+
+pub async fn list_recent_operational_diagnostics(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<OperationalDiagnosticSummary>> {
+    let pool = db::connect(config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            operational_diagnostic_id,
+            trace_id,
+            execution_id,
+            subsystem,
+            severity,
+            reason_code,
+            summary,
+            created_at
+        FROM operational_diagnostics
+        ORDER BY created_at DESC, operational_diagnostic_id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list recent operational diagnostics for management")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| OperationalDiagnosticSummary {
+            operational_diagnostic_id: row.get("operational_diagnostic_id"),
+            trace_id: row.get("trace_id"),
+            execution_id: row.get("execution_id"),
+            subsystem: row.get("subsystem"),
+            severity: row.get("severity"),
+            reason_code: row.get("reason_code"),
+            summary: row.get("summary"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn list_recovery_checkpoints(
+    config: &RuntimeConfig,
+    open_only: bool,
+    limit: u32,
+) -> Result<Vec<RecoveryCheckpointSummary>> {
+    let pool = db::connect(config).await?;
+    let rows = if open_only {
+        sqlx::query(
+            r#"
+            SELECT
+                recovery_checkpoint_id,
+                trace_id,
+                execution_id,
+                background_job_id,
+                background_job_run_id,
+                governed_action_execution_id,
+                approval_request_id,
+                checkpoint_kind,
+                recovery_reason_code,
+                status,
+                recovery_decision,
+                created_at,
+                resolved_at
+            FROM recovery_checkpoints
+            WHERE status = 'open'
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&pool)
+        .await
+        .context("failed to list open recovery checkpoints for management")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT
+                recovery_checkpoint_id,
+                trace_id,
+                execution_id,
+                background_job_id,
+                background_job_run_id,
+                governed_action_execution_id,
+                approval_request_id,
+                checkpoint_kind,
+                recovery_reason_code,
+                status,
+                recovery_decision,
+                created_at,
+                resolved_at
+            FROM recovery_checkpoints
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&pool)
+        .await
+        .context("failed to list recovery checkpoints for management")?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|row| RecoveryCheckpointSummary {
+            recovery_checkpoint_id: row.get("recovery_checkpoint_id"),
+            trace_id: row.get("trace_id"),
+            execution_id: row.get("execution_id"),
+            background_job_id: row.get("background_job_id"),
+            background_job_run_id: row.get("background_job_run_id"),
+            governed_action_execution_id: row.get("governed_action_execution_id"),
+            approval_request_id: row.get("approval_request_id"),
+            checkpoint_kind: row.get("checkpoint_kind"),
+            recovery_reason_code: row.get("recovery_reason_code"),
+            status: row.get("status"),
+            recovery_decision: row.get("recovery_decision"),
+            created_at: row.get("created_at"),
+            resolved_at: row.get("resolved_at"),
+        })
+        .collect())
 }
 
 pub async fn list_pending_foreground_conversations(
@@ -884,6 +1120,503 @@ async fn load_pending_work_summary(
         awaiting_approval_governed_action_count: awaiting_approval_governed_action_count as u32,
         blocked_governed_action_count: blocked_governed_action_count as u32,
     })
+}
+
+async fn load_recovery_health_summary(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    recent_window_start: DateTime<Utc>,
+) -> Result<RecoveryHealthSummary> {
+    let checkpoint_row = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'open') AS open_checkpoint_count,
+            COUNT(*) FILTER (WHERE status = 'open' AND checkpoint_kind = 'foreground')
+                AS open_foreground_checkpoint_count,
+            COUNT(*) FILTER (WHERE status = 'open' AND checkpoint_kind = 'background')
+                AS open_background_checkpoint_count,
+            COUNT(*) FILTER (WHERE status = 'open' AND checkpoint_kind = 'governed_action')
+                AS open_governed_action_checkpoint_count,
+            COUNT(*) FILTER (
+                WHERE status = 'resolved'
+                  AND resolved_at >= $1
+            ) AS recent_resolved_checkpoint_count,
+            COUNT(*) FILTER (
+                WHERE status = 'abandoned'
+                  AND resolved_at >= $1
+            ) AS recent_abandoned_checkpoint_count
+        FROM recovery_checkpoints
+        "#,
+    )
+    .bind(recent_window_start)
+    .fetch_one(pool)
+    .await
+    .context("failed to load recovery checkpoint health summary")?;
+
+    let lease_row = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) AS active_worker_lease_count,
+            COUNT(*) FILTER (WHERE lease_expires_at <= $1) AS overdue_active_worker_lease_count,
+            COUNT(*) FILTER (WHERE lease_expires_at <= $2) AS at_risk_active_worker_lease_count
+        FROM worker_leases
+        WHERE status = 'active'
+        "#,
+    )
+    .bind(now)
+    .bind(now + Duration::seconds(LEASE_AT_RISK_WINDOW_SECONDS))
+    .fetch_one(pool)
+    .await
+    .context("failed to load worker lease health summary")?;
+
+    Ok(RecoveryHealthSummary {
+        open_checkpoint_count: count_from_row(&checkpoint_row, "open_checkpoint_count"),
+        open_foreground_checkpoint_count: count_from_row(
+            &checkpoint_row,
+            "open_foreground_checkpoint_count",
+        ),
+        open_background_checkpoint_count: count_from_row(
+            &checkpoint_row,
+            "open_background_checkpoint_count",
+        ),
+        open_governed_action_checkpoint_count: count_from_row(
+            &checkpoint_row,
+            "open_governed_action_checkpoint_count",
+        ),
+        recent_resolved_checkpoint_count: count_from_row(
+            &checkpoint_row,
+            "recent_resolved_checkpoint_count",
+        ),
+        recent_abandoned_checkpoint_count: count_from_row(
+            &checkpoint_row,
+            "recent_abandoned_checkpoint_count",
+        ),
+        active_worker_lease_count: count_from_row(&lease_row, "active_worker_lease_count"),
+        overdue_active_worker_lease_count: count_from_row(
+            &lease_row,
+            "overdue_active_worker_lease_count",
+        ),
+        at_risk_active_worker_lease_count: count_from_row(
+            &lease_row,
+            "at_risk_active_worker_lease_count",
+        ),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct BaseDiagnosticRecord {
+    operational_diagnostic_id: Uuid,
+    trace_id: Option<Uuid>,
+    execution_id: Option<Uuid>,
+    subsystem: String,
+    severity: String,
+    reason_code: String,
+    created_at: DateTime<Utc>,
+}
+
+async fn load_recent_base_diagnostics(
+    pool: &PgPool,
+    recent_window_start: DateTime<Utc>,
+) -> Result<Vec<BaseDiagnosticRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            operational_diagnostic_id,
+            trace_id,
+            execution_id,
+            subsystem,
+            severity,
+            reason_code,
+            created_at
+        FROM operational_diagnostics
+        WHERE created_at >= $1
+          AND subsystem <> 'management_health'
+        ORDER BY created_at DESC, operational_diagnostic_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(recent_window_start)
+    .bind(HEALTH_RECENT_BASE_DIAGNOSTIC_LIMIT)
+    .fetch_all(pool)
+    .await
+    .context("failed to load recent operational diagnostics for health summary")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| BaseDiagnosticRecord {
+            operational_diagnostic_id: row.get("operational_diagnostic_id"),
+            trace_id: row.get("trace_id"),
+                execution_id: row.get("execution_id"),
+                subsystem: row.get("subsystem"),
+                severity: row.get("severity"),
+                reason_code: row.get("reason_code"),
+                created_at: row.get("created_at"),
+            })
+        .collect())
+}
+
+fn summarize_diagnostic_health(
+    diagnostics: &[BaseDiagnosticRecord],
+) -> DiagnosticHealthSummary {
+    let mut info_count = 0_u32;
+    let mut warn_count = 0_u32;
+    let mut error_count = 0_u32;
+    let mut critical_count = 0_u32;
+    let mut reasons: BTreeMap<String, OperationalReasonRollup> = BTreeMap::new();
+
+    for diagnostic in diagnostics {
+        match diagnostic.severity.as_str() {
+            "info" => info_count += 1,
+            "warn" => warn_count += 1,
+            "error" => error_count += 1,
+            "critical" => critical_count += 1,
+            _ => {}
+        }
+
+        reasons
+            .entry(diagnostic.reason_code.clone())
+            .and_modify(|rollup| {
+                rollup.count += 1;
+                if diagnostic.created_at > rollup.latest_at {
+                    rollup.latest_at = diagnostic.created_at;
+                }
+            })
+            .or_insert_with(|| OperationalReasonRollup {
+                reason_code: diagnostic.reason_code.clone(),
+                count: 1,
+                latest_at: diagnostic.created_at,
+            });
+    }
+
+    let mut top_reason_codes = reasons.into_values().collect::<Vec<_>>();
+    top_reason_codes.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| right.latest_at.cmp(&left.latest_at))
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    top_reason_codes.truncate(HEALTH_TOP_REASON_LIMIT);
+
+    DiagnosticHealthSummary {
+        recent_window_minutes: HEALTH_RECENT_WINDOW_MINUTES as u32,
+        observed_count: diagnostics.len() as u32,
+        info_count,
+        warn_count,
+        error_count,
+        critical_count,
+        top_reason_codes,
+    }
+}
+
+async fn record_operational_anomaly_rollups(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    recovery_summary: &RecoveryHealthSummary,
+    diagnostics: &[BaseDiagnosticRecord],
+) -> Result<()> {
+    let recent_window_start = now - Duration::minutes(HEALTH_RECENT_WINDOW_MINUTES);
+    let dedupe_window_start = now - Duration::minutes(ANOMALY_DEDUPE_WINDOW_MINUTES);
+
+    let mut repeated_by_reason: BTreeMap<String, Vec<&BaseDiagnosticRecord>> = BTreeMap::new();
+    for diagnostic in diagnostics {
+        repeated_by_reason
+            .entry(diagnostic.reason_code.clone())
+            .or_default()
+            .push(diagnostic);
+    }
+    for (reason_code, records) in repeated_by_reason {
+        if records.len() < ANOMALY_REPEAT_THRESHOLD {
+            continue;
+        }
+        let latest = records
+            .iter()
+            .max_by_key(|record| record.created_at)
+            .expect("repeated anomaly records should not be empty");
+        let first_seen_at = records
+            .iter()
+            .map(|record| record.created_at)
+            .min()
+            .expect("repeated anomaly records should not be empty");
+        let last_seen_at = records
+            .iter()
+            .map(|record| record.created_at)
+            .max()
+            .expect("repeated anomaly records should not be empty");
+        let severity = if records
+            .iter()
+            .any(|record| matches!(record.severity.as_str(), "critical" | "error"))
+        {
+            recovery::OperationalDiagnosticSeverity::Error
+        } else {
+            recovery::OperationalDiagnosticSeverity::Warn
+        };
+        let aggregate_key = format!("repeated_reason:{reason_code}");
+        insert_management_anomaly_if_missing(
+            pool,
+            now,
+            dedupe_window_start,
+            recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: latest.trace_id,
+                execution_id: latest.execution_id,
+                subsystem: "management_health".to_string(),
+                severity,
+                reason_code: "operational_repeated_condition_detected".to_string(),
+                summary: format!(
+                    "diagnostic reason '{reason_code}' repeated {} times in the last {} minutes",
+                    records.len(),
+                    HEALTH_RECENT_WINDOW_MINUTES
+                ),
+                diagnostic_payload: json!({
+                    "aggregate_key": aggregate_key,
+                    "anomaly_kind": "repeated_reason",
+                    "source_reason_code": reason_code,
+                    "occurrence_count": records.len(),
+                    "first_seen_at": first_seen_at,
+                    "last_seen_at": last_seen_at,
+                    "recent_window_minutes": HEALTH_RECENT_WINDOW_MINUTES,
+                    "source_operational_diagnostic_id": latest.operational_diagnostic_id,
+                    "source_subsystem": latest.subsystem,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    let failure_pressure_records = diagnostics
+        .iter()
+        .filter(|record| matches!(record.severity.as_str(), "error" | "critical"))
+        .collect::<Vec<_>>();
+    if failure_pressure_records.len() >= ANOMALY_FAILURE_PRESSURE_THRESHOLD {
+        let latest = failure_pressure_records
+            .iter()
+            .max_by_key(|record| record.created_at)
+            .expect("failure pressure records should not be empty");
+        insert_management_anomaly_if_missing(
+            pool,
+            now,
+            dedupe_window_start,
+            recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: latest.trace_id,
+                execution_id: latest.execution_id,
+                subsystem: "management_health".to_string(),
+                severity: recovery::OperationalDiagnosticSeverity::Error,
+                reason_code: "operational_failure_pressure_detected".to_string(),
+                summary: format!(
+                    "{} error or critical diagnostics observed in the last {} minutes",
+                    failure_pressure_records.len(),
+                    HEALTH_RECENT_WINDOW_MINUTES
+                ),
+                diagnostic_payload: json!({
+                    "aggregate_key": "failure_pressure",
+                    "anomaly_kind": "failure_pressure",
+                    "occurrence_count": failure_pressure_records.len(),
+                    "first_seen_at": failure_pressure_records
+                        .iter()
+                        .map(|record| record.created_at)
+                        .min(),
+                    "last_seen_at": failure_pressure_records
+                        .iter()
+                        .map(|record| record.created_at)
+                        .max(),
+                    "recent_window_minutes": HEALTH_RECENT_WINDOW_MINUTES,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    if recovery_summary.open_checkpoint_count > 0
+        || recovery_summary.overdue_active_worker_lease_count > 0
+        || recovery_summary.at_risk_active_worker_lease_count > 0
+    {
+        let latest_checkpoint = sqlx::query(
+            r#"
+            SELECT trace_id, execution_id, created_at
+            FROM recovery_checkpoints
+            WHERE status = 'open'
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(pool)
+        .await
+        .context("failed to load latest open recovery checkpoint for anomaly rollup")?;
+
+        insert_management_anomaly_if_missing(
+            pool,
+            now,
+            dedupe_window_start,
+            recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: latest_checkpoint.as_ref().map(|row| row.get("trace_id")),
+                execution_id: latest_checkpoint.as_ref().and_then(|row| row.get("execution_id")),
+                subsystem: "management_health".to_string(),
+                severity: if recovery_summary.open_checkpoint_count > 0
+                    || recovery_summary.overdue_active_worker_lease_count > 0
+                {
+                    recovery::OperationalDiagnosticSeverity::Error
+                } else {
+                    recovery::OperationalDiagnosticSeverity::Warn
+                },
+                reason_code: "operational_recovery_pressure_detected".to_string(),
+                summary: format!(
+                    "recovery pressure detected: {} open checkpoints, {} overdue active leases, {} at-risk active leases",
+                    recovery_summary.open_checkpoint_count,
+                    recovery_summary.overdue_active_worker_lease_count,
+                    recovery_summary.at_risk_active_worker_lease_count
+                ),
+                diagnostic_payload: json!({
+                    "aggregate_key": "recovery_pressure",
+                    "anomaly_kind": "recovery_pressure",
+                    "open_checkpoint_count": recovery_summary.open_checkpoint_count,
+                    "open_foreground_checkpoint_count": recovery_summary.open_foreground_checkpoint_count,
+                    "open_background_checkpoint_count": recovery_summary.open_background_checkpoint_count,
+                    "open_governed_action_checkpoint_count": recovery_summary.open_governed_action_checkpoint_count,
+                    "overdue_active_worker_lease_count": recovery_summary.overdue_active_worker_lease_count,
+                    "at_risk_active_worker_lease_count": recovery_summary.at_risk_active_worker_lease_count,
+                    "recent_window_minutes": HEALTH_RECENT_WINDOW_MINUTES,
+                    "evaluated_at": now,
+                    "recent_window_start": recent_window_start,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_management_anomaly_if_missing(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    dedupe_window_start: DateTime<Utc>,
+    diagnostic: recovery::NewOperationalDiagnostic,
+) -> Result<()> {
+    let aggregate_key = diagnostic.diagnostic_payload["aggregate_key"]
+        .as_str()
+        .context("management anomaly diagnostic payload must include aggregate_key")?;
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM operational_diagnostics
+            WHERE subsystem = 'management_health'
+              AND reason_code = $1
+              AND diagnostic_payload_json ->> 'aggregate_key' = $2
+              AND created_at >= $3
+        )
+        "#,
+    )
+    .bind(&diagnostic.reason_code)
+    .bind(aggregate_key)
+    .bind(dedupe_window_start)
+    .fetch_one(pool)
+    .await
+    .context("failed to check management anomaly dedupe window")?;
+
+    if exists {
+        return Ok(());
+    }
+
+    recovery::insert_operational_diagnostic(pool, &diagnostic)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert management anomaly diagnostic '{}' at {}",
+                diagnostic.reason_code, now
+            )
+        })?;
+    Ok(())
+}
+
+async fn load_recent_operational_anomalies(
+    pool: &PgPool,
+    recent_window_start: DateTime<Utc>,
+) -> Result<Vec<OperationalAnomalySummary>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            operational_diagnostic_id,
+            trace_id,
+            execution_id,
+            severity,
+            reason_code,
+            summary,
+            diagnostic_payload_json,
+            created_at
+        FROM operational_diagnostics
+        WHERE subsystem = 'management_health'
+          AND created_at >= $1
+        ORDER BY created_at DESC, operational_diagnostic_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(recent_window_start)
+    .bind(i64::from(DEFAULT_LIST_LIMIT))
+    .fetch_all(pool)
+    .await
+    .context("failed to load recent operational anomalies")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let payload: serde_json::Value = row.get("diagnostic_payload_json");
+            OperationalAnomalySummary {
+                anomaly_kind: payload["anomaly_kind"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                severity: row.get("severity"),
+                reason_code: row.get("reason_code"),
+                summary: row.get("summary"),
+                occurrence_count: payload["occurrence_count"].as_u64().unwrap_or(1) as u32,
+                latest_trace_id: row.get("trace_id"),
+                latest_execution_id: row.get("execution_id"),
+                first_seen_at: payload["first_seen_at"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                    .unwrap_or_else(|| row.get("created_at")),
+                last_seen_at: payload["last_seen_at"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                    .unwrap_or_else(|| row.get("created_at")),
+            }
+        })
+        .collect())
+}
+
+fn classify_overall_health(
+    pending_work: &PendingWorkSummary,
+    recovery: &RecoveryHealthSummary,
+    diagnostics: &DiagnosticHealthSummary,
+) -> String {
+    if recovery.open_checkpoint_count > 0
+        || recovery.overdue_active_worker_lease_count > 0
+        || diagnostics.error_count > 0
+        || diagnostics.critical_count > 0
+    {
+        return "unhealthy".to_string();
+    }
+
+    if recovery.at_risk_active_worker_lease_count > 0
+        || diagnostics.warn_count > 0
+        || pending_work.pending_wake_signal_count > 0
+        || pending_work.pending_approval_request_count > 0
+        || pending_work.blocked_governed_action_count > 0
+    {
+        return "degraded".to_string();
+    }
+
+    "healthy".to_string()
+}
+
+fn count_from_row(row: &sqlx::postgres::PgRow, field: &str) -> u32 {
+    row.get::<i64, _>(field).max(0) as u32
 }
 
 fn approval_request_summary(record: &approval::ApprovalRequestRecord) -> ApprovalRequestSummary {

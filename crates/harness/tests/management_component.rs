@@ -15,7 +15,7 @@ use harness::{
     },
     execution::{self, NewExecutionRecord},
     foreground::{self, NewIngressEvent},
-    governed_actions, management,
+    governed_actions, management, recovery,
     workspace::{self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun},
 };
 use serde_json::json;
@@ -359,6 +359,169 @@ async fn phase_five_management_surfaces_workspace_approvals_and_actions() -> Res
         assert_eq!(runs[0].workspace_script_id, script_id);
         assert_eq!(runs[0].status, "completed");
 
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn operational_health_summary_records_recovery_pressure_anomalies() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+
+        recovery::create_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::NewRecoveryCheckpoint {
+                recovery_checkpoint_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                checkpoint_kind: recovery::RecoveryCheckpointKind::Background,
+                recovery_reason_code: recovery::RecoveryReasonCode::TimeoutOrStall,
+                recovery_budget_remaining: 1,
+                checkpoint_payload: json!({
+                    "source": "management_component"
+                }),
+            },
+        )
+        .await?;
+
+        for offset_minutes in [0_i64, 5, 10] {
+            recovery::insert_operational_diagnostic(
+                &ctx.pool,
+                &recovery::NewOperationalDiagnostic {
+                    operational_diagnostic_id: Uuid::now_v7(),
+                    trace_id: Some(trace_id),
+                    execution_id: Some(execution_id),
+                    subsystem: "recovery".to_string(),
+                    severity: recovery::OperationalDiagnosticSeverity::Error,
+                    reason_code: "worker_lease_timeout_observed".to_string(),
+                    summary: "worker lease timeout observed during management health test"
+                        .to_string(),
+                    diagnostic_payload: json!({
+                        "source": "management_component",
+                        "offset_minutes": offset_minutes,
+                    }),
+                },
+            )
+            .await?;
+        }
+
+        let summary = management::load_operational_health_summary(&ctx.config).await?;
+        assert_eq!(summary.overall_status, "unhealthy");
+        assert_eq!(summary.recovery.open_checkpoint_count, 1);
+        assert_eq!(summary.diagnostics.error_count, 3);
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "repeated_reason")
+        );
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "failure_pressure")
+        );
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "recovery_pressure")
+        );
+
+        let diagnostics = management::list_recent_operational_diagnostics(&ctx.config, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_repeated_condition_detected"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_failure_pressure_detected"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_recovery_pressure_detected"
+        }));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn recovery_and_diagnostic_lists_surface_recent_operator_visibility() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let checkpoint = recovery::create_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::NewRecoveryCheckpoint {
+                recovery_checkpoint_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                checkpoint_kind: recovery::RecoveryCheckpointKind::Foreground,
+                recovery_reason_code: recovery::RecoveryReasonCode::Crash,
+                recovery_budget_remaining: 1,
+                checkpoint_payload: json!({
+                    "source": "management_component_visibility"
+                }),
+            },
+        )
+        .await?;
+        recovery::resolve_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::RecoveryCheckpointResolution {
+                recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+                status: recovery::RecoveryCheckpointStatus::Resolved,
+                recovery_decision: recovery::RecoveryDecision::Continue,
+                resolved_summary: Some("fresh worker continuation is safe".to_string()),
+                resolved_at: Utc::now(),
+            },
+        )
+        .await?;
+
+        recovery::insert_operational_diagnostic(
+            &ctx.pool,
+            &recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: Some(trace_id),
+                execution_id: Some(execution_id),
+                subsystem: "recovery".to_string(),
+                severity: recovery::OperationalDiagnosticSeverity::Warn,
+                reason_code: "worker_lease_soft_warning".to_string(),
+                summary: "worker lease is nearing expiry".to_string(),
+                diagnostic_payload: json!({
+                    "source": "management_component_visibility"
+                }),
+            },
+        )
+        .await?;
+
+        let checkpoints = management::list_recovery_checkpoints(&ctx.config, false, 10).await?;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0].recovery_checkpoint_id,
+            checkpoint.recovery_checkpoint_id
+        );
+        assert_eq!(checkpoints[0].checkpoint_kind, "foreground");
+        assert_eq!(checkpoints[0].recovery_reason_code, "crash");
+        assert_eq!(checkpoints[0].status, "resolved");
+        assert_eq!(
+            checkpoints[0].recovery_decision.as_deref(),
+            Some("continue")
+        );
+
+        let diagnostics = management::list_recent_operational_diagnostics(&ctx.config, 10).await?;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].reason_code, "worker_lease_soft_warning");
+        assert_eq!(diagnostics[0].severity, "warn");
         Ok(())
     })
     .await
