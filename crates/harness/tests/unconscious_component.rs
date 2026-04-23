@@ -21,6 +21,7 @@ use harness::{
     foreground::{self, NewEpisode, NewEpisodeMessage},
     migration,
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
+    recovery,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -1164,6 +1165,11 @@ async fn background_execution_times_out_and_marks_run_timed_out() -> Result<()> 
                 .iter()
                 .any(|event| event.event_kind == "background_job_timed_out")
         );
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "worker_lease_timeout_observed"
+                && diagnostic.execution_id == Some(execution_id)
+        }));
 
         let pid = read_pid_file(&pid_file).await?;
         tokio::time::sleep(StdDuration::from_millis(200)).await;

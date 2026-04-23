@@ -562,19 +562,46 @@ pub async fn execute_governed_action(
             ))
         }
     };
-    let release_result =
-        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now()).await;
+    let lease_completion_result = if result.as_ref().is_ok_and(governed_action_result_is_timeout) {
+        recovery::recover_observed_worker_timeout(
+            pool,
+            worker_lease.worker_lease_id,
+            Utc::now(),
+            "governed_action_timeout",
+            result
+                .as_ref()
+                .map(|result| result.outcome.summary.as_str())
+                .unwrap_or("governed action timed out"),
+        )
+        .await
+        .map(|_| ())
+        .context("failed to route timed-out governed-action worker lease through recovery")
+    } else {
+        if result.is_ok() {
+            recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to refresh governed-action worker lease after action progress")?;
+        }
+        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+            .await
+            .map(|_| ())
+    };
 
-    match (result, release_result) {
+    match (result, lease_completion_result) {
         (Ok(result), Ok(_)) => Ok(result),
         (Ok(_), Err(error)) => {
-            Err(error.context("failed to release governed-action worker lease after success"))
+            Err(error.context("failed to complete governed-action worker lease after success"))
         }
         (Err(error), Ok(_)) => Err(error),
-        (Err(action_error), Err(release_error)) => Err(release_error.context(format!(
-            "failed to release governed-action worker lease after action failure: {action_error}"
+        (Err(action_error), Err(lease_error)) => Err(lease_error.context(format!(
+            "failed to complete governed-action worker lease after action failure: {action_error}"
         ))),
     }
+}
+
+fn governed_action_result_is_timeout(result: &GovernedActionExecutionResult) -> bool {
+    result.outcome.status == GovernedActionStatus::Failed
+        && result.outcome.summary.contains("timed out")
 }
 
 async fn create_governed_action_worker_lease(

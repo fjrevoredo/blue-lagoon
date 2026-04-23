@@ -1288,18 +1288,40 @@ where
         timeout_ms,
     )
     .await;
-    let release_result =
-        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now()).await;
 
-    match (response, release_result) {
-        (Ok(response), Ok(_)) => Ok(response),
-        (Ok(_), Err(error)) => {
-            Err(error.context("failed to release foreground worker lease after success"))
+    match response {
+        Ok(response) => {
+            recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to refresh foreground worker lease after worker response")?;
+            recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to release foreground worker lease after success")?;
+            Ok(response)
         }
-        (Err(error), Ok(_)) => Err(error),
-        (Err(worker_error), Err(release_error)) => Err(release_error.context(format!(
-            "failed to release foreground worker lease after worker failure: {worker_error}"
-        ))),
+        Err(error) => {
+            let error_message = format_error_chain(&error);
+            if error_message.contains("timed out") {
+                recovery::recover_observed_worker_timeout(
+                    pool,
+                    worker_lease.worker_lease_id,
+                    Utc::now(),
+                    "foreground_worker_timeout",
+                    &error_message,
+                )
+                .await
+                .context(format!(
+                    "failed to route timed-out foreground worker lease through recovery: {error_message}"
+                ))?;
+            } else {
+                recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+                    .await
+                    .context(format!(
+                        "failed to release foreground worker lease after worker failure: {error_message}"
+                    ))?;
+            }
+            Err(error)
+        }
     }
 }
 

@@ -324,8 +324,8 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C2`
-- Completed tasks: `10/20`
+- Current active task: `C3`
+- Completed tasks: `11/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -707,7 +707,7 @@ Completion evidence:
 
 ### Task C2: Integrate leases, heartbeats, and stalled-worker handling into runtime orchestration
 
-Status: `IN PROGRESS`
+Status: `DONE`
 
 Deliverables:
 
@@ -725,7 +725,7 @@ Verification:
 
 - `cargo test -p harness --test recovery_integration -- --nocapture`
 
-Progress evidence:
+Completion evidence:
 
 - Added lease supervision classification for healthy, soft-warning, and
   hard-expired active worker leases.
@@ -743,15 +743,26 @@ Progress evidence:
 - Added `recovery_integration` coverage for expired worker lease recovery
   routing and soft-warning recording, and verified existing foreground,
   unconscious, and governed-action integration suites.
-
-Remaining C2 work from implementation self-check:
-
-- true heartbeat refresh is not yet integrated at observable worker protocol or
-  progress boundaries
-- direct worker timeout handling records bounded failure but does not yet create
-  and resolve recovery checkpoints through the unified recovery path
-- the C2 status must remain `IN PROGRESS` until stalled direct timeouts and
-  refreshable progress boundaries are covered by recovery integration evidence
+- Added progress-boundary lease refresh through
+  `recovery::refresh_worker_lease_progress`, with runtime calls from
+  foreground, background, and governed-action execution paths.
+- Added observed timeout recovery routing through
+  `recovery::recover_observed_worker_timeout`, including active lease
+  termination, checkpoint creation, unified recovery-decision evaluation,
+  checkpoint resolution, and operational diagnostics.
+- Wired observed worker timeout recovery into foreground, background, and
+  governed-action orchestration so direct timeout handling no longer bypasses
+  the unified recovery path.
+- Added recovery integration coverage for observed active-lease timeout
+  routing and progress-boundary heartbeat refresh.
+- Extended the background timeout component test to assert that the direct
+  timeout path emits recovery diagnostics.
+- Verified with `cargo test -p harness --test recovery_integration -- --nocapture`,
+  `cargo test -p harness --test unconscious_component -- --nocapture`,
+  `cargo test -p harness --test foreground_integration -- --nocapture`,
+  `cargo test -p harness --test governed_actions_component -- --nocapture`,
+  `cargo test -p harness --test governed_actions_integration -- --nocapture`,
+  and `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Task C3: Generalize foreground and background recovery triggers
 

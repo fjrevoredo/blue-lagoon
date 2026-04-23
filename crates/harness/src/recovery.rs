@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -359,86 +359,141 @@ pub async fn recover_expired_worker_leases(
     let mut outcomes = Vec::with_capacity(expired_leases.len());
 
     for lease in expired_leases {
-        let checkpoint = create_recovery_checkpoint(
-            pool,
-            &NewRecoveryCheckpoint {
-                recovery_checkpoint_id: Uuid::now_v7(),
-                trace_id: lease.trace_id,
-                execution_id: lease.execution_id,
-                background_job_id: lease.background_job_id,
-                background_job_run_id: lease.background_job_run_id,
-                governed_action_execution_id: lease.governed_action_execution_id,
-                approval_request_id: None,
-                checkpoint_kind: recovery_checkpoint_kind_for_worker_lease(lease.worker_kind),
-                recovery_reason_code: RecoveryReasonCode::TimeoutOrStall,
-                recovery_budget_remaining: 1,
-                checkpoint_payload: json!({
-                    "source": "worker_lease_expiry",
-                    "worker_lease_id": lease.worker_lease_id,
-                    "worker_kind": lease.worker_kind.as_str(),
-                    "worker_pid": lease.worker_pid,
-                    "lease_acquired_at": lease.lease_acquired_at,
-                    "lease_expires_at": lease.lease_expires_at,
-                    "last_heartbeat_at": lease.last_heartbeat_at,
-                    "metadata": lease.metadata,
-                }),
-            },
-        )
-        .await?;
-
-        let decision = evaluate_recovery_decision(&RecoveryDecisionRequest {
-            checkpoint_kind: checkpoint.checkpoint_kind,
-            reason_code: checkpoint.recovery_reason_code,
-            action_classification: recovery_action_classification_for_lease(&lease),
-            evidence_state: RecoveryEvidenceState::DurableIncomplete,
-            approval_state: RecoveryApprovalState::NotRequired,
-            policy_state: RecoveryPolicyState::Valid,
-            recovery_budget_remaining: checkpoint.recovery_budget_remaining,
-            clarification_available: false,
-        })?;
-        let checkpoint = resolve_recovery_checkpoint(
-            pool,
-            &RecoveryCheckpointResolution {
-                recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
-                status: decision.checkpoint_status,
-                recovery_decision: decision.decision,
-                resolved_summary: Some(decision.summary.clone()),
-                resolved_at: now,
-            },
-        )
-        .await?;
-        let diagnostic = insert_operational_diagnostic(
-            pool,
-            &NewOperationalDiagnostic {
-                operational_diagnostic_id: Uuid::now_v7(),
-                trace_id: Some(lease.trace_id),
-                execution_id: lease.execution_id,
-                subsystem: "recovery".to_string(),
-                severity: OperationalDiagnosticSeverity::Warn,
-                reason_code: "worker_lease_expired".to_string(),
-                summary: format!(
-                    "worker lease expired; recovery decision: {}",
-                    decision.decision.as_str()
-                ),
-                diagnostic_payload: json!({
-                    "worker_lease_id": lease.worker_lease_id,
-                    "worker_kind": lease.worker_kind.as_str(),
-                    "recovery_checkpoint_id": checkpoint.recovery_checkpoint_id,
-                    "recovery_decision": decision.decision.as_str(),
-                }),
-            },
-        )
-        .await?;
-
-        outcomes.push(WorkerLeaseRecoveryOutcome {
-            lease,
-            checkpoint,
-            decision,
-            diagnostic,
-        });
+        outcomes.push(
+            recover_worker_lease_timeout(
+                pool,
+                lease,
+                now,
+                "worker_lease_expiry",
+                "worker_lease_expired",
+                OperationalDiagnosticSeverity::Warn,
+                None,
+            )
+            .await?,
+        );
     }
 
     Ok(outcomes)
+}
+
+pub async fn recover_observed_worker_timeout(
+    pool: &PgPool,
+    worker_lease_id: Uuid,
+    now: DateTime<Utc>,
+    observed_source: &str,
+    error_message: &str,
+) -> Result<WorkerLeaseRecoveryOutcome> {
+    if observed_source.trim().is_empty() {
+        bail!("observed worker timeout source must not be empty");
+    }
+    if error_message.trim().is_empty() {
+        bail!("observed worker timeout error message must not be empty");
+    }
+
+    let lease = terminate_active_worker_lease(pool, worker_lease_id, now).await?;
+    recover_worker_lease_timeout(
+        pool,
+        lease,
+        now,
+        observed_source,
+        "worker_lease_timeout_observed",
+        OperationalDiagnosticSeverity::Error,
+        Some(error_message),
+    )
+    .await
+}
+
+async fn recover_worker_lease_timeout(
+    pool: &PgPool,
+    lease: WorkerLeaseRecord,
+    now: DateTime<Utc>,
+    source: &str,
+    diagnostic_reason_code: &str,
+    diagnostic_severity: OperationalDiagnosticSeverity,
+    error_message: Option<&str>,
+) -> Result<WorkerLeaseRecoveryOutcome> {
+    let checkpoint = create_recovery_checkpoint(
+        pool,
+        &NewRecoveryCheckpoint {
+            recovery_checkpoint_id: Uuid::now_v7(),
+            trace_id: lease.trace_id,
+            execution_id: lease.execution_id,
+            background_job_id: lease.background_job_id,
+            background_job_run_id: lease.background_job_run_id,
+            governed_action_execution_id: lease.governed_action_execution_id,
+            approval_request_id: None,
+            checkpoint_kind: recovery_checkpoint_kind_for_worker_lease(lease.worker_kind),
+            recovery_reason_code: RecoveryReasonCode::TimeoutOrStall,
+            recovery_budget_remaining: 1,
+            checkpoint_payload: json!({
+                "source": source,
+                "worker_lease_id": lease.worker_lease_id,
+                "worker_kind": lease.worker_kind.as_str(),
+                "worker_lease_status": lease.status.as_str(),
+                "worker_pid": lease.worker_pid,
+                "lease_acquired_at": lease.lease_acquired_at,
+                "lease_expires_at": lease.lease_expires_at,
+                "last_heartbeat_at": lease.last_heartbeat_at,
+                "error_message": error_message,
+                "metadata": lease.metadata.clone(),
+            }),
+        },
+    )
+    .await?;
+
+    let decision = evaluate_recovery_decision(&RecoveryDecisionRequest {
+        checkpoint_kind: checkpoint.checkpoint_kind,
+        reason_code: checkpoint.recovery_reason_code,
+        action_classification: recovery_action_classification_for_lease(&lease),
+        evidence_state: RecoveryEvidenceState::DurableIncomplete,
+        approval_state: RecoveryApprovalState::NotRequired,
+        policy_state: RecoveryPolicyState::Valid,
+        recovery_budget_remaining: checkpoint.recovery_budget_remaining,
+        clarification_available: false,
+    })?;
+    let checkpoint = resolve_recovery_checkpoint(
+        pool,
+        &RecoveryCheckpointResolution {
+            recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+            status: decision.checkpoint_status,
+            recovery_decision: decision.decision,
+            resolved_summary: Some(decision.summary.clone()),
+            resolved_at: now,
+        },
+    )
+    .await?;
+    let diagnostic = insert_operational_diagnostic(
+        pool,
+        &NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: Some(lease.trace_id),
+            execution_id: lease.execution_id,
+            subsystem: "recovery".to_string(),
+            severity: diagnostic_severity,
+            reason_code: diagnostic_reason_code.to_string(),
+            summary: format!(
+                "worker lease timeout or stall observed; recovery decision: {}",
+                decision.decision.as_str()
+            ),
+            diagnostic_payload: json!({
+                "source": source,
+                "worker_lease_id": lease.worker_lease_id,
+                "worker_kind": lease.worker_kind.as_str(),
+                "worker_lease_status": lease.status.as_str(),
+                "recovery_checkpoint_id": checkpoint.recovery_checkpoint_id,
+                "recovery_decision": decision.decision.as_str(),
+                "error_message": error_message,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(WorkerLeaseRecoveryOutcome {
+        lease,
+        checkpoint,
+        decision,
+        diagnostic,
+    })
 }
 
 pub async fn supervise_worker_leases(
@@ -1049,6 +1104,32 @@ pub async fn refresh_worker_lease(
     get_worker_lease(pool, worker_lease_id).await
 }
 
+pub async fn refresh_worker_lease_progress(
+    pool: &PgPool,
+    worker_lease_id: Uuid,
+    heartbeat_at: DateTime<Utc>,
+) -> Result<WorkerLeaseRecord> {
+    let lease = get_worker_lease(pool, worker_lease_id).await?;
+    if lease.status != WorkerLeaseStatus::Active {
+        bail!(
+            "worker lease {} cannot be refreshed because status is {}",
+            worker_lease_id,
+            lease.status.as_str()
+        );
+    }
+    let lease_duration = lease.lease_expires_at - lease.lease_acquired_at;
+    if lease_duration <= Duration::zero() {
+        bail!("worker lease duration must be positive for progress refresh");
+    }
+    refresh_worker_lease(
+        pool,
+        worker_lease_id,
+        heartbeat_at,
+        heartbeat_at + lease_duration,
+    )
+    .await
+}
+
 pub async fn release_worker_lease(
     pool: &PgPool,
     worker_lease_id: Uuid,
@@ -1115,6 +1196,60 @@ pub async fn expire_due_worker_leases(
     .context("failed to expire due worker leases")?;
 
     rows.iter().map(worker_lease_from_row).collect()
+}
+
+async fn terminate_active_worker_lease(
+    pool: &PgPool,
+    worker_lease_id: Uuid,
+    terminated_at: DateTime<Utc>,
+) -> Result<WorkerLeaseRecord> {
+    let row = sqlx::query(
+        r#"
+        UPDATE worker_leases
+        SET
+            status = $2,
+            released_at = $3,
+            updated_at = NOW()
+        WHERE worker_lease_id = $1
+          AND status = 'active'
+        RETURNING
+            worker_lease_id,
+            trace_id,
+            execution_id,
+            background_job_id,
+            background_job_run_id,
+            governed_action_execution_id,
+            worker_kind,
+            status,
+            lease_token,
+            worker_pid,
+            lease_acquired_at,
+            lease_expires_at,
+            last_heartbeat_at,
+            released_at,
+            metadata_json,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(worker_lease_id)
+    .bind(WorkerLeaseStatus::Terminated.as_str())
+    .bind(terminated_at)
+    .fetch_optional(pool)
+    .await
+    .context("failed to terminate active worker lease")?;
+
+    match row {
+        Some(row) => worker_lease_from_row(&row),
+        None => {
+            let lease = get_worker_lease(pool, worker_lease_id).await?;
+            bail!(
+                "worker lease {} cannot be recovered from observed timeout because status is {}",
+                worker_lease_id,
+                lease.status.as_str()
+            )
+        }
+    }
 }
 
 pub async fn insert_operational_diagnostic(

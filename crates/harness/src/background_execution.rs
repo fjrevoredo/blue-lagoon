@@ -211,10 +211,25 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
             let timed_out = error_message.contains("timed out");
             persist_background_failure(pool, &leased, started_at, None, &error_message, timed_out)
                 .await?;
-            release_background_worker_lease(pool, worker_lease.worker_lease_id).await?;
+            if timed_out {
+                recovery::recover_observed_worker_timeout(
+                    pool,
+                    worker_lease.worker_lease_id,
+                    Utc::now(),
+                    "background_worker_timeout",
+                    &error_message,
+                )
+                .await
+                .context("failed to route timed-out background worker lease through recovery")?;
+            } else {
+                release_background_worker_lease(pool, worker_lease.worker_lease_id).await?;
+            }
             return Err(error);
         }
     };
+    recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+        .await
+        .context("failed to refresh background worker lease after worker response")?;
     release_background_worker_lease(pool, worker_lease.worker_lease_id).await?;
 
     let response_payload = match serde_json::to_value(&response)
