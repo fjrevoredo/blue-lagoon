@@ -18,6 +18,7 @@ pub mod migration;
 pub mod model_gateway;
 pub mod policy;
 pub mod proposal;
+pub mod recovery;
 pub mod retrieval;
 pub mod runtime;
 pub mod schema;

@@ -1,4 +1,5 @@
 use anyhow::{Context, Error, Result, bail};
+use chrono::{Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::{
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
     governed_actions,
     model_gateway::ModelProviderTransport,
-    policy, proposal,
+    policy, proposal, recovery,
     telegram::{self, TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
@@ -667,12 +668,15 @@ where
         trigger.execution_id,
         assembly.context.clone(),
     );
-    let initial_response = match worker::launch_conscious_worker_with_timeout(
+    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+    let initial_response = match launch_leased_conscious_worker(
+        pool,
         config,
         model_gateway_config,
+        &trigger,
         &request,
         transport,
-        policy::effective_foreground_worker_timeout_ms(config),
+        foreground_timeout_ms,
     )
     .await
     {
@@ -739,12 +743,14 @@ where
             trigger.execution_id,
             follow_up_context,
         );
-        let follow_up_response = match worker::launch_conscious_worker_with_timeout(
+        let follow_up_response = match launch_leased_conscious_worker(
+            pool,
             config,
             model_gateway_config,
+            &trigger,
             &follow_up_request,
             transport,
-            policy::effective_foreground_worker_timeout_ms(config),
+            foreground_timeout_ms,
         )
         .await
         {
@@ -1233,6 +1239,68 @@ async fn record_foreground_failure(
     )
     .await?;
     Ok(())
+}
+
+async fn launch_leased_conscious_worker<T>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
+    trigger: &contracts::ForegroundTrigger,
+    request: &contracts::WorkerRequest,
+    transport: &T,
+    timeout_ms: u64,
+) -> Result<contracts::WorkerResponse>
+where
+    T: ModelProviderTransport,
+{
+    let started_at = Utc::now();
+    let timeout_ms_i64 =
+        i64::try_from(timeout_ms).context("foreground worker timeout exceeded chrono range")?;
+    let worker_lease = recovery::create_worker_lease(
+        pool,
+        &recovery::NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: trigger.trace_id,
+            execution_id: Some(trigger.execution_id),
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            worker_kind: recovery::WorkerLeaseKind::Foreground,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: started_at,
+            lease_expires_at: started_at + Duration::milliseconds(timeout_ms_i64),
+            last_heartbeat_at: started_at,
+            metadata: json!({
+                "source": "foreground_orchestration",
+                "trigger_kind": trigger.trigger_kind,
+                "ingress_id": trigger.ingress.ingress_id,
+            }),
+        },
+    )
+    .await?;
+
+    let response = worker::launch_conscious_worker_with_timeout(
+        config,
+        model_gateway_config,
+        request,
+        transport,
+        timeout_ms,
+    )
+    .await;
+    let release_result =
+        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now()).await;
+
+    match (response, release_result) {
+        (Ok(response), Ok(_)) => Ok(response),
+        (Ok(_), Err(error)) => {
+            Err(error.context("failed to release foreground worker lease after success"))
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Err(worker_error), Err(release_error)) => Err(release_error.context(format!(
+            "failed to release foreground worker lease after worker failure: {worker_error}"
+        ))),
+    }
 }
 
 async fn record_and_return_failure<T>(

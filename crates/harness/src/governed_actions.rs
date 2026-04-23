@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use contracts::{
     CapabilityScope, GovernedActionExecutionOutcome, GovernedActionFingerprint, GovernedActionKind,
     GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     config::RuntimeConfig,
-    execution, policy, tool_execution,
+    execution, policy, recovery, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -502,7 +502,9 @@ pub async fn execute_governed_action(
     )
     .await?;
 
-    match &started_record.payload {
+    let worker_lease =
+        create_governed_action_worker_lease(pool, &started_record, started_at).await?;
+    let result = match &started_record.payload {
         GovernedActionPayload::RunSubprocess(action) => {
             execute_subprocess_governed_action(config, pool, &started_record, action).await
         }
@@ -559,7 +561,52 @@ pub async fn execute_governed_action(
                 None,
             ))
         }
+    };
+    let release_result =
+        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now()).await;
+
+    match (result, release_result) {
+        (Ok(result), Ok(_)) => Ok(result),
+        (Ok(_), Err(error)) => {
+            Err(error.context("failed to release governed-action worker lease after success"))
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Err(action_error), Err(release_error)) => Err(release_error.context(format!(
+            "failed to release governed-action worker lease after action failure: {action_error}"
+        ))),
     }
+}
+
+async fn create_governed_action_worker_lease(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<recovery::WorkerLeaseRecord> {
+    let timeout_ms = i64::try_from(record.capability_scope.execution.timeout_ms)
+        .context("governed action timeout exceeded chrono range")?;
+    recovery::create_worker_lease(
+        pool,
+        &recovery::NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: record.trace_id,
+            execution_id: record.execution_id,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: Some(record.governed_action_execution_id),
+            worker_kind: recovery::WorkerLeaseKind::GovernedAction,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: started_at,
+            lease_expires_at: started_at + Duration::milliseconds(timeout_ms),
+            last_heartbeat_at: started_at,
+            metadata: json!({
+                "source": "governed_actions",
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+            }),
+        },
+    )
+    .await
 }
 
 pub fn fingerprint_governed_action(

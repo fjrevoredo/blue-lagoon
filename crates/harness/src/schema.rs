@@ -32,6 +32,17 @@ pub enum SchemaCompatibility {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaUpgradeAssessment {
+    pub policy: SchemaPolicy,
+    pub current_version: Option<i64>,
+    pub expected_version: i64,
+    pub discovered_versions: Vec<i64>,
+    pub applied_versions: Vec<i64>,
+    pub pending_versions: Vec<i64>,
+    pub compatibility: SchemaCompatibility,
+}
+
 impl SchemaCompatibility {
     pub fn ensure_supported(self) -> Result<i64> {
         match self {
@@ -80,18 +91,49 @@ pub fn evaluate(current: Option<i64>, policy: SchemaPolicy) -> SchemaCompatibili
 }
 
 pub async fn verify(pool: &PgPool, policy: SchemaPolicy) -> Result<i64> {
+    assess_upgrade_path(pool, policy)
+        .await?
+        .compatibility
+        .ensure_supported()
+}
+
+pub async fn assess_upgrade_path(
+    pool: &PgPool,
+    policy: SchemaPolicy,
+) -> Result<SchemaUpgradeAssessment> {
     let discovered = migration::load_migrations()?;
     migration::normalize_applied_migration_names(pool, &discovered).await?;
     let applied = migration::load_applied_migrations(pool).await?;
-    if let Err(error) = migration::validate_applied_history(&discovered, &applied) {
-        return SchemaCompatibility::IncompatibleHistory {
+    let discovered_versions = discovered
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let applied_versions = applied
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let current_version = applied.last().map(|migration| migration.version);
+    let pending_versions = discovered_versions
+        .iter()
+        .copied()
+        .filter(|version| current_version.is_none_or(|current| *version > current))
+        .collect::<Vec<_>>();
+    let compatibility = match migration::validate_applied_history(&discovered, &applied) {
+        Ok(()) => evaluate(current_version, policy),
+        Err(error) => SchemaCompatibility::IncompatibleHistory {
             details: error.to_string(),
-        }
-        .ensure_supported();
-    }
+        },
+    };
 
-    let current = applied.last().map(|migration| migration.version);
-    evaluate(current, policy).ensure_supported()
+    Ok(SchemaUpgradeAssessment {
+        policy,
+        current_version,
+        expected_version: policy.expected_version,
+        discovered_versions,
+        applied_versions,
+        pending_versions,
+        compatibility,
+    })
 }
 
 #[cfg(test)]

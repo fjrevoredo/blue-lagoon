@@ -23,6 +23,7 @@ use crate::{
     migration,
     model_gateway::{self, ModelProviderTransport},
     policy::{self, PolicyDecision},
+    recovery,
     schema::{self, SchemaPolicy},
     telegram::{self, TelegramDelivery, TelegramUpdate},
     trace::TraceContext,
@@ -119,6 +120,7 @@ pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
 
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
+    supervise_expired_worker_leases(&pool).await?;
 
     if options.idle {
         info!("harness boot verified and returned to idle");
@@ -171,6 +173,7 @@ pub async fn run_telegram_once(
 
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
+    supervise_expired_worker_leases(&pool).await?;
 
     let telegram_config = config.require_telegram_config()?;
     let model_gateway_config = config.require_model_gateway_config()?;
@@ -258,6 +261,23 @@ async fn verify_schema(pool: &PgPool, config: &RuntimeConfig) -> Result<i64> {
         expected_version: migration::latest_version(&migrations),
     };
     schema::verify(pool, policy).await
+}
+
+async fn supervise_expired_worker_leases(pool: &PgPool) -> Result<()> {
+    let summary = recovery::supervise_worker_leases(pool, Utc::now(), 80).await?;
+    if !summary.recovered_expired_leases.is_empty() {
+        info!(
+            expired_worker_lease_count = summary.recovered_expired_leases.len(),
+            "expired worker leases were routed through recovery"
+        );
+    }
+    if !summary.soft_warning_diagnostics.is_empty() {
+        info!(
+            soft_warning_count = summary.soft_warning_diagnostics.len(),
+            "worker lease soft warnings were recorded"
+        );
+    }
+    Ok(())
 }
 
 async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<HarnessOutcome> {
