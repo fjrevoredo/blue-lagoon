@@ -35,7 +35,11 @@ async fn migration_application_creates_unconscious_loop_tables() -> Result<()> {
         let summary =
             migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
 
-        assert_eq!(summary.discovered_versions, vec![1, 2, 3, 4, 5, 6]);
+        let expected_versions = migration::load_migrations()?
+            .into_iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.discovered_versions, expected_versions);
 
         let tables = sqlx::query(
             r#"

@@ -324,8 +324,8 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C3`
-- Completed tasks: `11/20`
+- Current active task: `C2`
+- Completed tasks: `10/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
 - Milestone C status: `IN PROGRESS`
@@ -707,7 +707,7 @@ Completion evidence:
 
 ### Task C2: Integrate leases, heartbeats, and stalled-worker handling into runtime orchestration
 
-Status: `DONE`
+Status: `IN PROGRESS`
 
 Deliverables:
 
@@ -725,7 +725,7 @@ Verification:
 
 - `cargo test -p harness --test recovery_integration -- --nocapture`
 
-Completion evidence:
+Progress evidence:
 
 - Added lease supervision classification for healthy, soft-warning, and
   hard-expired active worker leases.
@@ -743,6 +743,15 @@ Completion evidence:
 - Added `recovery_integration` coverage for expired worker lease recovery
   routing and soft-warning recording, and verified existing foreground,
   unconscious, and governed-action integration suites.
+
+Remaining C2 work from implementation self-check:
+
+- true heartbeat refresh is not yet integrated at observable worker protocol or
+  progress boundaries
+- direct worker timeout handling records bounded failure but does not yet create
+  and resolve recovery checkpoints through the unified recovery path
+- the C2 status must remain `IN PROGRESS` until stalled direct timeouts and
+  refreshable progress boundaries are covered by recovery integration evidence
 
 ### Task C3: Generalize foreground and background recovery triggers
 

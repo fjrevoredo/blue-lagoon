@@ -23,7 +23,11 @@ async fn migration_application_creates_foundation_and_foreground_tables() -> Res
         let summary =
             migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
 
-        assert_eq!(summary.discovered_versions, vec![1, 2, 3, 4, 5, 6]);
+        let expected_versions = migration::load_migrations()?
+            .into_iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.discovered_versions, expected_versions);
         let tables = sqlx::query(
             r#"
             SELECT table_name
@@ -68,20 +72,24 @@ async fn migration_application_creates_foundation_and_foreground_tables() -> Res
 #[serial]
 async fn startup_compatibility_reports_supported_and_unsupported_states() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
+        let migrations = migration::load_migrations()?;
+        let expected_version = migration::latest_version(&migrations);
         let supported = schema::verify(
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 6,
+                expected_version,
             },
         )
         .await?;
-        assert_eq!(supported, 6);
+        assert_eq!(supported, expected_version);
         Ok(())
     })
     .await?;
 
     support::with_clean_database(|ctx| async move {
+        let migrations = migration::load_migrations()?;
+        let expected_version = migration::latest_version(&migrations);
         migration::ensure_schema_migrations_table(&ctx.pool).await?;
         sqlx::query(
             r#"
@@ -98,7 +106,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 6,
+                expected_version,
             },
         )
         .await
@@ -109,14 +117,18 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
     .await?;
 
     support::with_migrated_database(|ctx| async move {
+        let migrations = migration::load_migrations()?;
+        let expected_version = migration::latest_version(&migrations);
+        let future_version = expected_version + 1;
         sqlx::query(
             r#"
             INSERT INTO schema_migrations
                 (version, name, checksum, applied_at, app_version, applied_by, execution_ms)
             VALUES
-                (7, 'future_schema', 'future', NOW(), 'test', 'test', 1)
+                ($1, 'future_schema', 'future', NOW(), 'test', 'test', 1)
             "#,
         )
+        .bind(future_version)
         .execute(&ctx.pool)
         .await?;
 
@@ -124,7 +136,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 6,
+                expected_version,
             },
         )
         .await
@@ -135,6 +147,8 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
     .await?;
 
     support::with_migrated_database(|ctx| async move {
+        let migrations = migration::load_migrations()?;
+        let expected_version = migration::latest_version(&migrations);
         sqlx::query(
             r#"
             UPDATE schema_migrations
@@ -149,7 +163,7 @@ async fn startup_compatibility_reports_supported_and_unsupported_states() -> Res
             &ctx.pool,
             SchemaPolicy {
                 minimum_supported_version: 1,
-                expected_version: 6,
+                expected_version,
             },
         )
         .await
@@ -196,17 +210,11 @@ async fn migrate_normalizes_schema_migration_names_to_capability_labels() -> Res
             .into_iter()
             .map(|row| (row.get::<i64, _>("version"), row.get::<String, _>("name")))
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                (1, "runtime_foundation".to_string()),
-                (2, "foreground_loop".to_string()),
-                (3, "migration_metadata_normalization".to_string()),
-                (4, "canonical_continuity".to_string()),
-                (5, "unconscious_loop".to_string()),
-                (6, "workspace_and_governed_actions".to_string()),
-            ]
-        );
+        let expected_names = migration::load_migrations()?
+            .into_iter()
+            .map(|migration| (migration.version, migration.name))
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected_names);
         Ok(())
     })
     .await
