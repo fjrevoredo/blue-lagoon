@@ -2673,6 +2673,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_new_worker_lease_rejects_heartbeat_before_acquisition() {
+        let acquired_at = Utc::now();
+        let lease = NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            worker_kind: WorkerLeaseKind::Foreground,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: acquired_at,
+            lease_expires_at: acquired_at + Duration::seconds(30),
+            last_heartbeat_at: acquired_at - Duration::seconds(1),
+            metadata: json!({}),
+        };
+
+        let error = validate_new_worker_lease(&lease)
+            .expect_err("heartbeat earlier than acquisition should be rejected");
+        assert!(error.to_string().contains("heartbeat"));
+    }
+
+    #[test]
     fn validate_new_operational_diagnostic_rejects_empty_fields() {
         let diagnostic = NewOperationalDiagnostic {
             operational_diagnostic_id: Uuid::now_v7(),
@@ -2748,6 +2772,41 @@ mod tests {
 
         assert_eq!(outcome.decision, RecoveryDecision::Reapprove);
         assert!(outcome.summary.contains("fresh approval"));
+    }
+
+    #[test]
+    fn recovery_decision_abandons_rejected_approval_fail_closed() {
+        let outcome = evaluate_recovery_decision(&RecoveryDecisionRequest {
+            reason_code: RecoveryReasonCode::ApprovalTransition,
+            approval_state: RecoveryApprovalState::Rejected,
+            ..base_recovery_decision_request()
+        })
+        .expect("rejected approval recovery should be classified");
+
+        assert_eq!(outcome.decision, RecoveryDecision::Abandon);
+        assert_eq!(
+            outcome.checkpoint_status,
+            RecoveryCheckpointStatus::Abandoned
+        );
+        assert!(outcome.summary.contains("approval"));
+    }
+
+    #[test]
+    fn recovery_decision_continues_when_durable_completion_proves_success() {
+        let outcome = evaluate_recovery_decision(&RecoveryDecisionRequest {
+            checkpoint_kind: RecoveryCheckpointKind::Background,
+            action_classification: RecoveryActionClassification::ProvablyIdempotentExternal,
+            evidence_state: RecoveryEvidenceState::DurableCompleted,
+            ..base_recovery_decision_request()
+        })
+        .expect("durable completion should short-circuit retry classification");
+
+        assert_eq!(outcome.decision, RecoveryDecision::Continue);
+        assert_eq!(
+            outcome.checkpoint_status,
+            RecoveryCheckpointStatus::Resolved
+        );
+        assert!(outcome.summary.contains("durable evidence"));
     }
 
     #[test]
@@ -2856,6 +2915,68 @@ mod tests {
             classify_worker_lease_supervision(&lease, acquired_at + Duration::seconds(101), 80)
                 .expect("expired lease should classify"),
             WorkerLeaseSupervisionDecision::HardExpired
+        );
+    }
+
+    #[test]
+    fn worker_lease_supervision_rejects_invalid_thresholds() {
+        let acquired_at = Utc::now();
+        let lease = WorkerLeaseRecord {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            worker_kind: WorkerLeaseKind::Background,
+            status: WorkerLeaseStatus::Active,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: acquired_at,
+            lease_expires_at: acquired_at + Duration::seconds(100),
+            last_heartbeat_at: acquired_at,
+            released_at: None,
+            metadata: json!({}),
+            created_at: acquired_at,
+            updated_at: acquired_at,
+        };
+
+        let error = classify_worker_lease_supervision(&lease, acquired_at, 0)
+            .expect_err("threshold below range should be rejected");
+        assert!(error.to_string().contains("between 1 and 100"));
+
+        let error = classify_worker_lease_supervision(&lease, acquired_at, 101)
+            .expect_err("threshold above range should be rejected");
+        assert!(error.to_string().contains("between 1 and 100"));
+    }
+
+    #[test]
+    fn worker_lease_supervision_treats_non_active_leases_as_healthy() {
+        let acquired_at = Utc::now();
+        let lease = WorkerLeaseRecord {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            worker_kind: WorkerLeaseKind::GovernedAction,
+            status: WorkerLeaseStatus::Released,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: acquired_at,
+            lease_expires_at: acquired_at - Duration::seconds(1),
+            last_heartbeat_at: acquired_at,
+            released_at: Some(acquired_at),
+            metadata: json!({}),
+            created_at: acquired_at,
+            updated_at: acquired_at,
+        };
+
+        assert_eq!(
+            classify_worker_lease_supervision(&lease, acquired_at + Duration::seconds(5), 80)
+                .expect("released lease should classify"),
+            WorkerLeaseSupervisionDecision::Healthy
         );
     }
 

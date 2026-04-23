@@ -13,6 +13,9 @@ function Invoke-Step {
     Write-Host ""
     Write-Host "==> $Label"
     & $Action
+    if ($LASTEXITCODE -ne 0) {
+        throw "step '$Label' failed with exit code $LASTEXITCODE"
+    }
 }
 
 Invoke-Step "docker compose config" { docker compose config }

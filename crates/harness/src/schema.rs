@@ -171,6 +171,42 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_reports_too_old_schema() {
+        let status = evaluate(
+            Some(1),
+            SchemaPolicy {
+                minimum_supported_version: 2,
+                expected_version: 4,
+            },
+        );
+        assert_eq!(
+            status,
+            SchemaCompatibility::TooOld {
+                current: 1,
+                minimum_supported: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_reports_too_new_schema() {
+        let status = evaluate(
+            Some(5),
+            SchemaPolicy {
+                minimum_supported_version: 1,
+                expected_version: 4,
+            },
+        );
+        assert_eq!(
+            status,
+            SchemaCompatibility::TooNew {
+                current: 5,
+                expected: 4,
+            }
+        );
+    }
+
+    #[test]
     fn evaluate_reports_supported_schema() {
         let status = evaluate(
             Some(1),
@@ -180,6 +216,38 @@ mod tests {
             },
         );
         assert_eq!(status, SchemaCompatibility::Supported { current: 1 });
+    }
+
+    #[test]
+    fn ensure_supported_reports_missing_pending_too_old_and_too_new_variants() {
+        let missing = SchemaCompatibility::Missing
+            .ensure_supported()
+            .expect_err("missing schema should fail closed");
+        assert!(missing.to_string().contains("missing"));
+
+        let too_old = SchemaCompatibility::TooOld {
+            current: 1,
+            minimum_supported: 2,
+        }
+        .ensure_supported()
+        .expect_err("too old schema should fail closed");
+        assert!(too_old.to_string().contains("minimum supported"));
+
+        let pending = SchemaCompatibility::PendingMigrations {
+            current: 3,
+            expected: 4,
+        }
+        .ensure_supported()
+        .expect_err("pending migrations should fail closed");
+        assert!(pending.to_string().contains("migrate command"));
+
+        let too_new = SchemaCompatibility::TooNew {
+            current: 5,
+            expected: 4,
+        }
+        .ensure_supported()
+        .expect_err("too new schema should fail closed");
+        assert!(too_new.to_string().contains("newer than runtime-supported"));
     }
 
     #[test]

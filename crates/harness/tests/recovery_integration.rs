@@ -933,6 +933,89 @@ async fn governed_action_stall_without_approval_routes_to_clarification() -> Res
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn governed_action_policy_recheck_failure_routes_to_blocked_recovery() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let planned = plan_governed_action_for_recovery(&ctx.config, &ctx.pool, false).await?;
+        let now = Utc::now();
+        let execution_id = Uuid::now_v7();
+        let started_at = now - Duration::seconds(30);
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id,
+                trace_id: planned.record.trace_id,
+                trigger_kind: "governed_action_recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({
+                    "test": "governed_action_policy_recheck_failure_routes_to_blocked_recovery"
+                }),
+            },
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE governed_action_executions
+            SET execution_id = $2, started_at = $3, updated_at = NOW()
+            WHERE governed_action_execution_id = $1
+            "#,
+        )
+        .bind(planned.record.governed_action_execution_id)
+        .bind(execution_id)
+        .bind(started_at)
+        .execute(&ctx.pool)
+        .await?;
+        let active_record = governed_actions::get_governed_action_execution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+        )
+        .await?;
+
+        let outcome = recovery::recover_governed_action_policy_recheck_failure(
+            &ctx.pool,
+            &active_record,
+            now,
+            "policy no longer permits the proposed subprocess scope",
+        )
+        .await?;
+
+        assert_eq!(outcome.decision.decision, RecoveryDecision::Abandon);
+        assert_eq!(
+            outcome.checkpoint.recovery_reason_code,
+            RecoveryReasonCode::IntegrityOrPolicyBlock
+        );
+        assert_eq!(
+            outcome.checkpoint.recovery_decision,
+            Some(RecoveryDecision::Abandon)
+        );
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["source"],
+            json!("policy_recheck")
+        );
+        assert_eq!(
+            outcome.diagnostic.reason_code,
+            "governed_action_policy_recheck_failed"
+        );
+        let record = governed_actions::get_governed_action_execution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+        )
+        .await?;
+        assert_eq!(record.status, contracts::GovernedActionStatus::Blocked);
+        assert_eq!(record.execution_id, Some(execution_id));
+        assert_eq!(record.started_at, active_record.started_at);
+        assert!(record.completed_at.is_some());
+        assert_eq!(
+            record.blocked_reason.as_deref(),
+            Some("policy or integrity validation blocks recovery")
+        );
+        Ok(())
+    })
+    .await
+}
+
 fn sample_capability_scope() -> CapabilityScope {
     CapabilityScope {
         filesystem: FilesystemCapabilityScope {

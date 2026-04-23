@@ -114,7 +114,7 @@ pub struct RecoveryCheckpointListCommand {
 pub struct RecoveryLeaseListCommand {
     #[arg(long, default_value_t = management::default_list_limit())]
     pub limit: u32,
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub soft_warning_threshold_percent: u8,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -122,7 +122,7 @@ pub struct RecoveryLeaseListCommand {
 
 #[derive(Debug, Args)]
 pub struct RecoverySuperviseCommand {
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub soft_warning_threshold_percent: u8,
     #[arg(long)]
     pub actor_ref: Option<String>,
@@ -1921,6 +1921,30 @@ mod tests {
     }
 
     #[test]
+    fn phase_six_admin_parser_rejects_invalid_recovery_thresholds() {
+        let lease_error = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "leases",
+            "list",
+            "--soft-warning-threshold-percent",
+            "0",
+        ])
+        .expect_err("zero recovery lease threshold should be rejected");
+        assert!(lease_error.to_string().contains("1..=100"));
+
+        let supervise_error = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "supervise",
+            "--soft-warning-threshold-percent",
+            "101",
+        ])
+        .expect_err("out-of-range supervision threshold should be rejected");
+        assert!(supervise_error.to_string().contains("1..=100"));
+    }
+
+    #[test]
     fn render_approval_requests_text_includes_resolution_metadata() {
         let rendered = render_approval_requests_text(&[sample_approval_request_summary()]);
         assert!(rendered.contains("status=approved"));
@@ -1995,5 +2019,13 @@ mod tests {
         assert!(rendered.contains("compatibility=pending_migrations"));
         assert!(rendered.contains("pending_versions=7"));
         assert!(rendered.contains("history_valid=yes"));
+    }
+
+    #[test]
+    fn phase_six_render_recovery_leases_text_reports_empty_state() {
+        assert_eq!(
+            render_recovery_leases_text(&[]),
+            "No active worker leases.".to_string()
+        );
     }
 }

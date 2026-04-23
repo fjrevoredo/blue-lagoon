@@ -94,6 +94,14 @@ Typical implementation workflow is:
   from bash/WSL.
 - `./scripts/pre-commit.ps1` to run the same pre-commit verification bundle
   from PowerShell.
+- `./scripts/recovery-hardening.sh` to run the dedicated PostgreSQL-backed
+  recovery component and integration gate from bash/WSL.
+- `./scripts/recovery-hardening.ps1` to run the same recovery-hardening gate
+  from PowerShell.
+- `./scripts/release-readiness.sh` to run the upgrade-path, smoke,
+  fault-injection, and critical-proof release-readiness bundle from bash/WSL.
+- `./scripts/release-readiness.ps1` to run the same release-readiness bundle
+  from PowerShell.
 - `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.sh` or
   `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.ps1` to make the
   optional Markdown lint step blocking once the repository Markdown baseline is
@@ -114,6 +122,21 @@ Typical implementation workflow is:
   surface.
 - `cargo run -p runtime -- admin status` to inspect runtime readiness and
   pending-work state without raw SQL.
+- `cargo run -p runtime -- admin health summary` to inspect rolled-up recovery,
+  lease, checkpoint, and diagnostic health signals.
+- `cargo run -p runtime -- admin diagnostics list` to inspect recent
+  operational diagnostics without querying SQL tables directly.
+- `cargo run -p runtime -- admin recovery checkpoints list` to inspect recent
+  recovery checkpoints, optionally restricted to unresolved entries.
+- `cargo run -p runtime -- admin recovery leases list` to inspect interrupted,
+  active, and stalled worker lease state through the management surface.
+- `cargo run -p runtime -- admin recovery supervise --soft-warning-threshold-percent <1-100> --actor-ref <actor-ref>` to
+  run bounded auditable worker-lease supervision through the harness-owned
+  recovery path.
+- `cargo run -p runtime -- admin schema status` to inspect current schema
+  compatibility against the configured support window.
+- `cargo run -p runtime -- admin schema upgrade-path` to inspect pending
+  reviewed migrations and upgrade safety.
 - `cargo run -p runtime -- admin foreground pending` to inspect pending or
   recoverable foreground work.
 - `cargo run -p runtime -- admin background list` to inspect recent background

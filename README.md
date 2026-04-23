@@ -77,6 +77,19 @@ Inspect runtime readiness and pending work without raw SQL:
 cargo run -p runtime -- admin status
 ```
 
+Inspect Phase 6 operational health, diagnostics, recovery state, and schema
+compatibility:
+
+```bash
+cargo run -p runtime -- admin health summary
+cargo run -p runtime -- admin diagnostics list
+cargo run -p runtime -- admin recovery checkpoints list
+cargo run -p runtime -- admin recovery leases list --soft-warning-threshold-percent 80
+cargo run -p runtime -- admin recovery supervise --soft-warning-threshold-percent 80 --actor-ref operator
+cargo run -p runtime -- admin schema status
+cargo run -p runtime -- admin schema upgrade-path
+```
+
 Inspect pending foreground work:
 
 ```bash
@@ -343,6 +356,14 @@ Matched pre-commit helper scripts run the same verification bundle locally:
 - bash/WSL: `./scripts/pre-commit.sh`
 - PowerShell: `./scripts/pre-commit.ps1`
 
+Phase 6 also adds dedicated local gate bundles for the new recovery and
+release-readiness layers:
+
+- bash/WSL: `./scripts/recovery-hardening.sh`
+- PowerShell: `./scripts/recovery-hardening.ps1`
+- bash/WSL: `./scripts/release-readiness.sh`
+- PowerShell: `./scripts/release-readiness.ps1`
+
 If `markdownlint` is installed locally, the scripts run it in warning-only mode
 by default because the repository-wide Markdown baseline is not yet fully
 clean. Set `BLUE_LAGOON_STRICT_MARKDOWNLINT=1` to make Markdown lint failures
@@ -359,6 +380,6 @@ cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegra
 
 Repository-hosted CI lives in `.github/workflows/ci.yml` and currently exposes
 the stable jobs `workspace-verification`, `foreground-runtime`,
-`canonical-persistence`, `background-maintenance`, `management-cli`, and
-`governed-actions`. Live-network Telegram and provider checks remain
-intentionally outside repository-hosted CI.
+`canonical-persistence`, `background-maintenance`, `management-cli`,
+`governed-actions`, `recovery-hardening`, and `release-readiness`. Live-network
+Telegram and provider checks remain intentionally outside repository-hosted CI.

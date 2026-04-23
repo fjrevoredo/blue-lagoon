@@ -897,7 +897,7 @@ Completion evidence:
 
 ### Task D1: Add unit coverage for critical Phase 6 safety logic
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -916,9 +916,28 @@ Verification:
 
 - `cargo test --workspace --lib -- --nocapture`
 
+Completion evidence:
+
+- Extended recovery unit coverage in `crates/harness/src/recovery.rs` for:
+  - rejected-approval fail-closed behavior
+  - durable-completion continuation proofs
+  - heartbeat-before-acquisition rejection
+  - invalid lease supervision threshold rejection
+  - non-active lease classification
+- Extended schema unit coverage in `crates/harness/src/schema.rs` for:
+  - `TooOld` and `TooNew` compatibility evaluation
+  - fail-closed `ensure_supported()` handling for missing, pending, too-old,
+    and too-new variants
+- Hardened CLI threshold validation in `crates/runtime/src/admin.rs` so
+  recovery threshold arguments fail fast at parse time, and added unit coverage
+  for invalid threshold rejection and empty lease-list formatting.
+- Verified with:
+  - `cargo fmt --all --check`
+  - `cargo test --workspace --lib -- --nocapture`
+
 ### Task D2: Add component and integration recovery suites
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -944,9 +963,36 @@ Verification:
 - `cargo test -p harness --test recovery_component -- --nocapture`
 - `cargo test -p harness --test recovery_integration -- --nocapture`
 
+Completion evidence:
+
+- `crates/harness/tests/recovery_component.rs` provides the dedicated
+  PostgreSQL-backed recovery component suite for:
+  - worker lease persistence, heartbeat refresh, release, and expiry handling
+  - recovery checkpoint persistence, rehydration, and resolution
+  - operational diagnostic persistence and recent-record listing
+- `crates/harness/tests/recovery_integration.rs` provides the dedicated
+  PostgreSQL-backed recovery integration suite for architecture-critical
+  recovery flows, including:
+  - worker crash recovery
+  - worker stall or lease expiry recovery
+  - supervisor restart continuation
+  - approval expiry recovery
+  - approval-transition recovery
+  - policy re-check failure recovery
+  - policy-block recovery
+  - wake-signal routing under degraded conditions
+- Added explicit policy re-check failure proof in
+  `governed_action_policy_recheck_failure_routes_to_blocked_recovery`, covering
+  checkpoint creation, diagnostic emission, and fail-closed governed-action
+  transition to `Blocked` when policy no longer permits recovery.
+- Verified with:
+  - `cargo fmt --all --check`
+  - `cargo test -p harness --test recovery_component -- --nocapture`
+  - `cargo test -p harness --test recovery_integration -- --nocapture`
+
 ### Task D3: Add upgrade-path, fault-injection, and smoke verification
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -965,9 +1011,26 @@ Verification:
 - dedicated Phase 6 upgrade, fault-injection, and smoke commands as implemented
 - `./scripts/pre-commit.sh` or `./scripts/pre-commit.ps1`
 
+Completion evidence:
+
+- Added dedicated release-grade verification bundles:
+  - `scripts/release-readiness.sh`
+  - `scripts/release-readiness.ps1`
+- The release-readiness bundle now runs:
+  - `migration_component` for reviewed migration and upgrade-path validation
+  - targeted `foundation_integration` smoke and timeout/fault-injection proofs
+  - selected critical safety regression anchors for recovery, schema
+    compatibility, and admin CLI validation
+- Hardened the PowerShell verification helpers to fail on nonzero external
+  command exits instead of silently continuing after cargo failures.
+- Stabilized the policy re-check recovery integration proof against PostgreSQL
+  timestamp precision so the release-grade recovery gate is deterministic.
+- Verified with:
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\release-readiness.ps1`
+
 ### Task D4: Extend repository CI/CD to cover recovery hardening and release gates
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -990,9 +1053,25 @@ Verification:
 - CI workflow self-check against implemented suites
 - local rerun of the lowest practical command subset before merge
 
+Completion evidence:
+
+- Added dedicated local gate bundles:
+  - `scripts/recovery-hardening.sh`
+  - `scripts/recovery-hardening.ps1`
+  - `scripts/release-readiness.sh`
+  - `scripts/release-readiness.ps1`
+- Extended `.github/workflows/ci.yml` with the stable gate names:
+  - `recovery-hardening`
+  - `release-readiness`
+- Mapped the repository-hosted gates directly onto the implemented local command
+  bundles by invoking the bash verification scripts from CI.
+- Verified the local gate bundles with:
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\recovery-hardening.ps1`
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\release-readiness.ps1`
+
 ### Task D5: Update operator and repository documentation for the hardened v1 posture
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1009,6 +1088,16 @@ Dependencies:
 Verification:
 
 - documentation self-check against implemented command surface and CI
+
+Completion evidence:
+
+- Updated `AGENTS.md` with the new recovery, health, diagnostics, schema, and
+  release-grade verification commands.
+- Updated `README.md` to document the Phase 6 operator command surface, the
+  new local verification bundles, and the CI gate names that now exist in the
+  repository.
+- Updated `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md` so the roadmap status no
+  longer describes Phase 6 as merely the next active phase.
 
 ## Phase 6 task ledger
 
