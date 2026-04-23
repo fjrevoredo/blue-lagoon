@@ -18,6 +18,10 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .assert()
         .success()
         .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("health"))
+        .stdout(predicate::str::contains("diagnostics"))
+        .stdout(predicate::str::contains("recovery"))
+        .stdout(predicate::str::contains("schema"))
         .stdout(predicate::str::contains("foreground"))
         .stdout(predicate::str::contains("background"))
         .stdout(predicate::str::contains("approvals"))
@@ -82,6 +86,60 @@ fn admin_workspace_runs_help_lists_filter_arguments() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn admin_recovery_checkpoints_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("recovery")
+        .arg("checkpoints")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--open-only"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_recovery_leases_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("recovery")
+        .arg("leases")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--soft-warning-threshold-percent"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_recovery_supervise_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("recovery")
+        .arg("supervise")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--soft-warning-threshold-percent"))
+        .stdout(predicate::str::contains("--actor-ref"))
+        .stdout(predicate::str::contains("--reason"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_status_json_runs_against_a_real_database() -> Result<()> {
     let admin_database_url = std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL")
@@ -112,6 +170,82 @@ async fn admin_status_json_runs_against_a_real_database() -> Result<()> {
         .stdout(predicate::str::contains("\"pending_work\""));
 
     drop_database(&admin_database_url, &database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase_six_admin_json_commands_run_against_a_real_database() -> Result<()> {
+    let admin_database_url = std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL")
+        .unwrap_or_else(|_| DEFAULT_TEST_POSTGRES_ADMIN_URL.to_string());
+    let database_name = format!("blue_lagoon_runtime_test_{}", Uuid::now_v7().simple());
+    let database_url = disposable_database_url(&admin_database_url, &database_name)?;
+    create_database(&admin_database_url, &database_name).await?;
+
+    let pool = PgPool::connect(&database_url)
+        .await
+        .context("failed to connect to disposable runtime test database")?;
+    harness::migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+    pool.close().await;
+
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "health", "summary", "--json"],
+        "\"overall_status\": \"healthy\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "diagnostics", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "recovery", "checkpoints", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "recovery", "leases", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &[
+            "admin",
+            "recovery",
+            "supervise",
+            "--actor-ref",
+            "cli:test-operator",
+            "--reason",
+            "runtime-cli-verification",
+            "--json",
+        ],
+        "\"actor_ref\": \"cli:test-operator\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "schema", "upgrade-path", "--json"],
+        "\"compatibility\": \"supported\"",
+    )?;
+
+    drop_database(&admin_database_url, &database_name).await?;
+    Ok(())
+}
+
+fn assert_admin_json_command(
+    database_url: &str,
+    args: &[&str],
+    expected_fragment: &str,
+) -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .current_dir(harness::migration::workspace_root())
+        .args(args)
+        .env("BLUE_LAGOON_DATABASE_URL", database_url);
+
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(expected_fragment));
     Ok(())
 }
 

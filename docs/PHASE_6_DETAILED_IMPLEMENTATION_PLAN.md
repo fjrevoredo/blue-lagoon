@@ -3,7 +3,7 @@
 ## Phase 6 Detailed Implementation Plan
 
 Date: 2026-04-23
-Status: In progress; Milestone A and Milestone B completed; Milestone C in progress with Tasks C3-C5 completed
+Status: In progress; Milestone A, Milestone B, and Milestone C completed; Milestone D not started
 Scope: High-level plan Phase 6 only
 Audience: LLM-assisted implementation work and human review
 
@@ -324,11 +324,11 @@ Execution rules for this phase:
 
 Current execution status:
 
-- Current active task: `C6`
-- Completed tasks: `14/20`
+- Current active task: `D1`
+- Completed tasks: `15/20`
 - Milestone A status: `DONE`
 - Milestone B status: `DONE`
-- Milestone C status: `IN PROGRESS`
+- Milestone C status: `DONE`
 - Milestone D status: `NOT STARTED`
 
 Repository sequencing note:
@@ -837,7 +837,7 @@ Verification:
 
 ### Task C6: Extend the management CLI for recovery, health, and diagnostics workflows
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -860,7 +860,38 @@ Verification:
 
 - `cargo test -p runtime --bin runtime -- --nocapture`
 - `cargo test -p runtime --test admin_cli -- --nocapture`
+- `cargo test -p harness --test management_component -- --nocapture`
 - `cargo test -p harness --test management_integration -- --nocapture`
+
+Completion evidence:
+
+- Added capability-oriented `runtime admin` namespaces for:
+  - `health summary`
+  - `diagnostics list`
+  - `recovery checkpoints list`
+  - `recovery leases list`
+  - `recovery supervise`
+  - `schema status`
+  - `schema upgrade-path`
+- Added harness-side management services for schema upgrade assessment,
+  interrupted or stalled work inspection through `worker_leases`, and bounded
+  worker-lease supervision so the CLI reuses harness-owned recovery and schema
+  logic instead of bypassing it.
+- Added audit-backed operator traceability for `recovery supervise`, including
+  per-invocation `trace_id`, `actor_ref`, `reason`, and completion/failure
+  events in `audit_events`.
+- Added parser, formatter, and help coverage in:
+  - `crates/runtime/src/admin.rs`
+  - `crates/runtime/tests/admin_cli.rs`
+- Added `management_integration` coverage proving the bounded recovery control
+  path can supervise and recover expired worker leases through the management
+  surface.
+- Verified with:
+  - `cargo fmt --all --check`
+  - `cargo test -p runtime --bin runtime -- --nocapture`
+  - `cargo test -p runtime --test admin_cli -- --nocapture`
+  - `cargo test -p harness --test management_component -- --nocapture`
+  - `cargo test -p harness --test management_integration -- --nocapture`
 
 ## Milestone D: Release-grade verification and CI hardening
 

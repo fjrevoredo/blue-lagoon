@@ -9,7 +9,9 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
-    approval, background_execution,
+    approval,
+    audit::{self, NewAuditEvent},
+    background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     config::RuntimeConfig,
     db, governed_actions, migration, model_gateway, recovery,
@@ -120,12 +122,67 @@ pub struct RecoveryCheckpointSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverySupervisionReport {
+    pub trace_id: Uuid,
+    pub supervised_at: DateTime<Utc>,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub soft_warning_count: u32,
+    pub recovered_expired_lease_count: u32,
+    pub soft_warning_diagnostics: Vec<OperationalDiagnosticSummary>,
+    pub recovered_expired_leases: Vec<RecoveredWorkerLeaseSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveredWorkerLeaseSummary {
+    pub worker_lease_id: Uuid,
+    pub worker_kind: String,
+    pub checkpoint_id: Uuid,
+    pub checkpoint_status: String,
+    pub recovery_decision: String,
+    pub diagnostic_reason_code: String,
+    pub diagnostic_severity: String,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLeaseInspectionSummary {
+    pub worker_lease_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub background_job_id: Option<Uuid>,
+    pub background_job_run_id: Option<Uuid>,
+    pub governed_action_execution_id: Option<Uuid>,
+    pub worker_kind: String,
+    pub lease_status: String,
+    pub supervision_status: String,
+    pub lease_acquired_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaStatusReport {
     pub compatibility: String,
     pub current_version: Option<i64>,
     pub expected_version: i64,
     pub minimum_supported_version: i64,
     pub applied_migration_count: usize,
+    pub history_valid: bool,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaUpgradeAssessmentReport {
+    pub compatibility: String,
+    pub current_version: Option<i64>,
+    pub expected_version: i64,
+    pub minimum_supported_version: i64,
+    pub discovered_versions: Vec<i64>,
+    pub applied_versions: Vec<i64>,
+    pub pending_versions: Vec<i64>,
     pub history_valid: bool,
     pub details: Option<String>,
 }
@@ -303,6 +360,13 @@ pub struct EnqueueBackgroundJobRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SuperviseWorkerLeasesRequest {
+    pub soft_warning_threshold_percent: u8,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum BackgroundEnqueueOutcome {
@@ -347,6 +411,18 @@ pub async fn load_runtime_status(config: &RuntimeConfig) -> Result<RuntimeStatus
     })
 }
 
+pub async fn load_schema_status(config: &RuntimeConfig) -> Result<SchemaStatusReport> {
+    let pool = db::connect(config).await?;
+    inspect_schema_status(&pool, config).await
+}
+
+pub async fn load_schema_upgrade_assessment(
+    config: &RuntimeConfig,
+) -> Result<SchemaUpgradeAssessmentReport> {
+    let pool = db::connect(config).await?;
+    inspect_schema_upgrade_assessment(&pool, config).await
+}
+
 pub async fn load_operational_health_summary(
     config: &RuntimeConfig,
 ) -> Result<OperationalHealthSummary> {
@@ -368,6 +444,149 @@ pub async fn load_operational_health_summary(
         diagnostics,
         anomalies,
     })
+}
+
+pub async fn supervise_worker_leases(
+    config: &RuntimeConfig,
+    request: SuperviseWorkerLeasesRequest,
+) -> Result<RecoverySupervisionReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("management recovery supervision actor_ref must not be empty");
+    }
+
+    let trace_id = Uuid::now_v7();
+    let supervised_at = Utc::now();
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_recovery_supervision_requested".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": request.reason,
+                "soft_warning_threshold_percent": request.soft_warning_threshold_percent,
+            }),
+        },
+    )
+    .await?;
+
+    let summary = match recovery::supervise_worker_leases(
+        &pool,
+        supervised_at,
+        request.soft_warning_threshold_percent,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = audit::insert(
+                &pool,
+                &NewAuditEvent {
+                    loop_kind: "operator".to_string(),
+                    subsystem: "management".to_string(),
+                    event_kind: "management_recovery_supervision_failed".to_string(),
+                    severity: "error".to_string(),
+                    trace_id,
+                    execution_id: None,
+                    worker_pid: None,
+                    payload: json!({
+                        "actor_ref": actor_ref,
+                        "reason": request.reason,
+                        "soft_warning_threshold_percent": request.soft_warning_threshold_percent,
+                        "error": error.to_string(),
+                    }),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_recovery_supervision_completed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": request.reason,
+                "soft_warning_threshold_percent": request.soft_warning_threshold_percent,
+                "soft_warning_count": summary.soft_warning_diagnostics.len(),
+                "recovered_expired_lease_count": summary.recovered_expired_leases.len(),
+            }),
+        },
+    )
+    .await?;
+
+    Ok(RecoverySupervisionReport {
+        trace_id,
+        supervised_at,
+        actor_ref: actor_ref.to_string(),
+        reason: request.reason,
+        soft_warning_count: summary.soft_warning_diagnostics.len() as u32,
+        recovered_expired_lease_count: summary.recovered_expired_leases.len() as u32,
+        soft_warning_diagnostics: summary
+            .soft_warning_diagnostics
+            .into_iter()
+            .map(operational_diagnostic_summary)
+            .collect(),
+        recovered_expired_leases: summary
+            .recovered_expired_leases
+            .into_iter()
+            .map(recovered_worker_lease_summary)
+            .collect(),
+    })
+}
+
+pub async fn list_active_worker_leases(
+    config: &RuntimeConfig,
+    limit: u32,
+    soft_warning_threshold_percent: u8,
+) -> Result<Vec<WorkerLeaseInspectionSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let now = Utc::now();
+    recovery::list_active_worker_leases(&pool, i64::from(limit))
+        .await?
+        .into_iter()
+        .map(|lease| {
+            let supervision_status = recovery::classify_worker_lease_supervision(
+                &lease,
+                now,
+                soft_warning_threshold_percent,
+            )?;
+            Ok(WorkerLeaseInspectionSummary {
+                worker_lease_id: lease.worker_lease_id,
+                trace_id: lease.trace_id,
+                execution_id: lease.execution_id,
+                background_job_id: lease.background_job_id,
+                background_job_run_id: lease.background_job_run_id,
+                governed_action_execution_id: lease.governed_action_execution_id,
+                worker_kind: worker_lease_kind_label(lease.worker_kind),
+                lease_status: worker_lease_status_label(lease.status),
+                supervision_status: worker_lease_supervision_status_label(supervision_status),
+                lease_acquired_at: lease.lease_acquired_at,
+                lease_expires_at: lease.lease_expires_at,
+                last_heartbeat_at: lease.last_heartbeat_at,
+                released_at: lease.released_at,
+            })
+        })
+        .collect()
 }
 
 pub async fn list_recent_operational_diagnostics(
@@ -978,7 +1197,50 @@ async fn inspect_schema_status(
         },
     };
 
-    let (compatibility_kind, details, history_valid) = match compatibility {
+    let (compatibility_kind, details, history_valid) =
+        schema_compatibility_report_fields(&compatibility);
+
+    Ok(SchemaStatusReport {
+        compatibility: compatibility_kind,
+        current_version,
+        expected_version,
+        minimum_supported_version: config.database.minimum_supported_schema_version,
+        applied_migration_count: applied.len(),
+        history_valid,
+        details,
+    })
+}
+
+async fn inspect_schema_upgrade_assessment(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+) -> Result<SchemaUpgradeAssessmentReport> {
+    let migrations = migration::load_migrations()?;
+    let policy = SchemaPolicy {
+        minimum_supported_version: config.database.minimum_supported_schema_version,
+        expected_version: migration::latest_version(&migrations),
+    };
+    let assessment = schema::assess_upgrade_path(pool, policy).await?;
+    let (compatibility, details, history_valid) =
+        schema_compatibility_report_fields(&assessment.compatibility);
+
+    Ok(SchemaUpgradeAssessmentReport {
+        compatibility,
+        current_version: assessment.current_version,
+        expected_version: assessment.expected_version,
+        minimum_supported_version: assessment.policy.minimum_supported_version,
+        discovered_versions: assessment.discovered_versions,
+        applied_versions: assessment.applied_versions,
+        pending_versions: assessment.pending_versions,
+        history_valid,
+        details,
+    })
+}
+
+fn schema_compatibility_report_fields(
+    compatibility: &SchemaCompatibility,
+) -> (String, Option<String>, bool) {
+    match compatibility {
         SchemaCompatibility::Supported { .. } => ("supported".to_string(), None, true),
         SchemaCompatibility::Missing => (
             "missing".to_string(),
@@ -1009,20 +1271,12 @@ async fn inspect_schema_status(
             )),
             true,
         ),
-        SchemaCompatibility::IncompatibleHistory { details } => {
-            ("incompatible_history".to_string(), Some(details), false)
-        }
-    };
-
-    Ok(SchemaStatusReport {
-        compatibility: compatibility_kind,
-        current_version,
-        expected_version,
-        minimum_supported_version: config.database.minimum_supported_schema_version,
-        applied_migration_count: applied.len(),
-        history_valid,
-        details,
-    })
+        SchemaCompatibility::IncompatibleHistory { details } => (
+            "incompatible_history".to_string(),
+            Some(details.clone()),
+            false,
+        ),
+    }
 }
 
 async fn load_pending_work_summary(
@@ -1617,6 +1871,37 @@ fn count_from_row(row: &sqlx::postgres::PgRow, field: &str) -> u32 {
     row.get::<i64, _>(field).max(0) as u32
 }
 
+fn recovered_worker_lease_summary(
+    outcome: recovery::WorkerLeaseRecoveryOutcome,
+) -> RecoveredWorkerLeaseSummary {
+    RecoveredWorkerLeaseSummary {
+        worker_lease_id: outcome.lease.worker_lease_id,
+        worker_kind: worker_lease_kind_label(outcome.lease.worker_kind),
+        checkpoint_id: outcome.checkpoint.recovery_checkpoint_id,
+        checkpoint_status: recovery_checkpoint_status_label(outcome.checkpoint.status),
+        recovery_decision: recovery_decision_label(outcome.decision.decision),
+        diagnostic_reason_code: outcome.diagnostic.reason_code,
+        diagnostic_severity: operational_diagnostic_severity_label(outcome.diagnostic.severity),
+        trace_id: outcome.lease.trace_id,
+        execution_id: outcome.lease.execution_id,
+    }
+}
+
+fn operational_diagnostic_summary(
+    record: recovery::OperationalDiagnosticRecord,
+) -> OperationalDiagnosticSummary {
+    OperationalDiagnosticSummary {
+        operational_diagnostic_id: record.operational_diagnostic_id,
+        trace_id: record.trace_id,
+        execution_id: record.execution_id,
+        subsystem: record.subsystem,
+        severity: operational_diagnostic_severity_label(record.severity),
+        reason_code: record.reason_code,
+        summary: record.summary,
+        created_at: record.created_at,
+    }
+}
+
 fn approval_request_summary(record: &approval::ApprovalRequestRecord) -> ApprovalRequestSummary {
     ApprovalRequestSummary {
         approval_request_id: record.approval_request_id,
@@ -1755,6 +2040,70 @@ fn workspace_script_run_status_label(status: contracts::WorkspaceScriptRunStatus
         contracts::WorkspaceScriptRunStatus::Failed => "failed",
         contracts::WorkspaceScriptRunStatus::TimedOut => "timed_out",
         contracts::WorkspaceScriptRunStatus::Blocked => "blocked",
+    }
+    .to_string()
+}
+
+fn worker_lease_kind_label(kind: recovery::WorkerLeaseKind) -> String {
+    match kind {
+        recovery::WorkerLeaseKind::Foreground => "foreground",
+        recovery::WorkerLeaseKind::Background => "background",
+        recovery::WorkerLeaseKind::GovernedAction => "governed_action",
+    }
+    .to_string()
+}
+
+fn worker_lease_status_label(status: recovery::WorkerLeaseStatus) -> String {
+    match status {
+        recovery::WorkerLeaseStatus::Active => "active",
+        recovery::WorkerLeaseStatus::Released => "released",
+        recovery::WorkerLeaseStatus::Expired => "expired",
+        recovery::WorkerLeaseStatus::Terminated => "terminated",
+    }
+    .to_string()
+}
+
+fn worker_lease_supervision_status_label(
+    status: recovery::WorkerLeaseSupervisionDecision,
+) -> String {
+    match status {
+        recovery::WorkerLeaseSupervisionDecision::Healthy => "healthy",
+        recovery::WorkerLeaseSupervisionDecision::SoftWarning => "soft_warning",
+        recovery::WorkerLeaseSupervisionDecision::HardExpired => "hard_expired",
+    }
+    .to_string()
+}
+
+fn recovery_checkpoint_status_label(status: recovery::RecoveryCheckpointStatus) -> String {
+    match status {
+        recovery::RecoveryCheckpointStatus::Open => "open",
+        recovery::RecoveryCheckpointStatus::Resolved => "resolved",
+        recovery::RecoveryCheckpointStatus::Abandoned => "abandoned",
+        recovery::RecoveryCheckpointStatus::Invalidated => "invalidated",
+    }
+    .to_string()
+}
+
+fn recovery_decision_label(decision: recovery::RecoveryDecision) -> String {
+    match decision {
+        recovery::RecoveryDecision::Continue => "continue",
+        recovery::RecoveryDecision::Retry => "retry",
+        recovery::RecoveryDecision::Defer => "defer",
+        recovery::RecoveryDecision::Reapprove => "reapprove",
+        recovery::RecoveryDecision::Clarify => "clarify",
+        recovery::RecoveryDecision::Abandon => "abandon",
+    }
+    .to_string()
+}
+
+fn operational_diagnostic_severity_label(
+    severity: recovery::OperationalDiagnosticSeverity,
+) -> String {
+    match severity {
+        recovery::OperationalDiagnosticSeverity::Info => "info",
+        recovery::OperationalDiagnosticSeverity::Warn => "warn",
+        recovery::OperationalDiagnosticSeverity::Error => "error",
+        recovery::OperationalDiagnosticSeverity::Critical => "critical",
     }
     .to_string()
 }

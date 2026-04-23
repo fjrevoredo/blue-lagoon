@@ -527,6 +527,50 @@ async fn recovery_and_diagnostic_lists_surface_recent_operator_visibility() -> R
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn recovery_lease_list_surfaces_stalled_work_inspection() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let now = Utc::now();
+
+        let active_lease = recovery::create_worker_lease(
+            &ctx.pool,
+            &recovery::NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                worker_kind: recovery::WorkerLeaseKind::Background,
+                lease_token: Uuid::now_v7(),
+                worker_pid: Some(4242),
+                lease_acquired_at: now - Duration::minutes(8),
+                lease_expires_at: now + Duration::minutes(1),
+                last_heartbeat_at: now - Duration::seconds(30),
+                metadata: json!({
+                    "source": "management_component_recovery_lease_list"
+                }),
+            },
+        )
+        .await?;
+
+        let leases = management::list_active_worker_leases(&ctx.config, 10, 80).await?;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].worker_lease_id, active_lease.worker_lease_id);
+        assert_eq!(leases[0].worker_kind, "background");
+        assert_eq!(leases[0].lease_status, "active");
+        assert_eq!(leases[0].supervision_status, "soft_warning");
+        assert_eq!(leases[0].execution_id, Some(execution_id));
+        assert_eq!(leases[0].background_job_id, None);
+        assert_eq!(leases[0].background_job_run_id, None);
+        Ok(())
+    })
+    .await
+}
+
 fn sample_ingress(
     external_event_id: String,
     internal_conversation_ref: &str,
