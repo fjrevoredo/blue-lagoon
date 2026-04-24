@@ -17,7 +17,7 @@ use harness::{
         ResolvedModelGatewayConfig, ResolvedTelegramConfig, SelfModelConfig,
     },
     context, continuity, execution, foreground, foreground_orchestration, ingress, model_gateway,
-    runtime, telegram, worker,
+    runtime, scheduled_foreground, telegram, worker,
 };
 use serial_test::serial;
 use sqlx::{Connection, PgConnection, Row};
@@ -2377,6 +2377,354 @@ async fn runtime_poll_once_fails_closed_when_telegram_config_is_absent() -> Resu
                 .to_string()
                 .contains("missing Telegram foreground configuration")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &ctx.config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "daily-checkin".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "Scheduled daily check-in".to_string(),
+                cadence_seconds: 600,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+        assert!(config.scheduled_foreground.enabled);
+        let preflight = scheduled_foreground::get_task_by_key(&ctx.pool, "daily-checkin")
+            .await?
+            .expect("scheduled task should exist before runtime iteration");
+        assert!(preflight.next_due_at <= Utc::now());
+        let due_tasks = scheduled_foreground::list_tasks(
+            &ctx.pool,
+            scheduled_foreground::ScheduledForegroundTaskListFilter {
+                status: Some(contracts::ScheduledForegroundTaskStatus::Active),
+                due_only: true,
+                limit: 10,
+            },
+        )
+        .await?;
+        assert_eq!(due_tasks.len(), 1);
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "scheduled proactive reply" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let handled = runtime::run_scheduled_foreground_iteration_with(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let task = scheduled_foreground::get_task_by_key(&ctx.pool, "daily-checkin")
+            .await?
+            .expect("scheduled task should still exist");
+        assert_eq!(handled, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(delivery.sent_messages()[0].chat_id, 42);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "scheduled proactive reply"
+        );
+        assert_eq!(delivery.sent_messages()[0].reply_to_message_id, None);
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Completed)
+        );
+        assert!(task.last_execution_id.is_some());
+        assert!(task.last_run_started_at.is_some());
+        assert!(task.last_run_completed_at.is_some());
+        assert!(task.next_due_at > Utc::now());
+
+        let ingress_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_events
+            WHERE raw_payload_ref = $1
+            "#,
+        )
+        .bind(format!(
+            "scheduled_foreground_task:{}",
+            task.scheduled_foreground_task_id
+        ))
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(ingress_count, 1);
+
+        let completed_audit_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'scheduled_foreground_task_completed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(completed_audit_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_runtime_suppresses_when_binding_disappears() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let binding = foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &ctx.config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "missing-binding".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "Scheduled message without binding".to_string(),
+                cadence_seconds: 600,
+                cooldown_seconds: Some(180),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM conversation_bindings
+            WHERE conversation_binding_id = $1
+            "#,
+        )
+        .bind(binding.conversation_binding_id)
+        .execute(&ctx.pool)
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let handled = runtime::run_scheduled_foreground_iteration_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_model_gateway_config(),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(handled, 1);
+        assert!(delivery.sent_messages().is_empty());
+
+        let task = scheduled_foreground::get_task_by_key(&ctx.pool, "missing-binding")
+            .await?
+            .expect("scheduled task should still exist");
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Suppressed)
+        );
+        assert_eq!(
+            task.last_outcome_reason.as_deref(),
+            Some("conversation_binding_missing")
+        );
+        assert!(task.last_execution_id.is_some());
+        assert!(task.next_due_at > Utc::now());
+
+        let execution = execution::get(
+            &ctx.pool,
+            task.last_execution_id
+                .expect("suppressed task should record an execution"),
+        )
+        .await?;
+        assert_eq!(execution.status, "completed");
+
+        let ingress_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_events
+            WHERE raw_payload_ref = $1
+            "#,
+        )
+        .bind(format!(
+            "scheduled_foreground_task:{}",
+            task.scheduled_foreground_task_id
+        ))
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(ingress_count, 0);
+
+        let suppressed_audit_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'scheduled_foreground_task_suppressed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(suppressed_audit_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_recovery_clears_stranded_in_progress_task() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &ctx.config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "stranded-task".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "Scheduled task that will strand".to_string(),
+                cadence_seconds: 600,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let trace_id = Uuid::now_v7();
+        let claimed_at = Utc::now();
+        let claimed = scheduled_foreground::claim_next_due_task(
+            &ctx.pool,
+            execution_id,
+            trace_id,
+            claimed_at,
+        )
+        .await?
+        .expect("scheduled task should be claimable");
+        assert!(claimed.ingress.is_some());
+        sqlx::query(
+            r#"
+            UPDATE scheduled_foreground_tasks
+            SET current_run_started_at = $2
+            WHERE scheduled_foreground_task_id = $1
+            "#,
+        )
+        .bind(claimed.task.scheduled_foreground_task_id)
+        .bind(Utc::now() - Duration::minutes(2))
+        .execute(&ctx.pool)
+        .await?;
+
+        let recovered =
+            runtime::recover_interrupted_scheduled_foreground_tasks(&ctx.pool, &ctx.config, 10)
+                .await?;
+        assert_eq!(recovered, 1);
+
+        let task = scheduled_foreground::get_task_by_key(&ctx.pool, "stranded-task")
+            .await?
+            .expect("scheduled task should still exist");
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Failed)
+        );
+        assert_eq!(
+            task.last_outcome_reason.as_deref(),
+            Some("supervisor_restart_recovery")
+        );
+
+        let execution = execution::get(&ctx.pool, execution_id).await?;
+        assert_eq!(execution.status, "failed");
+
+        let checkpoint_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM recovery_checkpoints
+            WHERE execution_id = $1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(checkpoint_count, 1);
+
+        let recovered_audit_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'scheduled_foreground_task_recovered_failed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(recovered_audit_count, 1);
         Ok(())
     })
     .await

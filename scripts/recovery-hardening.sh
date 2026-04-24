@@ -34,6 +34,10 @@ run_step "cargo test -p harness --test recovery_component -- --nocapture" \
   run_cargo test -p harness --test recovery_component -- --nocapture
 run_step "cargo test -p harness --test recovery_integration -- --nocapture" \
   run_cargo test -p harness --test recovery_integration -- --nocapture
+run_step "cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture" \
+  run_cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture
+run_step "cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture" \
+  run_cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture
 
 echo
 echo "recovery-hardening checks passed"

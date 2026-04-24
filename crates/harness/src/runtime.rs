@@ -24,7 +24,7 @@ use crate::{
     migration,
     model_gateway::{self, ModelProviderTransport},
     policy::{self, PolicyDecision},
-    recovery,
+    recovery, scheduled_foreground,
     schema::{self, SchemaPolicy},
     telegram::{self, TelegramDelivery, TelegramUpdate, TelegramUpdateSource},
     trace::TraceContext,
@@ -108,12 +108,37 @@ pub async fn run_harness_service(config: &RuntimeConfig) -> Result<()> {
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
     let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let resolved_gateway = if config.scheduled_foreground.enabled {
+        Some(config.require_model_gateway_config()?)
+    } else {
+        None
+    };
+    let mut delivery = if config.scheduled_foreground.enabled {
+        Some(telegram::ReqwestTelegramDelivery::new(
+            config.require_telegram_config()?,
+        ))
+    } else {
+        None
+    };
     let poll_interval =
         Duration::from_secs(config.background.scheduler.poll_interval_seconds.max(1));
 
     loop {
         supervise_expired_worker_leases(&pool).await?;
         supervise_background_supervisor_restart_recovery(&pool).await?;
+        recover_interrupted_scheduled_foreground_tasks(&pool, config, 40).await?;
+        if let (Some(model_gateway_config), Some(delivery)) =
+            (resolved_gateway.as_ref(), delivery.as_mut())
+        {
+            run_scheduled_foreground_iteration_with(
+                &pool,
+                config,
+                model_gateway_config,
+                &transport,
+                delivery,
+            )
+            .await?;
+        }
         run_background_scheduler_iteration(&pool, config, &transport).await?;
         tokio::time::sleep(poll_interval).await;
     }
@@ -516,6 +541,439 @@ async fn run_background_scheduler_iteration<T: ModelProviderTransport>(
         }
     }
     Ok(completed)
+}
+
+pub async fn run_scheduled_foreground_iteration_with<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<u32>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    if !config.scheduled_foreground.enabled {
+        return Ok(0);
+    }
+
+    recover_interrupted_scheduled_foreground_tasks(pool, config, 40).await?;
+
+    let due_limit = config
+        .scheduled_foreground
+        .max_due_tasks_per_iteration
+        .max(1);
+    let mut handled = 0_u32;
+    for _ in 0..due_limit {
+        let trace_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        let Some(claim) =
+            scheduled_foreground::claim_next_due_task(pool, execution_id, trace_id, Utc::now())
+                .await?
+        else {
+            break;
+        };
+
+        handle_claimed_scheduled_foreground_task(
+            pool,
+            config,
+            model_gateway_config,
+            claim,
+            trace_id,
+            execution_id,
+            transport,
+            delivery,
+        )
+        .await?;
+        handled += 1;
+    }
+
+    Ok(handled)
+}
+
+pub async fn recover_interrupted_scheduled_foreground_tasks(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    limit: i64,
+) -> Result<u32> {
+    if !config.scheduled_foreground.enabled {
+        return Ok(0);
+    }
+
+    let timeout_ms = i64::try_from(policy::effective_foreground_worker_timeout_ms(config))
+        .context("scheduled foreground worker timeout exceeded i64 range")?;
+    let stale_cutoff = Utc::now() - chrono::Duration::milliseconds(timeout_ms);
+    let recoverable =
+        scheduled_foreground::list_recoverable_in_progress_tasks(pool, stale_cutoff, limit).await?;
+    let mut recovered = 0_u32;
+    for task in recoverable {
+        recover_scheduled_foreground_task(pool, &task).await?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+async fn recover_scheduled_foreground_task(
+    pool: &PgPool,
+    recoverable: &scheduled_foreground::RecoverableScheduledForegroundTask,
+) -> Result<()> {
+    let execution_id = recoverable
+        .task
+        .current_execution_id
+        .context("recoverable scheduled foreground task is missing current_execution_id")?;
+    let trace_id = execution::get(pool, execution_id).await?.trace_id;
+    let now = Utc::now();
+    if let Some(ingress_id) = recoverable.ingress_id {
+        let selected_ingress_ids = [ingress_id];
+        recovery::recover_foreground_restart_trigger(
+            pool,
+            recovery::ForegroundRestartRecoveryRequest {
+                trace_id,
+                execution_id,
+                internal_conversation_ref: &recoverable.task.internal_conversation_ref,
+                recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
+                trigger_source: "scheduled_foreground_supervisor_recovery",
+                decision_reason: "scheduled_task_supervisor_restart_recovery",
+                selected_ingress_ids: &selected_ingress_ids,
+                primary_ingress_id: ingress_id,
+                recovery_mode: "single_ingress",
+            },
+            now,
+        )
+        .await
+        .context("failed to route interrupted scheduled foreground task through recovery")?;
+    }
+
+    match recoverable.execution_status.as_str() {
+        "completed" => {
+            let completed = scheduled_foreground::mark_task_completed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "scheduled foreground completion was finalized during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_completed",
+                "warn",
+                trace_id,
+                execution_id,
+                &completed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+        "failed" => {
+            let failed = scheduled_foreground::mark_task_failed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "supervisor_restart_recovery",
+                "scheduled foreground failure was finalized during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_failed",
+                "warn",
+                trace_id,
+                execution_id,
+                &failed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+        _ => {
+            execution::mark_failed(
+                pool,
+                execution_id,
+                &json!({
+                    "kind": "scheduled_foreground_recovery",
+                    "message": "scheduled foreground execution was interrupted and failed closed during supervisor recovery",
+                }),
+            )
+            .await?;
+            let failed = scheduled_foreground::mark_task_failed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "supervisor_restart_recovery",
+                "scheduled foreground execution was interrupted and failed closed during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_failed",
+                "warn",
+                trace_id,
+                execution_id,
+                &failed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_claimed_scheduled_foreground_task<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    claim: scheduled_foreground::ClaimedScheduledForegroundTask,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<()>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "scheduled_foreground".to_string(),
+            event_kind: "scheduled_foreground_task_started".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "scheduled_foreground_task_id": claim.task.scheduled_foreground_task_id,
+                "task_key": claim.task.task_key,
+                "internal_principal_ref": claim.task.internal_principal_ref,
+                "internal_conversation_ref": claim.task.internal_conversation_ref,
+            }),
+        },
+    )
+    .await?;
+
+    let Some(ingress) = claim.ingress.clone() else {
+        return suppress_scheduled_foreground_task(
+            pool,
+            &claim.task,
+            trace_id,
+            execution_id,
+            "conversation_binding_missing",
+            "scheduled foreground task has no matching conversation binding",
+        )
+        .await;
+    };
+
+    let ingress_record = foreground::get_ingress_event(pool, ingress.ingress_id).await?;
+    let plan = foreground::PendingForegroundExecutionPlan {
+        mode: contracts::ForegroundExecutionMode::SingleIngress,
+        primary_ingress: ingress_record,
+        ordered_ingress: vec![contracts::OrderedIngressReference {
+            ingress_id: ingress.ingress_id,
+            occurred_at: ingress.occurred_at,
+            external_message_id: ingress.external_message_id.clone(),
+            text_body: ingress.text_body.clone(),
+        }],
+        decision_reason: foreground::ForegroundExecutionDecisionReason::SingleIngress,
+    };
+
+    match foreground_orchestration::orchestrate_telegram_foreground_plan(
+        pool,
+        config,
+        model_gateway_config,
+        foreground_orchestration::TelegramForegroundPlanExecution {
+            execution: foreground_orchestration::ForegroundExecutionIds {
+                trace_id,
+                execution_id,
+            },
+            trigger_kind_override: Some(contracts::ForegroundTriggerKind::ScheduledTask),
+            plan,
+        },
+        transport,
+        delivery,
+    )
+    .await
+    {
+        Ok(TelegramForegroundOrchestrationOutcome::Completed(completion)) => {
+            let completed = scheduled_foreground::mark_task_completed(
+                pool,
+                &claim.task,
+                execution_id,
+                Utc::now(),
+                &format!(
+                    "scheduled foreground task '{}' delivered Telegram message {}",
+                    claim.task.task_key, completion.outbound_message_id
+                ),
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_completed",
+                "info",
+                trace_id,
+                execution_id,
+                &completed,
+                json!({
+                    "outbound_message_id": completion.outbound_message_id,
+                    "ingress_id": completion.ingress_id,
+                    "episode_id": completion.episode_id,
+                }),
+            )
+            .await
+        }
+        Ok(other) => {
+            let message = format!(
+                "scheduled foreground task '{}' returned an unexpected orchestration outcome: {other:?}",
+                claim.task.task_key
+            );
+            fail_scheduled_foreground_task(
+                pool,
+                &claim.task,
+                trace_id,
+                execution_id,
+                "unexpected_orchestration_outcome",
+                &message,
+            )
+            .await
+        }
+        Err(error) => {
+            let error_message = format_error_chain(&error);
+            fail_scheduled_foreground_task(
+                pool,
+                &claim.task,
+                trace_id,
+                execution_id,
+                "execution_failed",
+                &error_message,
+            )
+            .await
+        }
+    }
+}
+
+async fn suppress_scheduled_foreground_task(
+    pool: &PgPool,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    reason: &str,
+    summary: &str,
+) -> Result<()> {
+    execution::mark_succeeded(
+        pool,
+        execution_id,
+        "scheduled_foreground",
+        0,
+        &json!({
+            "kind": "scheduled_foreground_suppressed",
+            "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+            "task_key": task.task_key,
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await?;
+    let suppressed = scheduled_foreground::mark_task_suppressed(
+        pool,
+        task,
+        execution_id,
+        Utc::now(),
+        reason,
+        summary,
+    )
+    .await?;
+    record_scheduled_foreground_terminal_audit(
+        pool,
+        "scheduled_foreground_task_suppressed",
+        "warn",
+        trace_id,
+        execution_id,
+        &suppressed,
+        json!({
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await
+}
+
+async fn fail_scheduled_foreground_task(
+    pool: &PgPool,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    reason: &str,
+    summary: &str,
+) -> Result<()> {
+    let failed = scheduled_foreground::mark_task_failed(
+        pool,
+        task,
+        execution_id,
+        Utc::now(),
+        reason,
+        summary,
+    )
+    .await?;
+    record_scheduled_foreground_terminal_audit(
+        pool,
+        "scheduled_foreground_task_failed",
+        "error",
+        trace_id,
+        execution_id,
+        &failed,
+        json!({
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await
+}
+
+async fn record_scheduled_foreground_terminal_audit(
+    pool: &PgPool,
+    event_kind: &str,
+    severity: &str,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    detail: serde_json::Value,
+) -> Result<()> {
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "scheduled_foreground".to_string(),
+            event_kind: event_kind.to_string(),
+            severity: severity.to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+                "task_key": task.task_key,
+                "status": format!("{:?}", task.status),
+                "last_outcome": task.last_outcome.map(|value| format!("{value:?}")),
+                "next_due_at": task.next_due_at,
+                "detail": detail,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 struct TelegramProcessingContext<'a, T> {

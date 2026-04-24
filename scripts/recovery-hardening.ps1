@@ -24,6 +24,12 @@ Invoke-Step "cargo test -p harness --test recovery_component -- --nocapture" {
 Invoke-Step "cargo test -p harness --test recovery_integration -- --nocapture" {
     cargo test -p harness --test recovery_integration -- --nocapture
 }
+Invoke-Step "cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture" {
+    cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture" {
+    cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture
+}
 
 Write-Host ""
 Write-Host "recovery-hardening checks passed"

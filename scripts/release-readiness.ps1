@@ -39,6 +39,12 @@ Invoke-Step "cargo test --workspace --lib ensure_supported_reports_missing_pendi
 Invoke-Step "cargo test -p runtime --bin runtime phase_six_admin_parser_rejects_invalid_recovery_thresholds -- --nocapture" {
     cargo test -p runtime --bin runtime phase_six_admin_parser_rejects_invalid_recovery_thresholds -- --nocapture
 }
+Invoke-Step "cargo test -p runtime --test admin_cli phase_seven_admin_scheduled_foreground_commands_run_against_a_real_database -- --nocapture" {
+    cargo test -p runtime --test admin_cli phase_seven_admin_scheduled_foreground_commands_run_against_a_real_database -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_integration scheduled_foreground_runtime_run_executes_due_task_through_worker_binary -- --nocapture" {
+    cargo test -p harness --test foreground_integration scheduled_foreground_runtime_run_executes_due_task_through_worker_binary -- --nocapture
+}
 
 Write-Host ""
 Write-Host "release-readiness checks passed"

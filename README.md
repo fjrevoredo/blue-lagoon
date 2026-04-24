@@ -1,152 +1,186 @@
-# blue-lagoon
+# Blue Lagoon
 
-Blue Lagoon is a Rust workspace for a harness-governed assistant runtime. The
-repository centers on a control-plane architecture where the harness owns
-budgets, policy, context assembly, canonical writes, auditability, and runtime
-boundaries, while worker processes provide bounded foreground reasoning.
+Blue Lagoon is a harness-governed assistant runtime for a single Telegram user
+and chat. It runs as two long-lived services:
 
-Project philosophy lives in `PHILOSOPHY.md`. Canonical product and architecture
-specification lives in:
+- `runtime harness` owns scheduling, policy, recovery, audit, background
+  maintenance, approvals, and management surfaces.
+- `runtime telegram` ingests Telegram updates and routes them through the
+  harness-governed foreground path.
+
+If you want the deeper operational guide, use
+[`docs/USER_MANUAL.md`](docs/USER_MANUAL.md). Canonical architecture and
+requirements live in:
 
 - `docs/REQUIREMENTS.md`
 - `docs/LOOP_ARCHITECTURE.md`
 - `docs/IMPLEMENTATION_DESIGN.md`
 
-Implementation plans and detailed planning ledgers under `docs/` are useful
-project history, but they are not the stable description of repository
-behavior.
+## What You Need
 
-Planning labels belong only in planning documents. Deliverable artifacts such
-as code, tests, migrations, config, workflow steps, and canonical behavior
-docs should be named by capability or domain, not by sequencing labels from a
-project plan.
+- Rust toolchain with `cargo`
+- Docker with Compose support
+- A Telegram bot token
+- A foreground model API key
+- One allowed Telegram user ID and one allowed private chat ID
 
-## Workspace Layout
+The default config expects:
 
-- `crates/runtime`: thin CLI entrypoints
-- `crates/harness`: control-plane logic, policy, persistence, orchestration
-- `crates/contracts`: typed cross-process and cross-boundary contracts
-- `crates/workers`: worker executables and worker-facing tests
-- `migrations/`: reviewed SQL migrations
-- `config/default.toml`: versioned non-secret runtime configuration
-- `config/local.example.toml`: template for untracked local operator overrides
-- `config/self_model_seed.toml`: checked-in seed for the runtime self-model
-- `compose.yaml`: local PostgreSQL and a minimal runtime topology
+- PostgreSQL on `localhost:55432`
+- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN` in `.env`
+- `BLUE_LAGOON_FOREGROUND_API_KEY` in `.env`
+- Telegram binding overrides in `config/local.toml`
 
-## Runtime Commands
+## Quick Start
 
-Inspect the command surface:
+1. Copy the local config template:
 
 ```bash
-cargo run -p runtime -- --help
+cp config/local.example.toml config/local.toml
+cp .env.example .env
 ```
 
-Apply reviewed migrations:
+2. Edit `config/local.toml` and set your Telegram binding:
+
+```toml
+[telegram.foreground_binding]
+allowed_user_id = 123456789
+allowed_chat_id = 123456789
+internal_principal_ref = "primary-user"
+internal_conversation_ref = "telegram-primary"
+```
+
+3. Edit `.env` and set:
+
+- `BLUE_LAGOON_DATABASE_URL`
+- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`
+- `BLUE_LAGOON_FOREGROUND_API_KEY`
+
+4. Start PostgreSQL:
+
+```bash
+docker compose up -d postgres
+```
+
+5. Apply migrations:
 
 ```bash
 cargo run -p runtime -- migrate
 ```
 
-Verify the harness can boot safely and return to idle:
+6. Build the runtime and workers so the harness can find the worker binary:
+
+```bash
+cargo build -p runtime -p workers
+```
+
+7. Optional safe boot check:
 
 ```bash
 cargo run -p runtime -- harness --once --idle
 ```
 
-Run the synthetic harness smoke path:
+8. Start the harness service in one terminal:
 
 ```bash
-cargo run -p runtime -- harness --once --synthetic-trigger smoke
+cargo run -p runtime -- harness
 ```
 
-Run one due background-maintenance job through the harness one-shot path:
+9. Start the Telegram service in a second terminal:
 
 ```bash
-cargo run -p runtime -- harness --once --background-once
+cargo run -p runtime -- telegram
 ```
 
-Inspect the management CLI surface:
-
-```bash
-cargo run -p runtime -- admin --help
-```
-
-Inspect runtime readiness and pending work without raw SQL:
+10. Verify the runtime state:
 
 ```bash
 cargo run -p runtime -- admin status
 ```
 
-Inspect Phase 6 operational health, diagnostics, recovery state, and schema
-compatibility:
+## Common Commands
+
+Check readiness and health:
 
 ```bash
+cargo run -p runtime -- admin status
 cargo run -p runtime -- admin health summary
+```
+
+List diagnostics and recovery state:
+
+```bash
 cargo run -p runtime -- admin diagnostics list
 cargo run -p runtime -- admin recovery checkpoints list
-cargo run -p runtime -- admin recovery leases list --soft-warning-threshold-percent 80
-cargo run -p runtime -- admin recovery supervise --soft-warning-threshold-percent 80 --actor-ref operator
+cargo run -p runtime -- admin recovery leases list
+cargo run -p runtime -- admin recovery supervise --actor-ref operator:local --reason "manual review"
+```
+
+Create or update a scheduled foreground task:
+
+```bash
+cargo run -p runtime -- admin foreground schedules upsert \
+  --task-key morning-checkin \
+  --internal-principal-ref primary-user \
+  --internal-conversation-ref telegram-primary \
+  --message-text "Morning check-in" \
+  --cadence-seconds 86400 \
+  --cooldown-seconds 300 \
+  --actor-ref operator:local
+```
+
+Inspect scheduled foreground tasks:
+
+```bash
+cargo run -p runtime -- admin foreground schedules list
+cargo run -p runtime -- admin foreground schedules list --due-only
+cargo run -p runtime -- admin foreground schedules show --task-key morning-checkin
+```
+
+Inspect and resolve approvals:
+
+```bash
+cargo run -p runtime -- admin approvals list
+cargo run -p runtime -- admin approvals resolve \
+  --approval-request-id <uuid> \
+  --decision approve \
+  --actor-ref operator:local \
+  --reason "approved by operator"
+```
+
+Inspect or run background maintenance:
+
+```bash
+cargo run -p runtime -- admin background list
+cargo run -p runtime -- admin background enqueue --job-kind memory-consolidation
+cargo run -p runtime -- admin background run-next
+```
+
+Check schema compatibility:
+
+```bash
 cargo run -p runtime -- admin schema status
 cargo run -p runtime -- admin schema upgrade-path
 ```
 
-Inspect pending foreground work:
+## One-Shot Operator Checks
+
+Run one background job and exit:
 
 ```bash
-cargo run -p runtime -- admin foreground pending
+cargo run -p runtime -- harness --once --background-once
 ```
 
-Inspect recent background jobs:
+Run the synthetic smoke path:
 
 ```bash
-cargo run -p runtime -- admin background list
+cargo run -p runtime -- harness --once --synthetic-trigger smoke
 ```
 
-Enqueue one background-maintenance job through the management surface:
-
-```bash
-cargo run -p runtime -- admin background enqueue --job-kind memory-consolidation
-```
-
-Execute one due background-maintenance job through the management surface:
-
-```bash
-cargo run -p runtime -- admin background run-next
-```
-
-Inspect recent wake signals:
-
-```bash
-cargo run -p runtime -- admin wake-signals list
-```
-
-Inspect approval request state and resolve one request through the canonical
-approval path:
-
-```bash
-cargo run -p runtime -- admin approvals list
-cargo run -p runtime -- admin approvals resolve --approval-request-id <uuid> --decision approve
-```
-
-Inspect governed actions and governed workspace state:
-
-```bash
-cargo run -p runtime -- admin actions list
-cargo run -p runtime -- admin workspace artifacts list
-cargo run -p runtime -- admin workspace scripts list
-cargo run -p runtime -- admin workspace runs list
-```
-
-Replay one stored Telegram update through the foreground path:
+Replay a stored Telegram fixture:
 
 ```bash
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
-```
-
-Replay a stored delayed-backlog batch through the foreground path:
-
-```bash
-cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_backlog_batch.json
 ```
 
 Run one live Telegram poll cycle:
@@ -155,231 +189,18 @@ Run one live Telegram poll cycle:
 cargo run -p runtime -- telegram --poll-once
 ```
 
-The `telegram` command is intentionally one-shot. Live Telegram and live model
-provider checks are operator-run tasks because they require real credentials, a
-bound chat, and side-effect-aware execution.
+## Notes
 
-Before using the runtime entrypoints directly, make sure the runtime can locate
-the `workers` binary. The simplest local path is:
+- The default self-model seed path is `config/self_model_seed.toml`.
+- If you do not use the sibling `workers` binary in `target/debug`, set
+  `BLUE_LAGOON_WORKER_COMMAND` explicitly.
+- Most admin commands also support `--json` for automation.
+- `runtime harness` is the service that executes scheduled foreground tasks.
+- `runtime telegram` is the service that ingests live Telegram messages.
 
-```bash
-cargo build -p runtime -p workers
-```
+## Next Reading
 
-If you are not using a sibling `workers` binary in `target/debug`, set an
-explicit `BLUE_LAGOON_WORKER_COMMAND` instead.
-
-## Test Commands
-
-Fast workspace verification:
-
-```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib -- --nocapture
-```
-
-Foreground and continuity regression suites:
-
-```bash
-cargo test -p harness --test foreground_component -- --nocapture
-cargo test -p harness --test foreground_integration -- --nocapture
-cargo test -p harness --test continuity_component -- --nocapture
-cargo test -p harness --test continuity_integration -- --nocapture
-```
-
-Background-maintenance regression suites:
-
-```bash
-cargo test -p harness --test unconscious_component -- --nocapture
-cargo test -p harness --test unconscious_integration -- --nocapture
-```
-
-Foundation, migration, recovery, and naming regression suites:
-
-```bash
-cargo test -p harness --test foundation_component -- --nocapture
-cargo test -p harness --test foundation_integration -- --nocapture
-cargo test -p harness --test migration_component -- --nocapture
-cargo test -p harness --test recovery_component -- --nocapture
-cargo test -p harness --test recovery_integration -- --nocapture
-cargo test -p harness --test artifact_naming -- --nocapture
-```
-
-Management CLI regression suites:
-
-```bash
-cargo test -p runtime --test admin_cli -- --nocapture
-cargo test -p harness --test management_component -- --nocapture
-cargo test -p harness --test management_integration -- --nocapture
-```
-
-Governed-action regression suites:
-
-```bash
-cargo test -p harness --test governed_actions_component -- --nocapture
-cargo test -p harness --test governed_actions_integration -- --nocapture
-```
-
-## Local Development
-
-Start PostgreSQL:
-
-```bash
-docker compose up -d postgres
-```
-
-The default local PostgreSQL mapping is `localhost:55432`.
-
-Validate the compose topology:
-
-```bash
-docker compose config
-```
-
-If `BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL` is unset, the test support code starts
-local PostgreSQL through `docker compose up -d postgres`. Automated tests do
-not run against `BLUE_LAGOON_DATABASE_URL`; they create disposable databases
-through the test support fixtures. In CI or other managed environments, set
-`BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL` to a PostgreSQL admin connection that can
-create and drop per-test databases.
-
-## Configuration
-
-Default non-secret settings live in `config/default.toml`. Local operator
-overrides belong in untracked `config/local.toml`, typically created from
-`config/local.example.toml`. The default self-model seed lives in
-`config/self_model_seed.toml`. Runtime secrets are resolved through `.env` and
-process environment variables.
-
-Important runtime inputs include:
-
-- `BLUE_LAGOON_DATABASE_URL`: PostgreSQL connection string
-- `BLUE_LAGOON_LOG`: optional tracing filter override
-- `BLUE_LAGOON_WORKER_COMMAND`: explicit worker executable path when a sibling
-  `workers` binary is not used
-- `BLUE_LAGOON_WORKER_ARGS`: worker arguments as a JSON array of strings
-- `BLUE_LAGOON_WORKER_TIMEOUT_MS`: generic worker timeout override for smoke and
-  non-foreground worker launches
-- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`: Telegram bot token
-- `BLUE_LAGOON_FOREGROUND_ROUTE`: optional foreground route override in
-  `<provider>/<exact-model>` form
-- `BLUE_LAGOON_FOREGROUND_API_BASE_URL`: optional foreground provider API base
-  URL override for operator/debug use
-- `BLUE_LAGOON_FOREGROUND_API_KEY`: foreground model provider API key
-- `BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL`: optional automated-test-only PostgreSQL
-  admin connection used to create and drop disposable per-test databases
-
-The harness expects either:
-
-- a packaged sibling `workers` binary next to the runtime binary, or
-- an explicit worker command supplied in config or through
-  `BLUE_LAGOON_WORKER_COMMAND`
-
-The normal local workflow is:
-
-- copy `config/local.example.toml` to `config/local.toml`
-- fill in local Telegram binding values in `config/local.toml`
-- copy `.env.example` to `.env`
-- fill in runtime secrets in `.env`
-- run runtime commands directly without manually sourcing `.env`
-
-`cargo run -p runtime -- admin status` reports whether the self-model seed path
-is configured and whether the seed file exists.
-
-The Telegram foreground path also requires:
-
-- a configured single allowed Telegram user and private chat binding
-- a valid self-model seed file
-- a configured foreground model route
-
-Live Telegram foreground timeout behavior is derived from the harness budget:
-
-- foreground budget uses `harness.default_wall_clock_budget_ms`
-- model-call timeout is `min(model_gateway.foreground.timeout_ms, harness.default_wall_clock_budget_ms)`
-- conscious worker timeout is derived from the same harness budget plus a fixed
-  grace window
-- `worker.timeout_ms` and `BLUE_LAGOON_WORKER_TIMEOUT_MS` do not shorten or
-  extend that live Telegram foreground worker timeout
-
-Provider-specific foreground settings live under `model_gateway.<provider>`.
-For Z.ai, the stable config is `[model_gateway.z_ai]` with:
-
-- `api_surface = "general" | "coding"`
-- optional `api_base_url` only when a nonstandard endpoint override is needed
-
-`model_gateway.foreground.api_base_url` remains a compatibility fallback, but
-provider-specific sections are the preferred repository-facing configuration.
-
-Foreground Telegram intake is treated as an atomic accepted-trigger write path:
-
-- execution start, binding reconciliation, ingress persistence, and acceptance
-  audit commit together or not at all
-- rebinding preserves the canonical internal conversation binding row and
-  rewires historical ingress references before removing superseded duplicates
-- live Telegram fetch failures are durably audited as ingress failures
-
-Automated DB tests follow one repository-wide rule:
-
-- DB-using tests must provision disposable databases from reviewed migrations
-- DB-using tests must not target existing operator databases
-- live manual Telegram E2E uses the normal local app config and database, not a
-  dedicated test profile
-- use `with_clean_database(...)` when a test needs an unmigrated DB
-- use `with_migrated_database(...)` when a test needs the latest reviewed schema
-
-Repository config boundaries are strict:
-
-- `config/default.toml` must stay committed and repository-safe
-- `config/local.toml` is local operator config and must not be committed
-- `.env` is local secret/config override state and must not be committed
-
-## Verification
-
-The CI-aligned local verification commands are:
-
-```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib -- --nocapture
-cargo test -p harness --test foreground_component -- --nocapture
-cargo test -p harness --test foreground_integration -- --nocapture
-cargo test -p harness --test continuity_component -- --nocapture
-cargo test -p harness --test continuity_integration -- --nocapture
-docker compose config
-```
-
-Matched pre-commit helper scripts run the same verification bundle locally:
-
-- bash/WSL: `./scripts/pre-commit.sh`
-- PowerShell: `./scripts/pre-commit.ps1`
-
-Phase 6 also adds dedicated local gate bundles for the new recovery and
-release-readiness layers:
-
-- bash/WSL: `./scripts/recovery-hardening.sh`
-- PowerShell: `./scripts/recovery-hardening.ps1`
-- bash/WSL: `./scripts/release-readiness.sh`
-- PowerShell: `./scripts/release-readiness.ps1`
-
-If `markdownlint` is installed locally, the scripts run it in warning-only mode
-by default because the repository-wide Markdown baseline is not yet fully
-clean. Set `BLUE_LAGOON_STRICT_MARKDOWNLINT=1` to make Markdown lint failures
-blocking.
-
-Useful command-surface checks:
-
-```bash
-cargo run -p runtime -- --help
-cargo run -p runtime -- harness --once --idle
-cargo run -p runtime -- harness --once --synthetic-trigger smoke
-cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
-```
-
-Repository-hosted CI lives in `.github/workflows/ci.yml` and currently exposes
-the stable jobs `workspace-verification`, `foreground-runtime`,
-`canonical-persistence`, `background-maintenance`, `management-cli`,
-`governed-actions`, `recovery-hardening`, and `release-readiness`. Live-network
-Telegram and provider checks remain intentionally outside repository-hosted CI.
+- Operator guide: [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)
+- Requirements: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)
+- Loop architecture: [`docs/LOOP_ARCHITECTURE.md`](docs/LOOP_ARCHITECTURE.md)
+- Implementation design: [`docs/IMPLEMENTATION_DESIGN.md`](docs/IMPLEMENTATION_DESIGN.md)

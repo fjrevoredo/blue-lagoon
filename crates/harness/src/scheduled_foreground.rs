@@ -1,10 +1,18 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use contracts::{ChannelKind, ScheduledForegroundLastOutcome, ScheduledForegroundTaskStatus};
-use sqlx::{PgPool, Row};
+use contracts::{
+    ChannelKind, IngressEventKind, NormalizedIngress, ScheduledForegroundLastOutcome,
+    ScheduledForegroundTaskStatus,
+};
+use serde_json::json;
+use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
-use crate::config::RuntimeConfig;
+use crate::{
+    config::RuntimeConfig,
+    execution::{self, NewExecutionRecord},
+    foreground::{self, ConversationBindingRecord, NewIngressEvent},
+};
 
 #[derive(Debug, Clone)]
 pub struct UpsertScheduledForegroundTask {
@@ -55,6 +63,19 @@ pub struct ScheduledForegroundTaskRecord {
 pub struct ScheduledForegroundTaskWriteResult {
     pub action: ScheduledForegroundTaskWriteAction,
     pub record: ScheduledForegroundTaskRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedScheduledForegroundTask {
+    pub task: ScheduledForegroundTaskRecord,
+    pub ingress: Option<NormalizedIngress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverableScheduledForegroundTask {
+    pub task: ScheduledForegroundTaskRecord,
+    pub execution_status: String,
+    pub ingress_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +180,7 @@ pub async fn list_tasks(
                     updated_at
                 FROM scheduled_foreground_tasks
                 WHERE status = $1
+                  AND current_execution_id IS NULL
                   AND next_due_at <= NOW()
                 ORDER BY next_due_at ASC, task_key ASC
                 LIMIT $2
@@ -231,7 +253,8 @@ pub async fn list_tasks(
                     created_at,
                     updated_at
                 FROM scheduled_foreground_tasks
-                WHERE next_due_at <= NOW()
+                WHERE current_execution_id IS NULL
+                  AND next_due_at <= NOW()
                 ORDER BY next_due_at ASC, task_key ASC
                 LIMIT $1
                 "#,
@@ -277,6 +300,278 @@ pub async fn list_tasks(
     };
 
     rows.into_iter().map(decode_task_row).collect()
+}
+
+pub async fn claim_next_due_task(
+    pool: &PgPool,
+    execution_id: Uuid,
+    trace_id: Uuid,
+    claimed_at: DateTime<Utc>,
+) -> Result<Option<ClaimedScheduledForegroundTask>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to begin scheduled foreground claim transaction")?;
+
+    let Some(mut task) = select_next_due_task_locked(&mut tx, claimed_at).await? else {
+        tx.rollback()
+            .await
+            .context("failed to roll back empty scheduled foreground claim transaction")?;
+        return Ok(None);
+    };
+
+    execution::insert(
+        &mut *tx,
+        &NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "scheduled_foreground".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: json!({
+                "kind": "scheduled_foreground",
+                "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+                "task_key": task.task_key,
+                "internal_principal_ref": task.internal_principal_ref,
+                "internal_conversation_ref": task.internal_conversation_ref,
+            }),
+        },
+    )
+    .await
+    .context("failed to insert execution record for scheduled foreground task claim")?;
+
+    let binding = find_conversation_binding_locked(&mut tx, &task.internal_conversation_ref)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load conversation binding for scheduled foreground task '{}'",
+                task.task_key
+            )
+        })?;
+    let ingress = if let Some(binding) = binding.as_ref() {
+        let ingress = build_scheduled_task_ingress(&task, binding, execution_id, claimed_at);
+        foreground::insert_ingress_event(
+            &mut *tx,
+            &NewIngressEvent {
+                ingress: ingress.clone(),
+                conversation_binding_id: Some(binding.conversation_binding_id),
+                trace_id,
+                execution_id: Some(execution_id),
+                status: "accepted".to_string(),
+                rejection_reason: None,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert synthetic ingress event for scheduled foreground task '{}'",
+                task.task_key
+            )
+        })?;
+        mark_ingress_processing(&mut tx, ingress.ingress_id, execution_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to mark scheduled foreground ingress as processing for task '{}'",
+                    task.task_key
+                )
+            })?;
+        Some(ingress)
+    } else {
+        None
+    };
+
+    let row = sqlx::query(
+        r#"
+        UPDATE scheduled_foreground_tasks
+        SET
+            current_execution_id = $2,
+            current_run_started_at = $3,
+            updated_at = NOW()
+        WHERE scheduled_foreground_task_id = $1
+        RETURNING
+            scheduled_foreground_task_id,
+            task_key,
+            channel_kind,
+            status,
+            internal_principal_ref,
+            internal_conversation_ref,
+            message_text,
+            cadence_seconds,
+            cooldown_seconds,
+            next_due_at,
+            current_execution_id,
+            current_run_started_at,
+            last_execution_id,
+            last_run_started_at,
+            last_run_completed_at,
+            last_outcome,
+            last_outcome_reason,
+            last_outcome_summary,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(task.scheduled_foreground_task_id)
+    .bind(execution_id)
+    .bind(claimed_at)
+    .fetch_one(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to mark scheduled foreground task '{}' as in-progress",
+            task.task_key
+        )
+    })?;
+    task = decode_task_row(row)?;
+
+    tx.commit()
+        .await
+        .context("failed to commit scheduled foreground claim transaction")?;
+
+    Ok(Some(ClaimedScheduledForegroundTask { task, ingress }))
+}
+
+pub async fn mark_task_completed(
+    pool: &PgPool,
+    task: &ScheduledForegroundTaskRecord,
+    execution_id: Uuid,
+    completed_at: DateTime<Utc>,
+    summary: &str,
+) -> Result<ScheduledForegroundTaskRecord> {
+    update_task_run_outcome(
+        pool,
+        task,
+        execution_id,
+        completed_at,
+        ScheduledForegroundLastOutcome::Completed,
+        None,
+        Some(summary),
+        completed_at + cadence_as_duration(task.cadence_seconds)?,
+    )
+    .await
+}
+
+pub async fn mark_task_suppressed(
+    pool: &PgPool,
+    task: &ScheduledForegroundTaskRecord,
+    execution_id: Uuid,
+    completed_at: DateTime<Utc>,
+    reason: &str,
+    summary: &str,
+) -> Result<ScheduledForegroundTaskRecord> {
+    update_task_run_outcome(
+        pool,
+        task,
+        execution_id,
+        completed_at,
+        ScheduledForegroundLastOutcome::Suppressed,
+        Some(reason),
+        Some(summary),
+        completed_at + cadence_as_duration(task.cooldown_seconds)?,
+    )
+    .await
+}
+
+pub async fn mark_task_failed(
+    pool: &PgPool,
+    task: &ScheduledForegroundTaskRecord,
+    execution_id: Uuid,
+    completed_at: DateTime<Utc>,
+    reason: &str,
+    summary: &str,
+) -> Result<ScheduledForegroundTaskRecord> {
+    update_task_run_outcome(
+        pool,
+        task,
+        execution_id,
+        completed_at,
+        ScheduledForegroundLastOutcome::Failed,
+        Some(reason),
+        Some(summary),
+        completed_at + cadence_as_duration(task.cooldown_seconds)?,
+    )
+    .await
+}
+
+pub async fn list_recoverable_in_progress_tasks(
+    pool: &PgPool,
+    stale_cutoff: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<RecoverableScheduledForegroundTask>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            task.scheduled_foreground_task_id,
+            task.task_key,
+            task.channel_kind,
+            task.status,
+            task.internal_principal_ref,
+            task.internal_conversation_ref,
+            task.message_text,
+            task.cadence_seconds,
+            task.cooldown_seconds,
+            task.next_due_at,
+            task.current_execution_id,
+            task.current_run_started_at,
+            task.last_execution_id,
+            task.last_run_started_at,
+            task.last_run_completed_at,
+            task.last_outcome,
+            task.last_outcome_reason,
+            task.last_outcome_summary,
+            task.created_by,
+            task.updated_by,
+            task.created_at,
+            task.updated_at,
+            execution.status AS execution_status,
+            (
+                SELECT ingress_id
+                FROM ingress_events
+                WHERE execution_id = task.current_execution_id
+                ORDER BY received_at ASC
+                LIMIT 1
+            ) AS ingress_id
+        FROM scheduled_foreground_tasks task
+        JOIN execution_records execution
+          ON execution.execution_id = task.current_execution_id
+        WHERE task.current_execution_id IS NOT NULL
+          AND (
+              execution.status IN ('completed', 'failed')
+              OR (
+                  execution.status = 'started'
+                  AND task.current_run_started_at <= $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM worker_leases lease
+                      WHERE lease.execution_id = task.current_execution_id
+                        AND lease.status = 'active'
+                  )
+              )
+          )
+        ORDER BY task.current_run_started_at ASC, task.task_key ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(stale_cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("failed to list recoverable in-progress scheduled foreground tasks")?;
+
+    rows.into_iter()
+        .map(|row| {
+            let execution_status: String = row.get("execution_status");
+            let ingress_id: Option<Uuid> = row.get("ingress_id");
+            Ok(RecoverableScheduledForegroundTask {
+                task: decode_task_row(row)?,
+                execution_status,
+                ingress_id,
+            })
+        })
+        .collect()
 }
 
 pub async fn conversation_binding_present(
@@ -494,6 +789,218 @@ async fn update_task(
     decode_task_row(row)
 }
 
+async fn select_next_due_task_locked(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    claimed_at: DateTime<Utc>,
+) -> Result<Option<ScheduledForegroundTaskRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            scheduled_foreground_task_id,
+            task_key,
+            channel_kind,
+            status,
+            internal_principal_ref,
+            internal_conversation_ref,
+            message_text,
+            cadence_seconds,
+            cooldown_seconds,
+            next_due_at,
+            current_execution_id,
+            current_run_started_at,
+            last_execution_id,
+            last_run_started_at,
+            last_run_completed_at,
+            last_outcome,
+            last_outcome_reason,
+            last_outcome_summary,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at
+        FROM scheduled_foreground_tasks
+        WHERE status = 'active'
+          AND current_execution_id IS NULL
+          AND next_due_at <= $1
+        ORDER BY next_due_at ASC, task_key ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(claimed_at)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to select next due scheduled foreground task")?;
+
+    row.map(decode_task_row).transpose()
+}
+
+async fn find_conversation_binding_locked(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    internal_conversation_ref: &str,
+) -> Result<Option<ConversationBindingRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            conversation_binding_id,
+            channel_kind,
+            external_user_id,
+            external_conversation_id,
+            internal_principal_ref,
+            internal_conversation_ref
+        FROM conversation_bindings
+        WHERE internal_conversation_ref = $1
+        FOR SHARE
+        "#,
+    )
+    .bind(internal_conversation_ref)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to load conversation binding for scheduled foreground task")?;
+
+    Ok(row.map(|row| ConversationBindingRecord {
+        conversation_binding_id: row.get("conversation_binding_id"),
+        channel_kind: row.get("channel_kind"),
+        external_user_id: row.get("external_user_id"),
+        external_conversation_id: row.get("external_conversation_id"),
+        internal_principal_ref: row.get("internal_principal_ref"),
+        internal_conversation_ref: row.get("internal_conversation_ref"),
+    }))
+}
+
+fn build_scheduled_task_ingress(
+    task: &ScheduledForegroundTaskRecord,
+    binding: &ConversationBindingRecord,
+    execution_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> NormalizedIngress {
+    NormalizedIngress {
+        ingress_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: binding.external_user_id.clone(),
+        external_conversation_id: binding.external_conversation_id.clone(),
+        external_event_id: format!("scheduled-task:{}:{execution_id}", task.task_key),
+        external_message_id: None,
+        internal_principal_ref: task.internal_principal_ref.clone(),
+        internal_conversation_ref: task.internal_conversation_ref.clone(),
+        event_kind: IngressEventKind::MessageCreated,
+        occurred_at,
+        text_body: Some(task.message_text.clone()),
+        reply_to: None,
+        attachments: Vec::new(),
+        command_hint: None,
+        approval_payload: None,
+        raw_payload_ref: Some(format!(
+            "scheduled_foreground_task:{}",
+            task.scheduled_foreground_task_id
+        )),
+    }
+}
+
+async fn mark_ingress_processing(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    ingress_id: Uuid,
+    execution_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE ingress_events
+        SET
+            execution_id = $2,
+            foreground_status = 'processing',
+            last_processed_at = NOW()
+        WHERE ingress_id = $1
+        "#,
+    )
+    .bind(ingress_id)
+    .bind(execution_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to mark scheduled foreground ingress as processing")?;
+    Ok(())
+}
+
+async fn update_task_run_outcome(
+    pool: &PgPool,
+    task: &ScheduledForegroundTaskRecord,
+    execution_id: Uuid,
+    completed_at: DateTime<Utc>,
+    outcome: ScheduledForegroundLastOutcome,
+    reason: Option<&str>,
+    summary: Option<&str>,
+    next_due_at: DateTime<Utc>,
+) -> Result<ScheduledForegroundTaskRecord> {
+    let row = sqlx::query(
+        r#"
+        UPDATE scheduled_foreground_tasks
+        SET
+            current_execution_id = NULL,
+            current_run_started_at = NULL,
+            last_execution_id = $3,
+            last_run_started_at = COALESCE(current_run_started_at, $2),
+            last_run_completed_at = $2,
+            last_outcome = $4,
+            last_outcome_reason = $5,
+            last_outcome_summary = $6,
+            next_due_at = $7,
+            updated_at = NOW()
+        WHERE scheduled_foreground_task_id = $1
+          AND current_execution_id = $3
+        RETURNING
+            scheduled_foreground_task_id,
+            task_key,
+            channel_kind,
+            status,
+            internal_principal_ref,
+            internal_conversation_ref,
+            message_text,
+            cadence_seconds,
+            cooldown_seconds,
+            next_due_at,
+            current_execution_id,
+            current_run_started_at,
+            last_execution_id,
+            last_run_started_at,
+            last_run_completed_at,
+            last_outcome,
+            last_outcome_reason,
+            last_outcome_summary,
+            created_by,
+            updated_by,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(task.scheduled_foreground_task_id)
+    .bind(completed_at)
+    .bind(execution_id)
+    .bind(scheduled_last_outcome_as_str(outcome))
+    .bind(reason)
+    .bind(summary)
+    .bind(next_due_at)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to update scheduled foreground task '{}' run outcome",
+            task.task_key
+        )
+    })?
+    .with_context(|| {
+        format!(
+            "scheduled foreground task '{}' was no longer owned by execution {}",
+            task.task_key, execution_id
+        )
+    })?;
+
+    decode_task_row(row)
+}
+
+fn cadence_as_duration(seconds: u64) -> Result<chrono::Duration> {
+    let seconds = i64::try_from(seconds).context("scheduled foreground cadence exceeded i64")?;
+    Ok(chrono::Duration::seconds(seconds))
+}
+
 fn decode_task_row(row: sqlx::postgres::PgRow) -> Result<ScheduledForegroundTaskRecord> {
     Ok(ScheduledForegroundTaskRecord {
         scheduled_foreground_task_id: row.get("scheduled_foreground_task_id"),
@@ -561,6 +1068,14 @@ fn parse_scheduled_last_outcome(raw: &str) -> Result<ScheduledForegroundLastOutc
         "suppressed" => Ok(ScheduledForegroundLastOutcome::Suppressed),
         "failed" => Ok(ScheduledForegroundLastOutcome::Failed),
         other => bail!("unsupported scheduled foreground last outcome '{other}'"),
+    }
+}
+
+fn scheduled_last_outcome_as_str(value: ScheduledForegroundLastOutcome) -> &'static str {
+    match value {
+        ScheduledForegroundLastOutcome::Completed => "completed",
+        ScheduledForegroundLastOutcome::Suppressed => "suppressed",
+        ScheduledForegroundLastOutcome::Failed => "failed",
     }
 }
 

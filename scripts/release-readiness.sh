@@ -44,6 +44,10 @@ run_step "cargo test --workspace --lib ensure_supported_reports_missing_pending_
   run_cargo test --workspace --lib ensure_supported_reports_missing_pending_too_old_and_too_new_variants -- --nocapture
 run_step "cargo test -p runtime --bin runtime phase_six_admin_parser_rejects_invalid_recovery_thresholds -- --nocapture" \
   run_cargo test -p runtime --bin runtime phase_six_admin_parser_rejects_invalid_recovery_thresholds -- --nocapture
+run_step "cargo test -p runtime --test admin_cli phase_seven_admin_scheduled_foreground_commands_run_against_a_real_database -- --nocapture" \
+  run_cargo test -p runtime --test admin_cli phase_seven_admin_scheduled_foreground_commands_run_against_a_real_database -- --nocapture
+run_step "cargo test -p harness --test foreground_integration scheduled_foreground_runtime_run_executes_due_task_through_worker_binary -- --nocapture" \
+  run_cargo test -p harness --test foreground_integration scheduled_foreground_runtime_run_executes_due_task_through_worker_binary -- --nocapture
 
 echo
 echo "release-readiness checks passed"
