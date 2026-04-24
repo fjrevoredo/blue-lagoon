@@ -54,7 +54,8 @@ pub async fn plan_background_job(
     config: &RuntimeConfig,
     request: BackgroundPlanningRequest,
 ) -> Result<BackgroundPlanningDecision> {
-    let validation = validate_background_trigger(&request.trigger);
+    let validation = validate_background_trigger(&request.trigger)
+        .and_then(|()| validate_job_trigger_compatibility(request.job_kind, &request.trigger));
     if let Err(reason) = validation {
         audit::insert(
             pool,
@@ -202,6 +203,23 @@ pub fn validate_background_trigger(trigger: &BackgroundTrigger) -> std::result::
         | BackgroundTriggerKind::ForegroundDelegation
         | BackgroundTriggerKind::ExternalPassiveEvent
         | BackgroundTriggerKind::MaintenanceTrigger => Ok(()),
+    }
+}
+
+fn validate_job_trigger_compatibility(
+    job_kind: UnconsciousJobKind,
+    trigger: &BackgroundTrigger,
+) -> std::result::Result<(), String> {
+    match (job_kind, trigger.trigger_kind) {
+        (
+            UnconsciousJobKind::ContradictionAndDriftScan,
+            BackgroundTriggerKind::DriftOrAnomalySignal,
+        ) => Err(format!(
+            "trigger kind '{}' is recognized but not supported for job kind '{}'",
+            trigger_kind_as_str(trigger.trigger_kind),
+            job_kind_as_str(job_kind),
+        )),
+        _ => Ok(()),
     }
 }
 

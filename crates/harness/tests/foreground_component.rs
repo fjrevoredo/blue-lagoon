@@ -2392,6 +2392,9 @@ async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> R
                 .join("config")
                 .join("self_model_seed.toml"),
         });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
         foreground::upsert_conversation_binding(
             &ctx.pool,
             &foreground::NewConversationBinding {
