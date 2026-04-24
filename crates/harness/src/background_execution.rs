@@ -18,7 +18,7 @@ use crate::{
     execution::{self, NewExecutionRecord},
     foreground::{self, StagedForegroundIngressOutcome},
     model_gateway::ModelProviderTransport,
-    policy, proposal, retrieval, worker,
+    policy, proposal, recovery, retrieval, worker,
 };
 
 #[derive(Debug, Clone)]
@@ -196,6 +196,7 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
     )
     .await?;
 
+    let worker_lease = create_background_worker_lease(pool, &leased, started_at).await?;
     let response = match worker::launch_unconscious_worker(
         config,
         gateway,
@@ -210,9 +211,26 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
             let timed_out = error_message.contains("timed out");
             persist_background_failure(pool, &leased, started_at, None, &error_message, timed_out)
                 .await?;
+            if timed_out {
+                recovery::recover_observed_worker_timeout(
+                    pool,
+                    worker_lease.worker_lease_id,
+                    Utc::now(),
+                    "background_worker_timeout",
+                    &error_message,
+                )
+                .await
+                .context("failed to route timed-out background worker lease through recovery")?;
+            } else {
+                release_background_worker_lease(pool, worker_lease.worker_lease_id).await?;
+            }
             return Err(error);
         }
     };
+    recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+        .await
+        .context("failed to refresh background worker lease after worker response")?;
+    release_background_worker_lease(pool, worker_lease.worker_lease_id).await?;
 
     let response_payload = match serde_json::to_value(&response)
         .context("failed to serialize unconscious worker response payload")
@@ -437,6 +455,41 @@ pub async fn execute_leased_job<T: ModelProviderTransport>(
     })
 }
 
+async fn create_background_worker_lease(
+    pool: &PgPool,
+    leased: &LeasedBackgroundExecution,
+    started_at: DateTime<Utc>,
+) -> Result<recovery::WorkerLeaseRecord> {
+    recovery::create_worker_lease(
+        pool,
+        &recovery::NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: leased.job.trace_id,
+            execution_id: Some(leased.execution_id),
+            background_job_id: Some(leased.job.background_job_id),
+            background_job_run_id: Some(leased.background_job_run_id),
+            governed_action_execution_id: None,
+            worker_kind: recovery::WorkerLeaseKind::Background,
+            lease_token: leased.lease_token,
+            worker_pid: None,
+            lease_acquired_at: started_at,
+            lease_expires_at: leased.lease_expires_at,
+            last_heartbeat_at: started_at,
+            metadata: json!({
+                "source": "background_execution",
+                "job_kind": job_kind_as_str(leased.job.job_kind),
+            }),
+        },
+    )
+    .await
+}
+
+async fn release_background_worker_lease(pool: &PgPool, worker_lease_id: Uuid) -> Result<()> {
+    recovery::release_worker_lease(pool, worker_lease_id, Utc::now())
+        .await
+        .map(|_| ())
+}
+
 async fn persist_background_failure(
     pool: &PgPool,
     leased: &LeasedBackgroundExecution,
@@ -628,6 +681,18 @@ async fn persist_wake_signals(
             policy::evaluate_wake_signal(config, &recorded_signal.signal, evaluation_context);
         let mut persisted_decision = policy_decision.clone();
         let cooldown_until = cooldown_until(config, policy_decision.decision, requested_at);
+
+        if policy_decision.decision == WakeSignalDecisionKind::Rejected {
+            recovery::recover_wake_signal_policy_block(
+                pool,
+                &recorded_signal,
+                requested_at,
+                "wake_signal_routing_rejected",
+                &policy_decision.reason,
+            )
+            .await
+            .context("failed to route rejected wake-signal conversion through recovery")?;
+        }
 
         if policy_decision.decision == WakeSignalDecisionKind::Accepted {
             let binding = foreground_binding.context(
@@ -997,6 +1062,12 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            scheduled_foreground: crate::config::ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
             },
             workspace: crate::config::WorkspaceConfig {
                 root_dir: ".".into(),

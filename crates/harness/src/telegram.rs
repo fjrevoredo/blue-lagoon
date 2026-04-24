@@ -245,6 +245,7 @@ impl TelegramDelivery for FakeTelegramDelivery {
 pub struct ReqwestTelegramSource {
     client: reqwest::Client,
     config: ResolvedTelegramConfig,
+    next_offset: Option<i64>,
 }
 
 impl ReqwestTelegramSource {
@@ -255,20 +256,27 @@ impl ReqwestTelegramSource {
                 .build()
                 .expect("Telegram reqwest client should build"),
             config,
+            next_offset: None,
         }
     }
 }
 
 impl TelegramUpdateSource for ReqwestTelegramSource {
     async fn fetch_updates(&mut self, limit: u16) -> Result<Vec<TelegramUpdate>> {
+        let mut request_body = serde_json::Map::new();
+        request_body.insert("limit".to_string(), json!(limit));
+        request_body.insert("timeout".to_string(), json!(0));
+        request_body.insert(
+            "allowed_updates".to_string(),
+            json!(["message", "callback_query"]),
+        );
+        if let Some(offset) = self.next_offset {
+            request_body.insert("offset".to_string(), json!(offset));
+        }
         let response = self
             .client
             .post(telegram_api_url(&self.config, "getUpdates"))
-            .json(&json!({
-                "limit": limit,
-                "timeout": 0,
-                "allowed_updates": ["message", "callback_query"],
-            }))
+            .json(&serde_json::Value::Object(request_body))
             .send()
             .await
             .context("failed to call Telegram getUpdates")?;
@@ -283,6 +291,9 @@ impl TelegramUpdateSource for ReqwestTelegramSource {
             .context("failed to decode Telegram getUpdates response")?;
         if !body.ok {
             bail!("Telegram getUpdates response marked itself as not ok");
+        }
+        if let Some(max_update_id) = body.result.iter().map(|update| update.update_id).max() {
+            self.next_offset = Some(max_update_id + 1);
         }
         Ok(body.result)
     }

@@ -177,6 +177,12 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
                 max_recovery_batch_size: 8,
             },
         },
+        scheduled_foreground: harness::config::ScheduledForegroundConfig {
+            enabled: true,
+            max_due_tasks_per_iteration: 2,
+            min_cadence_seconds: 300,
+            default_cooldown_seconds: 300,
+        },
         workspace: harness::config::WorkspaceConfig {
             root_dir: workspace_root(),
             max_artifact_bytes: 1_048_576,
@@ -432,9 +438,6 @@ fn resolve_workers_binary() -> Result<PathBuf> {
         .join("target")
         .join("debug")
         .join(binary_name);
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
 
     let status = Command::new("cargo")
         .arg("build")

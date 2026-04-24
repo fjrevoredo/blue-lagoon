@@ -1,7 +1,7 @@
 mod support;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use contracts::{
     BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, ChannelKind,
     ModelProviderKind, UnconsciousJobKind, UnconsciousScope,
@@ -22,6 +22,7 @@ use harness::{
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
+    recovery,
     runtime::{self, HarnessOptions, HarnessOutcome},
 };
 
@@ -141,6 +142,171 @@ async fn background_runtime_flows_due_job_to_memory_merge_end_to_end() -> Result
                 .iter()
                 .any(|event| event.event_kind == "retrieval_update_applied")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_runtime_recovers_stranded_run_during_supervisor_restart() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.model_gateway = Some(sample_model_gateway_config(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+        ));
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now() - ChronoDuration::minutes(1),
+            UnconsciousJobKind::MemoryConsolidation,
+        )
+        .await?;
+        let job = background::get_job(&ctx.pool, background_job_id).await?;
+        let stranded_execution_id = seed_execution(&ctx.pool, job.trace_id).await?;
+        let stranded_run_id = Uuid::now_v7();
+        let lease_acquired_at = Utc::now() - ChronoDuration::minutes(5);
+        let lease_expires_at = Utc::now() + ChronoDuration::minutes(5);
+
+        background::update_job_status(
+            &ctx.pool,
+            background_job_id,
+            &background::UpdateBackgroundJobStatus {
+                status: background::BackgroundJobStatus::Running,
+                lease_expires_at: Some(lease_expires_at),
+                last_started_at: Some(lease_acquired_at),
+                last_completed_at: None,
+            },
+        )
+        .await?;
+        background::insert_job_run(
+            &ctx.pool,
+            &background::NewBackgroundJobRun {
+                background_job_run_id: stranded_run_id,
+                background_job_id,
+                trace_id: job.trace_id,
+                execution_id: Some(stranded_execution_id),
+                lease_token: Uuid::now_v7(),
+                status: background::BackgroundJobRunStatus::Running,
+                worker_pid: None,
+                lease_acquired_at,
+                lease_expires_at,
+                started_at: Some(lease_acquired_at),
+                completed_at: None,
+                result_payload: None,
+                failure_payload: None,
+            },
+        )
+        .await?;
+
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "recovered maintenance lexical summary" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        let outcome = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
+            || async {
+                runtime::run_harness_once_with_transport(
+                    &config,
+                    HarnessOptions {
+                        once: true,
+                        idle: false,
+                        background_once: true,
+                        synthetic_trigger: None,
+                    },
+                    &transport,
+                )
+                .await
+            },
+        )
+        .await?;
+
+        let recovered_execution_id = match outcome {
+            HarnessOutcome::BackgroundCompleted {
+                background_job_id: executed_job_id,
+                execution_id,
+                ..
+            } => {
+                assert_eq!(executed_job_id, background_job_id);
+                execution_id
+            }
+            other => panic!("expected background completion outcome, got {other:?}"),
+        };
+        assert_ne!(recovered_execution_id, stranded_execution_id);
+
+        let stranded_execution = execution::get(&ctx.pool, stranded_execution_id).await?;
+        assert_eq!(stranded_execution.status, "failed");
+        assert_eq!(
+            stranded_execution
+                .response_payload
+                .as_ref()
+                .and_then(|payload| payload.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("supervisor_restart_recovery")
+        );
+
+        let completed_runs =
+            background::list_completed_job_runs(&ctx.pool, background_job_id, 10).await?;
+        assert!(completed_runs.iter().any(|run| {
+            run.background_job_run_id == stranded_run_id
+                && run.status == background::BackgroundJobRunStatus::Failed
+        }));
+        assert!(completed_runs.iter().any(|run| {
+            run.execution_id == Some(recovered_execution_id)
+                && run.status == background::BackgroundJobRunStatus::Completed
+        }));
+
+        let checkpoint_row = sqlx::query(
+            r#"
+            SELECT recovery_reason_code, recovery_decision
+            FROM recovery_checkpoints
+            WHERE background_job_id = $1
+              AND background_job_run_id = $2
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(background_job_id)
+        .bind(stranded_run_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_reason_code"),
+            "supervisor_restart".to_string()
+        );
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_decision"),
+            "retry".to_string()
+        );
+
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "background_supervisor_restart_recovered"
+                && diagnostic.execution_id == Some(stranded_execution_id)
+        }));
+
+        let audit_events = audit::list_for_execution(&ctx.pool, stranded_execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| { event.event_kind == "background_job_supervisor_restart_recovered" })
+        );
+
         Ok(())
     })
     .await

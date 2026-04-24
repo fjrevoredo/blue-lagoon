@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,8 +24,9 @@ use crate::{
     migration,
     model_gateway::{self, ModelProviderTransport},
     policy::{self, PolicyDecision},
+    recovery, scheduled_foreground,
     schema::{self, SchemaPolicy},
-    telegram::{self, TelegramDelivery, TelegramUpdate},
+    telegram::{self, TelegramDelivery, TelegramUpdate, TelegramUpdateSource},
     trace::TraceContext,
     worker,
 };
@@ -102,6 +104,46 @@ pub async fn run_harness_once(
     run_harness_once_with_transport(config, options, &transport).await
 }
 
+pub async fn run_harness_service(config: &RuntimeConfig) -> Result<()> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let resolved_gateway = if config.scheduled_foreground.enabled {
+        Some(config.require_model_gateway_config()?)
+    } else {
+        None
+    };
+    let mut delivery = if config.scheduled_foreground.enabled {
+        Some(telegram::ReqwestTelegramDelivery::new(
+            config.require_telegram_config()?,
+        ))
+    } else {
+        None
+    };
+    let poll_interval =
+        Duration::from_secs(config.background.scheduler.poll_interval_seconds.max(1));
+
+    loop {
+        supervise_expired_worker_leases(&pool).await?;
+        supervise_background_supervisor_restart_recovery(&pool).await?;
+        recover_interrupted_scheduled_foreground_tasks(&pool, config, 40).await?;
+        if let (Some(model_gateway_config), Some(delivery)) =
+            (resolved_gateway.as_ref(), delivery.as_mut())
+        {
+            run_scheduled_foreground_iteration_with(
+                &pool,
+                config,
+                model_gateway_config,
+                &transport,
+                delivery,
+            )
+            .await?;
+        }
+        run_background_scheduler_iteration(&pool, config, &transport).await?;
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
     config: &RuntimeConfig,
     options: HarnessOptions,
@@ -119,6 +161,8 @@ pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
 
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
+    supervise_expired_worker_leases(&pool).await?;
+    supervise_background_supervisor_restart_recovery(&pool).await?;
 
     if options.idle {
         info!("harness boot verified and returned to idle");
@@ -171,6 +215,7 @@ pub async fn run_telegram_once(
 
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
+    supervise_expired_worker_leases(&pool).await?;
 
     let telegram_config = config.require_telegram_config()?;
     let model_gateway_config = config.require_model_gateway_config()?;
@@ -222,6 +267,49 @@ pub async fn run_telegram_once(
     Ok(TelegramOutcome::PollProcessed(summary))
 }
 
+pub async fn run_telegram_service(config: &RuntimeConfig) -> Result<()> {
+    const TELEGRAM_SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let telegram_config = config.require_telegram_config()?;
+    let model_gateway_config = config.require_model_gateway_config()?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let mut source = telegram::ReqwestTelegramSource::new(telegram_config.clone());
+    let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
+
+    loop {
+        supervise_expired_worker_leases(&pool).await?;
+        let updates = match source.fetch_updates(telegram_config.poll_limit).await {
+            Ok(updates) => updates,
+            Err(error) => {
+                if let Err(record_error) =
+                    record_telegram_fetch_failed(&pool, &error, Some("telegram:getUpdates")).await
+                {
+                    return Err(error.context(format!(
+                        "failed to record telegram fetch failure: {record_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        process_telegram_updates(
+            TelegramProcessingContext {
+                pool: &pool,
+                config,
+                telegram_config: &telegram_config,
+                model_gateway_config: &model_gateway_config,
+                transport: &transport,
+                raw_payload_ref: Some("telegram:getUpdates".to_string()),
+            },
+            updates,
+            &mut delivery,
+        )
+        .await?;
+        tokio::time::sleep(TELEGRAM_SERVICE_POLL_INTERVAL).await;
+    }
+}
+
 pub async fn run_telegram_fixture_with<T, D>(
     pool: &PgPool,
     config: &RuntimeConfig,
@@ -258,6 +346,34 @@ async fn verify_schema(pool: &PgPool, config: &RuntimeConfig) -> Result<i64> {
         expected_version: migration::latest_version(&migrations),
     };
     schema::verify(pool, policy).await
+}
+
+async fn supervise_expired_worker_leases(pool: &PgPool) -> Result<()> {
+    let summary = recovery::supervise_worker_leases(pool, Utc::now(), 80).await?;
+    if !summary.recovered_expired_leases.is_empty() {
+        info!(
+            expired_worker_lease_count = summary.recovered_expired_leases.len(),
+            "expired worker leases were routed through recovery"
+        );
+    }
+    if !summary.soft_warning_diagnostics.is_empty() {
+        info!(
+            soft_warning_count = summary.soft_warning_diagnostics.len(),
+            "worker lease soft warnings were recorded"
+        );
+    }
+    Ok(())
+}
+
+async fn supervise_background_supervisor_restart_recovery(pool: &PgPool) -> Result<()> {
+    let recovered = recovery::recover_background_supervisor_restart(pool, Utc::now(), 40).await?;
+    if !recovered.is_empty() {
+        info!(
+            stranded_background_job_count = recovered.len(),
+            "stranded background runs were routed through supervisor restart recovery"
+        );
+    }
+    Ok(())
 }
 
 async fn run_smoke_trigger(pool: &PgPool, config: &RuntimeConfig) -> Result<HarnessOutcome> {
@@ -391,6 +507,473 @@ async fn record_background_no_due_job(
     Ok(())
 }
 
+async fn run_background_scheduler_iteration<T: ModelProviderTransport>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    transport: &T,
+) -> Result<u32> {
+    let due_limit = config
+        .background
+        .scheduler
+        .max_due_jobs_per_iteration
+        .max(1);
+    if background::list_due_jobs(pool, Utc::now(), due_limit)
+        .await?
+        .is_empty()
+    {
+        return Ok(0);
+    }
+
+    let gateway = config.require_model_gateway_config()?;
+    let mut completed = 0_u32;
+    for _ in 0..due_limit {
+        match background_execution::execute_next_due_job(
+            pool,
+            config,
+            &gateway,
+            transport,
+            Utc::now(),
+        )
+        .await?
+        {
+            Some(_) => completed += 1,
+            None => break,
+        }
+    }
+    Ok(completed)
+}
+
+pub async fn run_scheduled_foreground_iteration_with<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<u32>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    if !config.scheduled_foreground.enabled {
+        return Ok(0);
+    }
+
+    recover_interrupted_scheduled_foreground_tasks(pool, config, 40).await?;
+
+    let due_limit = config
+        .scheduled_foreground
+        .max_due_tasks_per_iteration
+        .max(1);
+    let mut handled = 0_u32;
+    for _ in 0..due_limit {
+        let trace_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        let Some(claim) =
+            scheduled_foreground::claim_next_due_task(pool, execution_id, trace_id, Utc::now())
+                .await?
+        else {
+            break;
+        };
+
+        handle_claimed_scheduled_foreground_task(
+            pool,
+            config,
+            model_gateway_config,
+            claim,
+            foreground_orchestration::ForegroundExecutionIds {
+                trace_id,
+                execution_id,
+            },
+            transport,
+            delivery,
+        )
+        .await?;
+        handled += 1;
+    }
+
+    Ok(handled)
+}
+
+pub async fn recover_interrupted_scheduled_foreground_tasks(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    limit: i64,
+) -> Result<u32> {
+    if !config.scheduled_foreground.enabled {
+        return Ok(0);
+    }
+
+    let timeout_ms = i64::try_from(policy::effective_foreground_worker_timeout_ms(config))
+        .context("scheduled foreground worker timeout exceeded i64 range")?;
+    let stale_cutoff = Utc::now() - chrono::Duration::milliseconds(timeout_ms);
+    let recoverable =
+        scheduled_foreground::list_recoverable_in_progress_tasks(pool, stale_cutoff, limit).await?;
+    let mut recovered = 0_u32;
+    for task in recoverable {
+        recover_scheduled_foreground_task(pool, &task).await?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+async fn recover_scheduled_foreground_task(
+    pool: &PgPool,
+    recoverable: &scheduled_foreground::RecoverableScheduledForegroundTask,
+) -> Result<()> {
+    let execution_id = recoverable
+        .task
+        .current_execution_id
+        .context("recoverable scheduled foreground task is missing current_execution_id")?;
+    let trace_id = execution::get(pool, execution_id).await?.trace_id;
+    let now = Utc::now();
+    if let Some(ingress_id) = recoverable.ingress_id {
+        let selected_ingress_ids = [ingress_id];
+        recovery::recover_foreground_restart_trigger(
+            pool,
+            recovery::ForegroundRestartRecoveryRequest {
+                trace_id,
+                execution_id,
+                internal_conversation_ref: &recoverable.task.internal_conversation_ref,
+                recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
+                trigger_source: "scheduled_foreground_supervisor_recovery",
+                decision_reason: "scheduled_task_supervisor_restart_recovery",
+                selected_ingress_ids: &selected_ingress_ids,
+                primary_ingress_id: ingress_id,
+                recovery_mode: "single_ingress",
+            },
+            now,
+        )
+        .await
+        .context("failed to route interrupted scheduled foreground task through recovery")?;
+    }
+
+    match recoverable.execution_status.as_str() {
+        "completed" => {
+            let completed = scheduled_foreground::mark_task_completed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "scheduled foreground completion was finalized during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_completed",
+                "warn",
+                trace_id,
+                execution_id,
+                &completed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+        "failed" => {
+            let failed = scheduled_foreground::mark_task_failed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "supervisor_restart_recovery",
+                "scheduled foreground failure was finalized during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_failed",
+                "warn",
+                trace_id,
+                execution_id,
+                &failed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+        _ => {
+            execution::mark_failed(
+                pool,
+                execution_id,
+                &json!({
+                    "kind": "scheduled_foreground_recovery",
+                    "message": "scheduled foreground execution was interrupted and failed closed during supervisor recovery",
+                }),
+            )
+            .await?;
+            let failed = scheduled_foreground::mark_task_failed(
+                pool,
+                &recoverable.task,
+                execution_id,
+                now,
+                "supervisor_restart_recovery",
+                "scheduled foreground execution was interrupted and failed closed during supervisor recovery",
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_recovered_failed",
+                "warn",
+                trace_id,
+                execution_id,
+                &failed,
+                json!({
+                    "recovery": "supervisor_restart",
+                    "execution_status": recoverable.execution_status,
+                    "ingress_id": recoverable.ingress_id,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_claimed_scheduled_foreground_task<T, D>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
+    claim: scheduled_foreground::ClaimedScheduledForegroundTask,
+    ids: foreground_orchestration::ForegroundExecutionIds,
+    transport: &T,
+    delivery: &mut D,
+) -> Result<()>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "scheduled_foreground".to_string(),
+            event_kind: "scheduled_foreground_task_started".to_string(),
+            severity: "info".to_string(),
+            trace_id: ids.trace_id,
+            execution_id: Some(ids.execution_id),
+            worker_pid: None,
+            payload: json!({
+                "scheduled_foreground_task_id": claim.task.scheduled_foreground_task_id,
+                "task_key": claim.task.task_key,
+                "internal_principal_ref": claim.task.internal_principal_ref,
+                "internal_conversation_ref": claim.task.internal_conversation_ref,
+            }),
+        },
+    )
+    .await?;
+
+    let Some(ingress) = claim.ingress.clone() else {
+        return suppress_scheduled_foreground_task(
+            pool,
+            &claim.task,
+            ids.trace_id,
+            ids.execution_id,
+            "conversation_binding_missing",
+            "scheduled foreground task has no matching conversation binding",
+        )
+        .await;
+    };
+
+    let ingress_record = foreground::get_ingress_event(pool, ingress.ingress_id).await?;
+    let plan = foreground::PendingForegroundExecutionPlan {
+        mode: contracts::ForegroundExecutionMode::SingleIngress,
+        primary_ingress: ingress_record,
+        ordered_ingress: vec![contracts::OrderedIngressReference {
+            ingress_id: ingress.ingress_id,
+            occurred_at: ingress.occurred_at,
+            external_message_id: ingress.external_message_id.clone(),
+            text_body: ingress.text_body.clone(),
+        }],
+        decision_reason: foreground::ForegroundExecutionDecisionReason::SingleIngress,
+    };
+
+    match foreground_orchestration::orchestrate_telegram_foreground_plan(
+        pool,
+        config,
+        model_gateway_config,
+        foreground_orchestration::TelegramForegroundPlanExecution {
+            execution: ids,
+            trigger_kind_override: Some(contracts::ForegroundTriggerKind::ScheduledTask),
+            plan,
+        },
+        transport,
+        delivery,
+    )
+    .await
+    {
+        Ok(TelegramForegroundOrchestrationOutcome::Completed(completion)) => {
+            let completed = scheduled_foreground::mark_task_completed(
+                pool,
+                &claim.task,
+                ids.execution_id,
+                Utc::now(),
+                &format!(
+                    "scheduled foreground task '{}' delivered Telegram message {}",
+                    claim.task.task_key, completion.outbound_message_id
+                ),
+            )
+            .await?;
+            record_scheduled_foreground_terminal_audit(
+                pool,
+                "scheduled_foreground_task_completed",
+                "info",
+                ids.trace_id,
+                ids.execution_id,
+                &completed,
+                json!({
+                    "outbound_message_id": completion.outbound_message_id,
+                    "ingress_id": completion.ingress_id,
+                    "episode_id": completion.episode_id,
+                }),
+            )
+            .await
+        }
+        Ok(other) => {
+            let message = format!(
+                "scheduled foreground task '{}' returned an unexpected orchestration outcome: {other:?}",
+                claim.task.task_key
+            );
+            fail_scheduled_foreground_task(
+                pool,
+                &claim.task,
+                ids.trace_id,
+                ids.execution_id,
+                "unexpected_orchestration_outcome",
+                &message,
+            )
+            .await
+        }
+        Err(error) => {
+            let error_message = format_error_chain(&error);
+            fail_scheduled_foreground_task(
+                pool,
+                &claim.task,
+                ids.trace_id,
+                ids.execution_id,
+                "execution_failed",
+                &error_message,
+            )
+            .await
+        }
+    }
+}
+
+async fn suppress_scheduled_foreground_task(
+    pool: &PgPool,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    reason: &str,
+    summary: &str,
+) -> Result<()> {
+    execution::mark_succeeded(
+        pool,
+        execution_id,
+        "scheduled_foreground",
+        0,
+        &json!({
+            "kind": "scheduled_foreground_suppressed",
+            "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+            "task_key": task.task_key,
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await?;
+    let suppressed = scheduled_foreground::mark_task_suppressed(
+        pool,
+        task,
+        execution_id,
+        Utc::now(),
+        reason,
+        summary,
+    )
+    .await?;
+    record_scheduled_foreground_terminal_audit(
+        pool,
+        "scheduled_foreground_task_suppressed",
+        "warn",
+        trace_id,
+        execution_id,
+        &suppressed,
+        json!({
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await
+}
+
+async fn fail_scheduled_foreground_task(
+    pool: &PgPool,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    reason: &str,
+    summary: &str,
+) -> Result<()> {
+    let failed = scheduled_foreground::mark_task_failed(
+        pool,
+        task,
+        execution_id,
+        Utc::now(),
+        reason,
+        summary,
+    )
+    .await?;
+    record_scheduled_foreground_terminal_audit(
+        pool,
+        "scheduled_foreground_task_failed",
+        "error",
+        trace_id,
+        execution_id,
+        &failed,
+        json!({
+            "reason": reason,
+            "summary": summary,
+        }),
+    )
+    .await
+}
+
+async fn record_scheduled_foreground_terminal_audit(
+    pool: &PgPool,
+    event_kind: &str,
+    severity: &str,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    task: &scheduled_foreground::ScheduledForegroundTaskRecord,
+    detail: serde_json::Value,
+) -> Result<()> {
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "conscious".to_string(),
+            subsystem: "scheduled_foreground".to_string(),
+            event_kind: event_kind.to_string(),
+            severity: severity.to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+                "task_key": task.task_key,
+                "status": format!("{:?}", task.status),
+                "last_outcome": task.last_outcome.map(|value| format!("{value:?}")),
+                "next_due_at": task.next_due_at,
+                "detail": detail,
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 struct TelegramProcessingContext<'a, T> {
     pool: &'a PgPool,
     config: &'a RuntimeConfig,
@@ -414,6 +997,8 @@ where
         ..TelegramProcessingSummary::default()
     };
     let mut staged_conversations = BTreeSet::new();
+    let mut newly_staged_conversations = BTreeSet::new();
+    let mut recovery_scan_conversations = BTreeSet::new();
 
     for update in updates {
         let normalization = ingress::normalize_telegram_update(
@@ -458,7 +1043,8 @@ where
                 .await?
                 {
                     foreground::StagedForegroundIngressOutcome::Accepted(staged) => {
-                        staged_conversations.insert(staged.internal_conversation_ref);
+                        staged_conversations.insert(staged.internal_conversation_ref.clone());
+                        newly_staged_conversations.insert(staged.internal_conversation_ref);
                     }
                     foreground::StagedForegroundIngressOutcome::Duplicate(_) => {
                         summary.duplicate_count += 1;
@@ -502,7 +1088,8 @@ where
     for internal_conversation_ref in
         foreground::list_recoverable_foreground_conversations(context.pool, context.config).await?
     {
-        staged_conversations.insert(internal_conversation_ref);
+        staged_conversations.insert(internal_conversation_ref.clone());
+        recovery_scan_conversations.insert(internal_conversation_ref);
     }
 
     for internal_conversation_ref in staged_conversations {
@@ -537,16 +1124,74 @@ where
             continue;
         };
         let is_backlog_recovery = plan.mode == contracts::ForegroundExecutionMode::BacklogRecovery;
+        let selected_ingress_ids = plan
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect::<Vec<_>>();
+        let recovered_only_from_scan = recovery_scan_conversations
+            .contains(&internal_conversation_ref)
+            && !newly_staged_conversations.contains(&internal_conversation_ref);
+
+        if plan.decision_reason
+            == foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
+        {
+            recovery::recover_foreground_restart_trigger(
+                context.pool,
+                recovery::ForegroundRestartRecoveryRequest {
+                    trace_id,
+                    execution_id,
+                    internal_conversation_ref: &internal_conversation_ref,
+                    recovery_reason_code: recovery::RecoveryReasonCode::Crash,
+                    trigger_source: "telegram_foreground_processing_loop",
+                    decision_reason: plan.decision_reason.as_str(),
+                    selected_ingress_ids: &selected_ingress_ids,
+                    primary_ingress_id: plan.primary_ingress.ingress_id,
+                    recovery_mode: "backlog_recovery",
+                },
+                Utc::now(),
+            )
+            .await
+            .context("failed to route stale foreground processing through recovery")?;
+        } else if recovered_only_from_scan && is_backlog_recovery {
+            recovery::recover_foreground_restart_trigger(
+                context.pool,
+                recovery::ForegroundRestartRecoveryRequest {
+                    trace_id,
+                    execution_id,
+                    internal_conversation_ref: &internal_conversation_ref,
+                    recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
+                    trigger_source: "telegram_foreground_recovery_scan",
+                    decision_reason: plan.decision_reason.as_str(),
+                    selected_ingress_ids: &selected_ingress_ids,
+                    primary_ingress_id: plan.primary_ingress.ingress_id,
+                    recovery_mode: "backlog_recovery",
+                },
+                Utc::now(),
+            )
+            .await
+            .context("failed to route foreground supervisor restart through recovery")?;
+        }
 
         match foreground_orchestration::orchestrate_telegram_foreground_plan(
             context.pool,
             context.config,
             context.model_gateway_config,
-            foreground_orchestration::ForegroundExecutionIds {
-                trace_id,
-                execution_id,
+            foreground_orchestration::TelegramForegroundPlanExecution {
+                execution: foreground_orchestration::ForegroundExecutionIds {
+                    trace_id,
+                    execution_id,
+                },
+                trigger_kind_override: if plan.decision_reason
+                    == foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
+                    || (recovered_only_from_scan && is_backlog_recovery)
+                {
+                    Some(contracts::ForegroundTriggerKind::SupervisorRecoveryEvent)
+                } else {
+                    None
+                },
+                plan,
             },
-            plan,
             context.transport,
             delivery,
         )

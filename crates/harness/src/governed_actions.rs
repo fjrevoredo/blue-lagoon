@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use contracts::{
     CapabilityScope, GovernedActionExecutionOutcome, GovernedActionFingerprint, GovernedActionKind,
     GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     config::RuntimeConfig,
-    execution, policy, tool_execution,
+    execution, policy, recovery, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -424,6 +424,7 @@ pub async fn execute_governed_action(
     let proposal = proposal_from_record(record);
     if let Err(error) = validate_capability_scope(config, &proposal) {
         let summary = error.to_string();
+        let completed_at = Utc::now();
         let record = update_governed_action_execution(
             pool,
             GovernedActionExecutionUpdate {
@@ -433,8 +434,8 @@ pub async fn execute_governed_action(
                 output_ref: None,
                 blocked_reason: Some(&summary),
                 approval_request_id: None,
-                started_at: None,
-                completed_at: Some(Utc::now()),
+                started_at: Some(completed_at),
+                completed_at: Some(completed_at),
             },
         )
         .await?;
@@ -449,6 +450,14 @@ pub async fn execute_governed_action(
             }),
         )
         .await?;
+        recovery::recover_governed_action_policy_recheck_failure(
+            pool,
+            &record,
+            completed_at,
+            &summary,
+        )
+        .await
+        .context("failed to route governed-action policy re-check failure through recovery")?;
         let outcome = GovernedActionExecutionOutcome {
             status: GovernedActionStatus::Blocked,
             summary,
@@ -502,7 +511,9 @@ pub async fn execute_governed_action(
     )
     .await?;
 
-    match &started_record.payload {
+    let worker_lease =
+        create_governed_action_worker_lease(pool, &started_record, started_at).await?;
+    let result = match &started_record.payload {
         GovernedActionPayload::RunSubprocess(action) => {
             execute_subprocess_governed_action(config, pool, &started_record, action).await
         }
@@ -559,7 +570,79 @@ pub async fn execute_governed_action(
                 None,
             ))
         }
+    };
+    let lease_completion_result = if result.as_ref().is_ok_and(governed_action_result_is_timeout) {
+        recovery::recover_observed_worker_timeout(
+            pool,
+            worker_lease.worker_lease_id,
+            Utc::now(),
+            "governed_action_timeout",
+            result
+                .as_ref()
+                .map(|result| result.outcome.summary.as_str())
+                .unwrap_or("governed action timed out"),
+        )
+        .await
+        .map(|_| ())
+        .context("failed to route timed-out governed-action worker lease through recovery")
+    } else {
+        if result.is_ok() {
+            recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to refresh governed-action worker lease after action progress")?;
+        }
+        recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+            .await
+            .map(|_| ())
+    };
+
+    match (result, lease_completion_result) {
+        (Ok(result), Ok(_)) => Ok(result),
+        (Ok(_), Err(error)) => {
+            Err(error.context("failed to complete governed-action worker lease after success"))
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Err(action_error), Err(lease_error)) => Err(lease_error.context(format!(
+            "failed to complete governed-action worker lease after action failure: {action_error}"
+        ))),
     }
+}
+
+fn governed_action_result_is_timeout(result: &GovernedActionExecutionResult) -> bool {
+    result.outcome.status == GovernedActionStatus::Failed
+        && result.outcome.summary.contains("timed out")
+}
+
+async fn create_governed_action_worker_lease(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<recovery::WorkerLeaseRecord> {
+    let timeout_ms = i64::try_from(record.capability_scope.execution.timeout_ms)
+        .context("governed action timeout exceeded chrono range")?;
+    recovery::create_worker_lease(
+        pool,
+        &recovery::NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: record.trace_id,
+            execution_id: record.execution_id,
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: Some(record.governed_action_execution_id),
+            worker_kind: recovery::WorkerLeaseKind::GovernedAction,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: started_at,
+            lease_expires_at: started_at + Duration::milliseconds(timeout_ms),
+            last_heartbeat_at: started_at,
+            metadata: json!({
+                "source": "governed_actions",
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+            }),
+        },
+    )
+    .await
 }
 
 pub fn fingerprint_governed_action(
@@ -1309,18 +1392,18 @@ fn governed_action_execution_result(
     }
 }
 
-struct GovernedActionExecutionUpdate<'a> {
-    governed_action_execution_id: Uuid,
-    status: GovernedActionStatus,
-    execution_id: Option<Uuid>,
-    output_ref: Option<&'a str>,
-    blocked_reason: Option<&'a str>,
-    approval_request_id: Option<Uuid>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct GovernedActionExecutionUpdate<'a> {
+    pub(crate) governed_action_execution_id: Uuid,
+    pub(crate) status: GovernedActionStatus,
+    pub(crate) execution_id: Option<Uuid>,
+    pub(crate) output_ref: Option<&'a str>,
+    pub(crate) blocked_reason: Option<&'a str>,
+    pub(crate) approval_request_id: Option<Uuid>,
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn update_governed_action_execution(
+pub(crate) async fn update_governed_action_execution(
     pool: &PgPool,
     update: GovernedActionExecutionUpdate<'_>,
 ) -> Result<GovernedActionExecutionRecord> {
@@ -1354,7 +1437,7 @@ async fn update_governed_action_execution(
     get_governed_action_execution(pool, update.governed_action_execution_id).await
 }
 
-async fn write_governed_action_audit_event(
+pub(crate) async fn write_governed_action_audit_event(
     pool: &PgPool,
     record: &GovernedActionExecutionRecord,
     event_kind: &str,
@@ -1722,6 +1805,12 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            scheduled_foreground: crate::config::ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
             },
             workspace: crate::config::WorkspaceConfig {
                 root_dir: ".".into(),

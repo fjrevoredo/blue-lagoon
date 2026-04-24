@@ -27,6 +27,7 @@ Operational assets live at the repository root:
 - `migrations/`: reviewed SQL migrations
 - `config/default.toml`: versioned non-secret config
 - `config/local.example.toml`: template for untracked local operator overrides
+- `config/self_model_seed.toml`: checked-in seed for the runtime self-model
 - `compose.yaml`: local PostgreSQL plus runtime topology
 
 Use `docs/sources/` for research inputs and external references. Historical
@@ -55,10 +56,22 @@ Typical implementation workflow is:
   the canonical continuity component suite.
 - `cargo test -p harness --test continuity_integration -- --nocapture` to run
   the canonical continuity integration suite.
+- `cargo test -p harness --test foundation_component -- --nocapture` to run
+  the foundational PostgreSQL-backed component suite.
+- `cargo test -p harness --test foundation_integration -- --nocapture` to run
+  the foundational architecture integration suite.
+- `cargo test -p harness --test migration_component -- --nocapture` to run
+  the reviewed-migration component suite against disposable PostgreSQL.
+- `cargo test -p harness --test recovery_component -- --nocapture` to run
+  the checkpoint and recovery component suite.
+- `cargo test -p harness --test recovery_integration -- --nocapture` to run
+  the architecture-critical recovery integration suite.
 - `cargo test -p harness --test unconscious_component -- --nocapture` to run
   the PostgreSQL-backed background-maintenance component suite.
 - `cargo test -p harness --test unconscious_integration -- --nocapture` to run
   the architecture-critical background-maintenance integration suite.
+- `cargo test -p harness --test artifact_naming -- --nocapture` to run the
+  repository artifact-naming regression suite.
 - `cargo test -p runtime --test admin_cli -- --nocapture` to run the runtime
   management CLI surface tests.
 - `cargo test -p runtime --bin runtime -- --nocapture` to run the runtime
@@ -81,6 +94,14 @@ Typical implementation workflow is:
   from bash/WSL.
 - `./scripts/pre-commit.ps1` to run the same pre-commit verification bundle
   from PowerShell.
+- `./scripts/recovery-hardening.sh` to run the dedicated PostgreSQL-backed
+  recovery component and integration gate from bash/WSL.
+- `./scripts/recovery-hardening.ps1` to run the same recovery-hardening gate
+  from PowerShell.
+- `./scripts/release-readiness.sh` to run the upgrade-path, smoke,
+  fault-injection, and critical-proof release-readiness bundle from bash/WSL.
+- `./scripts/release-readiness.ps1` to run the same release-readiness bundle
+  from PowerShell.
 - `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.sh` or
   `BLUE_LAGOON_STRICT_MARKDOWNLINT=1 ./scripts/pre-commit.ps1` to make the
   optional Markdown lint step blocking once the repository Markdown baseline is
@@ -101,6 +122,21 @@ Typical implementation workflow is:
   surface.
 - `cargo run -p runtime -- admin status` to inspect runtime readiness and
   pending-work state without raw SQL.
+- `cargo run -p runtime -- admin health summary` to inspect rolled-up recovery,
+  lease, checkpoint, and diagnostic health signals.
+- `cargo run -p runtime -- admin diagnostics list` to inspect recent
+  operational diagnostics without querying SQL tables directly.
+- `cargo run -p runtime -- admin recovery checkpoints list` to inspect recent
+  recovery checkpoints, optionally restricted to unresolved entries.
+- `cargo run -p runtime -- admin recovery leases list` to inspect interrupted,
+  active, and stalled worker lease state through the management surface.
+- `cargo run -p runtime -- admin recovery supervise --soft-warning-threshold-percent <1-100> --actor-ref <actor-ref>` to
+  run bounded auditable worker-lease supervision through the harness-owned
+  recovery path.
+- `cargo run -p runtime -- admin schema status` to inspect current schema
+  compatibility against the configured support window.
+- `cargo run -p runtime -- admin schema upgrade-path` to inspect pending
+  reviewed migrations and upgrade safety.
 - `cargo run -p runtime -- admin foreground pending` to inspect pending or
   recoverable foreground work.
 - `cargo run -p runtime -- admin background list` to inspect recent background

@@ -1,14 +1,19 @@
 use std::fmt::Write as _;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness::{
     config::RuntimeConfig,
     management::{
         self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
         BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
-        GovernedActionSummary, PendingForegroundConversationSummary, ResolveApprovalRequest,
-        RuntimeStatusReport, WakeSignalSummary, WorkspaceScriptRunSummary,
+        GovernedActionSummary, OperationalDiagnosticSummary, OperationalHealthSummary,
+        PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
+        ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
+        ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
+        SuperviseWorkerLeasesRequest, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
+        WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
     },
 };
 
@@ -21,6 +26,10 @@ pub struct AdminCommand {
 #[derive(Debug, Subcommand)]
 pub enum AdminSubcommand {
     Status(StatusCommand),
+    Health(HealthCommand),
+    Diagnostics(DiagnosticsCommand),
+    Recovery(RecoveryCommand),
+    Schema(SchemaCommand),
     Foreground(ForegroundCommand),
     Background(BackgroundCommand),
     Approvals(ApprovalsCommand),
@@ -37,6 +46,108 @@ pub struct StatusCommand {
 }
 
 #[derive(Debug, Parser)]
+pub struct HealthCommand {
+    #[command(subcommand)]
+    pub command: HealthSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HealthSubcommand {
+    Summary(StatusCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct DiagnosticsCommand {
+    #[command(subcommand)]
+    pub command: DiagnosticsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticsSubcommand {
+    List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct RecoveryCommand {
+    #[command(subcommand)]
+    pub command: RecoverySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoverySubcommand {
+    Checkpoints(RecoveryCheckpointsCommand),
+    Leases(RecoveryLeasesCommand),
+    Supervise(RecoverySuperviseCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct RecoveryCheckpointsCommand {
+    #[command(subcommand)]
+    pub command: RecoveryCheckpointsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCheckpointsSubcommand {
+    List(RecoveryCheckpointListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct RecoveryLeasesCommand {
+    #[command(subcommand)]
+    pub command: RecoveryLeasesSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryLeasesSubcommand {
+    List(RecoveryLeaseListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct RecoveryCheckpointListCommand {
+    #[arg(long, default_value_t = false)]
+    pub open_only: bool,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecoveryLeaseListCommand {
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub soft_warning_threshold_percent: u8,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecoverySuperviseCommand {
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub soft_warning_threshold_percent: u8,
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct SchemaCommand {
+    #[command(subcommand)]
+    pub command: SchemaSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SchemaSubcommand {
+    Status(StatusCommand),
+    #[command(name = "upgrade-path")]
+    UpgradePath(StatusCommand),
+}
+
+#[derive(Debug, Parser)]
 pub struct ForegroundCommand {
     #[command(subcommand)]
     pub command: ForegroundSubcommand,
@@ -45,6 +156,66 @@ pub struct ForegroundCommand {
 #[derive(Debug, Subcommand)]
 pub enum ForegroundSubcommand {
     Pending(ListCommand),
+    Schedules(ForegroundSchedulesCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct ForegroundSchedulesCommand {
+    #[command(subcommand)]
+    pub command: ForegroundSchedulesSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ForegroundSchedulesSubcommand {
+    List(ForegroundScheduleListCommand),
+    Show(ForegroundScheduleShowCommand),
+    Upsert(ForegroundScheduleUpsertCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<ForegroundScheduleStatusArg>,
+    #[arg(long, default_value_t = false)]
+    pub due_only: bool,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleShowCommand {
+    #[arg(long)]
+    pub task_key: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleUpsertCommand {
+    #[arg(long)]
+    pub task_key: String,
+    #[arg(long)]
+    pub internal_principal_ref: String,
+    #[arg(long)]
+    pub internal_conversation_ref: String,
+    #[arg(long)]
+    pub message_text: String,
+    #[arg(long)]
+    pub cadence_seconds: u64,
+    #[arg(long)]
+    pub cooldown_seconds: Option<u64>,
+    #[arg(long)]
+    pub next_due_at: Option<String>,
+    #[arg(long, value_enum, default_value_t = ForegroundScheduleStatusArg::Active)]
+    pub status: ForegroundScheduleStatusArg,
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -259,6 +430,13 @@ pub enum GovernedActionStatusArg {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ForegroundScheduleStatusArg {
+    Active,
+    Paused,
+    Disabled,
+}
+
 impl From<JobKindArg> for contracts::UnconsciousJobKind {
     fn from(value: JobKindArg) -> Self {
         match value {
@@ -320,12 +498,83 @@ impl From<GovernedActionStatusArg> for contracts::GovernedActionStatus {
     }
 }
 
+impl From<ForegroundScheduleStatusArg> for contracts::ScheduledForegroundTaskStatus {
+    fn from(value: ForegroundScheduleStatusArg) -> Self {
+        match value {
+            ForegroundScheduleStatusArg::Active => Self::Active,
+            ForegroundScheduleStatusArg::Paused => Self::Paused,
+            ForegroundScheduleStatusArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
 pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) -> Result<()> {
     match command.command {
         AdminSubcommand::Status(command) => {
             let report = management::load_runtime_status(config).await?;
             print_status(report, command.json)?;
         }
+        AdminSubcommand::Health(command) => match command.command {
+            HealthSubcommand::Summary(command) => {
+                let summary = management::load_operational_health_summary(config).await?;
+                print_health_summary(summary, command.json)?;
+            }
+        },
+        AdminSubcommand::Diagnostics(command) => match command.command {
+            DiagnosticsSubcommand::List(command) => {
+                let diagnostics =
+                    management::list_recent_operational_diagnostics(config, command.limit).await?;
+                print_diagnostics(diagnostics, command.json)?;
+            }
+        },
+        AdminSubcommand::Recovery(command) => match command.command {
+            RecoverySubcommand::Checkpoints(command) => match command.command {
+                RecoveryCheckpointsSubcommand::List(command) => {
+                    let checkpoints = management::list_recovery_checkpoints(
+                        config,
+                        command.open_only,
+                        command.limit,
+                    )
+                    .await?;
+                    print_recovery_checkpoints(checkpoints, command.json)?;
+                }
+            },
+            RecoverySubcommand::Leases(command) => match command.command {
+                RecoveryLeasesSubcommand::List(command) => {
+                    let leases = management::list_active_worker_leases(
+                        config,
+                        command.limit,
+                        command.soft_warning_threshold_percent,
+                    )
+                    .await?;
+                    print_recovery_leases(leases, command.json)?;
+                }
+            },
+            RecoverySubcommand::Supervise(command) => {
+                let report = management::supervise_worker_leases(
+                    config,
+                    SuperviseWorkerLeasesRequest {
+                        soft_warning_threshold_percent: command.soft_warning_threshold_percent,
+                        actor_ref: command
+                            .actor_ref
+                            .unwrap_or_else(|| "cli:operator".to_string()),
+                        reason: command.reason,
+                    },
+                )
+                .await?;
+                print_recovery_supervision(report, command.json)?;
+            }
+        },
+        AdminSubcommand::Schema(command) => match command.command {
+            SchemaSubcommand::Status(command) => {
+                let report = management::load_schema_status(config).await?;
+                print_schema_status(report, command.json)?;
+            }
+            SchemaSubcommand::UpgradePath(command) => {
+                let report = management::load_schema_upgrade_assessment(config).await?;
+                print_schema_upgrade_assessment(report, command.json)?;
+            }
+        },
         AdminSubcommand::Foreground(command) => match command.command {
             ForegroundSubcommand::Pending(command) => {
                 let summaries =
@@ -333,6 +582,47 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                         .await?;
                 print_pending_foreground(summaries, command.json)?;
             }
+            ForegroundSubcommand::Schedules(command) => match command.command {
+                ForegroundSchedulesSubcommand::List(command) => {
+                    let schedules = management::list_scheduled_foreground_tasks(
+                        config,
+                        command.status.map(Into::into),
+                        command.due_only,
+                        command.limit,
+                    )
+                    .await?;
+                    print_scheduled_foreground_tasks(schedules, command.json)?;
+                }
+                ForegroundSchedulesSubcommand::Show(command) => {
+                    let schedule =
+                        management::get_scheduled_foreground_task(config, &command.task_key)
+                            .await?;
+                    print_scheduled_foreground_task(schedule, command.json)?;
+                }
+                ForegroundSchedulesSubcommand::Upsert(command) => {
+                    let summary = management::upsert_scheduled_foreground_task(
+                        config,
+                        UpsertScheduledForegroundTaskRequest {
+                            task_key: command.task_key,
+                            internal_principal_ref: command.internal_principal_ref,
+                            internal_conversation_ref: command.internal_conversation_ref,
+                            message_text: command.message_text,
+                            cadence_seconds: command.cadence_seconds,
+                            cooldown_seconds: command.cooldown_seconds,
+                            next_due_at: parse_optional_rfc3339_datetime(
+                                command.next_due_at.as_deref(),
+                            )?,
+                            status: command.status.into(),
+                            actor_ref: command
+                                .actor_ref
+                                .unwrap_or_else(|| "cli:operator".to_string()),
+                            reason: command.reason,
+                        },
+                    )
+                    .await?;
+                    print_scheduled_foreground_task_upsert(summary, command.json)?;
+                }
+            },
         },
         AdminSubcommand::Background(command) => match command.command {
             BackgroundSubcommand::List(command) => {
@@ -433,26 +723,7 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Schema");
-    println!("  compatibility: {}", report.schema.compatibility);
-    println!(
-        "  current/expected/minimum: {}/{}/{}",
-        report
-            .schema
-            .current_version
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        report.schema.expected_version,
-        report.schema.minimum_supported_version
-    );
-    println!(
-        "  applied migrations: {}",
-        report.schema.applied_migration_count
-    );
-    println!("  history valid: {}", yes_no(report.schema.history_valid));
-    if let Some(details) = &report.schema.details {
-        println!("  details: {details}");
-    }
+    print_schema_status_section(&report.schema);
 
     println!("Worker");
     println!("  resolution: {}", report.worker.resolution_kind);
@@ -556,6 +827,101 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_health_summary(summary: OperationalHealthSummary, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", render_health_summary_text(&summary));
+    Ok(())
+}
+
+fn print_diagnostics(diagnostics: Vec<OperationalDiagnosticSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        return Ok(());
+    }
+
+    println!("{}", render_diagnostics_text(&diagnostics));
+    Ok(())
+}
+
+fn print_recovery_checkpoints(
+    checkpoints: Vec<RecoveryCheckpointSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&checkpoints)?);
+        return Ok(());
+    }
+
+    println!("{}", render_recovery_checkpoints_text(&checkpoints));
+    Ok(())
+}
+
+fn print_recovery_leases(leases: Vec<WorkerLeaseInspectionSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&leases)?);
+        return Ok(());
+    }
+
+    println!("{}", render_recovery_leases_text(&leases));
+    Ok(())
+}
+
+fn print_recovery_supervision(report: RecoverySupervisionReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_recovery_supervision_text(&report));
+    Ok(())
+}
+
+fn print_schema_status(report: SchemaStatusReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_schema_status_section(&report);
+    Ok(())
+}
+
+fn print_schema_upgrade_assessment(
+    report: SchemaUpgradeAssessmentReport,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_schema_upgrade_assessment_text(&report));
+    Ok(())
+}
+
+fn print_schema_status_section(report: &SchemaStatusReport) {
+    println!("Schema");
+    println!("  compatibility: {}", report.compatibility);
+    println!(
+        "  current/expected/minimum: {}/{}/{}",
+        report
+            .current_version
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        report.expected_version,
+        report.minimum_supported_version
+    );
+    println!("  applied migrations: {}", report.applied_migration_count);
+    println!("  history valid: {}", yes_no(report.history_valid));
+    if let Some(details) = &report.details {
+        println!("  details: {details}");
+    }
+}
+
 fn print_pending_foreground(
     summaries: Vec<PendingForegroundConversationSummary>,
     json: bool,
@@ -582,6 +948,48 @@ fn print_pending_foreground(
             summary.newest_occurred_at
         );
     }
+    Ok(())
+}
+
+fn print_scheduled_foreground_tasks(
+    tasks: Vec<ScheduledForegroundTaskSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tasks)?);
+        return Ok(());
+    }
+
+    println!("{}", render_scheduled_foreground_tasks_text(&tasks));
+    Ok(())
+}
+
+fn print_scheduled_foreground_task(
+    task: Option<ScheduledForegroundTaskSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+        return Ok(());
+    }
+
+    match task {
+        Some(task) => println!("{}", render_scheduled_foreground_tasks_text(&[task])),
+        None => println!("Scheduled foreground task not found."),
+    }
+    Ok(())
+}
+
+fn print_scheduled_foreground_task_upsert(
+    summary: ScheduledForegroundTaskUpsertSummary,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", render_scheduled_foreground_task_upsert_text(&summary));
     Ok(())
 }
 
@@ -649,6 +1057,85 @@ fn print_workspace_runs(runs: Vec<WorkspaceScriptRunSummary>, json: bool) -> Res
 
     println!("{}", render_workspace_runs_text(&runs));
     Ok(())
+}
+
+fn render_scheduled_foreground_tasks_text(tasks: &[ScheduledForegroundTaskSummary]) -> String {
+    if tasks.is_empty() {
+        return "No scheduled foreground tasks.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, task) in tasks.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | channel={} | binding={} | cadence={}s | cooldown={}s | next_due_at={}",
+            task.task_key,
+            task.status,
+            task.channel_kind,
+            yes_no(task.conversation_binding_present),
+            task.cadence_seconds,
+            task.cooldown_seconds,
+            task.next_due_at
+        );
+        let _ = writeln!(
+            output,
+            "  principal={} conversation={}",
+            task.internal_principal_ref, task.internal_conversation_ref
+        );
+        let _ = writeln!(output, "  message_text: {}", task.message_text);
+        let _ = writeln!(
+            output,
+            "  current_execution_id={} last_execution_id={} last_outcome={}",
+            task.current_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            task.last_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            task.last_outcome.as_deref().unwrap_or("none")
+        );
+        let _ = writeln!(
+            output,
+            "  created_by={} updated_by={} updated_at={}",
+            task.created_by, task.updated_by, task.updated_at
+        );
+        if task.last_outcome_reason.is_some() || task.last_outcome_summary.is_some() {
+            let _ = writeln!(
+                output,
+                "  last_outcome_reason={} last_outcome_summary={}",
+                task.last_outcome_reason.as_deref().unwrap_or("none"),
+                task.last_outcome_summary.as_deref().unwrap_or("none")
+            );
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_scheduled_foreground_task_upsert_text(
+    summary: &ScheduledForegroundTaskUpsertSummary,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Scheduled foreground task {} {}",
+        summary.task.task_key, summary.action
+    );
+    let _ = writeln!(
+        output,
+        "  trace_id={} actor_ref={} reason={}",
+        summary.trace_id,
+        summary.actor_ref,
+        summary.reason.as_deref().unwrap_or("none")
+    );
+    let _ = write!(
+        output,
+        "{}",
+        render_scheduled_foreground_tasks_text(std::slice::from_ref(&summary.task))
+    );
+    output.trim_end().to_string()
 }
 
 fn render_approval_requests_text(summaries: &[ApprovalRequestSummary]) -> String {
@@ -848,6 +1335,313 @@ fn render_workspace_runs_text(runs: &[WorkspaceScriptRunSummary]) -> String {
     output.trim_end().to_string()
 }
 
+fn render_health_summary_text(summary: &OperationalHealthSummary) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Health | overall_status={} | evaluated_at={}",
+        summary.overall_status, summary.evaluated_at
+    );
+    let _ = writeln!(
+        output,
+        "  pending_work: foreground={} background_pending={} background_due={} wake_signals={} approvals={} blocked_actions={}",
+        summary.pending_work.pending_foreground_conversation_count,
+        summary.pending_work.pending_background_job_count,
+        summary.pending_work.due_background_job_count,
+        summary.pending_work.pending_wake_signal_count,
+        summary.pending_work.pending_approval_request_count,
+        summary.pending_work.blocked_governed_action_count
+    );
+    let _ = writeln!(
+        output,
+        "  recovery: open_checkpoints={} foreground={} background={} governed_actions={} overdue_leases={} at_risk_leases={} recent_resolved={} recent_abandoned={}",
+        summary.recovery.open_checkpoint_count,
+        summary.recovery.open_foreground_checkpoint_count,
+        summary.recovery.open_background_checkpoint_count,
+        summary.recovery.open_governed_action_checkpoint_count,
+        summary.recovery.overdue_active_worker_lease_count,
+        summary.recovery.at_risk_active_worker_lease_count,
+        summary.recovery.recent_resolved_checkpoint_count,
+        summary.recovery.recent_abandoned_checkpoint_count
+    );
+    let _ = writeln!(
+        output,
+        "  diagnostics: observed={} info={} warn={} error={} critical={}",
+        summary.diagnostics.observed_count,
+        summary.diagnostics.info_count,
+        summary.diagnostics.warn_count,
+        summary.diagnostics.error_count,
+        summary.diagnostics.critical_count
+    );
+
+    if summary.diagnostics.top_reason_codes.is_empty() {
+        let _ = writeln!(output, "  top_reason_codes: none");
+    } else {
+        for reason in &summary.diagnostics.top_reason_codes {
+            let _ = writeln!(
+                output,
+                "  top_reason_code: {} count={} latest_at={}",
+                reason.reason_code, reason.count, reason.latest_at
+            );
+        }
+    }
+
+    if summary.anomalies.is_empty() {
+        let _ = writeln!(output, "  anomalies: none");
+    } else {
+        for anomaly in &summary.anomalies {
+            let _ = writeln!(
+                output,
+                "  anomaly: kind={} severity={} reason={} count={} first_seen={} last_seen={} summary={}",
+                anomaly.anomaly_kind,
+                anomaly.severity,
+                anomaly.reason_code,
+                anomaly.occurrence_count,
+                anomaly.first_seen_at,
+                anomaly.last_seen_at,
+                anomaly.summary
+            );
+        }
+    }
+
+    output.trim_end().to_string()
+}
+
+fn render_diagnostics_text(diagnostics: &[OperationalDiagnosticSummary]) -> String {
+    if diagnostics.is_empty() {
+        return "No operational diagnostics.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | subsystem={} | severity={} | reason={} | created_at={} | summary={}",
+            diagnostic.operational_diagnostic_id,
+            diagnostic.subsystem,
+            diagnostic.severity,
+            diagnostic.reason_code,
+            diagnostic.created_at,
+            diagnostic.summary
+        );
+        let _ = writeln!(
+            output,
+            "  trace_id={} execution_id={}",
+            diagnostic
+                .trace_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic
+                .execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_recovery_checkpoints_text(checkpoints: &[RecoveryCheckpointSummary]) -> String {
+    if checkpoints.is_empty() {
+        return "No recovery checkpoints.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, checkpoint) in checkpoints.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | kind={} | reason={} | status={} | created_at={} | resolved_at={}",
+            checkpoint.recovery_checkpoint_id,
+            checkpoint.checkpoint_kind,
+            checkpoint.recovery_reason_code,
+            checkpoint.status,
+            checkpoint.created_at,
+            checkpoint
+                .resolved_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(
+            output,
+            "  trace_id={} execution_id={} background_job_id={} governed_action_execution_id={} approval_request_id={} decision={}",
+            checkpoint.trace_id,
+            checkpoint
+                .execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            checkpoint
+                .background_job_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            checkpoint
+                .governed_action_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            checkpoint
+                .approval_request_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            checkpoint.recovery_decision.as_deref().unwrap_or("none")
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_recovery_leases_text(leases: &[WorkerLeaseInspectionSummary]) -> String {
+    if leases.is_empty() {
+        return "No active worker leases.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, lease) in leases.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | kind={} | lease_status={} | supervision_status={} | lease_expires_at={} | last_heartbeat_at={}",
+            lease.worker_lease_id,
+            lease.worker_kind,
+            lease.lease_status,
+            lease.supervision_status,
+            lease.lease_expires_at,
+            lease.last_heartbeat_at
+        );
+        let _ = writeln!(
+            output,
+            "  trace_id={} execution_id={} background_job_id={} background_job_run_id={} governed_action_execution_id={} lease_acquired_at={} released_at={}",
+            lease.trace_id,
+            lease
+                .execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            lease
+                .background_job_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            lease
+                .background_job_run_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            lease
+                .governed_action_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            lease.lease_acquired_at,
+            lease
+                .released_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_recovery_supervision_text(report: &RecoverySupervisionReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Recovery supervision completed at {} | trace_id={} | actor_ref={} | soft_warnings={} | recovered_expired_leases={}",
+        report.supervised_at,
+        report.trace_id,
+        report.actor_ref,
+        report.soft_warning_count,
+        report.recovered_expired_lease_count
+    );
+    let _ = writeln!(
+        output,
+        "  reason={}",
+        report.reason.as_deref().unwrap_or("none")
+    );
+
+    if report.soft_warning_diagnostics.is_empty() {
+        let _ = writeln!(output, "  soft_warning_diagnostics: none");
+    } else {
+        for diagnostic in &report.soft_warning_diagnostics {
+            let _ = writeln!(
+                output,
+                "  soft_warning_diagnostic: {} reason={} severity={} created_at={}",
+                diagnostic.operational_diagnostic_id,
+                diagnostic.reason_code,
+                diagnostic.severity,
+                diagnostic.created_at
+            );
+        }
+    }
+
+    if report.recovered_expired_leases.is_empty() {
+        let _ = writeln!(output, "  recovered_expired_leases: none");
+    } else {
+        for lease in &report.recovered_expired_leases {
+            let _ = writeln!(
+                output,
+                "  recovered_expired_lease: {} kind={} checkpoint={} status={} decision={} diagnostic_reason={} diagnostic_severity={}",
+                lease.worker_lease_id,
+                lease.worker_kind,
+                lease.checkpoint_id,
+                lease.checkpoint_status,
+                lease.recovery_decision,
+                lease.diagnostic_reason_code,
+                lease.diagnostic_severity
+            );
+        }
+    }
+
+    output.trim_end().to_string()
+}
+
+fn render_schema_upgrade_assessment_text(report: &SchemaUpgradeAssessmentReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Schema upgrade path | compatibility={} | current={} | expected={} | minimum_supported={}",
+        report.compatibility,
+        report
+            .current_version
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        report.expected_version,
+        report.minimum_supported_version
+    );
+    let _ = writeln!(
+        output,
+        "  discovered_versions={}",
+        render_versions(&report.discovered_versions)
+    );
+    let _ = writeln!(
+        output,
+        "  applied_versions={}",
+        render_versions(&report.applied_versions)
+    );
+    let _ = writeln!(
+        output,
+        "  pending_versions={}",
+        render_versions(&report.pending_versions)
+    );
+    let _ = writeln!(output, "  history_valid={}", yes_no(report.history_valid));
+    if let Some(details) = &report.details {
+        let _ = writeln!(output, "  details={details}");
+    }
+    output.trim_end().to_string()
+}
+
+fn render_versions(versions: &[i64]) -> String {
+    if versions.is_empty() {
+        "none".to_string()
+    } else {
+        versions
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn print_background_jobs(jobs: Vec<BackgroundJobSummary>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -959,6 +1753,15 @@ fn print_wake_signals(signals: Vec<WakeSignalSummary>, json: bool) -> Result<()>
     Ok(())
 }
 
+fn parse_optional_rfc3339_datetime(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        Some(value) => Ok(Some(
+            DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc),
+        )),
+        None => Ok(None),
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1062,6 +1865,165 @@ mod tests {
         .expect("sample workspace artifact should deserialize")
     }
 
+    fn sample_health_summary() -> OperationalHealthSummary {
+        serde_json::from_value(json!({
+            "evaluated_at": "2026-04-23T10:00:00Z",
+            "overall_status": "degraded",
+            "pending_work": {
+                "pending_foreground_conversation_count": 1,
+                "pending_background_job_count": 2,
+                "due_background_job_count": 1,
+                "pending_wake_signal_count": 0,
+                "pending_approval_request_count": 1,
+                "awaiting_approval_governed_action_count": 1,
+                "blocked_governed_action_count": 0
+            },
+            "recovery": {
+                "open_checkpoint_count": 1,
+                "open_foreground_checkpoint_count": 1,
+                "open_background_checkpoint_count": 0,
+                "open_governed_action_checkpoint_count": 0,
+                "recent_resolved_checkpoint_count": 3,
+                "recent_abandoned_checkpoint_count": 1,
+                "active_worker_lease_count": 2,
+                "overdue_active_worker_lease_count": 0,
+                "at_risk_active_worker_lease_count": 1
+            },
+            "diagnostics": {
+                "recent_window_minutes": 60,
+                "observed_count": 4,
+                "info_count": 1,
+                "warn_count": 2,
+                "error_count": 1,
+                "critical_count": 0,
+                "top_reason_codes": [{
+                    "reason_code": "worker_lease_soft_warning",
+                    "count": 2,
+                    "latest_at": "2026-04-23T09:58:00Z"
+                }]
+            },
+            "anomalies": [{
+                "anomaly_kind": "recovery_pressure",
+                "severity": "warn",
+                "reason_code": "operational_recovery_pressure_detected",
+                "summary": "recovery pressure detected",
+                "occurrence_count": 1,
+                "latest_trace_id": "00000000-0000-0000-0000-000000000041",
+                "latest_execution_id": "00000000-0000-0000-0000-000000000042",
+                "first_seen_at": "2026-04-23T09:55:00Z",
+                "last_seen_at": "2026-04-23T09:58:00Z"
+            }]
+        }))
+        .expect("sample health summary should deserialize")
+    }
+
+    fn sample_recovery_supervision_report() -> RecoverySupervisionReport {
+        serde_json::from_value(json!({
+            "trace_id": "00000000-0000-0000-0000-000000000050",
+            "supervised_at": "2026-04-23T10:05:00Z",
+            "actor_ref": "cli:operator",
+            "reason": "manual recovery verification",
+            "soft_warning_count": 1,
+            "recovered_expired_lease_count": 1,
+            "soft_warning_diagnostics": [{
+                "operational_diagnostic_id": "00000000-0000-0000-0000-000000000051",
+                "trace_id": "00000000-0000-0000-0000-000000000052",
+                "execution_id": null,
+                "subsystem": "recovery",
+                "severity": "warn",
+                "reason_code": "worker_lease_soft_warning",
+                "summary": "worker lease is nearing expiry",
+                "created_at": "2026-04-23T10:05:00Z"
+            }],
+            "recovered_expired_leases": [{
+                "worker_lease_id": "00000000-0000-0000-0000-000000000053",
+                "worker_kind": "background",
+                "checkpoint_id": "00000000-0000-0000-0000-000000000054",
+                "checkpoint_status": "resolved",
+                "recovery_decision": "retry",
+                "diagnostic_reason_code": "worker_lease_expired",
+                "diagnostic_severity": "warn",
+                "trace_id": "00000000-0000-0000-0000-000000000055",
+                "execution_id": "00000000-0000-0000-0000-000000000056"
+            }]
+        }))
+        .expect("sample recovery supervision report should deserialize")
+    }
+
+    fn sample_worker_lease_inspection_summary() -> WorkerLeaseInspectionSummary {
+        serde_json::from_value(json!({
+            "worker_lease_id": "00000000-0000-0000-0000-000000000061",
+            "trace_id": "00000000-0000-0000-0000-000000000062",
+            "execution_id": "00000000-0000-0000-0000-000000000063",
+            "background_job_id": "00000000-0000-0000-0000-000000000064",
+            "background_job_run_id": "00000000-0000-0000-0000-000000000065",
+            "governed_action_execution_id": null,
+            "worker_kind": "background",
+            "lease_status": "active",
+            "supervision_status": "soft_warning",
+            "lease_acquired_at": "2026-04-23T10:00:00Z",
+            "lease_expires_at": "2026-04-23T10:10:00Z",
+            "last_heartbeat_at": "2026-04-23T10:08:30Z",
+            "released_at": null
+        }))
+        .expect("sample worker lease inspection summary should deserialize")
+    }
+
+    fn sample_scheduled_foreground_task_summary() -> ScheduledForegroundTaskSummary {
+        serde_json::from_value(json!({
+            "scheduled_foreground_task_id": "00000000-0000-0000-0000-000000000071",
+            "task_key": "daily-checkin",
+            "channel_kind": "telegram",
+            "status": "active",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "conversation_binding_present": true,
+            "message_text": "Daily check-in",
+            "cadence_seconds": 600,
+            "cooldown_seconds": 300,
+            "next_due_at": "2026-04-24T10:15:00Z",
+            "current_execution_id": null,
+            "current_run_started_at": null,
+            "last_execution_id": "00000000-0000-0000-0000-000000000072",
+            "last_run_started_at": "2026-04-24T10:00:00Z",
+            "last_run_completed_at": "2026-04-24T10:01:00Z",
+            "last_outcome": "completed",
+            "last_outcome_reason": "scheduled_delivery_completed",
+            "last_outcome_summary": "sent scheduled check-in",
+            "created_by": "cli:operator",
+            "updated_by": "cli:operator",
+            "created_at": "2026-04-24T09:55:00Z",
+            "updated_at": "2026-04-24T10:05:00Z"
+        }))
+        .expect("sample scheduled foreground task should deserialize")
+    }
+
+    fn sample_scheduled_foreground_task_upsert_summary() -> ScheduledForegroundTaskUpsertSummary {
+        serde_json::from_value(json!({
+            "trace_id": "00000000-0000-0000-0000-000000000073",
+            "action": "created",
+            "actor_ref": "cli:operator",
+            "reason": "manual schedule creation",
+            "task": sample_scheduled_foreground_task_summary()
+        }))
+        .expect("sample scheduled foreground task upsert summary should deserialize")
+    }
+
+    fn sample_schema_upgrade_assessment() -> SchemaUpgradeAssessmentReport {
+        serde_json::from_value(json!({
+            "compatibility": "pending_migrations",
+            "current_version": 6,
+            "expected_version": 7,
+            "minimum_supported_version": 1,
+            "discovered_versions": [1, 2, 3, 4, 5, 6, 7],
+            "applied_versions": [1, 2, 3, 4, 5, 6],
+            "pending_versions": [7],
+            "history_valid": true,
+            "details": "database schema version 6 is behind expected version 7"
+        }))
+        .expect("sample schema upgrade assessment should deserialize")
+    }
+
     #[test]
     fn phase_five_admin_parser_accepts_approval_resolution_command() {
         let command = AdminCommand::try_parse_from([
@@ -1147,6 +2109,217 @@ mod tests {
     }
 
     #[test]
+    fn phase_six_admin_parser_accepts_recovery_checkpoint_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "checkpoints",
+            "list",
+            "--open-only",
+            "--limit",
+            "7",
+        ])
+        .expect("recovery checkpoints command should parse");
+
+        match command.command {
+            AdminSubcommand::Recovery(RecoveryCommand {
+                command:
+                    RecoverySubcommand::Checkpoints(RecoveryCheckpointsCommand {
+                        command: RecoveryCheckpointsSubcommand::List(command),
+                    }),
+            }) => {
+                assert!(command.open_only);
+                assert_eq!(command.limit, 7);
+            }
+            other => panic!("expected recovery checkpoints command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_six_admin_parser_accepts_recovery_lease_list_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "leases",
+            "list",
+            "--limit",
+            "5",
+            "--soft-warning-threshold-percent",
+            "90",
+            "--json",
+        ])
+        .expect("recovery leases list command should parse");
+
+        match command.command {
+            AdminSubcommand::Recovery(RecoveryCommand {
+                command:
+                    RecoverySubcommand::Leases(RecoveryLeasesCommand {
+                        command: RecoveryLeasesSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 5);
+                assert_eq!(command.soft_warning_threshold_percent, 90);
+                assert!(command.json);
+            }
+            other => panic!("expected recovery leases list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_six_admin_parser_accepts_recovery_supervision_threshold() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "supervise",
+            "--soft-warning-threshold-percent",
+            "90",
+            "--actor-ref",
+            "cli:primary-user",
+            "--reason",
+            "manual recovery verification",
+        ])
+        .expect("recovery supervise command should parse");
+
+        match command.command {
+            AdminSubcommand::Recovery(RecoveryCommand {
+                command: RecoverySubcommand::Supervise(command),
+            }) => {
+                assert_eq!(command.soft_warning_threshold_percent, 90);
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:primary-user"));
+                assert_eq!(
+                    command.reason.as_deref(),
+                    Some("manual recovery verification")
+                );
+            }
+            other => panic!("expected recovery supervise command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_six_admin_parser_accepts_schema_upgrade_path_command() {
+        let command = AdminCommand::try_parse_from(["runtime", "schema", "upgrade-path", "--json"])
+            .expect("schema upgrade-path command should parse");
+
+        match command.command {
+            AdminSubcommand::Schema(SchemaCommand {
+                command: SchemaSubcommand::UpgradePath(command),
+            }) => {
+                assert!(command.json);
+            }
+            other => panic!("expected schema upgrade-path command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_six_admin_parser_rejects_invalid_recovery_thresholds() {
+        let lease_error = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "leases",
+            "list",
+            "--soft-warning-threshold-percent",
+            "0",
+        ])
+        .expect_err("zero recovery lease threshold should be rejected");
+        assert!(lease_error.to_string().contains("1..=100"));
+
+        let supervise_error = AdminCommand::try_parse_from([
+            "runtime",
+            "recovery",
+            "supervise",
+            "--soft-warning-threshold-percent",
+            "101",
+        ])
+        .expect_err("out-of-range supervision threshold should be rejected");
+        assert!(supervise_error.to_string().contains("1..=100"));
+    }
+
+    #[test]
+    fn phase_seven_admin_parser_accepts_scheduled_foreground_upsert_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "foreground",
+            "schedules",
+            "upsert",
+            "--task-key",
+            "daily-checkin",
+            "--internal-principal-ref",
+            "primary-user",
+            "--internal-conversation-ref",
+            "telegram-primary",
+            "--message-text",
+            "Daily check-in",
+            "--cadence-seconds",
+            "600",
+            "--cooldown-seconds",
+            "300",
+            "--next-due-at",
+            "2026-04-24T10:15:00Z",
+            "--status",
+            "paused",
+            "--actor-ref",
+            "cli:operator",
+            "--reason",
+            "manual schedule creation",
+        ])
+        .expect("scheduled foreground upsert command should parse");
+
+        match command.command {
+            AdminSubcommand::Foreground(ForegroundCommand {
+                command:
+                    ForegroundSubcommand::Schedules(ForegroundSchedulesCommand {
+                        command: ForegroundSchedulesSubcommand::Upsert(command),
+                    }),
+            }) => {
+                assert_eq!(command.task_key, "daily-checkin");
+                assert_eq!(command.cadence_seconds, 600);
+                assert_eq!(command.cooldown_seconds, Some(300));
+                assert!(matches!(
+                    command.status,
+                    ForegroundScheduleStatusArg::Paused
+                ));
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:operator"));
+            }
+            other => panic!("expected scheduled foreground upsert command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_seven_admin_parser_accepts_scheduled_foreground_list_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "foreground",
+            "schedules",
+            "list",
+            "--status",
+            "active",
+            "--due-only",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("scheduled foreground list command should parse");
+
+        match command.command {
+            AdminSubcommand::Foreground(ForegroundCommand {
+                command:
+                    ForegroundSubcommand::Schedules(ForegroundSchedulesCommand {
+                        command: ForegroundSchedulesSubcommand::List(command),
+                    }),
+            }) => {
+                assert!(matches!(
+                    command.status,
+                    Some(ForegroundScheduleStatusArg::Active)
+                ));
+                assert!(command.due_only);
+                assert_eq!(command.limit, 5);
+                assert!(command.json);
+            }
+            other => panic!("expected scheduled foreground list command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn render_approval_requests_text_includes_resolution_metadata() {
         let rendered = render_approval_requests_text(&[sample_approval_request_summary()]);
         assert!(rendered.contains("status=approved"));
@@ -1186,5 +2359,68 @@ mod tests {
             rendered
                 .contains("governed action: 00000000-0000-0000-0000-000000000011 status=blocked")
         );
+    }
+
+    #[test]
+    fn phase_six_render_health_summary_text_includes_recovery_and_anomalies() {
+        let rendered = render_health_summary_text(&sample_health_summary());
+        assert!(rendered.contains("overall_status=degraded"));
+        assert!(rendered.contains("open_checkpoints=1"));
+        assert!(rendered.contains("top_reason_code: worker_lease_soft_warning"));
+        assert!(rendered.contains("anomaly: kind=recovery_pressure"));
+    }
+
+    #[test]
+    fn phase_six_render_recovery_supervision_text_includes_counts() {
+        let rendered = render_recovery_supervision_text(&sample_recovery_supervision_report());
+        assert!(rendered.contains("soft_warnings=1"));
+        assert!(rendered.contains("recovered_expired_leases=1"));
+        assert!(rendered.contains("actor_ref=cli:operator"));
+        assert!(rendered.contains("reason=manual recovery verification"));
+        assert!(rendered.contains("diagnostic_reason=worker_lease_expired"));
+    }
+
+    #[test]
+    fn phase_six_render_recovery_leases_text_includes_supervision_status() {
+        let rendered = render_recovery_leases_text(&[sample_worker_lease_inspection_summary()]);
+        assert!(rendered.contains("lease_status=active"));
+        assert!(rendered.contains("supervision_status=soft_warning"));
+        assert!(rendered.contains("background_job_run_id=00000000-0000-0000-0000-000000000065"));
+    }
+
+    #[test]
+    fn phase_six_render_schema_upgrade_assessment_text_includes_versions() {
+        let rendered = render_schema_upgrade_assessment_text(&sample_schema_upgrade_assessment());
+        assert!(rendered.contains("compatibility=pending_migrations"));
+        assert!(rendered.contains("pending_versions=7"));
+        assert!(rendered.contains("history_valid=yes"));
+    }
+
+    #[test]
+    fn phase_six_render_recovery_leases_text_reports_empty_state() {
+        assert_eq!(
+            render_recovery_leases_text(&[]),
+            "No active worker leases.".to_string()
+        );
+    }
+
+    #[test]
+    fn phase_seven_render_scheduled_foreground_task_text_includes_binding_and_outcome() {
+        let rendered =
+            render_scheduled_foreground_tasks_text(&[sample_scheduled_foreground_task_summary()]);
+        assert!(rendered.contains("status=active"));
+        assert!(rendered.contains("binding=yes"));
+        assert!(rendered.contains("last_outcome=completed"));
+        assert!(rendered.contains("message_text: Daily check-in"));
+    }
+
+    #[test]
+    fn phase_seven_render_scheduled_foreground_upsert_text_includes_trace_and_reason() {
+        let rendered = render_scheduled_foreground_task_upsert_text(
+            &sample_scheduled_foreground_task_upsert_summary(),
+        );
+        assert!(rendered.contains("Scheduled foreground task daily-checkin created"));
+        assert!(rendered.contains("trace_id=00000000-0000-0000-0000-000000000073"));
+        assert!(rendered.contains("reason=manual schedule creation"));
     }
 }

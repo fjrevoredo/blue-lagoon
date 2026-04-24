@@ -1,4 +1,5 @@
 use anyhow::{Context, Error, Result, bail};
+use chrono::{Duration, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::{
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
     governed_actions,
     model_gateway::ModelProviderTransport,
-    policy, proposal,
+    policy, proposal, recovery,
     telegram::{self, TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
@@ -53,6 +54,13 @@ pub struct TelegramApprovalPromptDelivery {
 pub struct ForegroundExecutionIds {
     pub trace_id: Uuid,
     pub execution_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramForegroundPlanExecution {
+    pub execution: ForegroundExecutionIds,
+    pub trigger_kind_override: Option<contracts::ForegroundTriggerKind>,
+    pub plan: foreground::PendingForegroundExecutionPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,8 +164,7 @@ pub async fn orchestrate_telegram_foreground_plan<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
     model_gateway_config: &ResolvedModelGatewayConfig,
-    execution: ForegroundExecutionIds,
-    plan: foreground::PendingForegroundExecutionPlan,
+    execution: TelegramForegroundPlanExecution,
     transport: &T,
     delivery: &mut D,
 ) -> Result<TelegramForegroundOrchestrationOutcome>
@@ -166,13 +173,23 @@ where
     D: TelegramDelivery,
 {
     let primary_ingress =
-        foreground::load_normalized_ingress(pool, plan.primary_ingress.ingress_id).await?;
-    let trigger = foreground::build_foreground_trigger(
-        config,
-        execution.trace_id,
-        execution.execution_id,
-        primary_ingress,
-    )?;
+        foreground::load_normalized_ingress(pool, execution.plan.primary_ingress.ingress_id)
+            .await?;
+    let trigger = match execution.trigger_kind_override {
+        Some(trigger_kind) => foreground::build_foreground_trigger_with_kind(
+            config,
+            execution.execution.trace_id,
+            execution.execution.execution_id,
+            trigger_kind,
+            primary_ingress,
+        )?,
+        None => foreground::build_foreground_trigger(
+            config,
+            execution.execution.trace_id,
+            execution.execution.execution_id,
+            primary_ingress,
+        )?,
+    };
     if let Some(parsed_resolution) = parse_approval_resolution_ingress(&trigger.ingress)? {
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
@@ -185,7 +202,9 @@ where
     }
     let user_messages = build_trigger_user_messages(
         trigger.trigger_kind,
-        plan.ordered_ingress
+        execution
+            .plan
+            .ordered_ingress
             .iter()
             .filter_map(|ingress| {
                 ingress
@@ -206,8 +225,8 @@ where
         ForegroundExecutionInput {
             trigger,
             recovery_context: contracts::ForegroundRecoveryContext {
-                mode: plan.mode,
-                ordered_ingress: plan.ordered_ingress,
+                mode: execution.plan.mode,
+                ordered_ingress: execution.plan.ordered_ingress,
             },
             user_messages,
         },
@@ -667,12 +686,15 @@ where
         trigger.execution_id,
         assembly.context.clone(),
     );
-    let initial_response = match worker::launch_conscious_worker_with_timeout(
+    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+    let initial_response = match launch_leased_conscious_worker(
+        pool,
         config,
         model_gateway_config,
+        &trigger,
         &request,
         transport,
-        policy::effective_foreground_worker_timeout_ms(config),
+        foreground_timeout_ms,
     )
     .await
     {
@@ -739,12 +761,14 @@ where
             trigger.execution_id,
             follow_up_context,
         );
-        let follow_up_response = match worker::launch_conscious_worker_with_timeout(
+        let follow_up_response = match launch_leased_conscious_worker(
+            pool,
             config,
             model_gateway_config,
+            &trigger,
             &follow_up_request,
             transport,
-            policy::effective_foreground_worker_timeout_ms(config),
+            foreground_timeout_ms,
         )
         .await
         {
@@ -1149,6 +1173,15 @@ where
                         approval_request.approval_request_id,
                     )
                     .await?;
+                    recovery::recover_approval_request_transition(
+                        pool,
+                        &approval_request,
+                        recovery::RecoveryApprovalState::Pending,
+                        Utc::now(),
+                        "approval_transition_pending",
+                    )
+                    .await
+                    .context("failed to route pending approval transition through recovery")?;
                     deliver_telegram_approval_prompt(
                         config.approvals.prompt_mode,
                         &trigger.ingress,
@@ -1235,6 +1268,90 @@ async fn record_foreground_failure(
     Ok(())
 }
 
+async fn launch_leased_conscious_worker<T>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
+    trigger: &contracts::ForegroundTrigger,
+    request: &contracts::WorkerRequest,
+    transport: &T,
+    timeout_ms: u64,
+) -> Result<contracts::WorkerResponse>
+where
+    T: ModelProviderTransport,
+{
+    let started_at = Utc::now();
+    let timeout_ms_i64 =
+        i64::try_from(timeout_ms).context("foreground worker timeout exceeded chrono range")?;
+    let worker_lease = recovery::create_worker_lease(
+        pool,
+        &recovery::NewWorkerLease {
+            worker_lease_id: Uuid::now_v7(),
+            trace_id: trigger.trace_id,
+            execution_id: Some(trigger.execution_id),
+            background_job_id: None,
+            background_job_run_id: None,
+            governed_action_execution_id: None,
+            worker_kind: recovery::WorkerLeaseKind::Foreground,
+            lease_token: Uuid::now_v7(),
+            worker_pid: None,
+            lease_acquired_at: started_at,
+            lease_expires_at: started_at + Duration::milliseconds(timeout_ms_i64),
+            last_heartbeat_at: started_at,
+            metadata: json!({
+                "source": "foreground_orchestration",
+                "trigger_kind": trigger.trigger_kind,
+                "ingress_id": trigger.ingress.ingress_id,
+            }),
+        },
+    )
+    .await?;
+
+    let response = worker::launch_conscious_worker_with_timeout(
+        config,
+        model_gateway_config,
+        request,
+        transport,
+        timeout_ms,
+    )
+    .await;
+
+    match response {
+        Ok(response) => {
+            recovery::refresh_worker_lease_progress(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to refresh foreground worker lease after worker response")?;
+            recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+                .await
+                .context("failed to release foreground worker lease after success")?;
+            Ok(response)
+        }
+        Err(error) => {
+            let error_message = format_error_chain(&error);
+            if error_message.contains("timed out") {
+                recovery::recover_observed_worker_timeout(
+                    pool,
+                    worker_lease.worker_lease_id,
+                    Utc::now(),
+                    "foreground_worker_timeout",
+                    &error_message,
+                )
+                .await
+                .context(format!(
+                    "failed to route timed-out foreground worker lease through recovery: {error_message}"
+                ))?;
+            } else {
+                recovery::release_worker_lease(pool, worker_lease.worker_lease_id, Utc::now())
+                    .await
+                    .context(format!(
+                        "failed to release foreground worker lease after worker failure: {error_message}"
+                    ))?;
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn record_and_return_failure<T>(
     pool: &sqlx::PgPool,
     trace_id: Uuid,
@@ -1303,8 +1420,11 @@ fn build_trigger_user_messages(
     candidate_messages: Vec<UserEpisodeMessage>,
 ) -> Vec<UserEpisodeMessage> {
     match trigger_kind {
-        contracts::ForegroundTriggerKind::UserIngress => candidate_messages,
-        contracts::ForegroundTriggerKind::ApprovedWakeSignal => Vec::new(),
+        contracts::ForegroundTriggerKind::UserIngress
+        | contracts::ForegroundTriggerKind::ScheduledTask
+        | contracts::ForegroundTriggerKind::SupervisorRecoveryEvent => candidate_messages,
+        contracts::ForegroundTriggerKind::ApprovedWakeSignal
+        | contracts::ForegroundTriggerKind::ApprovalResolutionEvent => Vec::new(),
     }
 }
 
@@ -1313,8 +1433,17 @@ fn episode_trigger_metadata(
 ) -> (&'static str, &'static str) {
     match trigger_kind {
         contracts::ForegroundTriggerKind::UserIngress => ("user_ingress", "telegram"),
+        contracts::ForegroundTriggerKind::ScheduledTask => {
+            ("scheduled_task", "foreground_scheduler")
+        }
         contracts::ForegroundTriggerKind::ApprovedWakeSignal => {
             ("approved_wake_signal", "wake_signal")
+        }
+        contracts::ForegroundTriggerKind::SupervisorRecoveryEvent => {
+            ("supervisor_recovery_event", "foreground_recovery")
+        }
+        contracts::ForegroundTriggerKind::ApprovalResolutionEvent => {
+            ("approval_resolution_event", "approval_resolution")
         }
     }
 }

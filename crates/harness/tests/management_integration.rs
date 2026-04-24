@@ -8,13 +8,16 @@ use contracts::{
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
+    audit,
     config::{ForegroundModelRouteConfig, ModelGatewayConfig},
+    execution::{self, NewExecutionRecord},
     governed_actions,
     management::{
         self, BackgroundEnqueueOutcome, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
-        ResolveApprovalRequest,
+        ResolveApprovalRequest, SuperviseWorkerLeasesRequest,
     },
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
+    recovery,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -209,6 +212,126 @@ async fn resolve_approval_request_executes_linked_governed_action_from_managemen
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn supervise_worker_leases_recovers_expired_leases_from_management_surface() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let now = Utc::now();
+
+        recovery::create_worker_lease(
+            &ctx.pool,
+            &recovery::NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                worker_kind: recovery::WorkerLeaseKind::Foreground,
+                lease_token: Uuid::now_v7(),
+                worker_pid: Some(4242),
+                lease_acquired_at: now - Duration::minutes(5),
+                lease_expires_at: now - Duration::seconds(30),
+                last_heartbeat_at: now - Duration::minutes(1),
+                metadata: json!({
+                    "source": "management_integration"
+                }),
+            },
+        )
+        .await?;
+
+        let report = management::supervise_worker_leases(
+            &ctx.config,
+            SuperviseWorkerLeasesRequest {
+                soft_warning_threshold_percent: 80,
+                actor_ref: "cli:test-operator".to_string(),
+                reason: Some("management integration test".to_string()),
+            },
+        )
+        .await?;
+        assert_eq!(report.actor_ref, "cli:test-operator");
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("management integration test")
+        );
+        assert_eq!(report.recovered_expired_lease_count, 1);
+        assert_eq!(report.soft_warning_count, 0);
+        assert_eq!(report.recovered_expired_leases.len(), 1);
+        assert_eq!(report.recovered_expired_leases[0].worker_kind, "foreground");
+        assert_eq!(
+            report.recovered_expired_leases[0].recovery_decision,
+            "continue"
+        );
+        assert_eq!(
+            report.recovered_expired_leases[0].diagnostic_reason_code,
+            "worker_lease_expired"
+        );
+
+        let checkpoints = management::list_recovery_checkpoints(&ctx.config, true, 10).await?;
+        assert!(checkpoints.is_empty());
+
+        let audit_events = audit::list_for_trace(&ctx.pool, report.trace_id).await?;
+        let event_kinds = audit_events
+            .iter()
+            .map(|event| event.event_kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_kinds,
+            vec![
+                "management_recovery_supervision_requested",
+                "management_recovery_supervision_completed",
+            ]
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn recovery_lease_list_surfaces_active_soft_warning_leases_from_management_surface()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let now = Utc::now();
+
+        let lease = recovery::create_worker_lease(
+            &ctx.pool,
+            &recovery::NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                worker_kind: recovery::WorkerLeaseKind::Background,
+                lease_token: Uuid::now_v7(),
+                worker_pid: Some(4242),
+                lease_acquired_at: now - Duration::minutes(8),
+                lease_expires_at: now + Duration::minutes(1),
+                last_heartbeat_at: now - Duration::seconds(20),
+                metadata: json!({
+                    "source": "management_integration_recovery_lease_list"
+                }),
+            },
+        )
+        .await?;
+
+        let leases = management::list_active_worker_leases(&ctx.config, 10, 80).await?;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].worker_lease_id, lease.worker_lease_id);
+        assert_eq!(leases[0].worker_kind, "background");
+        assert_eq!(leases[0].lease_status, "active");
+        assert_eq!(leases[0].supervision_status, "soft_warning");
+        assert_eq!(leases[0].execution_id, Some(execution_id));
+        Ok(())
+    })
+    .await
+}
+
 fn configure_management_execution(config: &mut harness::config::RuntimeConfig) {
     let worker_binary = support::workers_binary().expect("workers binary should resolve");
     config.worker.command = worker_binary.to_string_lossy().into_owned();
@@ -234,6 +357,27 @@ fn configure_management_execution(config: &mut harness::config::RuntimeConfig) {
         },
         z_ai: None,
     });
+}
+
+async fn seed_execution(pool: &sqlx::PgPool, trace_id: Uuid) -> Result<Uuid> {
+    let execution_id = Uuid::now_v7();
+    execution::insert(
+        pool,
+        &NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "management_integration_test".to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: json!({
+                "request_id": Uuid::now_v7(),
+                "sent_at": Utc::now(),
+                "kind": "management_integration_test"
+            }),
+        },
+    )
+    .await?;
+    Ok(execution_id)
 }
 
 fn immediate_scope() -> CapabilityScope {

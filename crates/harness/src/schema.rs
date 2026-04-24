@@ -32,6 +32,17 @@ pub enum SchemaCompatibility {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaUpgradeAssessment {
+    pub policy: SchemaPolicy,
+    pub current_version: Option<i64>,
+    pub expected_version: i64,
+    pub discovered_versions: Vec<i64>,
+    pub applied_versions: Vec<i64>,
+    pub pending_versions: Vec<i64>,
+    pub compatibility: SchemaCompatibility,
+}
+
 impl SchemaCompatibility {
     pub fn ensure_supported(self) -> Result<i64> {
         match self {
@@ -80,18 +91,49 @@ pub fn evaluate(current: Option<i64>, policy: SchemaPolicy) -> SchemaCompatibili
 }
 
 pub async fn verify(pool: &PgPool, policy: SchemaPolicy) -> Result<i64> {
+    assess_upgrade_path(pool, policy)
+        .await?
+        .compatibility
+        .ensure_supported()
+}
+
+pub async fn assess_upgrade_path(
+    pool: &PgPool,
+    policy: SchemaPolicy,
+) -> Result<SchemaUpgradeAssessment> {
     let discovered = migration::load_migrations()?;
     migration::normalize_applied_migration_names(pool, &discovered).await?;
     let applied = migration::load_applied_migrations(pool).await?;
-    if let Err(error) = migration::validate_applied_history(&discovered, &applied) {
-        return SchemaCompatibility::IncompatibleHistory {
+    let discovered_versions = discovered
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let applied_versions = applied
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let current_version = applied.last().map(|migration| migration.version);
+    let pending_versions = discovered_versions
+        .iter()
+        .copied()
+        .filter(|version| current_version.is_none_or(|current| *version > current))
+        .collect::<Vec<_>>();
+    let compatibility = match migration::validate_applied_history(&discovered, &applied) {
+        Ok(()) => evaluate(current_version, policy),
+        Err(error) => SchemaCompatibility::IncompatibleHistory {
             details: error.to_string(),
-        }
-        .ensure_supported();
-    }
+        },
+    };
 
-    let current = applied.last().map(|migration| migration.version);
-    evaluate(current, policy).ensure_supported()
+    Ok(SchemaUpgradeAssessment {
+        policy,
+        current_version,
+        expected_version: policy.expected_version,
+        discovered_versions,
+        applied_versions,
+        pending_versions,
+        compatibility,
+    })
 }
 
 #[cfg(test)]
@@ -129,6 +171,42 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_reports_too_old_schema() {
+        let status = evaluate(
+            Some(1),
+            SchemaPolicy {
+                minimum_supported_version: 2,
+                expected_version: 4,
+            },
+        );
+        assert_eq!(
+            status,
+            SchemaCompatibility::TooOld {
+                current: 1,
+                minimum_supported: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_reports_too_new_schema() {
+        let status = evaluate(
+            Some(5),
+            SchemaPolicy {
+                minimum_supported_version: 1,
+                expected_version: 4,
+            },
+        );
+        assert_eq!(
+            status,
+            SchemaCompatibility::TooNew {
+                current: 5,
+                expected: 4,
+            }
+        );
+    }
+
+    #[test]
     fn evaluate_reports_supported_schema() {
         let status = evaluate(
             Some(1),
@@ -138,6 +216,38 @@ mod tests {
             },
         );
         assert_eq!(status, SchemaCompatibility::Supported { current: 1 });
+    }
+
+    #[test]
+    fn ensure_supported_reports_missing_pending_too_old_and_too_new_variants() {
+        let missing = SchemaCompatibility::Missing
+            .ensure_supported()
+            .expect_err("missing schema should fail closed");
+        assert!(missing.to_string().contains("missing"));
+
+        let too_old = SchemaCompatibility::TooOld {
+            current: 1,
+            minimum_supported: 2,
+        }
+        .ensure_supported()
+        .expect_err("too old schema should fail closed");
+        assert!(too_old.to_string().contains("minimum supported"));
+
+        let pending = SchemaCompatibility::PendingMigrations {
+            current: 3,
+            expected: 4,
+        }
+        .ensure_supported()
+        .expect_err("pending migrations should fail closed");
+        assert!(pending.to_string().contains("migrate command"));
+
+        let too_new = SchemaCompatibility::TooNew {
+            current: 5,
+            expected: 4,
+        }
+        .ensure_supported()
+        .expect_err("too new schema should fail closed");
+        assert!(too_new.to_string().contains("newer than runtime-supported"));
     }
 
     #[test]

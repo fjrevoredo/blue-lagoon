@@ -5,17 +5,19 @@ use chrono::{Duration, Utc};
 use contracts::{
     CapabilityScope, ChannelKind, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
     FilesystemCapabilityScope, GovernedActionKind, GovernedActionRiskTier, IngressEventKind,
-    NetworkAccessPosture, NormalizedIngress, WorkspaceArtifactKind, WorkspaceScriptRunStatus,
+    NetworkAccessPosture, NormalizedIngress, ScheduledForegroundTaskStatus, WorkspaceArtifactKind,
+    WorkspaceScriptRunStatus,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
+    audit,
     background::{
         self, BackgroundJobRunStatus, BackgroundJobStatus, NewBackgroundJob, NewBackgroundJobRun,
         NewWakeSignalRecord, WakeSignalStatus,
     },
     execution::{self, NewExecutionRecord},
-    foreground::{self, NewIngressEvent},
-    governed_actions, management,
+    foreground::{self, NewConversationBinding, NewIngressEvent},
+    governed_actions, management, recovery,
     workspace::{self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun},
 };
 use serde_json::json;
@@ -359,6 +361,290 @@ async fn phase_five_management_surfaces_workspace_approvals_and_actions() -> Res
         assert_eq!(runs[0].workspace_script_id, script_id);
         assert_eq!(runs[0].status, "completed");
 
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn operational_health_summary_records_recovery_pressure_anomalies() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+
+        recovery::create_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::NewRecoveryCheckpoint {
+                recovery_checkpoint_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                checkpoint_kind: recovery::RecoveryCheckpointKind::Background,
+                recovery_reason_code: recovery::RecoveryReasonCode::TimeoutOrStall,
+                recovery_budget_remaining: 1,
+                checkpoint_payload: json!({
+                    "source": "management_component"
+                }),
+            },
+        )
+        .await?;
+
+        for offset_minutes in [0_i64, 5, 10] {
+            recovery::insert_operational_diagnostic(
+                &ctx.pool,
+                &recovery::NewOperationalDiagnostic {
+                    operational_diagnostic_id: Uuid::now_v7(),
+                    trace_id: Some(trace_id),
+                    execution_id: Some(execution_id),
+                    subsystem: "recovery".to_string(),
+                    severity: recovery::OperationalDiagnosticSeverity::Error,
+                    reason_code: "worker_lease_timeout_observed".to_string(),
+                    summary: "worker lease timeout observed during management health test"
+                        .to_string(),
+                    diagnostic_payload: json!({
+                        "source": "management_component",
+                        "offset_minutes": offset_minutes,
+                    }),
+                },
+            )
+            .await?;
+        }
+
+        let summary = management::load_operational_health_summary(&ctx.config).await?;
+        assert_eq!(summary.overall_status, "unhealthy");
+        assert_eq!(summary.recovery.open_checkpoint_count, 1);
+        assert_eq!(summary.diagnostics.error_count, 3);
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "repeated_reason")
+        );
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "failure_pressure")
+        );
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.anomaly_kind == "recovery_pressure")
+        );
+
+        let diagnostics = management::list_recent_operational_diagnostics(&ctx.config, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_repeated_condition_detected"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_failure_pressure_detected"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "operational_recovery_pressure_detected"
+        }));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn recovery_and_diagnostic_lists_surface_recent_operator_visibility() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let checkpoint = recovery::create_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::NewRecoveryCheckpoint {
+                recovery_checkpoint_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                checkpoint_kind: recovery::RecoveryCheckpointKind::Foreground,
+                recovery_reason_code: recovery::RecoveryReasonCode::Crash,
+                recovery_budget_remaining: 1,
+                checkpoint_payload: json!({
+                    "source": "management_component_visibility"
+                }),
+            },
+        )
+        .await?;
+        recovery::resolve_recovery_checkpoint(
+            &ctx.pool,
+            &recovery::RecoveryCheckpointResolution {
+                recovery_checkpoint_id: checkpoint.recovery_checkpoint_id,
+                status: recovery::RecoveryCheckpointStatus::Resolved,
+                recovery_decision: recovery::RecoveryDecision::Continue,
+                resolved_summary: Some("fresh worker continuation is safe".to_string()),
+                resolved_at: Utc::now(),
+            },
+        )
+        .await?;
+
+        recovery::insert_operational_diagnostic(
+            &ctx.pool,
+            &recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: Some(trace_id),
+                execution_id: Some(execution_id),
+                subsystem: "recovery".to_string(),
+                severity: recovery::OperationalDiagnosticSeverity::Warn,
+                reason_code: "worker_lease_soft_warning".to_string(),
+                summary: "worker lease is nearing expiry".to_string(),
+                diagnostic_payload: json!({
+                    "source": "management_component_visibility"
+                }),
+            },
+        )
+        .await?;
+
+        let checkpoints = management::list_recovery_checkpoints(&ctx.config, false, 10).await?;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0].recovery_checkpoint_id,
+            checkpoint.recovery_checkpoint_id
+        );
+        assert_eq!(checkpoints[0].checkpoint_kind, "foreground");
+        assert_eq!(checkpoints[0].recovery_reason_code, "crash");
+        assert_eq!(checkpoints[0].status, "resolved");
+        assert_eq!(
+            checkpoints[0].recovery_decision.as_deref(),
+            Some("continue")
+        );
+
+        let diagnostics = management::list_recent_operational_diagnostics(&ctx.config, 10).await?;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].reason_code, "worker_lease_soft_warning");
+        assert_eq!(diagnostics[0].severity, "warn");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn recovery_lease_list_surfaces_stalled_work_inspection() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        let now = Utc::now();
+
+        let active_lease = recovery::create_worker_lease(
+            &ctx.pool,
+            &recovery::NewWorkerLease {
+                worker_lease_id: Uuid::now_v7(),
+                trace_id,
+                execution_id: Some(execution_id),
+                background_job_id: None,
+                background_job_run_id: None,
+                governed_action_execution_id: None,
+                worker_kind: recovery::WorkerLeaseKind::Background,
+                lease_token: Uuid::now_v7(),
+                worker_pid: Some(4242),
+                lease_acquired_at: now - Duration::minutes(8),
+                lease_expires_at: now + Duration::minutes(1),
+                last_heartbeat_at: now - Duration::seconds(30),
+                metadata: json!({
+                    "source": "management_component_recovery_lease_list"
+                }),
+            },
+        )
+        .await?;
+
+        let leases = management::list_active_worker_leases(&ctx.config, 10, 80).await?;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].worker_lease_id, active_lease.worker_lease_id);
+        assert_eq!(leases[0].worker_kind, "background");
+        assert_eq!(leases[0].lease_status, "active");
+        assert_eq!(leases[0].supervision_status, "soft_warning");
+        assert_eq!(leases[0].execution_id, Some(execution_id));
+        assert_eq!(leases[0].background_job_id, None);
+        assert_eq!(leases[0].background_job_run_id, None);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_management_upsert_list_and_show_are_auditable() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "24".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let next_due_at = Utc::now() + Duration::minutes(10);
+        let upserted = management::upsert_scheduled_foreground_task(
+            &ctx.config,
+            management::UpsertScheduledForegroundTaskRequest {
+                task_key: "daily-checkin".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "Daily check-in".to_string(),
+                cadence_seconds: 600,
+                cooldown_seconds: Some(300),
+                next_due_at: Some(next_due_at),
+                status: ScheduledForegroundTaskStatus::Active,
+                actor_ref: "cli:primary-user".to_string(),
+                reason: Some("phase7 management coverage".to_string()),
+            },
+        )
+        .await?;
+
+        assert_eq!(upserted.action, "created");
+        assert_eq!(upserted.task.task_key, "daily-checkin");
+        assert_eq!(upserted.task.status, "active");
+        assert!(upserted.task.conversation_binding_present);
+        assert_eq!(upserted.task.cooldown_seconds, 300);
+
+        let listed = management::list_scheduled_foreground_tasks(
+            &ctx.config,
+            Some(ScheduledForegroundTaskStatus::Active),
+            false,
+            10,
+        )
+        .await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task_key, "daily-checkin");
+        assert_eq!(listed[0].channel_kind, "telegram");
+
+        let shown = management::get_scheduled_foreground_task(&ctx.config, "daily-checkin")
+            .await?
+            .expect("scheduled task should exist");
+        assert_eq!(
+            shown.scheduled_foreground_task_id,
+            upserted.task.scheduled_foreground_task_id
+        );
+        assert_eq!(shown.message_text, "Daily check-in");
+
+        let audit_events = audit::list_for_trace(&ctx.pool, upserted.trace_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "management_scheduled_foreground_upsert_requested")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "management_scheduled_foreground_upsert_completed")
+        );
         Ok(())
     })
     .await

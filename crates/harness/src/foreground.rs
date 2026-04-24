@@ -820,7 +820,9 @@ pub fn build_foreground_trigger_with_kind(
 }
 
 pub fn infer_foreground_trigger_kind(ingress: &NormalizedIngress) -> ForegroundTriggerKind {
-    if ingress
+    if is_approval_resolution_ingress(ingress) {
+        ForegroundTriggerKind::ApprovalResolutionEvent
+    } else if ingress
         .external_event_id
         .starts_with(WAKE_SIGNAL_EXTERNAL_EVENT_PREFIX)
         || ingress
@@ -832,6 +834,23 @@ pub fn infer_foreground_trigger_kind(ingress: &NormalizedIngress) -> ForegroundT
     } else {
         ForegroundTriggerKind::UserIngress
     }
+}
+
+fn is_approval_resolution_ingress(ingress: &NormalizedIngress) -> bool {
+    if ingress
+        .approval_payload
+        .as_ref()
+        .is_some_and(|payload| !payload.token.trim().is_empty())
+    {
+        return true;
+    }
+
+    ingress.command_hint.as_ref().is_some_and(|hint| {
+        matches!(
+            hint.command.trim(),
+            "approve" | "approved" | "reject" | "rejected"
+        )
+    })
 }
 
 pub async fn insert_execution_ingress_link<'e, E>(
@@ -2248,6 +2267,30 @@ where
 mod tests {
     use super::*;
     use crate::config::BacklogRecoveryConfig;
+    use contracts::{
+        ApprovalPayload, AttachmentReference, ChannelKind, CommandHint, IngressEventKind,
+    };
+
+    fn sample_normalized_ingress() -> NormalizedIngress {
+        NormalizedIngress {
+            ingress_id: Uuid::now_v7(),
+            channel_kind: ChannelKind::Telegram,
+            external_user_id: "42".to_string(),
+            external_conversation_id: "24".to_string(),
+            external_event_id: "telegram:update:42".to_string(),
+            external_message_id: Some("42".to_string()),
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            event_kind: IngressEventKind::MessageCreated,
+            occurred_at: Utc::now(),
+            text_body: Some("hello".to_string()),
+            reply_to: None,
+            attachments: Vec::<AttachmentReference>::new(),
+            command_hint: None,
+            approval_payload: None,
+            raw_payload_ref: None,
+        }
+    }
 
     fn sample_ingress_event(
         minutes_ago: i64,
@@ -2394,6 +2437,47 @@ mod tests {
         assert_eq!(
             decision.reason,
             ForegroundExecutionDecisionReason::ForcedRecovery
+        );
+    }
+
+    #[test]
+    fn infer_foreground_trigger_kind_detects_approved_wake_signal() {
+        let mut ingress = sample_normalized_ingress();
+        ingress.external_event_id = "wake-signal:123".to_string();
+
+        assert_eq!(
+            infer_foreground_trigger_kind(&ingress),
+            ForegroundTriggerKind::ApprovedWakeSignal
+        );
+    }
+
+    #[test]
+    fn infer_foreground_trigger_kind_detects_approval_resolution_event() {
+        let mut ingress = sample_normalized_ingress();
+        ingress.event_kind = IngressEventKind::ApprovalCallback;
+        ingress.approval_payload = Some(ApprovalPayload {
+            token: "approval-token".to_string(),
+            callback_data: Some("approve:approval-token".to_string()),
+        });
+
+        assert_eq!(
+            infer_foreground_trigger_kind(&ingress),
+            ForegroundTriggerKind::ApprovalResolutionEvent
+        );
+    }
+
+    #[test]
+    fn infer_foreground_trigger_kind_detects_approval_resolution_command() {
+        let mut ingress = sample_normalized_ingress();
+        ingress.event_kind = IngressEventKind::CommandIssued;
+        ingress.command_hint = Some(CommandHint {
+            command: "approve".to_string(),
+            args: vec!["approval-token".to_string()],
+        });
+
+        assert_eq!(
+            infer_foreground_trigger_kind(&ingress),
+            ForegroundTriggerKind::ApprovalResolutionEvent
         );
     }
 }

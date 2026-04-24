@@ -1,0 +1,35 @@
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+function Invoke-Step {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action
+    )
+
+    Write-Host ""
+    Write-Host "==> $Label"
+    & $Action
+    if ($LASTEXITCODE -ne 0) {
+        throw "step '$Label' failed with exit code $LASTEXITCODE"
+    }
+}
+
+Invoke-Step "cargo test -p harness --test recovery_component -- --nocapture" {
+    cargo test -p harness --test recovery_component -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test recovery_integration -- --nocapture" {
+    cargo test -p harness --test recovery_integration -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture" {
+    cargo test -p harness --test foreground_component scheduled_foreground_recovery_clears_stranded_in_progress_task -- --nocapture
+}
+Invoke-Step "cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture" {
+    cargo test -p harness --test foreground_integration scheduled_foreground_runtime_recovery_finalizes_stranded_execution -- --nocapture
+}
+
+Write-Host ""
+Write-Host "recovery-hardening checks passed"

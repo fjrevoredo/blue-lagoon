@@ -21,6 +21,7 @@ use harness::{
     foreground::{self, NewEpisode, NewEpisodeMessage},
     migration,
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
+    recovery,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -35,7 +36,11 @@ async fn migration_application_creates_unconscious_loop_tables() -> Result<()> {
         let summary =
             migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
 
-        assert_eq!(summary.discovered_versions, vec![1, 2, 3, 4, 5, 6]);
+        let expected_versions = migration::load_migrations()?
+            .into_iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.discovered_versions, expected_versions);
 
         let tables = sqlx::query(
             r#"
@@ -1080,6 +1085,33 @@ async fn background_execution_rejects_wake_signal_when_no_foreground_binding_is_
                 .decision,
             WakeSignalDecisionKind::Rejected
         );
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "wake_signal_routing_rejected"
+                && diagnostic.diagnostic_payload["wake_signal_id"] == json!(wake_signal_id)
+        }));
+        let checkpoint_row = sqlx::query(
+            r#"
+            SELECT recovery_reason_code, recovery_decision
+            FROM recovery_checkpoints
+            WHERE background_job_id = $1
+              AND checkpoint_payload_json ->> 'wake_signal_id' = $2
+            ORDER BY created_at DESC, recovery_checkpoint_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(background_job_id)
+        .bind(wake_signal_id.to_string())
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_reason_code"),
+            "integrity_or_policy_block".to_string()
+        );
+        assert_eq!(
+            checkpoint_row.get::<String, _>("recovery_decision"),
+            "abandon".to_string()
+        );
 
         let staged_count: i64 = sqlx::query_scalar(
             r#"
@@ -1160,6 +1192,11 @@ async fn background_execution_times_out_and_marks_run_timed_out() -> Result<()> 
                 .iter()
                 .any(|event| event.event_kind == "background_job_timed_out")
         );
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "worker_lease_timeout_observed"
+                && diagnostic.execution_id == Some(execution_id)
+        }));
 
         let pid = read_pid_file(&pid_file).await?;
         tokio::time::sleep(StdDuration::from_millis(200)).await;
