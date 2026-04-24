@@ -432,9 +432,6 @@ fn resolve_workers_binary() -> Result<PathBuf> {
         .join("target")
         .join("debug")
         .join(binary_name);
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
 
     let status = Command::new("cargo")
         .arg("build")

@@ -3,7 +3,7 @@
 ## High-Level Implementation Plan
 
 Date: 2026-04-06
-Status: Phase 1, Phase 1.1, Phase 2, Phase 3, Phase 4, Phase 4.5, Phase 5, and Phase 6 completed
+Status: Phase 1, Phase 1.1, Phase 2, Phase 3, Phase 4, Phase 4.5, Phase 5, and Phase 6 completed; Phase 7 planned
 Audience: Project planning before the detailed implementation plan
 
 ## Purpose
@@ -117,7 +117,7 @@ from Phase 4.5 onward:
 
 ## Phase structure
 
-The implementation should proceed through six major product-capability phases,
+The implementation should proceed through seven major product-capability phases,
 with one bridging Phase 1.1 dedicated to establishing the minimum repository
 CI/CD baseline and one bridging Phase 4.5 dedicated to the initial management
 CLI surface before Phase 5 broadens the governed action surface.
@@ -131,6 +131,8 @@ CLI surface before Phase 5 broadens the governed action surface.
 - Phase 4 status: `COMPLETE`
 - Phase 4.5 status: `COMPLETE`
 - Phase 5 status: `COMPLETE`
+- Phase 6 status: `COMPLETE`
+- Phase 7 status: `PLANNED`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -161,8 +163,9 @@ CLI surface before Phase 5 broadens the governed action surface.
 - The current repository state now includes governed action planning, bounded
   subprocess and workspace-script execution, canonical approval handling,
   Phase 5 management CLI inspection and bounded resolution commands, and the
-  dedicated `governed-actions` CI gate, so Phase 5 is complete and Phase 6 is
-  now the active next phase
+  dedicated `governed-actions` CI gate. Phase 5 is complete, and the repository
+  has now also completed the Phase 6 recovery, diagnostics, migration-safety,
+  and release-readiness hardening slice.
 
 ### Phase 1: Runtime foundation and authority boundaries
 
@@ -508,6 +511,42 @@ fault-handling, migration discipline, and release-grade verification.
 - CI/CD is capable of enforcing the required staged gates and supporting the
   first controlled release workflow without bypassing safety checks.
 
+### Phase 7: Post-Phase-6 drift closure and user-facing documentation
+
+#### Phase 7 goal
+
+Close any remaining implementation drift against the canonical requirements
+without weakening those requirements, and publish stable user-facing
+documentation once the required surface is actually implemented.
+
+#### Phase 7 primary outcomes
+
+- Implement the required scheduled foreground task trigger end to end so the
+  runtime matches the canonical conscious-trigger model.
+- Add the harness-owned planning, policy, audit, recovery, and management
+  surfaces needed for scheduled foreground work to be safe and diagnosable.
+- Run a full post-Phase-6 self-check against `docs/REQUIREMENTS.md`,
+  `docs/LOOP_ARCHITECTURE.md`, and `docs/IMPLEMENTATION_DESIGN.md`, and treat
+  any remaining mismatch as implementation work rather than as a documentation
+  rewrite.
+- Rewrite `README.md` as a true user-facing quick start only after the shipped
+  runtime behavior and command surface match the canonical design.
+- Add a dedicated user manual for normal setup, run, approval, recovery,
+  upgrade, and troubleshooting workflows after the user-facing README is
+  grounded in stable runtime behavior.
+
+#### Phase 7 exit criteria
+
+- Scheduled foreground task triggering exists in the shipped runtime and is
+  covered by automated tests at the appropriate unit, component, and
+  integration layers.
+- The canonical requirements, loop architecture, and implementation design no
+  longer require caveats or narrowing language to fit the implementation.
+- `README.md` and any dedicated user manual describe the actual supported user
+  workflows rather than planned or inferred behavior.
+- The roadmap and detailed phase plan clearly capture the closure of the last
+  known post-Phase-6 drift items.
+
 ## Cross-cutting work that starts on day one
 
 The following work should not be postponed to the end of the project. It should
@@ -582,3 +621,11 @@ Detailed planning for Phase 5 now lives in
 `docs/PHASE_5_DETAILED_IMPLEMENTATION_PLAN.md`, where the next execution work
 should focus on workspace state, governed execution, approval handling,
 capability scoping, and the required management CLI extensions.
+
+Detailed planning and execution evidence for Phase 6 now lives in
+`docs/PHASE_6_DETAILED_IMPLEMENTATION_PLAN.md`.
+
+Detailed planning for Phase 7 now lives in
+`docs/PHASE_7_DETAILED_IMPLEMENTATION_PLAN.md`, focused on closing remaining
+post-Phase-6 drift against the canonical requirements and on publishing
+user-facing documentation only after that drift is resolved.

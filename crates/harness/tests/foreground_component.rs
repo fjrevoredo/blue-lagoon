@@ -1932,11 +1932,14 @@ async fn planned_foreground_orchestration_processes_backlog_batch_with_single_re
             &ctx.pool,
             &config,
             &gateway,
-            foreground_orchestration::ForegroundExecutionIds {
-                trace_id,
-                execution_id,
+            foreground_orchestration::TelegramForegroundPlanExecution {
+                execution: foreground_orchestration::ForegroundExecutionIds {
+                    trace_id,
+                    execution_id,
+                },
+                trigger_kind_override: None,
+                plan,
             },
-            plan,
             &transport,
             &mut delivery,
         )

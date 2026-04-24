@@ -273,7 +273,10 @@ pub struct ApprovalPayload {
 #[serde(rename_all = "snake_case")]
 pub enum ForegroundTriggerKind {
     UserIngress,
+    ScheduledTask,
     ApprovedWakeSignal,
+    SupervisorRecoveryEvent,
+    ApprovalResolutionEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

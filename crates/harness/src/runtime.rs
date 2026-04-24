@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -25,7 +26,7 @@ use crate::{
     policy::{self, PolicyDecision},
     recovery,
     schema::{self, SchemaPolicy},
-    telegram::{self, TelegramDelivery, TelegramUpdate},
+    telegram::{self, TelegramDelivery, TelegramUpdate, TelegramUpdateSource},
     trace::TraceContext,
     worker,
 };
@@ -101,6 +102,21 @@ pub async fn run_harness_once(
 ) -> Result<HarnessOutcome> {
     let transport = model_gateway::ReqwestModelProviderTransport::new();
     run_harness_once_with_transport(config, options, &transport).await
+}
+
+pub async fn run_harness_service(config: &RuntimeConfig) -> Result<()> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let poll_interval =
+        Duration::from_secs(config.background.scheduler.poll_interval_seconds.max(1));
+
+    loop {
+        supervise_expired_worker_leases(&pool).await?;
+        supervise_background_supervisor_restart_recovery(&pool).await?;
+        run_background_scheduler_iteration(&pool, config, &transport).await?;
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 pub async fn run_harness_once_with_transport<T: ModelProviderTransport>(
@@ -224,6 +240,49 @@ pub async fn run_telegram_once(
     )
     .await?;
     Ok(TelegramOutcome::PollProcessed(summary))
+}
+
+pub async fn run_telegram_service(config: &RuntimeConfig) -> Result<()> {
+    const TELEGRAM_SERVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let telegram_config = config.require_telegram_config()?;
+    let model_gateway_config = config.require_model_gateway_config()?;
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let mut source = telegram::ReqwestTelegramSource::new(telegram_config.clone());
+    let mut delivery = telegram::ReqwestTelegramDelivery::new(telegram_config.clone());
+
+    loop {
+        supervise_expired_worker_leases(&pool).await?;
+        let updates = match source.fetch_updates(telegram_config.poll_limit).await {
+            Ok(updates) => updates,
+            Err(error) => {
+                if let Err(record_error) =
+                    record_telegram_fetch_failed(&pool, &error, Some("telegram:getUpdates")).await
+                {
+                    return Err(error.context(format!(
+                        "failed to record telegram fetch failure: {record_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        process_telegram_updates(
+            TelegramProcessingContext {
+                pool: &pool,
+                config,
+                telegram_config: &telegram_config,
+                model_gateway_config: &model_gateway_config,
+                transport: &transport,
+                raw_payload_ref: Some("telegram:getUpdates".to_string()),
+            },
+            updates,
+            &mut delivery,
+        )
+        .await?;
+        tokio::time::sleep(TELEGRAM_SERVICE_POLL_INTERVAL).await;
+    }
 }
 
 pub async fn run_telegram_fixture_with<T, D>(
@@ -421,6 +480,42 @@ async fn record_background_no_due_job(
     )
     .await?;
     Ok(())
+}
+
+async fn run_background_scheduler_iteration<T: ModelProviderTransport>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    transport: &T,
+) -> Result<u32> {
+    let due_limit = config
+        .background
+        .scheduler
+        .max_due_jobs_per_iteration
+        .max(1);
+    if background::list_due_jobs(pool, Utc::now(), due_limit)
+        .await?
+        .is_empty()
+    {
+        return Ok(0);
+    }
+
+    let gateway = config.require_model_gateway_config()?;
+    let mut completed = 0_u32;
+    for _ in 0..due_limit {
+        match background_execution::execute_next_due_job(
+            pool,
+            config,
+            &gateway,
+            transport,
+            Utc::now(),
+        )
+        .await?
+        {
+            Some(_) => completed += 1,
+            None => break,
+        }
+    }
+    Ok(completed)
 }
 
 struct TelegramProcessingContext<'a, T> {
@@ -626,11 +721,21 @@ where
             context.pool,
             context.config,
             context.model_gateway_config,
-            foreground_orchestration::ForegroundExecutionIds {
-                trace_id,
-                execution_id,
+            foreground_orchestration::TelegramForegroundPlanExecution {
+                execution: foreground_orchestration::ForegroundExecutionIds {
+                    trace_id,
+                    execution_id,
+                },
+                trigger_kind_override: if plan.decision_reason
+                    == foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
+                    || (recovered_only_from_scan && is_backlog_recovery)
+                {
+                    Some(contracts::ForegroundTriggerKind::SupervisorRecoveryEvent)
+                } else {
+                    None
+                },
+                plan,
             },
-            plan,
             context.transport,
             delivery,
         )

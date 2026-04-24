@@ -57,6 +57,13 @@ pub struct ForegroundExecutionIds {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramForegroundPlanExecution {
+    pub execution: ForegroundExecutionIds,
+    pub trigger_kind_override: Option<contracts::ForegroundTriggerKind>,
+    pub plan: foreground::PendingForegroundExecutionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UserEpisodeMessage {
     text_body: String,
     external_message_id: Option<String>,
@@ -157,8 +164,7 @@ pub async fn orchestrate_telegram_foreground_plan<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
     model_gateway_config: &ResolvedModelGatewayConfig,
-    execution: ForegroundExecutionIds,
-    plan: foreground::PendingForegroundExecutionPlan,
+    execution: TelegramForegroundPlanExecution,
     transport: &T,
     delivery: &mut D,
 ) -> Result<TelegramForegroundOrchestrationOutcome>
@@ -167,13 +173,23 @@ where
     D: TelegramDelivery,
 {
     let primary_ingress =
-        foreground::load_normalized_ingress(pool, plan.primary_ingress.ingress_id).await?;
-    let trigger = foreground::build_foreground_trigger(
-        config,
-        execution.trace_id,
-        execution.execution_id,
-        primary_ingress,
-    )?;
+        foreground::load_normalized_ingress(pool, execution.plan.primary_ingress.ingress_id)
+            .await?;
+    let trigger = match execution.trigger_kind_override {
+        Some(trigger_kind) => foreground::build_foreground_trigger_with_kind(
+            config,
+            execution.execution.trace_id,
+            execution.execution.execution_id,
+            trigger_kind,
+            primary_ingress,
+        )?,
+        None => foreground::build_foreground_trigger(
+            config,
+            execution.execution.trace_id,
+            execution.execution.execution_id,
+            primary_ingress,
+        )?,
+    };
     if let Some(parsed_resolution) = parse_approval_resolution_ingress(&trigger.ingress)? {
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
@@ -186,7 +202,9 @@ where
     }
     let user_messages = build_trigger_user_messages(
         trigger.trigger_kind,
-        plan.ordered_ingress
+        execution
+            .plan
+            .ordered_ingress
             .iter()
             .filter_map(|ingress| {
                 ingress
@@ -207,8 +225,8 @@ where
         ForegroundExecutionInput {
             trigger,
             recovery_context: contracts::ForegroundRecoveryContext {
-                mode: plan.mode,
-                ordered_ingress: plan.ordered_ingress,
+                mode: execution.plan.mode,
+                ordered_ingress: execution.plan.ordered_ingress,
             },
             user_messages,
         },
@@ -1402,8 +1420,11 @@ fn build_trigger_user_messages(
     candidate_messages: Vec<UserEpisodeMessage>,
 ) -> Vec<UserEpisodeMessage> {
     match trigger_kind {
-        contracts::ForegroundTriggerKind::UserIngress => candidate_messages,
-        contracts::ForegroundTriggerKind::ApprovedWakeSignal => Vec::new(),
+        contracts::ForegroundTriggerKind::UserIngress
+        | contracts::ForegroundTriggerKind::ScheduledTask
+        | contracts::ForegroundTriggerKind::SupervisorRecoveryEvent => candidate_messages,
+        contracts::ForegroundTriggerKind::ApprovedWakeSignal
+        | contracts::ForegroundTriggerKind::ApprovalResolutionEvent => Vec::new(),
     }
 }
 
@@ -1412,8 +1433,17 @@ fn episode_trigger_metadata(
 ) -> (&'static str, &'static str) {
     match trigger_kind {
         contracts::ForegroundTriggerKind::UserIngress => ("user_ingress", "telegram"),
+        contracts::ForegroundTriggerKind::ScheduledTask => {
+            ("scheduled_task", "foreground_scheduler")
+        }
         contracts::ForegroundTriggerKind::ApprovedWakeSignal => {
             ("approved_wake_signal", "wake_signal")
+        }
+        contracts::ForegroundTriggerKind::SupervisorRecoveryEvent => {
+            ("supervisor_recovery_event", "foreground_recovery")
+        }
+        contracts::ForegroundTriggerKind::ApprovalResolutionEvent => {
+            ("approval_resolution_event", "approval_resolution")
         }
     }
 }

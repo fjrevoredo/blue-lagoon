@@ -198,16 +198,10 @@ pub fn validate_background_trigger(trigger: &BackgroundTrigger) -> std::result::
     match trigger.trigger_kind {
         BackgroundTriggerKind::TimeSchedule
         | BackgroundTriggerKind::VolumeThreshold
+        | BackgroundTriggerKind::DriftOrAnomalySignal
         | BackgroundTriggerKind::ForegroundDelegation
+        | BackgroundTriggerKind::ExternalPassiveEvent
         | BackgroundTriggerKind::MaintenanceTrigger => Ok(()),
-        BackgroundTriggerKind::DriftOrAnomalySignal => Err(
-            "drift_or_anomaly_signal is recognized but not yet schedulable in the current trigger policy slice"
-                .to_string(),
-        ),
-        BackgroundTriggerKind::ExternalPassiveEvent => Err(
-            "external_passive_event is recognized but not yet schedulable in the current trigger policy slice"
-                .to_string(),
-        ),
     }
 }
 
@@ -444,26 +438,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validation_accepts_and_defers_expected_trigger_kinds() {
-        let allowed = BackgroundTrigger {
-            trigger_id: Uuid::now_v7(),
-            trigger_kind: BackgroundTriggerKind::TimeSchedule,
-            requested_at: Utc::now(),
-            reason_summary: "scheduled sweep".to_string(),
-            payload_ref: None,
-        };
-        assert!(validate_background_trigger(&allowed).is_ok());
-
-        let deferred = BackgroundTrigger {
-            trigger_id: Uuid::now_v7(),
-            trigger_kind: BackgroundTriggerKind::DriftOrAnomalySignal,
-            requested_at: Utc::now(),
-            reason_summary: "diagnostic event".to_string(),
-            payload_ref: None,
-        };
-        let error = validate_background_trigger(&deferred)
-            .expect_err("drift triggers should fail closed for now");
-        assert!(error.contains("recognized"));
+    fn validation_accepts_required_trigger_kinds() {
+        for trigger_kind in [
+            BackgroundTriggerKind::TimeSchedule,
+            BackgroundTriggerKind::VolumeThreshold,
+            BackgroundTriggerKind::DriftOrAnomalySignal,
+            BackgroundTriggerKind::ForegroundDelegation,
+            BackgroundTriggerKind::ExternalPassiveEvent,
+            BackgroundTriggerKind::MaintenanceTrigger,
+        ] {
+            let trigger = BackgroundTrigger {
+                trigger_id: Uuid::now_v7(),
+                trigger_kind,
+                requested_at: Utc::now(),
+                reason_summary: "trigger validation".to_string(),
+                payload_ref: None,
+            };
+            assert!(validate_background_trigger(&trigger).is_ok());
+        }
     }
 
     #[test]
