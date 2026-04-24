@@ -580,8 +580,7 @@ where
             config,
             model_gateway_config,
             claim,
-            trace_id,
-            execution_id,
+            foreground_orchestration::ForegroundExecutionIds { trace_id, execution_id },
             transport,
             delivery,
         )
@@ -737,8 +736,7 @@ async fn handle_claimed_scheduled_foreground_task<T, D>(
     config: &RuntimeConfig,
     model_gateway_config: &crate::config::ResolvedModelGatewayConfig,
     claim: scheduled_foreground::ClaimedScheduledForegroundTask,
-    trace_id: Uuid,
-    execution_id: Uuid,
+    ids: foreground_orchestration::ForegroundExecutionIds,
     transport: &T,
     delivery: &mut D,
 ) -> Result<()>
@@ -753,8 +751,8 @@ where
             subsystem: "scheduled_foreground".to_string(),
             event_kind: "scheduled_foreground_task_started".to_string(),
             severity: "info".to_string(),
-            trace_id,
-            execution_id: Some(execution_id),
+            trace_id: ids.trace_id,
+            execution_id: Some(ids.execution_id),
             worker_pid: None,
             payload: json!({
                 "scheduled_foreground_task_id": claim.task.scheduled_foreground_task_id,
@@ -770,8 +768,8 @@ where
         return suppress_scheduled_foreground_task(
             pool,
             &claim.task,
-            trace_id,
-            execution_id,
+            ids.trace_id,
+            ids.execution_id,
             "conversation_binding_missing",
             "scheduled foreground task has no matching conversation binding",
         )
@@ -796,10 +794,7 @@ where
         config,
         model_gateway_config,
         foreground_orchestration::TelegramForegroundPlanExecution {
-            execution: foreground_orchestration::ForegroundExecutionIds {
-                trace_id,
-                execution_id,
-            },
+            execution: ids,
             trigger_kind_override: Some(contracts::ForegroundTriggerKind::ScheduledTask),
             plan,
         },
@@ -812,7 +807,7 @@ where
             let completed = scheduled_foreground::mark_task_completed(
                 pool,
                 &claim.task,
-                execution_id,
+                ids.execution_id,
                 Utc::now(),
                 &format!(
                     "scheduled foreground task '{}' delivered Telegram message {}",
@@ -824,8 +819,8 @@ where
                 pool,
                 "scheduled_foreground_task_completed",
                 "info",
-                trace_id,
-                execution_id,
+                ids.trace_id,
+                ids.execution_id,
                 &completed,
                 json!({
                     "outbound_message_id": completion.outbound_message_id,
@@ -843,8 +838,8 @@ where
             fail_scheduled_foreground_task(
                 pool,
                 &claim.task,
-                trace_id,
-                execution_id,
+                ids.trace_id,
+                ids.execution_id,
                 "unexpected_orchestration_outcome",
                 &message,
             )
@@ -855,8 +850,8 @@ where
             fail_scheduled_foreground_task(
                 pool,
                 &claim.task,
-                trace_id,
-                execution_id,
+                ids.trace_id,
+                ids.execution_id,
                 "execution_failed",
                 &error_message,
             )

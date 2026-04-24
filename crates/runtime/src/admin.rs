@@ -1133,7 +1133,7 @@ fn render_scheduled_foreground_task_upsert_text(
     let _ = write!(
         output,
         "{}",
-        render_scheduled_foreground_tasks_text(&[summary.task.clone()])
+        render_scheduled_foreground_tasks_text(std::slice::from_ref(&summary.task))
     );
     output.trim_end().to_string()
 }

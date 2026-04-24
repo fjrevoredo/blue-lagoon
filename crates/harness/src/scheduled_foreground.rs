@@ -33,6 +33,12 @@ pub enum ScheduledForegroundTaskWriteAction {
     Updated,
 }
 
+struct TaskRunOutcomeData<'a> {
+    outcome: ScheduledForegroundLastOutcome,
+    reason: Option<&'a str>,
+    summary: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledForegroundTaskRecord {
     pub scheduled_foreground_task_id: Uuid,
@@ -446,9 +452,7 @@ pub async fn mark_task_completed(
         task,
         execution_id,
         completed_at,
-        ScheduledForegroundLastOutcome::Completed,
-        None,
-        Some(summary),
+        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Completed, reason: None, summary: Some(summary) },
         completed_at + cadence_as_duration(task.cadence_seconds)?,
     )
     .await
@@ -467,9 +471,7 @@ pub async fn mark_task_suppressed(
         task,
         execution_id,
         completed_at,
-        ScheduledForegroundLastOutcome::Suppressed,
-        Some(reason),
-        Some(summary),
+        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Suppressed, reason: Some(reason), summary: Some(summary) },
         completed_at + cadence_as_duration(task.cooldown_seconds)?,
     )
     .await
@@ -488,9 +490,7 @@ pub async fn mark_task_failed(
         task,
         execution_id,
         completed_at,
-        ScheduledForegroundLastOutcome::Failed,
-        Some(reason),
-        Some(summary),
+        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Failed, reason: Some(reason), summary: Some(summary) },
         completed_at + cadence_as_duration(task.cooldown_seconds)?,
     )
     .await
@@ -925,9 +925,7 @@ async fn update_task_run_outcome(
     task: &ScheduledForegroundTaskRecord,
     execution_id: Uuid,
     completed_at: DateTime<Utc>,
-    outcome: ScheduledForegroundLastOutcome,
-    reason: Option<&str>,
-    summary: Option<&str>,
+    outcome_data: TaskRunOutcomeData<'_>,
     next_due_at: DateTime<Utc>,
 ) -> Result<ScheduledForegroundTaskRecord> {
     let row = sqlx::query(
@@ -974,9 +972,9 @@ async fn update_task_run_outcome(
     .bind(task.scheduled_foreground_task_id)
     .bind(completed_at)
     .bind(execution_id)
-    .bind(scheduled_last_outcome_as_str(outcome))
-    .bind(reason)
-    .bind(summary)
+    .bind(scheduled_last_outcome_as_str(outcome_data.outcome))
+    .bind(outcome_data.reason)
+    .bind(outcome_data.summary)
     .bind(next_due_at)
     .fetch_optional(pool)
     .await
