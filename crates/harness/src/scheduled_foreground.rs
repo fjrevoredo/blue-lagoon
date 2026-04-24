@@ -452,7 +452,11 @@ pub async fn mark_task_completed(
         task,
         execution_id,
         completed_at,
-        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Completed, reason: None, summary: Some(summary) },
+        TaskRunOutcomeData {
+            outcome: ScheduledForegroundLastOutcome::Completed,
+            reason: None,
+            summary: Some(summary),
+        },
         completed_at + cadence_as_duration(task.cadence_seconds)?,
     )
     .await
@@ -471,7 +475,11 @@ pub async fn mark_task_suppressed(
         task,
         execution_id,
         completed_at,
-        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Suppressed, reason: Some(reason), summary: Some(summary) },
+        TaskRunOutcomeData {
+            outcome: ScheduledForegroundLastOutcome::Suppressed,
+            reason: Some(reason),
+            summary: Some(summary),
+        },
         completed_at + cadence_as_duration(task.cooldown_seconds)?,
     )
     .await
@@ -490,7 +498,11 @@ pub async fn mark_task_failed(
         task,
         execution_id,
         completed_at,
-        TaskRunOutcomeData { outcome: ScheduledForegroundLastOutcome::Failed, reason: Some(reason), summary: Some(summary) },
+        TaskRunOutcomeData {
+            outcome: ScheduledForegroundLastOutcome::Failed,
+            reason: Some(reason),
+            summary: Some(summary),
+        },
         completed_at + cadence_as_duration(task.cooldown_seconds)?,
     )
     .await

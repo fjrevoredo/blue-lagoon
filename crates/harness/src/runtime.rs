@@ -580,7 +580,10 @@ where
             config,
             model_gateway_config,
             claim,
-            foreground_orchestration::ForegroundExecutionIds { trace_id, execution_id },
+            foreground_orchestration::ForegroundExecutionIds {
+                trace_id,
+                execution_id,
+            },
             transport,
             delivery,
         )
