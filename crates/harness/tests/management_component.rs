@@ -5,16 +5,18 @@ use chrono::{Duration, Utc};
 use contracts::{
     CapabilityScope, ChannelKind, EnvironmentCapabilityScope, ExecutionCapabilityBudget,
     FilesystemCapabilityScope, GovernedActionKind, GovernedActionRiskTier, IngressEventKind,
-    NetworkAccessPosture, NormalizedIngress, WorkspaceArtifactKind, WorkspaceScriptRunStatus,
+    NetworkAccessPosture, NormalizedIngress, ScheduledForegroundTaskStatus, WorkspaceArtifactKind,
+    WorkspaceScriptRunStatus,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
+    audit,
     background::{
         self, BackgroundJobRunStatus, BackgroundJobStatus, NewBackgroundJob, NewBackgroundJobRun,
         NewWakeSignalRecord, WakeSignalStatus,
     },
     execution::{self, NewExecutionRecord},
-    foreground::{self, NewIngressEvent},
+    foreground::{self, NewConversationBinding, NewIngressEvent},
     governed_actions, management, recovery,
     workspace::{self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun},
 };
@@ -566,6 +568,83 @@ async fn recovery_lease_list_surfaces_stalled_work_inspection() -> Result<()> {
         assert_eq!(leases[0].execution_id, Some(execution_id));
         assert_eq!(leases[0].background_job_id, None);
         assert_eq!(leases[0].background_job_run_id, None);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_management_upsert_list_and_show_are_auditable() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "24".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let next_due_at = Utc::now() + Duration::minutes(10);
+        let upserted = management::upsert_scheduled_foreground_task(
+            &ctx.config,
+            management::UpsertScheduledForegroundTaskRequest {
+                task_key: "daily-checkin".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "Daily check-in".to_string(),
+                cadence_seconds: 600,
+                cooldown_seconds: Some(300),
+                next_due_at: Some(next_due_at),
+                status: ScheduledForegroundTaskStatus::Active,
+                actor_ref: "cli:primary-user".to_string(),
+                reason: Some("phase7 management coverage".to_string()),
+            },
+        )
+        .await?;
+
+        assert_eq!(upserted.action, "created");
+        assert_eq!(upserted.task.task_key, "daily-checkin");
+        assert_eq!(upserted.task.status, "active");
+        assert!(upserted.task.conversation_binding_present);
+        assert_eq!(upserted.task.cooldown_seconds, 300);
+
+        let listed = management::list_scheduled_foreground_tasks(
+            &ctx.config,
+            Some(ScheduledForegroundTaskStatus::Active),
+            false,
+            10,
+        )
+        .await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task_key, "daily-checkin");
+        assert_eq!(listed[0].channel_kind, "telegram");
+
+        let shown = management::get_scheduled_foreground_task(&ctx.config, "daily-checkin")
+            .await?
+            .expect("scheduled task should exist");
+        assert_eq!(
+            shown.scheduled_foreground_task_id,
+            upserted.task.scheduled_foreground_task_id
+        );
+        assert_eq!(shown.message_text, "Daily check-in");
+
+        let audit_events = audit::list_for_trace(&ctx.pool, upserted.trace_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "management_scheduled_foreground_upsert_requested")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "management_scheduled_foreground_upsert_completed")
+        );
         Ok(())
     })
     .await

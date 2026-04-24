@@ -21,6 +21,7 @@ pub mod proposal;
 pub mod recovery;
 pub mod retrieval;
 pub mod runtime;
+pub mod scheduled_foreground;
 pub mod schema;
 pub mod self_model;
 pub mod telegram;

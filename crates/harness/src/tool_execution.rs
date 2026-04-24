@@ -279,8 +279,8 @@ mod tests {
         AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
         BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
         BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, GovernedActionsConfig,
-        HarnessConfig, RetrievalConfig, RuntimeConfig, WakeSignalPolicyConfig, WorkerConfig,
-        WorkspaceConfig,
+        HarnessConfig, RetrievalConfig, RuntimeConfig, ScheduledForegroundConfig,
+        WakeSignalPolicyConfig, WorkerConfig, WorkspaceConfig,
     };
     use contracts::{
         EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
@@ -337,6 +337,12 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            scheduled_foreground: ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
             },
             workspace: WorkspaceConfig {
                 root_dir: env::current_dir().expect("current dir should resolve"),

@@ -2,6 +2,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use assert_cmd::prelude::*;
+use contracts::ChannelKind;
 use predicates::prelude::*;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use url::Url;
@@ -140,6 +141,48 @@ fn admin_recovery_supervise_help_lists_operator_arguments() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn admin_foreground_schedules_list_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("foreground")
+        .arg("schedules")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
+        .stdout(predicate::str::contains("--due-only"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_foreground_schedules_upsert_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("foreground")
+        .arg("schedules")
+        .arg("upsert")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--task-key"))
+        .stdout(predicate::str::contains("--internal-principal-ref"))
+        .stdout(predicate::str::contains("--internal-conversation-ref"))
+        .stdout(predicate::str::contains("--message-text"))
+        .stdout(predicate::str::contains("--cadence-seconds"))
+        .stdout(predicate::str::contains("--next-due-at"))
+        .stdout(predicate::str::contains("--actor-ref"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_status_json_runs_against_a_real_database() -> Result<()> {
     let admin_database_url = std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL")
@@ -225,6 +268,96 @@ async fn phase_six_admin_json_commands_run_against_a_real_database() -> Result<(
         &database_url,
         &["admin", "schema", "upgrade-path", "--json"],
         "\"compatibility\": \"supported\"",
+    )?;
+
+    drop_database(&admin_database_url, &database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase_seven_admin_scheduled_foreground_commands_run_against_a_real_database() -> Result<()>
+{
+    let admin_database_url = std::env::var("BLUE_LAGOON_TEST_POSTGRES_ADMIN_URL")
+        .unwrap_or_else(|_| DEFAULT_TEST_POSTGRES_ADMIN_URL.to_string());
+    let database_name = format!("blue_lagoon_runtime_test_{}", Uuid::now_v7().simple());
+    let database_url = disposable_database_url(&admin_database_url, &database_name)?;
+    create_database(&admin_database_url, &database_name).await?;
+
+    let pool = PgPool::connect(&database_url)
+        .await
+        .context("failed to connect to disposable runtime test database")?;
+    harness::migration::apply_pending_migrations(&pool, env!("CARGO_PKG_VERSION")).await?;
+    harness::foreground::upsert_conversation_binding(
+        &pool,
+        &harness::foreground::NewConversationBinding {
+            conversation_binding_id: Uuid::now_v7(),
+            channel_kind: ChannelKind::Telegram,
+            external_user_id: "42".to_string(),
+            external_conversation_id: "24".to_string(),
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+        },
+    )
+    .await?;
+    pool.close().await;
+
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "foreground", "schedules", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &[
+            "admin",
+            "foreground",
+            "schedules",
+            "upsert",
+            "--task-key",
+            "daily-checkin",
+            "--internal-principal-ref",
+            "primary-user",
+            "--internal-conversation-ref",
+            "telegram-primary",
+            "--message-text",
+            "Daily check-in",
+            "--cadence-seconds",
+            "600",
+            "--cooldown-seconds",
+            "300",
+            "--actor-ref",
+            "cli:test-operator",
+            "--reason",
+            "runtime-cli-verification",
+            "--json",
+        ],
+        "\"action\": \"created\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &[
+            "admin",
+            "foreground",
+            "schedules",
+            "show",
+            "--task-key",
+            "daily-checkin",
+            "--json",
+        ],
+        "\"task_key\": \"daily-checkin\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &[
+            "admin",
+            "foreground",
+            "schedules",
+            "list",
+            "--status",
+            "active",
+            "--json",
+        ],
+        "\"conversation_binding_present\": true",
     )?;
 
     drop_database(&admin_database_url, &database_name).await?;

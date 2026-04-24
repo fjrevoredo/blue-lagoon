@@ -281,6 +281,22 @@ pub enum ForegroundTriggerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ScheduledForegroundTaskStatus {
+    Active,
+    Paused,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledForegroundLastOutcome {
+    Completed,
+    Suppressed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ForegroundExecutionMode {
     SingleIngress,
     BacklogRecovery,

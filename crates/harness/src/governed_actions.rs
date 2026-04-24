@@ -1806,6 +1806,12 @@ mod tests {
                     max_recovery_batch_size: 8,
                 },
             },
+            scheduled_foreground: crate::config::ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
+            },
             workspace: crate::config::WorkspaceConfig {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,

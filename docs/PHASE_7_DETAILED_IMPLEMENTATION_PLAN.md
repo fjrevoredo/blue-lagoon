@@ -3,7 +3,7 @@
 ## Phase 7 Detailed Implementation Plan
 
 Date: 2026-04-24
-Status: Planned; Milestone A, Milestone B, Milestone C, and Milestone D not started
+Status: In progress; Milestone A and Milestone B complete, Milestone C in progress, and Milestone D not started
 Scope: High-level plan Phase 7 only
 Audience: LLM-assisted implementation work and human review
 
@@ -329,12 +329,12 @@ remains the durable execution record.
 
 ## Progress snapshot
 
-- Milestone A: `TODO`
-- Milestone B: `TODO`
-- Milestone C: `TODO`
+- Milestone A: `DONE`
+- Milestone B: `DONE`
+- Milestone C: `IN PROGRESS`
 - Milestone D: `TODO`
-- Completed task count: `0 / 19`
-- Current critical-path task: `A1`
+- Completed task count: `10 / 19`
+- Current critical-path task: `C1`
 
 ## Execution refinement notes
 
@@ -694,19 +694,19 @@ Before Phase 7 is closed, verify that:
 
 | Task | Title | Status | Notes |
 | --- | --- | --- | --- |
-| A1 | Lock the exact post-Phase-6 drift list | TODO | Remaining canonical gap and accepted prior fixes |
-| A2 | Translate the scheduled-foreground model into architecture constraints | TODO | Runtime, policy, persistence, recovery, delivery |
-| A3 | Define the Phase 7 operator workflows and CLI expansion boundary | TODO | Scheduled-foreground management surface |
-| A4 | Define the Phase 7 test and CI gate strategy | TODO | Extend existing stable jobs |
-| B1 | Add reviewed SQL migration for scheduled foreground task state | TODO | Canonical schedule persistence |
-| B2 | Implement canonical Phase 7 contracts and harness persistence services | TODO | Validation, records, due-task helpers |
-| B3 | Extend config and policy for proactive scheduling controls | TODO | Cooldowns, limits, budgets, suppression |
-| B4 | Implement management services for scheduled foreground inspection | TODO | Harness-side read models |
-| B5 | Add PostgreSQL-backed component tests for scheduled-task state | TODO | Persistence and policy coverage |
+| A1 | Lock the exact post-Phase-6 drift list | DONE | Phase 7 remained focused on the scheduled-foreground trigger gap plus deferred user-facing docs |
+| A2 | Translate the scheduled-foreground model into architecture constraints | DONE | v1 shape settled around harness-owned persistence, management authoring, and later runtime execution |
+| A3 | Define the Phase 7 operator workflows and CLI expansion boundary | DONE | `admin foreground schedules list/show/upsert` established as the bounded v1 authoring and inspection path |
+| A4 | Define the Phase 7 test and CI gate strategy | DONE | Focused runtime parser/formatter coverage and PostgreSQL-backed management coverage are now in place |
+| B1 | Add reviewed SQL migration for scheduled foreground task state | DONE | Added `migrations/0008__scheduled_foreground_tasks.sql` |
+| B2 | Implement canonical Phase 7 contracts and harness persistence services | DONE | Added scheduled-task status/outcome contracts plus harness persistence and lookup helpers |
+| B3 | Extend config and policy for proactive scheduling controls | DONE | Added `scheduled_foreground` config with enablement, cadence floor, cooldown default, and due-task iteration cap |
+| B4 | Implement management services for scheduled foreground inspection | DONE | Added auditable harness management upsert/list/show with conversation-binding validation |
+| B5 | Add PostgreSQL-backed component tests for scheduled-task state | DONE | Added management component coverage for scheduled-task upsert/list/show and audit trace emission |
 | C1 | Integrate due scheduled-task planning into the harness service loop | TODO | Continuous runtime integration |
 | C2 | Implement scheduled foreground trigger construction and orchestration | TODO | Real `ScheduledTask` producer path |
 | C3 | Integrate scheduled foreground recovery and restart handling | TODO | Lease, checkpoint, restart, fail-closed behavior |
-| C4 | Extend the management CLI for scheduled foreground workflows | TODO | `admin` command expansion |
+| C4 | Extend the management CLI for scheduled foreground workflows | DONE | Added runtime admin parser/help/JSON/text support for scheduled task list/show/upsert |
 | C5 | Add end-to-end integration coverage for scheduled foreground behavior | TODO | Execution, suppression, recovery, CLI |
 | D1 | Run and document the full post-Phase-7 canonical drift audit | TODO | Requirements-to-implementation recheck |
 | D2 | Add final parser, formatter, and release-readiness coverage | TODO | CLI and gate completion |

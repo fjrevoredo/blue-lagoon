@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness::{
     config::RuntimeConfig,
@@ -9,8 +10,9 @@ use harness::{
         BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
         GovernedActionSummary, OperationalDiagnosticSummary, OperationalHealthSummary,
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
-        ResolveApprovalRequest, RuntimeStatusReport, SchemaStatusReport,
-        SchemaUpgradeAssessmentReport, SuperviseWorkerLeasesRequest, WakeSignalSummary,
+        ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
+        ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
+        SuperviseWorkerLeasesRequest, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
         WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
     },
 };
@@ -154,6 +156,66 @@ pub struct ForegroundCommand {
 #[derive(Debug, Subcommand)]
 pub enum ForegroundSubcommand {
     Pending(ListCommand),
+    Schedules(ForegroundSchedulesCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct ForegroundSchedulesCommand {
+    #[command(subcommand)]
+    pub command: ForegroundSchedulesSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ForegroundSchedulesSubcommand {
+    List(ForegroundScheduleListCommand),
+    Show(ForegroundScheduleShowCommand),
+    Upsert(ForegroundScheduleUpsertCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<ForegroundScheduleStatusArg>,
+    #[arg(long, default_value_t = false)]
+    pub due_only: bool,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleShowCommand {
+    #[arg(long)]
+    pub task_key: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForegroundScheduleUpsertCommand {
+    #[arg(long)]
+    pub task_key: String,
+    #[arg(long)]
+    pub internal_principal_ref: String,
+    #[arg(long)]
+    pub internal_conversation_ref: String,
+    #[arg(long)]
+    pub message_text: String,
+    #[arg(long)]
+    pub cadence_seconds: u64,
+    #[arg(long)]
+    pub cooldown_seconds: Option<u64>,
+    #[arg(long)]
+    pub next_due_at: Option<String>,
+    #[arg(long, value_enum, default_value_t = ForegroundScheduleStatusArg::Active)]
+    pub status: ForegroundScheduleStatusArg,
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -368,6 +430,13 @@ pub enum GovernedActionStatusArg {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ForegroundScheduleStatusArg {
+    Active,
+    Paused,
+    Disabled,
+}
+
 impl From<JobKindArg> for contracts::UnconsciousJobKind {
     fn from(value: JobKindArg) -> Self {
         match value {
@@ -425,6 +494,16 @@ impl From<GovernedActionStatusArg> for contracts::GovernedActionStatus {
             GovernedActionStatusArg::Blocked => Self::Blocked,
             GovernedActionStatusArg::Executed => Self::Executed,
             GovernedActionStatusArg::Failed => Self::Failed,
+        }
+    }
+}
+
+impl From<ForegroundScheduleStatusArg> for contracts::ScheduledForegroundTaskStatus {
+    fn from(value: ForegroundScheduleStatusArg) -> Self {
+        match value {
+            ForegroundScheduleStatusArg::Active => Self::Active,
+            ForegroundScheduleStatusArg::Paused => Self::Paused,
+            ForegroundScheduleStatusArg::Disabled => Self::Disabled,
         }
     }
 }
@@ -503,6 +582,47 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                         .await?;
                 print_pending_foreground(summaries, command.json)?;
             }
+            ForegroundSubcommand::Schedules(command) => match command.command {
+                ForegroundSchedulesSubcommand::List(command) => {
+                    let schedules = management::list_scheduled_foreground_tasks(
+                        config,
+                        command.status.map(Into::into),
+                        command.due_only,
+                        command.limit,
+                    )
+                    .await?;
+                    print_scheduled_foreground_tasks(schedules, command.json)?;
+                }
+                ForegroundSchedulesSubcommand::Show(command) => {
+                    let schedule =
+                        management::get_scheduled_foreground_task(config, &command.task_key)
+                            .await?;
+                    print_scheduled_foreground_task(schedule, command.json)?;
+                }
+                ForegroundSchedulesSubcommand::Upsert(command) => {
+                    let summary = management::upsert_scheduled_foreground_task(
+                        config,
+                        UpsertScheduledForegroundTaskRequest {
+                            task_key: command.task_key,
+                            internal_principal_ref: command.internal_principal_ref,
+                            internal_conversation_ref: command.internal_conversation_ref,
+                            message_text: command.message_text,
+                            cadence_seconds: command.cadence_seconds,
+                            cooldown_seconds: command.cooldown_seconds,
+                            next_due_at: parse_optional_rfc3339_datetime(
+                                command.next_due_at.as_deref(),
+                            )?,
+                            status: command.status.into(),
+                            actor_ref: command
+                                .actor_ref
+                                .unwrap_or_else(|| "cli:operator".to_string()),
+                            reason: command.reason,
+                        },
+                    )
+                    .await?;
+                    print_scheduled_foreground_task_upsert(summary, command.json)?;
+                }
+            },
         },
         AdminSubcommand::Background(command) => match command.command {
             BackgroundSubcommand::List(command) => {
@@ -831,6 +951,48 @@ fn print_pending_foreground(
     Ok(())
 }
 
+fn print_scheduled_foreground_tasks(
+    tasks: Vec<ScheduledForegroundTaskSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tasks)?);
+        return Ok(());
+    }
+
+    println!("{}", render_scheduled_foreground_tasks_text(&tasks));
+    Ok(())
+}
+
+fn print_scheduled_foreground_task(
+    task: Option<ScheduledForegroundTaskSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+        return Ok(());
+    }
+
+    match task {
+        Some(task) => println!("{}", render_scheduled_foreground_tasks_text(&[task])),
+        None => println!("Scheduled foreground task not found."),
+    }
+    Ok(())
+}
+
+fn print_scheduled_foreground_task_upsert(
+    summary: ScheduledForegroundTaskUpsertSummary,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", render_scheduled_foreground_task_upsert_text(&summary));
+    Ok(())
+}
+
 fn print_approval_requests(summaries: Vec<ApprovalRequestSummary>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
@@ -895,6 +1057,85 @@ fn print_workspace_runs(runs: Vec<WorkspaceScriptRunSummary>, json: bool) -> Res
 
     println!("{}", render_workspace_runs_text(&runs));
     Ok(())
+}
+
+fn render_scheduled_foreground_tasks_text(tasks: &[ScheduledForegroundTaskSummary]) -> String {
+    if tasks.is_empty() {
+        return "No scheduled foreground tasks.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, task) in tasks.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | channel={} | binding={} | cadence={}s | cooldown={}s | next_due_at={}",
+            task.task_key,
+            task.status,
+            task.channel_kind,
+            yes_no(task.conversation_binding_present),
+            task.cadence_seconds,
+            task.cooldown_seconds,
+            task.next_due_at
+        );
+        let _ = writeln!(
+            output,
+            "  principal={} conversation={}",
+            task.internal_principal_ref, task.internal_conversation_ref
+        );
+        let _ = writeln!(output, "  message_text: {}", task.message_text);
+        let _ = writeln!(
+            output,
+            "  current_execution_id={} last_execution_id={} last_outcome={}",
+            task.current_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            task.last_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            task.last_outcome.as_deref().unwrap_or("none")
+        );
+        let _ = writeln!(
+            output,
+            "  created_by={} updated_by={} updated_at={}",
+            task.created_by, task.updated_by, task.updated_at
+        );
+        if task.last_outcome_reason.is_some() || task.last_outcome_summary.is_some() {
+            let _ = writeln!(
+                output,
+                "  last_outcome_reason={} last_outcome_summary={}",
+                task.last_outcome_reason.as_deref().unwrap_or("none"),
+                task.last_outcome_summary.as_deref().unwrap_or("none")
+            );
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_scheduled_foreground_task_upsert_text(
+    summary: &ScheduledForegroundTaskUpsertSummary,
+) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Scheduled foreground task {} {}",
+        summary.task.task_key, summary.action
+    );
+    let _ = writeln!(
+        output,
+        "  trace_id={} actor_ref={} reason={}",
+        summary.trace_id,
+        summary.actor_ref,
+        summary.reason.as_deref().unwrap_or("none")
+    );
+    let _ = write!(
+        output,
+        "{}",
+        render_scheduled_foreground_tasks_text(&[summary.task.clone()])
+    );
+    output.trim_end().to_string()
 }
 
 fn render_approval_requests_text(summaries: &[ApprovalRequestSummary]) -> String {
@@ -1512,6 +1753,15 @@ fn print_wake_signals(signals: Vec<WakeSignalSummary>, json: bool) -> Result<()>
     Ok(())
 }
 
+fn parse_optional_rfc3339_datetime(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        Some(value) => Ok(Some(
+            DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc),
+        )),
+        None => Ok(None),
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1717,6 +1967,46 @@ mod tests {
             "released_at": null
         }))
         .expect("sample worker lease inspection summary should deserialize")
+    }
+
+    fn sample_scheduled_foreground_task_summary() -> ScheduledForegroundTaskSummary {
+        serde_json::from_value(json!({
+            "scheduled_foreground_task_id": "00000000-0000-0000-0000-000000000071",
+            "task_key": "daily-checkin",
+            "channel_kind": "telegram",
+            "status": "active",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "conversation_binding_present": true,
+            "message_text": "Daily check-in",
+            "cadence_seconds": 600,
+            "cooldown_seconds": 300,
+            "next_due_at": "2026-04-24T10:15:00Z",
+            "current_execution_id": null,
+            "current_run_started_at": null,
+            "last_execution_id": "00000000-0000-0000-0000-000000000072",
+            "last_run_started_at": "2026-04-24T10:00:00Z",
+            "last_run_completed_at": "2026-04-24T10:01:00Z",
+            "last_outcome": "completed",
+            "last_outcome_reason": "scheduled_delivery_completed",
+            "last_outcome_summary": "sent scheduled check-in",
+            "created_by": "cli:operator",
+            "updated_by": "cli:operator",
+            "created_at": "2026-04-24T09:55:00Z",
+            "updated_at": "2026-04-24T10:05:00Z"
+        }))
+        .expect("sample scheduled foreground task should deserialize")
+    }
+
+    fn sample_scheduled_foreground_task_upsert_summary() -> ScheduledForegroundTaskUpsertSummary {
+        serde_json::from_value(json!({
+            "trace_id": "00000000-0000-0000-0000-000000000073",
+            "action": "created",
+            "actor_ref": "cli:operator",
+            "reason": "manual schedule creation",
+            "task": sample_scheduled_foreground_task_summary()
+        }))
+        .expect("sample scheduled foreground task upsert summary should deserialize")
     }
 
     fn sample_schema_upgrade_assessment() -> SchemaUpgradeAssessmentReport {
@@ -1945,6 +2235,91 @@ mod tests {
     }
 
     #[test]
+    fn phase_seven_admin_parser_accepts_scheduled_foreground_upsert_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "foreground",
+            "schedules",
+            "upsert",
+            "--task-key",
+            "daily-checkin",
+            "--internal-principal-ref",
+            "primary-user",
+            "--internal-conversation-ref",
+            "telegram-primary",
+            "--message-text",
+            "Daily check-in",
+            "--cadence-seconds",
+            "600",
+            "--cooldown-seconds",
+            "300",
+            "--next-due-at",
+            "2026-04-24T10:15:00Z",
+            "--status",
+            "paused",
+            "--actor-ref",
+            "cli:operator",
+            "--reason",
+            "manual schedule creation",
+        ])
+        .expect("scheduled foreground upsert command should parse");
+
+        match command.command {
+            AdminSubcommand::Foreground(ForegroundCommand {
+                command:
+                    ForegroundSubcommand::Schedules(ForegroundSchedulesCommand {
+                        command: ForegroundSchedulesSubcommand::Upsert(command),
+                    }),
+            }) => {
+                assert_eq!(command.task_key, "daily-checkin");
+                assert_eq!(command.cadence_seconds, 600);
+                assert_eq!(command.cooldown_seconds, Some(300));
+                assert!(matches!(
+                    command.status,
+                    ForegroundScheduleStatusArg::Paused
+                ));
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:operator"));
+            }
+            other => panic!("expected scheduled foreground upsert command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_seven_admin_parser_accepts_scheduled_foreground_list_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "foreground",
+            "schedules",
+            "list",
+            "--status",
+            "active",
+            "--due-only",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("scheduled foreground list command should parse");
+
+        match command.command {
+            AdminSubcommand::Foreground(ForegroundCommand {
+                command:
+                    ForegroundSubcommand::Schedules(ForegroundSchedulesCommand {
+                        command: ForegroundSchedulesSubcommand::List(command),
+                    }),
+            }) => {
+                assert!(matches!(
+                    command.status,
+                    Some(ForegroundScheduleStatusArg::Active)
+                ));
+                assert!(command.due_only);
+                assert_eq!(command.limit, 5);
+                assert!(command.json);
+            }
+            other => panic!("expected scheduled foreground list command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn render_approval_requests_text_includes_resolution_metadata() {
         let rendered = render_approval_requests_text(&[sample_approval_request_summary()]);
         assert!(rendered.contains("status=approved"));
@@ -2027,5 +2402,25 @@ mod tests {
             render_recovery_leases_text(&[]),
             "No active worker leases.".to_string()
         );
+    }
+
+    #[test]
+    fn phase_seven_render_scheduled_foreground_task_text_includes_binding_and_outcome() {
+        let rendered =
+            render_scheduled_foreground_tasks_text(&[sample_scheduled_foreground_task_summary()]);
+        assert!(rendered.contains("status=active"));
+        assert!(rendered.contains("binding=yes"));
+        assert!(rendered.contains("last_outcome=completed"));
+        assert!(rendered.contains("message_text: Daily check-in"));
+    }
+
+    #[test]
+    fn phase_seven_render_scheduled_foreground_upsert_text_includes_trace_and_reason() {
+        let rendered = render_scheduled_foreground_task_upsert_text(
+            &sample_scheduled_foreground_task_upsert_summary(),
+        );
+        assert!(rendered.contains("Scheduled foreground task daily-checkin created"));
+        assert!(rendered.contains("trace_id=00000000-0000-0000-0000-000000000073"));
+        assert!(rendered.contains("reason=manual schedule creation"));
     }
 }

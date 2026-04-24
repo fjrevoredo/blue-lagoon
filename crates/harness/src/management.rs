@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use contracts::{BackgroundTrigger, BackgroundTriggerKind, UnconsciousJobKind};
+use contracts::{
+    BackgroundTrigger, BackgroundTriggerKind, ChannelKind, ScheduledForegroundLastOutcome,
+    ScheduledForegroundTaskStatus, UnconsciousJobKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -14,7 +17,7 @@ use crate::{
     background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     config::RuntimeConfig,
-    db, governed_actions, migration, model_gateway, recovery,
+    db, governed_actions, migration, model_gateway, recovery, scheduled_foreground,
     schema::{self, SchemaCompatibility, SchemaPolicy},
     worker, workspace,
 };
@@ -161,6 +164,42 @@ pub struct WorkerLeaseInspectionSummary {
     pub lease_expires_at: DateTime<Utc>,
     pub last_heartbeat_at: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledForegroundTaskSummary {
+    pub scheduled_foreground_task_id: Uuid,
+    pub task_key: String,
+    pub channel_kind: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub conversation_binding_present: bool,
+    pub message_text: String,
+    pub cadence_seconds: u64,
+    pub cooldown_seconds: u64,
+    pub next_due_at: DateTime<Utc>,
+    pub current_execution_id: Option<Uuid>,
+    pub current_run_started_at: Option<DateTime<Utc>>,
+    pub last_execution_id: Option<Uuid>,
+    pub last_run_started_at: Option<DateTime<Utc>>,
+    pub last_run_completed_at: Option<DateTime<Utc>>,
+    pub last_outcome: Option<String>,
+    pub last_outcome_reason: Option<String>,
+    pub last_outcome_summary: Option<String>,
+    pub created_by: String,
+    pub updated_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledForegroundTaskUpsertSummary {
+    pub trace_id: Uuid,
+    pub action: String,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub task: ScheduledForegroundTaskSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +402,20 @@ pub struct EnqueueBackgroundJobRequest {
 #[derive(Debug, Clone)]
 pub struct SuperviseWorkerLeasesRequest {
     pub soft_warning_threshold_percent: u8,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertScheduledForegroundTaskRequest {
+    pub task_key: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub message_text: String,
+    pub cadence_seconds: u64,
+    pub cooldown_seconds: Option<u64>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub status: ScheduledForegroundTaskStatus,
     pub actor_ref: String,
     pub reason: Option<String>,
 }
@@ -587,6 +640,189 @@ pub async fn list_active_worker_leases(
             })
         })
         .collect()
+}
+
+pub async fn list_scheduled_foreground_tasks(
+    config: &RuntimeConfig,
+    status: Option<ScheduledForegroundTaskStatus>,
+    due_only: bool,
+    limit: u32,
+) -> Result<Vec<ScheduledForegroundTaskSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let records = scheduled_foreground::list_tasks(
+        &pool,
+        scheduled_foreground::ScheduledForegroundTaskListFilter {
+            status,
+            due_only,
+            limit: i64::from(limit),
+        },
+    )
+    .await?;
+
+    let mut summaries = Vec::with_capacity(records.len());
+    for record in records {
+        summaries.push(scheduled_foreground_task_summary_from_record(&pool, record).await?);
+    }
+    Ok(summaries)
+}
+
+pub async fn get_scheduled_foreground_task(
+    config: &RuntimeConfig,
+    task_key: &str,
+) -> Result<Option<ScheduledForegroundTaskSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let task_key = task_key.trim();
+    if task_key.is_empty() {
+        bail!("scheduled foreground task key must not be empty");
+    }
+
+    let Some(record) = scheduled_foreground::get_task_by_key(&pool, task_key).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        scheduled_foreground_task_summary_from_record(&pool, record).await?,
+    ))
+}
+
+pub async fn upsert_scheduled_foreground_task(
+    config: &RuntimeConfig,
+    request: UpsertScheduledForegroundTaskRequest,
+) -> Result<ScheduledForegroundTaskUpsertSummary> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("scheduled foreground actor_ref must not be empty");
+    }
+
+    let task_key = request.task_key.trim();
+    if task_key.is_empty() {
+        bail!("scheduled foreground task key must not be empty");
+    }
+
+    let internal_conversation_ref = request.internal_conversation_ref.trim();
+    if internal_conversation_ref.is_empty() {
+        bail!("scheduled foreground internal_conversation_ref must not be empty");
+    }
+
+    let binding_present =
+        scheduled_foreground::conversation_binding_present(&pool, internal_conversation_ref)
+            .await?;
+    if !binding_present {
+        bail!(
+            "scheduled foreground internal_conversation_ref '{}' does not have a bound conversation",
+            internal_conversation_ref
+        );
+    }
+
+    let trace_id = Uuid::now_v7();
+    let reason = request.reason.clone();
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_scheduled_foreground_upsert_requested".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "task_key": task_key,
+                "internal_principal_ref": request.internal_principal_ref.trim(),
+                "internal_conversation_ref": internal_conversation_ref,
+                "binding_present": binding_present,
+                "cadence_seconds": request.cadence_seconds,
+                "cooldown_seconds": request.cooldown_seconds,
+                "next_due_at": request.next_due_at,
+                "status": scheduled_foreground_task_status_label(request.status),
+            }),
+        },
+    )
+    .await?;
+
+    let upsert_result = match scheduled_foreground::upsert_task(
+        &pool,
+        config,
+        &scheduled_foreground::UpsertScheduledForegroundTask {
+            task_key: task_key.to_string(),
+            internal_principal_ref: request.internal_principal_ref,
+            internal_conversation_ref: request.internal_conversation_ref,
+            message_text: request.message_text,
+            cadence_seconds: request.cadence_seconds,
+            cooldown_seconds: request.cooldown_seconds,
+            next_due_at: request.next_due_at,
+            status: request.status,
+            actor_ref: actor_ref.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = audit::insert(
+                &pool,
+                &NewAuditEvent {
+                    loop_kind: "operator".to_string(),
+                    subsystem: "management".to_string(),
+                    event_kind: "management_scheduled_foreground_upsert_failed".to_string(),
+                    severity: "error".to_string(),
+                    trace_id,
+                    execution_id: None,
+                    worker_pid: None,
+                    payload: json!({
+                        "actor_ref": actor_ref,
+                        "reason": reason.clone(),
+                        "task_key": task_key,
+                        "error": error.to_string(),
+                    }),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+
+    let action = scheduled_foreground_task_write_action_label(upsert_result.action);
+    let task = scheduled_foreground_task_summary_from_record(&pool, upsert_result.record).await?;
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_scheduled_foreground_upsert_completed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "action": action,
+                "task_key": task.task_key.clone(),
+                "scheduled_foreground_task_id": task.scheduled_foreground_task_id,
+                "status": task.status.clone(),
+                "next_due_at": task.next_due_at,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(ScheduledForegroundTaskUpsertSummary {
+        trace_id,
+        action,
+        actor_ref: actor_ref.to_string(),
+        reason,
+        task,
+    })
 }
 
 pub async fn list_recent_operational_diagnostics(
@@ -1871,6 +2107,42 @@ fn count_from_row(row: &sqlx::postgres::PgRow, field: &str) -> u32 {
     row.get::<i64, _>(field).max(0) as u32
 }
 
+async fn scheduled_foreground_task_summary_from_record(
+    pool: &PgPool,
+    record: scheduled_foreground::ScheduledForegroundTaskRecord,
+) -> Result<ScheduledForegroundTaskSummary> {
+    let conversation_binding_present =
+        scheduled_foreground::conversation_binding_present(pool, &record.internal_conversation_ref)
+            .await?;
+    Ok(ScheduledForegroundTaskSummary {
+        scheduled_foreground_task_id: record.scheduled_foreground_task_id,
+        task_key: record.task_key,
+        channel_kind: scheduled_foreground_channel_kind_label(record.channel_kind),
+        status: scheduled_foreground_task_status_label(record.status),
+        internal_principal_ref: record.internal_principal_ref,
+        internal_conversation_ref: record.internal_conversation_ref,
+        conversation_binding_present,
+        message_text: record.message_text,
+        cadence_seconds: record.cadence_seconds,
+        cooldown_seconds: record.cooldown_seconds,
+        next_due_at: record.next_due_at,
+        current_execution_id: record.current_execution_id,
+        current_run_started_at: record.current_run_started_at,
+        last_execution_id: record.last_execution_id,
+        last_run_started_at: record.last_run_started_at,
+        last_run_completed_at: record.last_run_completed_at,
+        last_outcome: record
+            .last_outcome
+            .map(scheduled_foreground_last_outcome_label),
+        last_outcome_reason: record.last_outcome_reason,
+        last_outcome_summary: record.last_outcome_summary,
+        created_by: record.created_by,
+        updated_by: record.updated_by,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    })
+}
+
 fn recovered_worker_lease_summary(
     outcome: recovery::WorkerLeaseRecoveryOutcome,
 ) -> RecoveredWorkerLeaseSummary {
@@ -2074,6 +2346,41 @@ fn worker_lease_supervision_status_label(
     .to_string()
 }
 
+fn scheduled_foreground_channel_kind_label(kind: ChannelKind) -> String {
+    match kind {
+        ChannelKind::Telegram => "telegram",
+    }
+    .to_string()
+}
+
+fn scheduled_foreground_task_status_label(status: ScheduledForegroundTaskStatus) -> String {
+    match status {
+        ScheduledForegroundTaskStatus::Active => "active",
+        ScheduledForegroundTaskStatus::Paused => "paused",
+        ScheduledForegroundTaskStatus::Disabled => "disabled",
+    }
+    .to_string()
+}
+
+fn scheduled_foreground_last_outcome_label(outcome: ScheduledForegroundLastOutcome) -> String {
+    match outcome {
+        ScheduledForegroundLastOutcome::Completed => "completed",
+        ScheduledForegroundLastOutcome::Suppressed => "suppressed",
+        ScheduledForegroundLastOutcome::Failed => "failed",
+    }
+    .to_string()
+}
+
+fn scheduled_foreground_task_write_action_label(
+    action: scheduled_foreground::ScheduledForegroundTaskWriteAction,
+) -> String {
+    match action {
+        scheduled_foreground::ScheduledForegroundTaskWriteAction::Created => "created",
+        scheduled_foreground::ScheduledForegroundTaskWriteAction::Updated => "updated",
+    }
+    .to_string()
+}
+
 fn recovery_checkpoint_status_label(status: recovery::RecoveryCheckpointStatus) -> String {
     match status {
         recovery::RecoveryCheckpointStatus::Open => "open",
@@ -2185,8 +2492,8 @@ mod tests {
         AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
         BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
         ContinuityConfig, DatabaseConfig, GovernedActionsConfig, HarnessConfig, ModelGatewayConfig,
-        SelfModelConfig, TelegramConfig, TelegramForegroundBindingConfig, WakeSignalPolicyConfig,
-        WorkerConfig, WorkspaceConfig,
+        ScheduledForegroundConfig, SelfModelConfig, TelegramConfig,
+        TelegramForegroundBindingConfig, WakeSignalPolicyConfig, WorkerConfig, WorkspaceConfig,
     };
     use std::path::PathBuf;
 
@@ -2240,6 +2547,12 @@ mod tests {
                     stale_pending_ingress_age_seconds_threshold: 300,
                     max_recovery_batch_size: 8,
                 },
+            },
+            scheduled_foreground: ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
             },
             workspace: WorkspaceConfig {
                 root_dir: ".".into(),

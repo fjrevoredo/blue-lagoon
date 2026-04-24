@@ -11,6 +11,12 @@ default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 60000
 default_foreground_token_budget = 4000
 
+[scheduled_foreground]
+enabled = true
+max_due_tasks_per_iteration = 2
+min_cadence_seconds = 300
+default_cooldown_seconds = 300
+
 [background.scheduler]
 poll_interval_seconds = 300
 max_due_jobs_per_iteration = 4

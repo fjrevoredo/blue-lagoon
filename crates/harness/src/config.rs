@@ -17,6 +17,7 @@ pub struct RuntimeConfig {
     pub app: AppConfig,
     pub database: DatabaseConfig,
     pub harness: HarnessConfig,
+    pub scheduled_foreground: ScheduledForegroundConfig,
     pub background: BackgroundConfig,
     pub continuity: ContinuityConfig,
     pub workspace: WorkspaceConfig,
@@ -46,6 +47,14 @@ pub struct HarnessConfig {
     pub default_foreground_iteration_budget: u32,
     pub default_wall_clock_budget_ms: u64,
     pub default_foreground_token_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ScheduledForegroundConfig {
+    pub enabled: bool,
+    pub max_due_tasks_per_iteration: u32,
+    pub min_cadence_seconds: u64,
+    pub default_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -235,6 +244,7 @@ struct FileConfig {
     app: AppConfig,
     database: FileDatabaseConfig,
     harness: HarnessConfig,
+    scheduled_foreground: ScheduledForegroundConfig,
     background: BackgroundConfig,
     continuity: ContinuityConfig,
     workspace: WorkspaceConfig,
@@ -313,6 +323,7 @@ impl RuntimeConfig {
                     .minimum_supported_schema_version,
             },
             harness: file_config.harness,
+            scheduled_foreground: file_config.scheduled_foreground,
             background: file_config.background,
             continuity: file_config.continuity,
             workspace: file_config.workspace,
@@ -351,6 +362,7 @@ impl RuntimeConfig {
         if self.harness.default_foreground_token_budget == 0 {
             bail!("harness.default_foreground_token_budget must be greater than zero");
         }
+        self.scheduled_foreground.validate()?;
         self.background.validate()?;
         self.continuity.validate()?;
         self.workspace.validate()?;
@@ -721,6 +733,21 @@ impl ContinuityConfig {
     }
 }
 
+impl ScheduledForegroundConfig {
+    fn validate(&self) -> Result<()> {
+        if self.max_due_tasks_per_iteration == 0 {
+            bail!("scheduled_foreground.max_due_tasks_per_iteration must be greater than zero");
+        }
+        if self.min_cadence_seconds == 0 {
+            bail!("scheduled_foreground.min_cadence_seconds must be greater than zero");
+        }
+        if self.default_cooldown_seconds == 0 {
+            bail!("scheduled_foreground.default_cooldown_seconds must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
 impl BackgroundConfig {
     fn validate(&self) -> Result<()> {
         self.scheduler.validate()?;
@@ -943,6 +970,12 @@ mod tests {
                 default_wall_clock_budget_ms: 30_000,
                 default_foreground_token_budget: 4_000,
             },
+            scheduled_foreground: ScheduledForegroundConfig {
+                enabled: true,
+                max_due_tasks_per_iteration: 2,
+                min_cadence_seconds: 300,
+                default_cooldown_seconds: 300,
+            },
             background: BackgroundConfig {
                 scheduler: BackgroundSchedulerConfig {
                     poll_interval_seconds: 300,
@@ -1049,6 +1082,12 @@ allow_synthetic_smoke = true
 default_foreground_iteration_budget = 1
 default_wall_clock_budget_ms = 30000
 default_foreground_token_budget = 4000
+
+[scheduled_foreground]
+enabled = true
+max_due_tasks_per_iteration = 2
+min_cadence_seconds = 300
+default_cooldown_seconds = 300
 
 [background.scheduler]
 poll_interval_seconds = 300
