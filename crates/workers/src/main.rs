@@ -541,35 +541,87 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
     } else {
         messages.push(ModelInputMessage {
             role: ModelMessageRole::Developer,
-            content: format!(
-                "If you need a governed action, append exactly one fenced ```{} block containing JSON with an 'actions' array of governed-action proposals. Keep all user-facing text outside that block. If no governed action is needed, do not emit the block.",
-                GOVERNED_ACTIONS_BLOCK_TAG
-            ),
+            content: governed_action_schema_message(),
         });
     }
 
+    let subgoals_fragment = if context.self_model.current_subgoals.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Active subgoals: {}.",
+            join_or_none(&context.self_model.current_subgoals)
+        )
+    };
+    let active_conditions_fragment = if context.internal_state.active_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Active conditions: {}.",
+            join_or_none(&context.internal_state.active_conditions)
+        )
+    };
+
     ModelInput {
         system_prompt: format!(
-            "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}. Execution mode: {}.",
-            context.self_model.stable_identity,
-            context.self_model.role,
-            context.self_model.communication_style,
-            join_or_none(&context.self_model.capabilities),
-            join_or_none(&context.self_model.constraints),
-            join_or_none(&context.self_model.preferences),
-            join_or_none(&context.self_model.current_goals),
-            join_or_none(&context.self_model.current_subgoals),
-            context.internal_state.load_pct,
-            context.internal_state.health_pct,
-            context.internal_state.reliability_pct,
-            context.internal_state.resource_pressure_pct,
-            context.internal_state.confidence_pct,
-            context.internal_state.connection_quality_pct,
-            join_or_none(&context.internal_state.active_conditions),
-            foreground_execution_mode_as_str(context.recovery_context.mode),
+            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
+            name = context.self_model.stable_identity,
+            role = context.self_model.role,
+            style = context.self_model.communication_style,
+            preferences = join_or_none(&context.self_model.preferences),
+            capabilities = join_or_none(&context.self_model.capabilities),
+            constraints = join_or_none(&context.self_model.constraints),
+            goals = join_or_none(&context.self_model.current_goals),
+            subgoals = subgoals_fragment,
+            conditions = active_conditions_fragment,
+            load = context.internal_state.load_pct,
+            health = context.internal_state.health_pct,
+            confidence = context.internal_state.confidence_pct,
+            mode = foreground_execution_mode_as_str(context.recovery_context.mode),
         ),
         messages,
     }
+}
+
+fn governed_action_schema_message() -> String {
+    let template = r#"GOVERNED ACTION SYSTEM
+
+To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block.
+
+Available action kinds:
+- run_subprocess: execute a bounded shell command
+- run_workspace_script: run a registered workspace script by its script_id UUID
+
+Block format (wrap all proposals in {"actions": [...]}):
+```TAG
+{
+  "actions": [
+    {
+      "proposal_id": "<generate a fresh UUID v4>",
+      "title": "<one-line description>",
+      "rationale": "<why this action is needed>",
+      "action_kind": "run_subprocess",
+      "requested_risk_tier": null,
+      "capability_scope": {
+        "filesystem": { "read_roots": ["<absolute path>"], "write_roots": [] },
+        "network": "disabled",
+        "environment": { "allow_variables": [] },
+        "execution": { "timeout_ms": 30000, "max_stdout_bytes": 16384, "max_stderr_bytes": 8192 }
+      },
+      "payload": {
+        "kind": "run_subprocess",
+        "value": { "command": "<executable>", "args": ["<arg1>", "<arg2>"], "working_directory": "<absolute path or null>" }
+      }
+    }
+  ]
+}
+```
+
+Alternate payload shape for run_workspace_script:
+- "payload": { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
+
+Scope rules: filesystem.read_roots must be non-empty. write_roots only if the action writes files. Propose at most one action per turn."#;
+    template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
 fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
@@ -1359,13 +1411,8 @@ mod tests {
                 .system_prompt
                 .contains("reply_to_current_message")
         );
-        assert!(model_request.input.system_prompt.contains("load_pct=15"));
-        assert!(
-            model_request
-                .input
-                .system_prompt
-                .contains("confidence_pct=80")
-        );
+        assert!(model_request.input.system_prompt.contains("load=15%"));
+        assert!(model_request.input.system_prompt.contains("confidence=80%"));
         assert!(model_request.input.messages.iter().any(|message| {
             message.content == "remember that I prefer concise replies and be direct"
         }));

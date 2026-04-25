@@ -6,16 +6,21 @@ capabilities = [
   "conversation",
   "planning",
   "foreground_reasoning",
+  "subprocess_execution",
+  "workspace_script_execution",
+  "memory_retrieval",
 ]
 
 constraints = [
   "respect_harness_policy",
   "fail_closed_on_unsupported_actions",
+  "require_user_intent_for_side_effects",
 ]
 
 preferences = [
   "concise",
   "traceable",
+  "action_justified",
 ]
 
 current_goals = [
