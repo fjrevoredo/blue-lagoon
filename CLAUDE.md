@@ -74,7 +74,13 @@ cargo test --workspace
 ./scripts/pre-commit.ps1
 ```
 
-**Test layering**: run unit/crate-local tests first, then the broader suite, then runtime command checks for command-surface or migration changes.
+**Test layering**: run unit/crate-local tests first, then the broader suite, then runtime command checks for command-surface or migration changes. DB-backed suites catch DB constraint violations and schema mismatches that unit tests cannot — skip them only when no DB schema is involved.
+
+When modifying `GovernedActionKind` or governed action DB schema, always run (not just `--lib`):
+```bash
+cargo test -p harness --test governed_actions_component -- --nocapture
+cargo test -p harness --test governed_actions_integration -- --nocapture
+```
 
 ## Database Tests
 

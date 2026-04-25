@@ -1,6 +1,6 @@
 mod support;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use contracts::{
     ApprovalRequestStatus, ApprovalResolutionDecision, CapabilityScope, EnvironmentCapabilityScope,
@@ -22,6 +22,17 @@ use harness::{
         WorkspaceArtifactStatus,
     },
 };
+
+/// Exhaustive match — adding a GovernedActionKind variant without adding an arm here
+/// is a compile error, forcing the developer to also provide the DB string and write a migration.
+fn kind_str(kind: GovernedActionKind) -> &'static str {
+    match kind {
+        GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        GovernedActionKind::RunSubprocess => "run_subprocess",
+        GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        GovernedActionKind::WebFetch => "web_fetch",
+    }
+}
 
 #[tokio::test]
 #[serial]
@@ -1083,6 +1094,57 @@ async fn web_fetch_validation_rejects_oversized_response_bytes() -> Result<()> {
             ),
             "max_response_bytes exceeding max should produce a blocked outcome"
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        // Must stay in sync with kind_str() above — add new variants here too.
+        let all_kinds = [
+            GovernedActionKind::InspectWorkspaceArtifact,
+            GovernedActionKind::RunSubprocess,
+            GovernedActionKind::RunWorkspaceScript,
+            GovernedActionKind::WebFetch,
+        ];
+
+        let targets = [
+            (
+                "governed_action_executions",
+                "governed_action_executions_action_kind_check",
+            ),
+            ("approval_requests", "approval_requests_action_kind_check"),
+        ];
+
+        for (table, constraint) in targets {
+            let def: String = sqlx::query_scalar(
+                "SELECT pg_get_constraintdef(oid) \
+                 FROM pg_constraint \
+                 WHERE conrelid = $1::regclass AND conname = $2",
+            )
+            .bind(table)
+            .bind(constraint)
+            .fetch_one(&ctx.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "constraint '{constraint}' not found on '{table}' \
+                     — was the migration applied?"
+                )
+            })?;
+
+            for kind in all_kinds {
+                let s = kind_str(kind);
+                assert!(
+                    def.contains(s),
+                    "action_kind '{s}' missing from constraint '{constraint}' on '{table}' \
+                     — write a migration adding '{s}' to the CHECK IN list"
+                );
+            }
+        }
         Ok(())
     })
     .await
