@@ -343,7 +343,7 @@ async fn uc4_governed_action_requires_approval_then_executes_after_user_approves
         // Intermediate assertions: the approval prompt is delivered (plus the initial model text,
         // since the orchestration delivers the stripped initial response when no follow-up runs)
         assert!(
-            delivery.sent_messages().len() >= 1,
+            !delivery.sent_messages().is_empty(),
             "at least the approval prompt should be delivered; got 0 messages"
         );
 
