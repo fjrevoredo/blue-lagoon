@@ -528,7 +528,7 @@ async fn web_fetch_proposal_plans_with_approval_and_execution_is_attempted() -> 
             &ctx.pool,
             &approval::ApprovalResolutionAttempt {
                 token: approval_request.token.clone(),
-                actor_ref: "operator:local".to_string(),
+                actor_ref: "telegram:primary-user".to_string(),
                 expected_action_fingerprint: planned.record.action_fingerprint.clone(),
                 decision: contracts::ApprovalResolutionDecision::Approved,
                 reason: Some("integration test approval".to_string()),
