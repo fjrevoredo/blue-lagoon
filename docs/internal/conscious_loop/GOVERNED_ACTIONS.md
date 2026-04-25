@@ -182,10 +182,11 @@ Risk tier is classified by `policy::classify_governed_action_risk()` — the age
 4. Add an execution arm in the `execute_governed_action()` dispatch and implement the backend function.
 5. Add a risk-classification arm in `policy::classify_governed_action_risk()`.
 6. Update validation in `validate_capability_scope()` and `validate_proposal_shape()` in `governed_actions.rs`.
-7. Update `governed_action_schema_message()` in `workers/src/main.rs` to expose the new kind to the agent.
+7. Update `governed_action_schema_message()` in `workers/src/main.rs` to expose the new kind to the agent. **The alternate payload description must show the complete `capability_scope` object, not a diff — every field (`filesystem`, `network`, `environment`, `execution`) must be present, or the model will omit fields and deserialization will fail.**
 8. Add WebFetch arms to all other `GovernedActionKind` match expressions (currently: `approval.rs`, `management.rs`, `recovery.rs`, `workers/src/main.rs`).
 9. Add tests in `governed_actions_component` and `governed_actions_integration` test suites.
 10. Update all `GovernedActionsConfig` test constructors with any new config fields.
+11. **Write a new migration** (`migrations/NNNN__<name>.sql`) that drops and recreates the `action_kind` check constraints on `governed_action_executions` and `approval_requests` to include the new kind string. `action_kind` is a constrained `TEXT` column in the DB — the Rust enum alone is not enough. Verify the exact constraint names against the existing migration before writing the `DROP CONSTRAINT` statement.
 
 ---
 

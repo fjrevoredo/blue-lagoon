@@ -631,6 +631,7 @@ Alternate payload shape for web_fetch:
 - "payload": { "kind": "web_fetch", "value": { "url": "https://...", "timeout_ms": 10000, "max_response_bytes": 524288 } }
 - capability_scope.filesystem: { "read_roots": [], "write_roots": [] } (no filesystem access needed)
 - capability_scope.network must be "enabled" (triggers approval flow)
+- capability_scope.environment: { "allow_variables": [] }
 - capability_scope.execution: { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 } (ignored for web_fetch)
 
 Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action per turn."#;
