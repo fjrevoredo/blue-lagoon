@@ -516,9 +516,13 @@ pub async fn execute_governed_action(
         GovernedActionPayload::WebFetch(action) => action.timeout_ms,
         _ => started_record.capability_scope.execution.timeout_ms,
     };
-    let worker_lease =
-        create_governed_action_worker_lease(pool, &started_record, started_at, effective_timeout_ms)
-            .await?;
+    let worker_lease = create_governed_action_worker_lease(
+        pool,
+        &started_record,
+        started_at,
+        effective_timeout_ms,
+    )
+    .await?;
     let result = match &started_record.payload {
         GovernedActionPayload::RunSubprocess(action) => {
             execute_subprocess_governed_action(config, pool, &started_record, action).await
@@ -628,8 +632,8 @@ async fn create_governed_action_worker_lease(
     started_at: chrono::DateTime<chrono::Utc>,
     timeout_ms: u64,
 ) -> Result<recovery::WorkerLeaseRecord> {
-    let timeout_ms = i64::try_from(timeout_ms)
-        .context("governed action timeout exceeded chrono range")?;
+    let timeout_ms =
+        i64::try_from(timeout_ms).context("governed action timeout exceeded chrono range")?;
     recovery::create_worker_lease(
         pool,
         &recovery::NewWorkerLease {
