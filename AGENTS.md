@@ -15,6 +15,20 @@ to purpose:
 - detailed implementation plans under `docs/`: implementation ledgers and
   historical execution records, not canonical runtime behavior
 
+Implementation reference material lives in `docs/internal/`:
+
+- `docs/internal/INTERNAL_DOCUMENTATION.md`: index, template, and conventions
+- `docs/internal/conscious_loop/CONTEXT_ASSEMBLY.md`: assembly pipeline,
+  system prompt format, message array ordering, token budget, self-model seed
+- `docs/internal/conscious_loop/GOVERNED_ACTIONS.md`: governed action JSON
+  schema, payload shapes, capability scope validation, risk tiers
+
+This layer documents exact implementation details — source line references,
+config defaults, validation rules — that the canonical docs deliberately omit.
+It must never contradict `docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`,
+or `docs/IMPLEMENTATION_DESIGN.md`. When a conflict is found, the canonical doc
+wins and the internal doc must be corrected.
+
 Runtime code lives under `crates/`:
 
 - `crates/runtime`: thin CLI entrypoints and runtime wiring
@@ -236,6 +250,20 @@ repository-oriented and stable rather than being written as handoff notes or
 temporary execution status reports. Re-read modified files in rendered
 Markdown when possible. Treat broken links, contradictory definitions, and
 unclear scope boundaries as defects that must be fixed before merge.
+
+When a code change touches behavior documented in `docs/internal/`, the
+internal doc must be updated in the same commit:
+
+- Verify every `path/to/file.rs:line_number` reference still resolves to the
+  correct symbol.
+- Re-stamp the verified date at the bottom of the affected doc.
+- If a `> **NOT IMPLEMENTED:**` callout is now implemented, remove it and
+  document the live behavior.
+- If the change adds a new operator-configurable knob or extension point,
+  add it to section 3 (Configuration & Extension) of the relevant doc.
+
+A stale source reference in `docs/internal/` is treated as a defect on par
+with a failing test: it misleads future agents and must be fixed before merge.
 
 ## Commit & Pull Request Guidelines
 

@@ -155,7 +155,21 @@ This repository is used from both WSL and Windows. Line-ending normalization can
 - `PHILOSOPHY.md`, `README.md`, `AGENTS.md` — repository identity and decision principles
 - `docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`, `docs/IMPLEMENTATION_DESIGN.md` — canonical product and architecture guidance
 - `docs/HIGH_LEVEL_IMPLEMENTATION_PLAN.md` — roadmap and sequencing
+- `docs/internal/` — implementation reference: exact formats, limits, schemas, and source line references for key subsystems; never contradicts canonical docs
 - `docs/sources/` — research inputs, not canonical behavior
 - `docs/archive/` — historical context only, not current guidance
 
 Planning labels (Phase N, etc.) belong only in planning documents, never in code, tests, migrations, config, or canonical docs.
+
+## Internal Documentation
+
+`docs/internal/` documents exact implementation details that are not in the canonical architecture docs: the system prompt format, message array ordering, governed action JSON schema, context assembly limits, config defaults, and source line references. Start with `docs/internal/INTERNAL_DOCUMENTATION.md` for the index and template.
+
+**When to read it**: before modifying or debugging behavior covered by an internal doc — context assembly, governed actions, system prompt rendering, self-model seed. The docs provide a map to the relevant source locations.
+
+**When to update it**: whenever a code change affects something an internal doc describes. At minimum:
+- Verify every `path/to/file.rs:line_number` reference still points to the correct symbol.
+- Re-stamp the verified date at the bottom of the doc (`Last verified: commit <hash>, session <date>`).
+- If a `> **NOT IMPLEMENTED:**` callout becomes implemented, remove it and document the new behavior.
+
+A stale line reference misleads future agents. Treat it as a defect on par with a broken test.
