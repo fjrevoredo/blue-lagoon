@@ -562,9 +562,14 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         )
     };
 
+    let current_time = context
+        .assembled_at
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string();
+
     ModelInput {
         system_prompt: format!(
-            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
+            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
             name = context.self_model.stable_identity,
             role = context.self_model.role,
             style = context.self_model.communication_style,
@@ -574,6 +579,7 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
             goals = join_or_none(&context.self_model.current_goals),
             subgoals = subgoals_fragment,
             conditions = active_conditions_fragment,
+            current_time = current_time,
             load = context.internal_state.load_pct,
             health = context.internal_state.health_pct,
             confidence = context.internal_state.confidence_pct,
@@ -591,6 +597,7 @@ To perform an action, append exactly one fenced code block tagged "TAG" after yo
 Available action kinds:
 - run_subprocess: execute a bounded shell command
 - run_workspace_script: run a registered workspace script by its script_id UUID
+- web_fetch: perform an HTTP GET request to a URL (requires network: "enabled"; automatically routed for approval)
 
 Block format (wrap all proposals in {"actions": [...]}):
 ```TAG
@@ -620,7 +627,13 @@ Block format (wrap all proposals in {"actions": [...]}):
 Alternate payload shape for run_workspace_script:
 - "payload": { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
 
-Scope rules: filesystem.read_roots must be non-empty. write_roots only if the action writes files. Propose at most one action per turn."#;
+Alternate payload shape for web_fetch:
+- "payload": { "kind": "web_fetch", "value": { "url": "https://...", "timeout_ms": 10000, "max_response_bytes": 524288 } }
+- capability_scope.filesystem: { "read_roots": [], "write_roots": [] } (no filesystem access needed)
+- capability_scope.network must be "enabled" (triggers approval flow)
+- capability_scope.execution: { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 } (ignored for web_fetch)
+
+Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action per turn."#;
     template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
@@ -686,6 +699,7 @@ fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static 
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
 }
 

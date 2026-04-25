@@ -180,6 +180,7 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
 
     match proposal.action_kind {
         GovernedActionKind::InspectWorkspaceArtifact => GovernedActionRiskTier::Tier0,
+        GovernedActionKind::WebFetch => GovernedActionRiskTier::Tier2,
         GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
             if has_network && has_write_scope {
                 GovernedActionRiskTier::Tier3
@@ -350,6 +351,8 @@ mod tests {
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
                 max_environment_variables_per_action: 8,
                 max_captured_output_bytes: 65_536,
+                max_web_fetch_timeout_ms: 15_000,
+                max_web_fetch_response_bytes: 524_288,
             },
             worker: WorkerConfig {
                 timeout_ms: 10_000,

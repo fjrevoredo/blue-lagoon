@@ -6,7 +6,8 @@ use contracts::{
     CapabilityScope, GovernedActionExecutionOutcome, GovernedActionFingerprint, GovernedActionKind,
     GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
     GovernedActionRiskTier, GovernedActionStatus, InspectWorkspaceArtifactAction,
-    NetworkAccessPosture, SubprocessAction, WorkspaceScriptAction, WorkspaceScriptRunStatus,
+    NetworkAccessPosture, SubprocessAction, WebFetchAction, WorkspaceScriptAction,
+    WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -511,14 +512,22 @@ pub async fn execute_governed_action(
     )
     .await?;
 
+    let effective_timeout_ms = match &started_record.payload {
+        GovernedActionPayload::WebFetch(action) => action.timeout_ms,
+        _ => started_record.capability_scope.execution.timeout_ms,
+    };
     let worker_lease =
-        create_governed_action_worker_lease(pool, &started_record, started_at).await?;
+        create_governed_action_worker_lease(pool, &started_record, started_at, effective_timeout_ms)
+            .await?;
     let result = match &started_record.payload {
         GovernedActionPayload::RunSubprocess(action) => {
             execute_subprocess_governed_action(config, pool, &started_record, action).await
         }
         GovernedActionPayload::RunWorkspaceScript(action) => {
             execute_workspace_script_governed_action(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::WebFetch(action) => {
+            execute_web_fetch_governed_action(pool, &started_record, action).await
         }
         GovernedActionPayload::InspectWorkspaceArtifact(_) => {
             let summary =
@@ -617,8 +626,9 @@ async fn create_governed_action_worker_lease(
     pool: &PgPool,
     record: &GovernedActionExecutionRecord,
     started_at: chrono::DateTime<chrono::Utc>,
+    timeout_ms: u64,
 ) -> Result<recovery::WorkerLeaseRecord> {
-    let timeout_ms = i64::try_from(record.capability_scope.execution.timeout_ms)
+    let timeout_ms = i64::try_from(timeout_ms)
         .context("governed action timeout exceeded chrono range")?;
     recovery::create_worker_lease(
         pool,
@@ -670,8 +680,10 @@ pub fn validate_capability_scope(
 ) -> Result<()> {
     let scope = &proposal.capability_scope;
     let filesystem_roots = normalized_filesystem_roots(scope);
+    let is_web_fetch = proposal.action_kind == GovernedActionKind::WebFetch;
     if filesystem_roots.is_empty()
         && proposal.action_kind != GovernedActionKind::InspectWorkspaceArtifact
+        && !is_web_fetch
     {
         bail!("governed actions must request at least one filesystem root");
     }
@@ -694,26 +706,28 @@ pub fn validate_capability_scope(
         }
     }
 
-    if scope.execution.timeout_ms == 0 {
-        bail!("governed action timeout must be greater than zero");
-    }
-    if scope.execution.timeout_ms > config.governed_actions.max_subprocess_timeout_ms {
-        bail!(
-            "governed action timeout {} exceeds the configured maximum ({})",
-            scope.execution.timeout_ms,
-            config.governed_actions.max_subprocess_timeout_ms
-        );
-    }
-    if scope.execution.max_stdout_bytes == 0 || scope.execution.max_stderr_bytes == 0 {
-        bail!("governed action captured output limits must be greater than zero");
-    }
-    if scope.execution.max_stdout_bytes > config.governed_actions.max_captured_output_bytes
-        || scope.execution.max_stderr_bytes > config.governed_actions.max_captured_output_bytes
-    {
-        bail!(
-            "governed action captured output exceeds the configured maximum ({})",
-            config.governed_actions.max_captured_output_bytes
-        );
+    if !is_web_fetch {
+        if scope.execution.timeout_ms == 0 {
+            bail!("governed action timeout must be greater than zero");
+        }
+        if scope.execution.timeout_ms > config.governed_actions.max_subprocess_timeout_ms {
+            bail!(
+                "governed action timeout {} exceeds the configured maximum ({})",
+                scope.execution.timeout_ms,
+                config.governed_actions.max_subprocess_timeout_ms
+            );
+        }
+        if scope.execution.max_stdout_bytes == 0 || scope.execution.max_stderr_bytes == 0 {
+            bail!("governed action captured output limits must be greater than zero");
+        }
+        if scope.execution.max_stdout_bytes > config.governed_actions.max_captured_output_bytes
+            || scope.execution.max_stderr_bytes > config.governed_actions.max_captured_output_bytes
+        {
+            bail!(
+                "governed action captured output exceeds the configured maximum ({})",
+                config.governed_actions.max_captured_output_bytes
+            );
+        }
     }
 
     if scope.environment.allow_variables.len()
@@ -765,6 +779,9 @@ pub fn validate_capability_scope(
         ) => {
             validate_workspace_script_action(action)?;
         }
+        (GovernedActionKind::WebFetch, GovernedActionPayload::WebFetch(action)) => {
+            validate_web_fetch_action(config, scope, action)?;
+        }
         _ => bail!("governed action kind does not match the proposal payload"),
     }
 
@@ -787,6 +804,9 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::RunWorkspaceScript,
             GovernedActionPayload::RunWorkspaceScript(action),
         ) => validate_workspace_script_action(action),
+        (GovernedActionKind::WebFetch, GovernedActionPayload::WebFetch(action)) => {
+            validate_web_fetch_shape(action)
+        }
         _ => bail!("governed action kind does not match the proposal payload"),
     }
 }
@@ -808,6 +828,53 @@ fn validate_subprocess_action(action: &SubprocessAction) -> Result<()> {
 fn validate_workspace_script_action(action: &WorkspaceScriptAction) -> Result<()> {
     if action.args.iter().any(|arg| arg.trim().is_empty()) {
         bail!("workspace script arguments must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_web_fetch_shape(action: &WebFetchAction) -> Result<()> {
+    if action.url.trim().is_empty() {
+        bail!("web fetch proposals must declare a URL");
+    }
+    if action.timeout_ms == 0 {
+        bail!("web fetch timeout_ms must be greater than zero");
+    }
+    if action.max_response_bytes == 0 {
+        bail!("web fetch max_response_bytes must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_web_fetch_action(
+    config: &RuntimeConfig,
+    scope: &CapabilityScope,
+    action: &WebFetchAction,
+) -> Result<()> {
+    validate_web_fetch_shape(action)?;
+    let parsed = reqwest::Url::parse(&action.url)
+        .with_context(|| format!("web fetch URL '{}' is not a valid URL", action.url))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        bail!(
+            "web fetch URL must use http or https scheme, got '{}'",
+            parsed.scheme()
+        );
+    }
+    if action.timeout_ms > config.governed_actions.max_web_fetch_timeout_ms {
+        bail!(
+            "web fetch timeout_ms {} exceeds the configured maximum ({})",
+            action.timeout_ms,
+            config.governed_actions.max_web_fetch_timeout_ms
+        );
+    }
+    if action.max_response_bytes > config.governed_actions.max_web_fetch_response_bytes {
+        bail!(
+            "web fetch max_response_bytes {} exceeds the configured maximum ({})",
+            action.max_response_bytes,
+            config.governed_actions.max_web_fetch_response_bytes
+        );
+    }
+    if scope.network != NetworkAccessPosture::Enabled {
+        bail!("web fetch proposals must set capability_scope.network to \"enabled\"");
     }
     Ok(())
 }
@@ -1309,6 +1376,131 @@ async fn execute_workspace_script_governed_action(
     ))
 }
 
+async fn execute_web_fetch_governed_action(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &WebFetchAction,
+) -> Result<GovernedActionExecutionResult> {
+    let Some(execution_id) = record.execution_id else {
+        bail!("governed web fetch execution requires an attached execution record");
+    };
+    let started_at = record.started_at.unwrap_or_else(Utc::now);
+    let output_ref = format!("execution_record:{execution_id}");
+
+    let fetch_result = tool_execution::execute_web_fetch(action).await;
+    let completed_at = Utc::now();
+
+    match fetch_result {
+        Err(error) => {
+            let summary = error.to_string();
+            execution::mark_failed(
+                pool,
+                execution_id,
+                &json!({
+                    "status": "failed",
+                    "summary": summary,
+                }),
+            )
+            .await?;
+            let failed_record = update_governed_action_execution(
+                pool,
+                GovernedActionExecutionUpdate {
+                    governed_action_execution_id: record.governed_action_execution_id,
+                    status: GovernedActionStatus::Failed,
+                    execution_id: Some(execution_id),
+                    output_ref: Some(&output_ref),
+                    blocked_reason: Some(&summary),
+                    approval_request_id: None,
+                    started_at: Some(started_at),
+                    completed_at: Some(completed_at),
+                },
+            )
+            .await?;
+            write_governed_action_audit_event(
+                pool,
+                &failed_record,
+                "governed_action_execution_failed",
+                "warn",
+                json!({
+                    "reason": summary,
+                    "phase": "backend",
+                }),
+            )
+            .await?;
+            let execution_outcome = GovernedActionExecutionOutcome {
+                status: GovernedActionStatus::Failed,
+                summary,
+                fingerprint: Some(failed_record.action_fingerprint.clone()),
+                output_ref: Some(output_ref),
+            };
+            Ok(governed_action_execution_result(
+                failed_record,
+                execution_outcome,
+                None,
+            ))
+        }
+        Ok(outcome) => {
+            let truncation_note = if outcome.truncated {
+                format!(" [truncated to {} bytes]", action.max_response_bytes)
+            } else {
+                String::new()
+            };
+            let summary = format!("web fetch completed{truncation_note}");
+            execution::mark_succeeded(
+                pool,
+                execution_id,
+                "governed_action",
+                0,
+                &json!({
+                    "status": "completed",
+                    "summary": summary,
+                    "url": action.url,
+                    "body": outcome.body,
+                    "truncated": outcome.truncated,
+                }),
+            )
+            .await?;
+            let updated_record = update_governed_action_execution(
+                pool,
+                GovernedActionExecutionUpdate {
+                    governed_action_execution_id: record.governed_action_execution_id,
+                    status: GovernedActionStatus::Executed,
+                    execution_id: Some(execution_id),
+                    output_ref: Some(&output_ref),
+                    blocked_reason: None,
+                    approval_request_id: None,
+                    started_at: Some(started_at),
+                    completed_at: Some(completed_at),
+                },
+            )
+            .await?;
+            write_governed_action_audit_event(
+                pool,
+                &updated_record,
+                "governed_action_execution_completed",
+                "info",
+                json!({
+                    "url": action.url,
+                    "body_bytes": outcome.body.len(),
+                    "truncated": outcome.truncated,
+                }),
+            )
+            .await?;
+            let execution_outcome = GovernedActionExecutionOutcome {
+                status: GovernedActionStatus::Executed,
+                summary,
+                fingerprint: Some(updated_record.action_fingerprint.clone()),
+                output_ref: Some(output_ref),
+            };
+            Ok(governed_action_execution_result(
+                updated_record,
+                execution_outcome,
+                None,
+            ))
+        }
+    }
+}
+
 fn build_workspace_script_subprocess_action(
     config: &RuntimeConfig,
     script: &workspace::WorkspaceScriptRecord,
@@ -1599,6 +1791,7 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        GovernedActionKind::WebFetch => "web_fetch",
     }
 }
 
@@ -1607,6 +1800,7 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "inspect_workspace_artifact" => Ok(GovernedActionKind::InspectWorkspaceArtifact),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
+        "web_fetch" => Ok(GovernedActionKind::WebFetch),
         other => bail!("unrecognized governed action kind '{other}'"),
     }
 }
@@ -1709,6 +1903,11 @@ enum CanonicalGovernedActionPayload {
         script_version_id: Option<Uuid>,
         args: Vec<String>,
     },
+    WebFetch {
+        url: String,
+        timeout_ms: u64,
+        max_response_bytes: u64,
+    },
 }
 
 impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
@@ -1732,6 +1931,11 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                 script_id: action.script_id,
                 script_version_id: action.script_version_id,
                 args: action.args.clone(),
+            },
+            GovernedActionPayload::WebFetch(action) => Self::WebFetch {
+                url: action.url.trim().to_string(),
+                timeout_ms: action.timeout_ms,
+                max_response_bytes: action.max_response_bytes,
             },
         }
     }
@@ -1832,6 +2036,8 @@ mod tests {
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
                 max_environment_variables_per_action: 8,
                 max_captured_output_bytes: 65_536,
+                max_web_fetch_timeout_ms: 15_000,
+                max_web_fetch_response_bytes: 524_288,
             },
             worker: crate::config::WorkerConfig {
                 timeout_ms: 20_000,

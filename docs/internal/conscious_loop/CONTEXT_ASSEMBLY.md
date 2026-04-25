@@ -52,7 +52,7 @@ The unconscious loop uses the same pattern but caps `max_output_tokens` at `1_20
 
 ### System Prompt Template
 
-Constructed in `build_model_input()` at `main.rs:566–581`. Exact format:
+Constructed in `build_model_input()` at `main.rs:565–584`. Exact format:
 
 ```
 You are {stable_identity}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.
@@ -63,9 +63,11 @@ Capabilities: {capabilities}.
 Active constraints: {constraints}.
 Goals: {current_goals}.[ Active subgoals: {current_subgoals}.][ Active conditions: {active_conditions}.]
 
+Current time: {current_time}.
+
 Runtime state: load={load_pct}%, health={health_pct}%, confidence={confidence_pct}%, mode={mode}.
 
-You have governed actions available for executing commands and running workspace scripts. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.
+You have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.
 ```
 
 Field sources:
@@ -81,6 +83,7 @@ Field sources:
 | `{current_goals}` | `self_model.current_goals` joined |
 | `{current_subgoals}` | `self_model.current_subgoals` joined — **fragment omitted when empty** |
 | `{active_conditions}` | `internal_state.active_conditions` joined — **fragment omitted when empty** |
+| `{current_time}` | `context.assembled_at` formatted as `"%Y-%m-%d %H:%M UTC"` |
 | `{load_pct}` | `internal_state.load_pct` (u8, 0–100) |
 | `{health_pct}` | `internal_state.health_pct` (u8, 0–100) |
 | `{confidence_pct}` | `internal_state.confidence_pct` (u8, 0–100) |
@@ -161,4 +164,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: commit `d3bed6e` (branch `usage-improvements`), session 2026-04-25.*
+*Last verified: commit `6752e2c` (branch `usage-improvements`), session 2026-04-25.*

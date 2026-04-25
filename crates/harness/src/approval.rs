@@ -879,6 +879,7 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        GovernedActionKind::WebFetch => "web_fetch",
     }
 }
 

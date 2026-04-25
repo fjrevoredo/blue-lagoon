@@ -68,6 +68,8 @@ default_network_access = "disabled"
 allowlisted_environment_variables = ["BLUE_LAGOON_DATABASE_URL"]
 max_environment_variables_per_action = 8
 max_captured_output_bytes = 65536
+max_web_fetch_timeout_ms = 15000
+max_web_fetch_response_bytes = 524288
 
 [worker]
 timeout_ms = 10000

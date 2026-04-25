@@ -715,6 +715,7 @@ pub enum GovernedActionKind {
     InspectWorkspaceArtifact,
     RunSubprocess,
     RunWorkspaceScript,
+    WebFetch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,11 +750,19 @@ pub struct WorkspaceScriptAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebFetchAction {
+    pub url: String,
+    pub timeout_ms: u64,
+    pub max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum GovernedActionPayload {
     InspectWorkspaceArtifact(InspectWorkspaceArtifactAction),
     RunSubprocess(SubprocessAction),
     RunWorkspaceScript(WorkspaceScriptAction),
+    WebFetch(WebFetchAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,50 @@
+[25/04/2026 10:00] Richard: Running well. Capabilities:
+
+- **Conversation** — Q&A, discussion, explanation
+- **Planning** — task organization, scheduling advice, project breakdown
+- **Reasoning** — problem analysis, decision support, logical walkthroughs
+
+All constrained to text-based interaction. No web access, file I/O, timers, or external integrations.
+
+What do you need?
+[25/04/2026 10:01] Francisco: that is weird, you should have way more things available. Tell me exactly everything you see available
+[25/04/2026 10:01] Richard: Here's the full picture:
+
+**Core capabilities:**
+- Conversation
+- Planning
+- Foreground reasoning
+
+**Governed actions (tool execution):**
+- **run_subprocess** — Execute shell commands in a bounded sandbox. Configurable per-invocation with limits on filesystem access (read/write roots), network (disabled by default), environment variables, timeout (max 30s), and output size.
+- **run_workspace_script** — Run pre-registered workspace scripts by their script ID.
+
+**Constraints:**
+- Must respect harness policy
+- Fail closed on unsupported actions
+- Each action requires a scoped proposal before execution
+- No hidden capabilities beyond what's listed
+
+That's it. The earlier "no tools" line was inaccurate — I do have command execution available through the governed action system, scoped and sandboxed. What do you need done?
+[25/04/2026 10:02] Francisco: ok, what else do you know about yourself?
+[25/04/2026 10:02] Richard: **Identity:** blue-lagoon, harness-governed personal AI assistant
+
+**Communication:** Single privileged user via Telegram. Style: direct.
+
+**Behavioral preferences:** Concise, traceable.
+
+**Active constraints:**
+- respect_harness_policy
+- fail_closed_on_unsupported_actions
+
+**Goal:** support_the_user
+
+**Runtime state:**
+- Load: 10%
+- Health: 100%
+- Confidence: 80%
+- Mode: single_ingress
+
+**Episode history:** Three prior foreground responses completed. Zero proposals, zero governed actions executed, zero blocks.
+
+**What I don't have:** Memory of conversations before this session. No persistent user profile. No access to past episodes' content — just the summary counts shown above.

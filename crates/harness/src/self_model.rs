@@ -471,6 +471,8 @@ mod tests {
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
                 max_environment_variables_per_action: 8,
                 max_captured_output_bytes: 65_536,
+                max_web_fetch_timeout_ms: 15_000,
+                max_web_fetch_response_bytes: 524_288,
             },
             worker: WorkerConfig {
                 timeout_ms: 5_000,
