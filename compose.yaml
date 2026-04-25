@@ -15,18 +15,71 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
-  runtime:
+  build:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command: ["cargo", "build", "-p", "runtime", "-p", "workers"]
+    volumes:
+      - ./:/workspace
+      - target:/workspace/target
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+
+  migrate:
     image: rust:1.88-bookworm
     working_dir: /workspace
     depends_on:
       postgres:
         condition: service_healthy
+      build:
+        condition: service_completed_successfully
+    command: ["./target/debug/runtime", "migrate"]
     environment:
       BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@postgres:5432/blue_lagoon
       BLUE_LAGOON_LOG: info
-    command: ["cargo", "run", "-p", "runtime", "--", "harness", "--once", "--idle"]
     volumes:
       - ./:/workspace
+      - target:/workspace/target
+
+  harness:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["./target/debug/runtime", "harness"]
+    environment:
+      BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@postgres:5432/blue_lagoon
+      BLUE_LAGOON_LOG: info
+      BLUE_LAGOON_WORKER_COMMAND: /workspace/target/debug/workers
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./:/workspace
+      - target:/workspace/target
+    restart: on-failure
+
+  telegram:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["./target/debug/runtime", "telegram"]
+    environment:
+      BLUE_LAGOON_DATABASE_URL: postgres://blue_lagoon:blue_lagoon@postgres:5432/blue_lagoon
+      BLUE_LAGOON_LOG: info
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./:/workspace
+      - target:/workspace/target
+    restart: on-failure
 
 volumes:
   postgres-data:
+  target:
+  cargo-registry:
+  cargo-git:

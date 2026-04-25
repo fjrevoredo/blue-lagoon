@@ -50,49 +50,21 @@ internal_principal_ref = "primary-user"
 internal_conversation_ref = "telegram-primary"
 ```
 
-3. Edit `.env` and set:
+3. Edit `.env` and set `BLUE_LAGOON_TELEGRAM_BOT_TOKEN` and
+   `BLUE_LAGOON_FOREGROUND_API_KEY`. The database URL does not need to be
+   changed — Docker Compose injects the correct container-network address
+   automatically.
 
-- `BLUE_LAGOON_DATABASE_URL`
-- `BLUE_LAGOON_TELEGRAM_BOT_TOKEN`
-- `BLUE_LAGOON_FOREGROUND_API_KEY`
-
-4. Start PostgreSQL:
-
-```bash
-docker compose up -d postgres
-```
-
-5. Apply migrations:
+4. Start everything:
 
 ```bash
-cargo run -p runtime -- migrate
+docker compose up
 ```
 
-6. Build the runtime and workers so the harness can find the worker binary:
+On the first run this compiles the workspace from scratch — allow several
+minutes. Subsequent starts reuse the build cache.
 
-```bash
-cargo build -p runtime -p workers
-```
-
-7. Optional safe boot check:
-
-```bash
-cargo run -p runtime -- harness --once --idle
-```
-
-8. Start the harness service in one terminal:
-
-```bash
-cargo run -p runtime -- harness
-```
-
-9. Start the Telegram service in a second terminal:
-
-```bash
-cargo run -p runtime -- telegram
-```
-
-10. Verify the runtime state:
+5. Verify the runtime state:
 
 ```bash
 cargo run -p runtime -- admin status
