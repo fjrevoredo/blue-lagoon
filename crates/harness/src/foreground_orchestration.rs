@@ -124,9 +124,11 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            model_gateway_config,
             trigger,
             parsed_resolution,
             delivery,
+            transport,
         )
         .await;
     }
@@ -194,9 +196,11 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            model_gateway_config,
             trigger,
             parsed_resolution,
             delivery,
+            transport,
         )
         .await;
     }
@@ -236,14 +240,17 @@ where
     .await
 }
 
-async fn orchestrate_telegram_approval_resolution_trigger<D>(
+async fn orchestrate_telegram_approval_resolution_trigger<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
     trigger: contracts::ForegroundTrigger,
     parsed_resolution: ParsedApprovalResolutionIngress,
     delivery: &mut D,
+    transport: &T,
 ) -> Result<TelegramForegroundOrchestrationOutcome>
 where
+    T: ModelProviderTransport,
     D: TelegramDelivery,
 {
     let approval_request = match approval::get_approval_request_by_token(
@@ -407,6 +414,184 @@ where
             .await;
         }
     };
+
+    if let Some(ref executed) = action_execution {
+        let follow_up_episode_id = Uuid::now_v7();
+        let (episode_trigger_kind, episode_trigger_source) =
+            episode_trigger_metadata(trigger.trigger_kind);
+
+        let episode_inserted = match foreground::insert_episode(
+            pool,
+            &NewEpisode {
+                episode_id: follow_up_episode_id,
+                trace_id: trigger.trace_id,
+                execution_id: trigger.execution_id,
+                ingress_id: Some(trigger.ingress.ingress_id),
+                internal_principal_ref: trigger.ingress.internal_principal_ref.clone(),
+                internal_conversation_ref: trigger.ingress.internal_conversation_ref.clone(),
+                trigger_kind: episode_trigger_kind.to_string(),
+                trigger_source: episode_trigger_source.to_string(),
+                status: "started".to_string(),
+                started_at: trigger.received_at,
+            },
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: "conscious".to_string(),
+                        subsystem: "foreground_orchestration".to_string(),
+                        event_kind: "approval_follow_up_failed".to_string(),
+                        severity: "warning".to_string(),
+                        trace_id: trigger.trace_id,
+                        execution_id: Some(trigger.execution_id),
+                        worker_pid: None,
+                        payload: json!({
+                            "step": "insert_episode",
+                            "error": format_error_chain(&error),
+                        }),
+                    },
+                )
+                .await;
+                false
+            }
+        };
+
+        if episode_inserted {
+            let follow_up_result: Result<()> = async {
+                let mut assembly = context::assemble_foreground_context(
+                    pool,
+                    config,
+                    trigger.clone(),
+                    context::ContextAssemblyOptions {
+                        episode_id: Some(follow_up_episode_id),
+                        ..context::ContextAssemblyOptions::default()
+                    },
+                )
+                .await?;
+                assembly.context.governed_action_observations = vec![executed.observation.clone()];
+
+                let follow_up_request = contracts::WorkerRequest::conscious(
+                    trigger.trace_id,
+                    trigger.execution_id,
+                    assembly.context.clone(),
+                );
+                let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+                let follow_up_response = launch_leased_conscious_worker(
+                    pool,
+                    config,
+                    model_gateway_config,
+                    &trigger,
+                    &follow_up_request,
+                    transport,
+                    foreground_timeout_ms,
+                )
+                .await?;
+
+                let contracts::WorkerResult::Conscious(follow_up_conscious_result) =
+                    &follow_up_response.result
+                else {
+                    bail!("conscious approval follow-up worker returned a non-conscious result");
+                };
+
+                let follow_up_message_id = Uuid::now_v7();
+                foreground::insert_episode_message(
+                    pool,
+                    &NewEpisodeMessage {
+                        episode_message_id: follow_up_message_id,
+                        episode_id: follow_up_episode_id,
+                        trace_id: trigger.trace_id,
+                        execution_id: trigger.execution_id,
+                        message_order: 0,
+                        message_role: "assistant".to_string(),
+                        channel_kind: follow_up_conscious_result.assistant_output.channel_kind,
+                        text_body: Some(follow_up_conscious_result.assistant_output.text.clone()),
+                        external_message_id: None,
+                    },
+                )
+                .await?;
+
+                proposal::apply_candidate_proposals(
+                    pool,
+                    config,
+                    &proposal::ProposalProcessingContext {
+                        trace_id: trigger.trace_id,
+                        execution_id: trigger.execution_id,
+                        episode_id: Some(follow_up_episode_id),
+                        source_ingress_id: Some(trigger.ingress.ingress_id),
+                        source_loop_kind: "conscious".to_string(),
+                    },
+                    "foreground_orchestration",
+                    None,
+                    &follow_up_conscious_result.candidate_proposals,
+                )
+                .await?;
+
+                let follow_up_receipt = delivery
+                    .send_message(&TelegramOutboundMessage {
+                        chat_id,
+                        text: follow_up_conscious_result.assistant_output.text.clone(),
+                        reply_to_message_id,
+                        reply_markup: None,
+                    })
+                    .await?;
+
+                foreground::update_episode_message_external_message_id(
+                    pool,
+                    follow_up_message_id,
+                    &follow_up_receipt.message_id.to_string(),
+                )
+                .await?;
+
+                foreground::mark_episode_completed(
+                    pool,
+                    follow_up_episode_id,
+                    "completed",
+                    &follow_up_conscious_result
+                        .assistant_output
+                        .text
+                        .chars()
+                        .take(120)
+                        .collect::<String>(),
+                )
+                .await?;
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = follow_up_result {
+                let error_message = format_error_chain(&error);
+                let _ = foreground::mark_episode_failed(
+                    pool,
+                    follow_up_episode_id,
+                    "follow_up_failed",
+                    &error_message,
+                )
+                .await;
+                let _ = audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: "conscious".to_string(),
+                        subsystem: "foreground_orchestration".to_string(),
+                        event_kind: "approval_follow_up_failed".to_string(),
+                        severity: "warning".to_string(),
+                        trace_id: trigger.trace_id,
+                        execution_id: Some(trigger.execution_id),
+                        worker_pid: None,
+                        payload: json!({
+                            "follow_up_episode_id": follow_up_episode_id,
+                            "error": error_message,
+                        }),
+                    },
+                )
+                .await;
+            }
+        }
+    }
 
     let response_payload = json!({
         "kind": "approval_resolution",
