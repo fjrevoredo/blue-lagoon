@@ -888,6 +888,7 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "inspect_workspace_artifact" => Ok(GovernedActionKind::InspectWorkspaceArtifact),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
+        "web_fetch" => Ok(GovernedActionKind::WebFetch),
         other => bail!("unrecognized governed action kind '{other}'"),
     }
 }
