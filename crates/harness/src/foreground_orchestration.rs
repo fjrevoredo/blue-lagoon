@@ -437,7 +437,7 @@ where
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
-            text: approval_resolution_message(&resolution, action_execution.as_ref()),
+            text: approval_resolution_message(&resolution),
             reply_to_message_id,
             reply_markup: None,
         })
@@ -540,6 +540,9 @@ where
                     &executed.observation,
                     &follow_up_conscious_result.assistant_output.text,
                 );
+                let delivered_follow_up_text = approval_follow_up_delivery_text(
+                    &follow_up_conscious_result.assistant_output.text,
+                );
 
                 let follow_up_message_id = Uuid::now_v7();
                 foreground::insert_episode_message(
@@ -577,7 +580,7 @@ where
                 let follow_up_receipt = delivery
                     .send_message(&TelegramOutboundMessage {
                         chat_id,
-                        text: persisted_follow_up_text.clone(),
+                        text: delivered_follow_up_text,
                         reply_to_message_id,
                         reply_markup: None,
                     })
@@ -1042,6 +1045,8 @@ where
         (initial_response.clone(), initial_result.clone())
     };
 
+    let assistant_text =
+        foreground_assistant_delivery_text(&result.assistant_output.text, &governed_action_summary);
     let assistant_episode_message_id = Uuid::now_v7();
     if let Err(error) = foreground::insert_episode_message(
         pool,
@@ -1053,7 +1058,7 @@ where
             message_order: user_messages.len() as i32,
             message_role: "assistant".to_string(),
             channel_kind: result.assistant_output.channel_kind,
-            text_body: Some(result.assistant_output.text.clone()),
+            text_body: Some(assistant_text.clone()),
             external_message_id: None,
         },
     )
@@ -1102,7 +1107,7 @@ where
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
-            text: result.assistant_output.text.clone(),
+            text: assistant_text.clone(),
             reply_to_message_id,
             reply_markup: None,
         })
@@ -1841,11 +1846,8 @@ fn parse_approval_callback_decision(
     }
 }
 
-fn approval_resolution_message(
-    resolution: &approval::ApprovalResolutionResult,
-    action_execution: Option<&governed_actions::GovernedActionExecutionResult>,
-) -> String {
-    let base_message = match resolution.event.decision {
+fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) -> String {
+    match resolution.event.decision {
         contracts::ApprovalResolutionDecision::Approved => {
             format!("Approved: {}", resolution.request.title)
         }
@@ -1858,10 +1860,6 @@ fn approval_resolution_message(
         contracts::ApprovalResolutionDecision::Invalidated => {
             "Approval request is no longer valid because the requested action changed.".to_string()
         }
-    };
-    match action_execution {
-        Some(action_execution) => format!("{}. {}", base_message, action_execution.outcome.summary),
-        None => base_message,
     }
 }
 
@@ -1882,11 +1880,107 @@ fn approval_follow_up_episode_text(
     }
 }
 
+fn approval_follow_up_delivery_text(model_text: &str) -> String {
+    let trimmed = model_text.trim();
+    if trimmed.is_empty() {
+        "Approved action completed.".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn foreground_assistant_delivery_text(
+    model_text: &str,
+    governed_action_summary: &GovernedActionProcessingSummary,
+) -> String {
+    let trimmed = model_text.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    if governed_action_summary.pending_approval_count > 0 {
+        return if governed_action_summary.pending_approval_count == 1 {
+            "Approval requested. Use the approval prompt above to continue.".to_string()
+        } else {
+            format!(
+                "{} approvals requested. Use the approval prompts above to continue.",
+                governed_action_summary.pending_approval_count
+            )
+        };
+    }
+
+    "No assistant response was generated.".to_string()
+}
+
 fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static str {
     match kind {
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_follow_up_delivery_uses_model_text_only() {
+        let delivered = approval_follow_up_delivery_text(
+            "  The fetch completed and the current rate is available.  ",
+        );
+
+        assert_eq!(
+            delivered,
+            "The fetch completed and the current rate is available."
+        );
+    }
+
+    #[test]
+    fn approval_follow_up_delivery_falls_back_when_model_text_is_empty() {
+        assert_eq!(
+            approval_follow_up_delivery_text(" \n\t "),
+            "Approved action completed."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_uses_model_text_when_present() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 1,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary),
+            "Waiting on approval."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_single_pending_approval() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 1,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text("", &summary),
+            "Approval requested. Use the approval prompt above to continue."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_multiple_pending_approvals() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 2,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text(" \n", &summary),
+            "2 approvals requested. Use the approval prompts above to continue."
+        );
     }
 }

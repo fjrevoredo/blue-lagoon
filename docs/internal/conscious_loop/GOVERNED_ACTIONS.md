@@ -22,7 +22,7 @@ This design keeps the agent's output plain text and makes all side-effects audit
 | `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 696), `execute_governed_action()` (line 435), `execute_web_fetch_governed_action()` (line 1398), `web_fetch_execution_summary()` (line 1560) |
 | `crates/harness/src/fetched_content.rs` | `FetchedContentInput` (line 4), `FetchedContentFormatter` (line 20), `DefaultFetchedContentFormatter` (line 25), `HtmlMarkdownFormatter` (line 38), `remove_non_content_html_blocks()` (line 133), `extract_first_tag_content()` (line 161) |
 | `crates/harness/src/tool_execution.rs` | `WebFetchOutcome` (line 275), `execute_web_fetch()` (line 281) |
-| `crates/harness/src/foreground_orchestration.rs` | `orchestrate_telegram_approval_resolution_trigger()` (line 244), `approval_follow_up_episode_text()` (line 1868) |
+| `crates/harness/src/foreground_orchestration.rs` | `orchestrate_telegram_approval_resolution_trigger()` (line 244), `approval_resolution_message()` (line 1849), `approval_follow_up_episode_text()` (line 1866), `approval_follow_up_delivery_text()` (line 1883), `foreground_assistant_delivery_text()` (line 1892) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()`, `governed_action_requires_approval()` |
 | `crates/contracts/src/lib.rs` | `GovernedActionProposal` (line 722), `CapabilityScope` (line 705), `GovernedActionPayload` (line 761) |
 | `config/default.toml` | `[governed_actions]` section |
@@ -156,7 +156,9 @@ the same plain-text sanitizer. If the response was byte-truncated by the
 configured `max_response_bytes`, or if the model-facing preview was
 character-truncated, the summary explicitly says so.
 
-For approval-triggered action execution, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1868`) prepends `Harness governed-action observation: {kind}:{summary}` to the model follow-up text before storing and delivering the assistant follow-up message. This makes the result visible in `recent_history` on subsequent foreground turns even if the model's natural-language follow-up omits details.
+For approval-triggered action execution, `approval_resolution_message()` (`crates/harness/src/foreground_orchestration.rs:1849`) sends only the approval decision acknowledgement and request title. After an approved action executes, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1866`) prepends `Harness governed-action observation: {kind}:{summary}` to the model follow-up text before storing the assistant follow-up message. This makes the result visible in `recent_history` on subsequent foreground turns even if the model's natural-language follow-up omits details. Telegram delivery uses `approval_follow_up_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1883`), which sends only the model's user-facing follow-up text and falls back to `"Approved action completed."` when the model text is empty.
+
+Normal foreground Telegram delivery also passes through `foreground_assistant_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1892`). If the model text is empty after one or more approval prompts were created, the delivered and stored assistant text becomes an explicit approval-pending fallback instead of an empty string. This prevents Telegram `sendMessage` HTTP 400 failures from leaving the original ingress in `processing` state and replaying it during restart recovery.
 
 ---
 
