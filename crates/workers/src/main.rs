@@ -534,7 +534,7 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         messages.push(ModelInputMessage {
             role: ModelMessageRole::Developer,
             content: format!(
-                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. Do not repeat the same action proposal unless the previous action failed and a materially different retry is required.",
+                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. This immediate follow-up cannot execute another governed action; if another fetch or command is still required, say exactly what is missing and ask the user to request it in the next turn. Do not claim that you will perform another action now.",
                 governed_action_observation_summary(&context.governed_action_observations)
             ),
         });
@@ -1437,6 +1437,50 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| { message.content.contains(GOVERNED_ACTIONS_BLOCK_TAG) })
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_observation_follow_up_forbids_new_action_promises() {
+        let mut context = sample_context();
+        context.governed_action_observations = vec![contracts::GovernedActionObservation {
+            observation_id: uuid::Uuid::now_v7(),
+            action_kind: contracts::GovernedActionKind::WebFetch,
+            outcome: contracts::GovernedActionExecutionOutcome {
+                status: contracts::GovernedActionStatus::Executed,
+                summary: "web fetch completed for https://example.com/; preview truncated"
+                    .to_string(),
+                fingerprint: None,
+                output_ref: Some("execution_record:test".to_string()),
+            },
+        }];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let developer_message = model_request
+            .input
+            .messages
+            .iter()
+            .find(|message| message.role == ModelMessageRole::Developer)
+            .expect("developer message should exist");
+
+        assert!(
+            developer_message
+                .content
+                .contains("cannot execute another governed action")
+        );
+        assert!(
+            developer_message
+                .content
+                .contains("Do not claim that you will perform another action now")
+        );
+        assert!(
+            !developer_message
+                .content
+                .contains(GOVERNED_ACTIONS_BLOCK_TAG)
         );
     }
 

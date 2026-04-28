@@ -106,7 +106,7 @@ Messages are appended in this order by `build_model_input()`:
 
 `ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:471–474`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:1866` prepends the harness observation to the stored assistant follow-up message. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:1883`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:1866` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:1883`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 
@@ -135,7 +135,7 @@ All three assembly limits live as constants in `crates/harness/src/context.rs:13
 
 | Constant | Default | What it controls |
 |---|---|---|
-| `DEFAULT_RECENT_HISTORY_LIMIT` | `3` | Max episodes fetched from DB per turn |
+| `DEFAULT_RECENT_HISTORY_LIMIT` | `8` | Max episodes fetched from DB per turn |
 | `DEFAULT_TRIGGER_TEXT_CHAR_LIMIT` | `2_000` | Max chars of incoming trigger text |
 | `DEFAULT_HISTORY_MESSAGE_CHAR_LIMIT` | `400` | Max chars per episode message (user and assistant independently) |
 

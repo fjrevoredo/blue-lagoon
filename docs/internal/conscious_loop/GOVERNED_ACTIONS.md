@@ -132,7 +132,7 @@ After execution, the harness feeds results back to the agent in the next model c
 
 ```
 Harness governed-action observations: {kind}:{status}:{summary} | ...
-Continue the foreground turn using these outcomes. Do not repeat the same action proposal unless the previous action failed and a materially different retry is required.
+Continue the foreground turn using these outcomes. This immediate follow-up cannot execute another governed action; if another fetch or command is still required, say exactly what is missing and ask the user to request it in the next turn. Do not claim that you will perform another action now.
 ```
 
 Format produced by `governed_action_observation_summary()` (`crates/workers/src/main.rs:641`). Multiple observations are joined with ` | `.
@@ -156,7 +156,7 @@ the same plain-text sanitizer. If the response was byte-truncated by the
 configured `max_response_bytes`, or if the model-facing preview was
 character-truncated, the summary explicitly says so.
 
-For approval-triggered action execution, `approval_resolution_message()` (`crates/harness/src/foreground_orchestration.rs:1849`) sends only the approval decision acknowledgement and request title. After an approved action executes, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1866`) prepends `Harness governed-action observation: {kind}:{summary}` to the model follow-up text before storing the assistant follow-up message. This makes the result visible in `recent_history` on subsequent foreground turns even if the model's natural-language follow-up omits details. Telegram delivery uses `approval_follow_up_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1883`), which sends only the model's user-facing follow-up text and falls back to `"Approved action completed."` when the model text is empty.
+For approval-triggered action execution, `approval_resolution_message()` (`crates/harness/src/foreground_orchestration.rs:1849`) sends only the approval decision acknowledgement and request title. After an approved action executes, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1866`) stores the model follow-up text first, then appends `Harness governed-action observation: {kind}:{summary}` to the stored assistant follow-up message. This keeps the model's user-facing commitment visible when later context assembly truncates recent-history messages, while still making the action result visible in `recent_history` on subsequent foreground turns. Telegram delivery uses `approval_follow_up_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1883`), which sends only the model's user-facing follow-up text and falls back to `"Approved action completed."` when the model text is empty.
 
 Normal foreground Telegram delivery also passes through `foreground_assistant_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1892`). If the model text is empty after one or more approval prompts were created, the delivered and stored assistant text becomes an explicit approval-pending fallback instead of an empty string. This prevents Telegram `sendMessage` HTTP 400 failures from leaving the original ingress in `processing` state and replaying it during restart recovery.
 

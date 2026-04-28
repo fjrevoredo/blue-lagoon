@@ -1876,7 +1876,7 @@ fn approval_follow_up_episode_text(
     if trimmed_model_text.is_empty() {
         observation_text
     } else {
-        format!("{observation_text}\n\n{trimmed_model_text}")
+        format!("{trimmed_model_text}\n\n{observation_text}")
     }
 }
 
@@ -1935,6 +1935,27 @@ mod tests {
             delivered,
             "The fetch completed and the current rate is available."
         );
+    }
+
+    #[test]
+    fn approval_follow_up_episode_text_keeps_model_text_first_for_history() {
+        let observation = contracts::GovernedActionObservation {
+            observation_id: Uuid::now_v7(),
+            action_kind: contracts::GovernedActionKind::WebFetch,
+            outcome: contracts::GovernedActionExecutionOutcome {
+                status: contracts::GovernedActionStatus::Executed,
+                summary: "web fetch completed for https://example.com/; preview: very long"
+                    .to_string(),
+                fingerprint: None,
+                output_ref: None,
+            },
+        };
+
+        let stored =
+            approval_follow_up_episode_text(&observation, "I found the page. Let me summarize it.");
+
+        assert!(stored.starts_with("I found the page. Let me summarize it."));
+        assert!(stored.contains("Harness governed-action observation: web_fetch:"));
     }
 
     #[test]

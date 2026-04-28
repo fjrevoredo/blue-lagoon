@@ -107,6 +107,19 @@ pub struct TelegramDeliveryReceipt {
     pub message_id: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramChatAction {
+    Typing,
+}
+
+impl TelegramChatAction {
+    fn as_telegram_api_value(self) -> &'static str {
+        match self {
+            TelegramChatAction::Typing => "typing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramApprovalPrompt {
     pub token: String,
@@ -145,6 +158,12 @@ pub trait TelegramDelivery {
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt>;
+
+    async fn send_chat_action(
+        &mut self,
+        chat_id: i64,
+        action: TelegramChatAction,
+    ) -> Result<()>;
 }
 
 pub struct TelegramAdapter<S, D> {
@@ -219,12 +238,17 @@ impl TelegramUpdateSource for FixtureTelegramSource {
 #[derive(Debug, Default, Clone)]
 pub struct FakeTelegramDelivery {
     sent_messages: Vec<TelegramOutboundMessage>,
+    sent_chat_actions: Vec<(i64, TelegramChatAction)>,
     next_message_id: i64,
 }
 
 impl FakeTelegramDelivery {
     pub fn sent_messages(&self) -> &[TelegramOutboundMessage] {
         &self.sent_messages
+    }
+
+    pub fn sent_chat_actions(&self) -> &[(i64, TelegramChatAction)] {
+        &self.sent_chat_actions
     }
 }
 
@@ -239,6 +263,15 @@ impl TelegramDelivery for FakeTelegramDelivery {
             chat_id: message.chat_id,
             message_id: self.next_message_id,
         })
+    }
+
+    async fn send_chat_action(
+        &mut self,
+        chat_id: i64,
+        action: TelegramChatAction,
+    ) -> Result<()> {
+        self.sent_chat_actions.push((chat_id, action));
+        Ok(())
     }
 }
 
@@ -372,6 +405,45 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
             chat_id: body.result.chat.id,
             message_id: body.result.message_id,
         })
+    }
+
+    async fn send_chat_action(
+        &mut self,
+        chat_id: i64,
+        action: TelegramChatAction,
+    ) -> Result<()> {
+        let request_body = json!({
+            "chat_id": chat_id,
+            "action": action.as_telegram_api_value(),
+        });
+        let response = self
+            .client
+            .post(telegram_api_url(&self.config, "sendChatAction"))
+            .json(&request_body)
+            .send()
+            .await
+            .context("failed to call Telegram sendChatAction")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            bail!("Telegram sendChatAction returned HTTP {status}: {body}");
+        }
+
+        let body: TelegramApiResponse<bool> = response
+            .json()
+            .await
+            .context("failed to decode Telegram sendChatAction response")?;
+        if !body.ok {
+            bail!("Telegram sendChatAction response marked itself as not ok");
+        }
+        if !body.result {
+            bail!("Telegram sendChatAction response result was false");
+        }
+
+        Ok(())
     }
 }
 
