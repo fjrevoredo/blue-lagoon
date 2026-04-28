@@ -274,6 +274,7 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: u64) -> String {
 
 pub struct WebFetchOutcome {
     pub body: String,
+    pub content_type: Option<String>,
     pub truncated: bool,
 }
 
@@ -288,6 +289,11 @@ pub async fn execute_web_fetch(action: &WebFetchAction) -> Result<WebFetchOutcom
         .send()
         .await
         .with_context(|| format!("HTTP GET failed for '{}'", action.url))?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
 
     let bytes = response
         .bytes()
@@ -298,7 +304,11 @@ pub async fn execute_web_fetch(action: &WebFetchAction) -> Result<WebFetchOutcom
     let truncated = bytes.len() > max;
     let body = truncate_utf8_lossy(&bytes, action.max_response_bytes);
 
-    Ok(WebFetchOutcome { body, truncated })
+    Ok(WebFetchOutcome {
+        body,
+        content_type,
+        truncated,
+    })
 }
 
 #[cfg(test)]

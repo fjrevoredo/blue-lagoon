@@ -19,7 +19,11 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     config::RuntimeConfig,
-    execution, policy, recovery, tool_execution,
+    execution,
+    fetched_content::{
+        DefaultFetchedContentFormatter, FetchedContentFormatter, FetchedContentInput,
+    },
+    policy, recovery, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -1470,7 +1474,15 @@ async fn execute_web_fetch_governed_action(
             ))
         }
         Ok(outcome) => {
-            let summary = web_fetch_execution_summary(action, &outcome.body, outcome.truncated);
+            let formatted = DefaultFetchedContentFormatter.format(&FetchedContentInput {
+                url: &action.url,
+                content_type: outcome.content_type.as_deref(),
+                body: &outcome.body,
+                response_truncated: outcome.truncated,
+                max_response_bytes: action.max_response_bytes,
+                max_preview_chars: WEB_FETCH_OBSERVATION_PREVIEW_CHARS,
+            })?;
+            let summary = web_fetch_execution_summary(action, &outcome, &formatted);
             execution::mark_succeeded(
                 pool,
                 execution_id,
@@ -1481,6 +1493,10 @@ async fn execute_web_fetch_governed_action(
                     "summary": summary,
                     "url": action.url,
                     "body": outcome.body,
+                    "content_type": outcome.content_type.as_deref(),
+                    "formatted_preview": formatted.preview.clone(),
+                    "formatter_kind": formatted.formatter_kind,
+                    "preview_truncated": formatted.preview_truncated,
                     "truncated": outcome.truncated,
                 }),
             )
@@ -1507,6 +1523,10 @@ async fn execute_web_fetch_governed_action(
                 json!({
                     "url": action.url,
                     "body_bytes": outcome.body.len(),
+                    "content_type": outcome.content_type.as_deref(),
+                    "formatter_kind": formatted.formatter_kind,
+                    "preview_chars": formatted.preview.chars().count(),
+                    "preview_truncated": formatted.preview_truncated,
                     "truncated": outcome.truncated,
                 }),
             )
@@ -1515,6 +1535,9 @@ async fn execute_web_fetch_governed_action(
                 governed_action_execution_id = %updated_record.governed_action_execution_id,
                 execution_id = %execution_id,
                 url = %action.url,
+                content_type = ?outcome.content_type,
+                formatter_kind = formatted.formatter_kind,
+                preview_truncated = formatted.preview_truncated,
                 body_bytes = outcome.body.len(),
                 truncated = outcome.truncated,
                 "governed web fetch execution completed"
@@ -1536,40 +1559,34 @@ async fn execute_web_fetch_governed_action(
 
 fn web_fetch_execution_summary(
     action: &WebFetchAction,
-    response_body: &str,
-    response_truncated: bool,
+    outcome: &tool_execution::WebFetchOutcome,
+    formatted: &crate::fetched_content::FetchedContentForModel,
 ) -> String {
-    let preview = normalize_preview(response_body, WEB_FETCH_OBSERVATION_PREVIEW_CHARS);
-    let response_suffix = if preview.is_empty() {
-        "response preview: <empty>".to_string()
+    let preview = if formatted.preview.is_empty() {
+        "<empty>".to_string()
     } else {
-        format!("response preview: {preview}")
+        formatted.preview.clone()
     };
-    let truncation_note = if response_truncated {
+    let truncation_note = if outcome.truncated {
         format!(
             "; response truncated to {} bytes",
             action.max_response_bytes
         )
-    } else if response_body.chars().count() > WEB_FETCH_OBSERVATION_PREVIEW_CHARS {
-        format!("; preview truncated to {WEB_FETCH_OBSERVATION_PREVIEW_CHARS} chars")
+    } else if formatted.preview_truncated {
+        format!(
+            "; preview truncated to {} chars",
+            WEB_FETCH_OBSERVATION_PREVIEW_CHARS
+        )
     } else {
         String::new()
     };
 
     format!(
-        "web fetch completed for {}; {response_suffix}{truncation_note}",
-        action.url
+        "web fetch completed for {}; content_type: {}; formatted_as: {}; preview:\n{preview}{truncation_note}",
+        action.url,
+        outcome.content_type.as_deref().unwrap_or("unknown"),
+        formatted.formatter_kind
     )
-}
-
-fn normalize_preview(value: &str, max_chars: usize) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(max_chars)
-        .collect()
 }
 
 fn build_workspace_script_subprocess_action(
@@ -2297,12 +2314,28 @@ mod tests {
             timeout_ms: 10_000,
             max_response_bytes: 65_536,
         };
+        let outcome = tool_execution::WebFetchOutcome {
+            body: "  Weather\n\nReport: sunny and mild.  ".to_string(),
+            content_type: Some("text/plain".to_string()),
+            truncated: false,
+        };
+        let formatted = DefaultFetchedContentFormatter
+            .format(&FetchedContentInput {
+                url: &action.url,
+                content_type: outcome.content_type.as_deref(),
+                body: &outcome.body,
+                response_truncated: outcome.truncated,
+                max_response_bytes: action.max_response_bytes,
+                max_preview_chars: WEB_FETCH_OBSERVATION_PREVIEW_CHARS,
+            })
+            .expect("web fetch body should format");
 
-        let summary =
-            web_fetch_execution_summary(&action, "  Weather\n\nReport: sunny and mild.  ", false);
+        let summary = web_fetch_execution_summary(&action, &outcome, &formatted);
 
         assert!(summary.contains("web fetch completed for https://example.com/weather"));
-        assert!(summary.contains("response preview: Weather Report: sunny and mild."));
+        assert!(summary.contains("content_type: text/plain"));
+        assert!(summary.contains("formatted_as: plain_text_sanitized"));
+        assert!(summary.contains("Weather\nReport: sunny and mild."));
     }
 
     #[test]
@@ -2312,8 +2345,23 @@ mod tests {
             timeout_ms: 10_000,
             max_response_bytes: 32,
         };
+        let outcome = tool_execution::WebFetchOutcome {
+            body: "abcdef".to_string(),
+            content_type: None,
+            truncated: true,
+        };
+        let formatted = DefaultFetchedContentFormatter
+            .format(&FetchedContentInput {
+                url: &action.url,
+                content_type: outcome.content_type.as_deref(),
+                body: &outcome.body,
+                response_truncated: outcome.truncated,
+                max_response_bytes: action.max_response_bytes,
+                max_preview_chars: WEB_FETCH_OBSERVATION_PREVIEW_CHARS,
+            })
+            .expect("web fetch body should format");
 
-        let summary = web_fetch_execution_summary(&action, "abcdef", true);
+        let summary = web_fetch_execution_summary(&action, &outcome, &formatted);
 
         assert!(summary.contains("response truncated to 32 bytes"));
     }

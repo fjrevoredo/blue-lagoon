@@ -19,7 +19,9 @@ This design keeps the agent's output plain text and makes all side-effects audit
 | File | Relevant symbol |
 |---|---|
 | `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 656), `governed_action_observation_summary()` (line 641), `GOVERNED_ACTIONS_BLOCK_TAG` (line 24) |
-| `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 692), `execute_governed_action()` (line 431), `execute_web_fetch_governed_action()` (line 1394), `web_fetch_execution_summary()` (line 1537) |
+| `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 696), `execute_governed_action()` (line 435), `execute_web_fetch_governed_action()` (line 1398), `web_fetch_execution_summary()` (line 1560) |
+| `crates/harness/src/fetched_content.rs` | `FetchedContentInput` (line 4), `FetchedContentFormatter` (line 20), `DefaultFetchedContentFormatter` (line 25), `HtmlMarkdownFormatter` (line 38), `remove_non_content_html_blocks()` (line 133), `extract_first_tag_content()` (line 161) |
+| `crates/harness/src/tool_execution.rs` | `WebFetchOutcome` (line 275), `execute_web_fetch()` (line 281) |
 | `crates/harness/src/foreground_orchestration.rs` | `orchestrate_telegram_approval_resolution_trigger()` (line 244), `approval_follow_up_episode_text()` (line 1868) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()`, `governed_action_requires_approval()` |
 | `crates/contracts/src/lib.rs` | `GovernedActionProposal` (line 722), `CapabilityScope` (line 705), `GovernedActionPayload` (line 761) |
@@ -135,7 +137,24 @@ Continue the foreground turn using these outcomes. Do not repeat the same action
 
 Format produced by `governed_action_observation_summary()` (`crates/workers/src/main.rs:641`). Multiple observations are joined with ` | `.
 
-For `web_fetch`, the execution summary includes the target URL and a whitespace-normalized response preview capped at 1,500 characters (`crates/harness/src/governed_actions.rs:1537`). The full fetched body is still stored in the execution record payload. If the response was byte-truncated by the configured `max_response_bytes`, the summary explicitly says so.
+For `web_fetch`, the execution summary includes the target URL, response
+content type, formatter kind, and a formatter-produced preview capped at 1,500
+characters (`crates/harness/src/governed_actions.rs:1560`). The raw fetched
+body is still stored in the execution record payload together with formatter
+metadata: `formatted_preview`, `formatter_kind`, `preview_truncated`, and
+`content_type`.
+
+Formatter selection is isolated behind `FetchedContentFormatter` in
+`crates/harness/src/fetched_content.rs:20`. The default implementation routes
+HTML content to `HtmlMarkdownFormatter`, which first removes non-content
+`script`, `style`, `noscript`, and `svg` blocks. If a `<pre>` block is present,
+the formatter treats the page as terminal-style HTML, extracts that text, strips
+tags, decodes common HTML entities, removes terminal escape sequences, replaces
+box-drawing table rules, normalizes whitespace by line, and preserves readable
+line breaks. Other HTML is converted through `html2md`. Non-HTML content uses
+the same plain-text sanitizer. If the response was byte-truncated by the
+configured `max_response_bytes`, or if the model-facing preview was
+character-truncated, the summary explicitly says so.
 
 For approval-triggered action execution, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1868`) prepends `Harness governed-action observation: {kind}:{summary}` to the model follow-up text before storing and delivering the assistant follow-up message. This makes the result visible in `recent_history` on subsequent foreground turns even if the model's natural-language follow-up omits details.
 
