@@ -13,7 +13,7 @@ use crate::{
     governed_actions,
     model_gateway::ModelProviderTransport,
     policy, proposal, recovery,
-    telegram::{self, TelegramDelivery, TelegramOutboundMessage},
+    telegram::{self, TelegramChatAction, TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
 
@@ -326,6 +326,39 @@ where
         "approval request resolved"
     );
 
+    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
+        Ok(chat_id) => chat_id,
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
+        Ok(reply_to_message_id) => reply_to_message_id,
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    emit_typing_chat_action(
+        delivery,
+        chat_id,
+        trigger.trace_id,
+        trigger.execution_id,
+        "approval_resolution",
+    )
+    .await;
+
     let action_execution =
         match governed_actions::get_governed_action_execution_by_approval_request_id(
             pool,
@@ -409,31 +442,6 @@ where
             }
         };
 
-    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
-        Ok(chat_id) => chat_id,
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
-    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
-        Ok(reply_to_message_id) => reply_to_message_id,
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
-
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
@@ -456,6 +464,15 @@ where
     };
 
     if let Some(ref executed) = action_execution {
+        emit_typing_chat_action(
+            delivery,
+            chat_id,
+            trigger.trace_id,
+            trigger.execution_id,
+            "approval_follow_up",
+        )
+        .await;
+
         let follow_up_episode_id = Uuid::now_v7();
         let (episode_trigger_kind, episode_trigger_source) =
             episode_trigger_metadata(trigger.trigger_kind);
@@ -851,6 +868,43 @@ where
         }
     }
 
+    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
+        Ok(chat_id) => chat_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
+        Ok(reply_to_message_id) => reply_to_message_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    emit_typing_chat_action(
+        delivery,
+        chat_id,
+        trigger.trace_id,
+        trigger.execution_id,
+        "foreground_start",
+    )
+    .await;
+
     let assembly = match context::assemble_foreground_context(
         pool,
         config,
@@ -990,6 +1044,14 @@ where
     let (response, result) = if !governed_action_summary.observations.is_empty()
         && governed_action_summary.pending_approval_count == 0
     {
+        emit_typing_chat_action(
+            delivery,
+            chat_id,
+            trigger.trace_id,
+            trigger.execution_id,
+            "foreground_follow_up",
+        )
+        .await;
         let mut follow_up_context = assembly.context.clone();
         follow_up_context.governed_action_observations =
             governed_action_summary.observations.clone();
@@ -1074,35 +1136,6 @@ where
         )
         .await;
     }
-
-    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
-        Ok(chat_id) => chat_id,
-        Err(error) => {
-            return record_and_return_failure(
-                pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
-    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
-        Ok(reply_to_message_id) => reply_to_message_id,
-        Err(error) => {
-            return record_and_return_failure(
-                pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
 
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
@@ -1910,6 +1943,41 @@ fn foreground_assistant_delivery_text(
     }
 
     "No assistant response was generated.".to_string()
+}
+
+async fn emit_typing_chat_action<D>(
+    delivery: &mut D,
+    chat_id: i64,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    phase: &'static str,
+) where
+    D: TelegramDelivery,
+{
+    match delivery
+        .send_chat_action(chat_id, TelegramChatAction::Typing)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                chat_id,
+                phase,
+                "telegram typing chat action sent"
+            );
+        }
+        Err(error) => {
+            warn!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                chat_id,
+                phase,
+                error = %format_error_chain(&error),
+                "telegram typing chat action failed"
+            );
+        }
+    }
 }
 
 fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static str {

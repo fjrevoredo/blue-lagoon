@@ -159,11 +159,7 @@ pub trait TelegramDelivery {
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt>;
 
-    async fn send_chat_action(
-        &mut self,
-        chat_id: i64,
-        action: TelegramChatAction,
-    ) -> Result<()>;
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()>;
 }
 
 pub struct TelegramAdapter<S, D> {
@@ -265,11 +261,7 @@ impl TelegramDelivery for FakeTelegramDelivery {
         })
     }
 
-    async fn send_chat_action(
-        &mut self,
-        chat_id: i64,
-        action: TelegramChatAction,
-    ) -> Result<()> {
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()> {
         self.sent_chat_actions.push((chat_id, action));
         Ok(())
     }
@@ -407,11 +399,7 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
         })
     }
 
-    async fn send_chat_action(
-        &mut self,
-        chat_id: i64,
-        action: TelegramChatAction,
-    ) -> Result<()> {
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()> {
         let request_body = json!({
             "chat_id": chat_id,
             "action": action.as_telegram_api_value(),
@@ -729,6 +717,21 @@ mod tests {
         assert_eq!(delivery.sent_messages()[0].reply_markup, None);
     }
 
+    #[tokio::test]
+    async fn fake_delivery_captures_chat_actions() {
+        let mut delivery = FakeTelegramDelivery::default();
+
+        delivery
+            .send_chat_action(42, TelegramChatAction::Typing)
+            .await
+            .expect("chat action should succeed");
+
+        assert_eq!(
+            delivery.sent_chat_actions(),
+            &[(42, TelegramChatAction::Typing)]
+        );
+    }
+
     #[test]
     fn approval_prompt_message_renders_inline_buttons_and_fallback_text() {
         let prompt = TelegramApprovalPrompt {
@@ -904,6 +907,35 @@ mod tests {
         assert!(request.contains("\"callback_data\":\"approve:42\""));
         assert_eq!(receipt.chat_id, 42);
         assert_eq!(receipt.message_id, 99);
+    }
+
+    #[tokio::test]
+    async fn reqwest_delivery_sends_chat_action_to_telegram_api() {
+        let (api_base_url, receiver, handle) = spawn_single_use_http_server(serde_json::json!({
+            "ok": true,
+            "result": true
+        }));
+        let mut delivery = ReqwestTelegramDelivery::new(ResolvedTelegramConfig {
+            api_base_url,
+            bot_token: "secret".to_string(),
+            allowed_user_id: 42,
+            allowed_chat_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            poll_limit: 10,
+        });
+
+        delivery
+            .send_chat_action(42, TelegramChatAction::Typing)
+            .await
+            .expect("chat action should send");
+
+        let request = receiver.recv().expect("request should be captured");
+        handle.join().expect("server thread should join");
+
+        assert!(request.contains("POST /botsecret/sendChatAction HTTP/1.1"));
+        assert!(request.contains("\"chat_id\":42"));
+        assert!(request.contains("\"action\":\"typing\""));
     }
 
     fn spawn_single_use_http_server(
