@@ -10,6 +10,7 @@ use crate::config::{ApprovalPromptMode, ResolvedTelegramConfig};
 
 const DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS: u64 = 10_000;
 const TELEGRAM_MAX_CALLBACK_DATA_BYTES: usize = 64;
+const TELEGRAM_PARSE_MODE_HTML: &str = "HTML";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TelegramUpdate {
@@ -322,10 +323,12 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt> {
+        let rendered_message = render_telegram_html_message(&message.text);
         let request_body = {
             let mut body = serde_json::Map::new();
             body.insert("chat_id".to_string(), json!(message.chat_id));
-            body.insert("text".to_string(), json!(message.text));
+            body.insert("text".to_string(), json!(rendered_message));
+            body.insert("parse_mode".to_string(), json!(TELEGRAM_PARSE_MODE_HTML));
             if let Some(reply_to_message_id) = message.reply_to_message_id {
                 body.insert(
                     "reply_to_message_id".to_string(),
@@ -481,6 +484,64 @@ fn governed_action_risk_tier_label(risk_tier: GovernedActionRiskTier) -> &'stati
         GovernedActionRiskTier::Tier1 => "tier_1",
         GovernedActionRiskTier::Tier2 => "tier_2",
         GovernedActionRiskTier::Tier3 => "tier_3",
+    }
+}
+
+fn render_telegram_html_message(text: &str) -> String {
+    render_inline_markdownish_html(text)
+}
+
+fn render_inline_markdownish_html(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let remainder = &text[cursor..];
+        if let Some(inner_start) = remainder.strip_prefix("**") {
+            if let Some(end_offset) = inner_start.find("**") {
+                let inner = &inner_start[..end_offset];
+                output.push_str("<b>");
+                output.push_str(&escape_telegram_html(inner));
+                output.push_str("</b>");
+                cursor += 2 + end_offset + 2;
+                continue;
+            }
+        }
+        if let Some(inner_start) = remainder.strip_prefix('`') {
+            if let Some(end_offset) = inner_start.find('`') {
+                let inner = &inner_start[..end_offset];
+                output.push_str("<code>");
+                output.push_str(&escape_telegram_html(inner));
+                output.push_str("</code>");
+                cursor += 1 + end_offset + 1;
+                continue;
+            }
+        }
+
+        let ch = remainder
+            .chars()
+            .next()
+            .expect("cursor is inside a non-empty string");
+        push_escaped_telegram_html_char(&mut output, ch);
+        cursor += ch.len_utf8();
+    }
+    output
+}
+
+fn escape_telegram_html(text: &str) -> String {
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        push_escaped_telegram_html_char(&mut escaped, ch);
+    }
+    escaped
+}
+
+fn push_escaped_telegram_html_char(output: &mut String, ch: char) {
+    match ch {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '"' => output.push_str("&quot;"),
+        _ => output.push(ch),
     }
 }
 
@@ -657,6 +718,25 @@ mod tests {
         assert!(message.text.contains(&long_token));
     }
 
+    #[test]
+    fn telegram_html_renderer_handles_common_model_markdown() {
+        let rendered = render_telegram_html_message(
+            "**rate.sx** — A cryptocurrency site.\n- **Market Cap:** ~$2.5T\nUse `BTC & ETH` <now>.",
+        );
+
+        assert_eq!(
+            rendered,
+            "<b>rate.sx</b> — A cryptocurrency site.\n- <b>Market Cap:</b> ~$2.5T\nUse <code>BTC &amp; ETH</code> &lt;now&gt;."
+        );
+    }
+
+    #[test]
+    fn telegram_html_renderer_leaves_unmatched_markdown_escaped() {
+        let rendered = render_telegram_html_message("Unmatched **bold and <raw> HTML");
+
+        assert_eq!(rendered, "Unmatched **bold and &lt;raw&gt; HTML");
+    }
+
     #[tokio::test]
     async fn reqwest_source_fetches_updates_from_telegram_api() {
         let (api_base_url, receiver, handle) = spawn_single_use_http_server(serde_json::json!({
@@ -725,7 +805,7 @@ mod tests {
         let receipt = delivery
             .send_message(&TelegramOutboundMessage {
                 chat_id: 42,
-                text: "reply".to_string(),
+                text: "**reply** <ok>".to_string(),
                 reply_to_message_id: Some(7),
                 reply_markup: Some(TelegramReplyMarkup::InlineKeyboard(
                     TelegramInlineKeyboardMarkup {
@@ -745,7 +825,8 @@ mod tests {
         assert!(request.contains("POST /botsecret/sendMessage HTTP/1.1"));
         assert!(request.contains("\"chat_id\":42"));
         assert!(request.contains("\"reply_to_message_id\":7"));
-        assert!(request.contains("\"text\":\"reply\""));
+        assert!(request.contains("\"parse_mode\":\"HTML\""));
+        assert!(request.contains("\"text\":\"<b>reply</b> &lt;ok&gt;\""));
         assert!(request.contains("\"reply_markup\""));
         assert!(request.contains("\"inline_keyboard\""));
         assert!(request.contains("\"callback_data\":\"approve:42\""));
