@@ -350,7 +350,11 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
             .context("failed to call Telegram sendMessage")?;
         let status = response.status();
         if !status.is_success() {
-            bail!("Telegram sendMessage returned HTTP {status}");
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            bail!("Telegram sendMessage returned HTTP {status}: {body}");
         }
 
         let body: TelegramApiResponse<TelegramSendMessageResult> = response

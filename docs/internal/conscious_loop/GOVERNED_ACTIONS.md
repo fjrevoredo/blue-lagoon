@@ -6,7 +6,7 @@
 
 The governed action system is the mechanism by which the conscious agent proposes side-effecting operations — running shell commands, executing workspace scripts — without using native API tool-use.
 
-Instead of emitting a tool-call in the model response format, the agent appends a structured JSON block to its text output. The harness extracts this block, validates the capability scope, classifies the risk tier, optionally routes it through the approval workflow, and then executes it. Observations from execution are fed back to the agent in the next model call within the same episode, allowing multi-step turns.
+Instead of emitting a tool-call in the model response format, the agent appends a structured JSON block to its text output. The harness extracts this block, validates the capability scope, classifies the risk tier, optionally routes it through the approval workflow, and then executes it. Observations from execution are fed back to the agent in the next model call within the same episode, allowing multi-step turns. Approval-triggered follow-up episodes also persist the harness observation with the assistant follow-up text so later foreground turns can recover the approved action result from recent history.
 
 This design keeps the agent's output plain text and makes all side-effects auditable and policy-governed before they reach the OS.
 
@@ -18,10 +18,11 @@ This design keeps the agent's output plain text and makes all side-effects audit
 
 | File | Relevant symbol |
 |---|---|
-| `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 586), `build_governed_action_proposals()` (line 642), `GOVERNED_ACTIONS_BLOCK_TAG` (line 24) |
-| `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 667), `execute_governed_action()` |
+| `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 656), `governed_action_observation_summary()` (line 641), `GOVERNED_ACTIONS_BLOCK_TAG` (line 24) |
+| `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 692), `execute_governed_action()` (line 431), `execute_web_fetch_governed_action()` (line 1394), `web_fetch_execution_summary()` (line 1537) |
+| `crates/harness/src/foreground_orchestration.rs` | `orchestrate_telegram_approval_resolution_trigger()` (line 244), `approval_follow_up_episode_text()` (line 1868) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()`, `governed_action_requires_approval()` |
-| `crates/contracts/src/lib.rs` | `GovernedActionProposal` (line 721), `CapabilityScope` (line 705), `GovernedActionPayload` (line 753) |
+| `crates/contracts/src/lib.rs` | `GovernedActionProposal` (line 722), `CapabilityScope` (line 705), `GovernedActionPayload` (line 761) |
 | `config/default.toml` | `[governed_actions]` section |
 
 ### Tool Policy
@@ -132,7 +133,11 @@ Harness governed-action observations: {kind}:{status}:{summary} | ...
 Continue the foreground turn using these outcomes. Do not repeat the same action proposal unless the previous action failed and a materially different retry is required.
 ```
 
-Format produced by `governed_action_observation_summary()` (`main.rs:627`). Multiple observations are joined with ` | `.
+Format produced by `governed_action_observation_summary()` (`crates/workers/src/main.rs:641`). Multiple observations are joined with ` | `.
+
+For `web_fetch`, the execution summary includes the target URL and a whitespace-normalized response preview capped at 1,500 characters (`crates/harness/src/governed_actions.rs:1537`). The full fetched body is still stored in the execution record payload. If the response was byte-truncated by the configured `max_response_bytes`, the summary explicitly says so.
+
+For approval-triggered action execution, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1868`) prepends `Harness governed-action observation: {kind}:{summary}` to the model follow-up text before storing and delivering the assistant follow-up message. This makes the result visible in `recent_history` on subsequent foreground turns even if the model's natural-language follow-up omits details.
 
 ---
 
@@ -140,7 +145,7 @@ Format produced by `governed_action_observation_summary()` (`main.rs:627`). Mult
 
 ### `capability_scope` Validation Rules
 
-Enforced by `validate_capability_scope()` in `governed_actions.rs:667`. All limits are read from `RuntimeConfig` (`config/default.toml: [governed_actions]`).
+Enforced by `validate_capability_scope()` in `governed_actions.rs:692`. All limits are read from `RuntimeConfig` (`config/default.toml: [governed_actions]`).
 
 | Rule | Applies to | Default limit | Config key |
 |---|---|---|---|
@@ -200,4 +205,4 @@ Risk tier is classified by `policy::classify_governed_action_risk()` — the age
 
 ---
 
-*Last verified: commit `6752e2c` (branch `usage-improvements`), session 2026-04-25.*
+*Last verified: branch `usage-improvements`, session 2026-04-28.*

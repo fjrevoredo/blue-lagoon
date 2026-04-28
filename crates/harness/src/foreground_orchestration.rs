@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result, bail};
 use chrono::{Duration, Utc};
 use serde_json::json;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -253,6 +254,13 @@ where
     T: ModelProviderTransport,
     D: TelegramDelivery,
 {
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        ingress_id = %trigger.ingress.ingress_id,
+        approval_token = %parsed_resolution.approval_token,
+        "resolving telegram approval trigger"
+    );
     let approval_request = match approval::get_approval_request_by_token(
         pool,
         &parsed_resolution.approval_token,
@@ -310,6 +318,13 @@ where
             .await;
         }
     };
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        approval_request_id = %resolution.request.approval_request_id,
+        decision = ?resolution.event.decision,
+        "approval request resolved"
+    );
 
     let action_execution =
         match governed_actions::get_governed_action_execution_by_approval_request_id(
@@ -319,6 +334,13 @@ where
         .await
         {
             Ok(Some(record)) => {
+                info!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    approval_request_id = %resolution.request.approval_request_id,
+                    governed_action_execution_id = %record.governed_action_execution_id,
+                    "approval resolution matched governed action execution"
+                );
                 let synced = match governed_actions::sync_status_from_approval_resolution(
                     pool,
                     record.governed_action_execution_id,
@@ -342,7 +364,17 @@ where
 
                 if resolution.event.decision == contracts::ApprovalResolutionDecision::Approved {
                     match governed_actions::execute_governed_action(config, pool, &synced).await {
-                        Ok(executed) => Some(executed),
+                        Ok(executed) => {
+                            info!(
+                                trace_id = %trigger.trace_id,
+                                execution_id = %trigger.execution_id,
+                                governed_action_execution_id = %executed.record.governed_action_execution_id,
+                                status = ?executed.outcome.status,
+                                output_ref = ?executed.outcome.output_ref,
+                                "approved governed action executed"
+                            );
+                            Some(executed)
+                        }
                         Err(error) => {
                             return record_and_return_approval_resolution_failure(
                                 pool,
@@ -357,7 +389,15 @@ where
                     None
                 }
             }
-            Ok(None) => None,
+            Ok(None) => {
+                warn!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    approval_request_id = %resolution.request.approval_request_id,
+                    "approval resolution had no linked governed action execution"
+                );
+                None
+            }
             Err(error) => {
                 return record_and_return_approval_resolution_failure(
                     pool,
@@ -496,6 +536,10 @@ where
                 else {
                     bail!("conscious approval follow-up worker returned a non-conscious result");
                 };
+                let persisted_follow_up_text = approval_follow_up_episode_text(
+                    &executed.observation,
+                    &follow_up_conscious_result.assistant_output.text,
+                );
 
                 let follow_up_message_id = Uuid::now_v7();
                 foreground::insert_episode_message(
@@ -508,7 +552,7 @@ where
                         message_order: 0,
                         message_role: "assistant".to_string(),
                         channel_kind: follow_up_conscious_result.assistant_output.channel_kind,
-                        text_body: Some(follow_up_conscious_result.assistant_output.text.clone()),
+                        text_body: Some(persisted_follow_up_text.clone()),
                         external_message_id: None,
                     },
                 )
@@ -533,7 +577,7 @@ where
                 let follow_up_receipt = delivery
                     .send_message(&TelegramOutboundMessage {
                         chat_id,
-                        text: follow_up_conscious_result.assistant_output.text.clone(),
+                        text: persisted_follow_up_text.clone(),
                         reply_to_message_id,
                         reply_markup: None,
                     })
@@ -550,9 +594,7 @@ where
                     pool,
                     follow_up_episode_id,
                     "completed",
-                    &follow_up_conscious_result
-                        .assistant_output
-                        .text
+                    &persisted_follow_up_text
                         .chars()
                         .take(120)
                         .collect::<String>(),
@@ -565,6 +607,13 @@ where
 
             if let Err(error) = follow_up_result {
                 let error_message = format_error_chain(&error);
+                warn!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    follow_up_episode_id = %follow_up_episode_id,
+                    error = %error_message,
+                    "approval follow-up worker failed after governed action execution"
+                );
                 let _ = foreground::mark_episode_failed(
                     pool,
                     follow_up_episode_id,
@@ -1813,5 +1862,31 @@ fn approval_resolution_message(
     match action_execution {
         Some(action_execution) => format!("{}. {}", base_message, action_execution.outcome.summary),
         None => base_message,
+    }
+}
+
+fn approval_follow_up_episode_text(
+    observation: &contracts::GovernedActionObservation,
+    model_text: &str,
+) -> String {
+    let observation_text = format!(
+        "Harness governed-action observation: {}:{}",
+        governed_action_kind_label(observation.action_kind),
+        observation.outcome.summary
+    );
+    let trimmed_model_text = model_text.trim();
+    if trimmed_model_text.is_empty() {
+        observation_text
+    } else {
+        format!("{observation_text}\n\n{trimmed_model_text}")
+    }
+}
+
+fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static str {
+    match kind {
+        contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
+        contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
 }

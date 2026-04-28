@@ -106,6 +106,8 @@ Messages are appended in this order by `build_model_input()`:
 
 `ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:471–474`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
 
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:1868` prepends the harness observation to the delivered and stored assistant follow-up message. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call.
+
 ### Self-Model Seed
 
 Location: `config/self_model_seed.toml`. Loaded by `self_model::load_self_model_snapshot()`. Fields map 1:1 to `SelfModelSnapshot` in `crates/contracts/src/lib.rs`.
@@ -164,4 +166,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: commit `6752e2c` (branch `usage-improvements`), session 2026-04-25.*
+*Last verified: branch `usage-improvements`, session 2026-04-28.*

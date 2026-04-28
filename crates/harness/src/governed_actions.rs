@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -23,6 +24,8 @@ use crate::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
 };
+
+const WEB_FETCH_OBSERVATION_PREVIEW_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone)]
 pub struct GovernedActionPlanningRequest {
@@ -401,7 +404,7 @@ pub async fn sync_status_from_approval_resolution(
         contracts::ApprovalResolutionDecision::Invalidated => GovernedActionStatus::Invalidated,
     };
 
-    update_governed_action_execution(
+    let updated = update_governed_action_execution(
         pool,
         GovernedActionExecutionUpdate {
             governed_action_execution_id,
@@ -414,7 +417,15 @@ pub async fn sync_status_from_approval_resolution(
             completed_at: None,
         },
     )
-    .await
+    .await?;
+    info!(
+        governed_action_execution_id = %updated.governed_action_execution_id,
+        approval_request_id = ?updated.approval_request_id,
+        action_kind = governed_action_kind_as_str(updated.action_kind),
+        status = governed_action_status_as_str(updated.status),
+        "governed action status synced from approval resolution"
+    );
+    Ok(updated)
 }
 
 pub async fn execute_governed_action(
@@ -1391,12 +1402,27 @@ async fn execute_web_fetch_governed_action(
     let started_at = record.started_at.unwrap_or_else(Utc::now);
     let output_ref = format!("execution_record:{execution_id}");
 
+    info!(
+        governed_action_execution_id = %record.governed_action_execution_id,
+        execution_id = %execution_id,
+        url = %action.url,
+        timeout_ms = action.timeout_ms,
+        max_response_bytes = action.max_response_bytes,
+        "starting governed web fetch execution"
+    );
     let fetch_result = tool_execution::execute_web_fetch(action).await;
     let completed_at = Utc::now();
 
     match fetch_result {
         Err(error) => {
             let summary = error.to_string();
+            warn!(
+                governed_action_execution_id = %record.governed_action_execution_id,
+                execution_id = %execution_id,
+                url = %action.url,
+                error = %summary,
+                "governed web fetch execution failed"
+            );
             execution::mark_failed(
                 pool,
                 execution_id,
@@ -1444,12 +1470,7 @@ async fn execute_web_fetch_governed_action(
             ))
         }
         Ok(outcome) => {
-            let truncation_note = if outcome.truncated {
-                format!(" [truncated to {} bytes]", action.max_response_bytes)
-            } else {
-                String::new()
-            };
-            let summary = format!("web fetch completed{truncation_note}");
+            let summary = web_fetch_execution_summary(action, &outcome.body, outcome.truncated);
             execution::mark_succeeded(
                 pool,
                 execution_id,
@@ -1490,6 +1511,14 @@ async fn execute_web_fetch_governed_action(
                 }),
             )
             .await?;
+            info!(
+                governed_action_execution_id = %updated_record.governed_action_execution_id,
+                execution_id = %execution_id,
+                url = %action.url,
+                body_bytes = outcome.body.len(),
+                truncated = outcome.truncated,
+                "governed web fetch execution completed"
+            );
             let execution_outcome = GovernedActionExecutionOutcome {
                 status: GovernedActionStatus::Executed,
                 summary,
@@ -1503,6 +1532,44 @@ async fn execute_web_fetch_governed_action(
             ))
         }
     }
+}
+
+fn web_fetch_execution_summary(
+    action: &WebFetchAction,
+    response_body: &str,
+    response_truncated: bool,
+) -> String {
+    let preview = normalize_preview(response_body, WEB_FETCH_OBSERVATION_PREVIEW_CHARS);
+    let response_suffix = if preview.is_empty() {
+        "response preview: <empty>".to_string()
+    } else {
+        format!("response preview: {preview}")
+    };
+    let truncation_note = if response_truncated {
+        format!(
+            "; response truncated to {} bytes",
+            action.max_response_bytes
+        )
+    } else if response_body.chars().count() > WEB_FETCH_OBSERVATION_PREVIEW_CHARS {
+        format!("; preview truncated to {WEB_FETCH_OBSERVATION_PREVIEW_CHARS} chars")
+    } else {
+        String::new()
+    };
+
+    format!(
+        "web fetch completed for {}; {response_suffix}{truncation_note}",
+        action.url
+    )
+}
+
+fn normalize_preview(value: &str, max_chars: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn build_workspace_script_subprocess_action(
@@ -2221,5 +2288,33 @@ mod tests {
                 .to_string()
                 .contains("captured output exceeds the configured maximum")
         );
+    }
+
+    #[test]
+    fn web_fetch_summary_carries_bounded_response_preview() {
+        let action = WebFetchAction {
+            url: "https://example.com/weather".to_string(),
+            timeout_ms: 10_000,
+            max_response_bytes: 65_536,
+        };
+
+        let summary =
+            web_fetch_execution_summary(&action, "  Weather\n\nReport: sunny and mild.  ", false);
+
+        assert!(summary.contains("web fetch completed for https://example.com/weather"));
+        assert!(summary.contains("response preview: Weather Report: sunny and mild."));
+    }
+
+    #[test]
+    fn web_fetch_summary_marks_truncation() {
+        let action = WebFetchAction {
+            url: "https://example.com/large".to_string(),
+            timeout_ms: 10_000,
+            max_response_bytes: 32,
+        };
+
+        let summary = web_fetch_execution_summary(&action, "abcdef", true);
+
+        assert!(summary.contains("response truncated to 32 bytes"));
     }
 }
