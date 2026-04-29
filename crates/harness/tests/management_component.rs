@@ -603,7 +603,7 @@ async fn scheduled_foreground_management_upsert_list_and_show_are_auditable() ->
                 next_due_at: Some(next_due_at),
                 status: ScheduledForegroundTaskStatus::Active,
                 actor_ref: "cli:primary-user".to_string(),
-                reason: Some("phase7 management coverage".to_string()),
+                reason: Some("scheduled foreground management coverage".to_string()),
             },
         )
         .await?;

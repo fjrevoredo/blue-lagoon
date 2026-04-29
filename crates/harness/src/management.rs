@@ -2275,6 +2275,20 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        contracts::GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        contracts::GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        contracts::GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        contracts::GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        contracts::GovernedActionKind::AppendWorkspaceScriptVersion => {
+            "append_workspace_script_version"
+        }
+        contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
+            "upsert_scheduled_foreground_task"
+        }
+        contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
     .to_string()

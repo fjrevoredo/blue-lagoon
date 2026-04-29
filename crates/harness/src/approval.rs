@@ -877,6 +877,16 @@ fn approval_resolution_to_status(decision: ApprovalResolutionDecision) -> Approv
 fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
     match kind {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
+        GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
+        GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         GovernedActionKind::WebFetch => "web_fetch",
@@ -886,6 +896,16 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
 fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
     match value {
         "inspect_workspace_artifact" => Ok(GovernedActionKind::InspectWorkspaceArtifact),
+        "list_workspace_artifacts" => Ok(GovernedActionKind::ListWorkspaceArtifacts),
+        "create_workspace_artifact" => Ok(GovernedActionKind::CreateWorkspaceArtifact),
+        "update_workspace_artifact" => Ok(GovernedActionKind::UpdateWorkspaceArtifact),
+        "list_workspace_scripts" => Ok(GovernedActionKind::ListWorkspaceScripts),
+        "inspect_workspace_script" => Ok(GovernedActionKind::InspectWorkspaceScript),
+        "create_workspace_script" => Ok(GovernedActionKind::CreateWorkspaceScript),
+        "append_workspace_script_version" => Ok(GovernedActionKind::AppendWorkspaceScriptVersion),
+        "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
+        "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
+        "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
         "web_fetch" => Ok(GovernedActionKind::WebFetch),

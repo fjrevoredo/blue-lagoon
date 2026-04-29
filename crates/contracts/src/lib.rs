@@ -713,6 +713,16 @@ pub struct CapabilityScope {
 #[serde(rename_all = "snake_case")]
 pub enum GovernedActionKind {
     InspectWorkspaceArtifact,
+    ListWorkspaceArtifacts,
+    CreateWorkspaceArtifact,
+    UpdateWorkspaceArtifact,
+    ListWorkspaceScripts,
+    InspectWorkspaceScript,
+    CreateWorkspaceScript,
+    AppendWorkspaceScriptVersion,
+    ListWorkspaceScriptRuns,
+    UpsertScheduledForegroundTask,
+    RequestBackgroundJob,
     RunSubprocess,
     RunWorkspaceScript,
     WebFetch,
@@ -733,6 +743,102 @@ pub struct GovernedActionProposal {
 pub struct InspectWorkspaceArtifactAction {
     pub artifact_id: Uuid,
     pub artifact_kind: WorkspaceArtifactKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceArtifactStatusFilter {
+    Active,
+    Archived,
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListWorkspaceArtifactsAction {
+    pub artifact_kind: Option<WorkspaceArtifactKind>,
+    pub status: WorkspaceArtifactStatusFilter,
+    pub query: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWorkspaceArtifactAction {
+    pub artifact_kind: WorkspaceArtifactKind,
+    pub title: String,
+    pub content_text: String,
+    pub provenance: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateWorkspaceArtifactAction {
+    pub artifact_id: Uuid,
+    pub expected_updated_at: Option<DateTime<Utc>>,
+    pub title: Option<String>,
+    pub content_text: String,
+    pub change_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListWorkspaceScriptsAction {
+    pub status: WorkspaceArtifactStatusFilter,
+    pub language: Option<String>,
+    pub query: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectWorkspaceScriptAction {
+    pub script_id: Uuid,
+    pub script_version_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWorkspaceScriptAction {
+    pub title: String,
+    pub language: String,
+    pub content_text: String,
+    pub description: Option<String>,
+    pub requested_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendWorkspaceScriptVersionAction {
+    pub script_id: Uuid,
+    pub expected_latest_version_id: Option<Uuid>,
+    pub expected_content_sha256: Option<String>,
+    pub language: String,
+    pub content_text: String,
+    pub change_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListWorkspaceScriptRunsAction {
+    pub script_id: Uuid,
+    pub status: Option<WorkspaceScriptRunStatus>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpsertScheduledForegroundTaskAction {
+    pub task_key: String,
+    pub title: String,
+    pub user_facing_prompt: String,
+    pub next_due_at_utc: Option<DateTime<Utc>>,
+    pub cadence_seconds: u64,
+    pub cooldown_seconds: Option<u64>,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestBackgroundJobAction {
+    pub job_kind: UnconsciousJobKind,
+    pub rationale: String,
+    pub input_scope_ref: Option<String>,
+    pub urgency: Option<String>,
+    pub wake_preference: Option<String>,
+    pub internal_conversation_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,6 +866,16 @@ pub struct WebFetchAction {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum GovernedActionPayload {
     InspectWorkspaceArtifact(InspectWorkspaceArtifactAction),
+    ListWorkspaceArtifacts(ListWorkspaceArtifactsAction),
+    CreateWorkspaceArtifact(CreateWorkspaceArtifactAction),
+    UpdateWorkspaceArtifact(UpdateWorkspaceArtifactAction),
+    ListWorkspaceScripts(ListWorkspaceScriptsAction),
+    InspectWorkspaceScript(InspectWorkspaceScriptAction),
+    CreateWorkspaceScript(CreateWorkspaceScriptAction),
+    AppendWorkspaceScriptVersion(AppendWorkspaceScriptVersionAction),
+    ListWorkspaceScriptRuns(ListWorkspaceScriptRunsAction),
+    UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
+    RequestBackgroundJob(RequestBackgroundJobAction),
     RunSubprocess(SubprocessAction),
     RunWorkspaceScript(WorkspaceScriptAction),
     WebFetch(WebFetchAction),

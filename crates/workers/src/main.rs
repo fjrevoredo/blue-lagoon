@@ -595,6 +595,17 @@ fn governed_action_schema_message() -> String {
 To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block.
 
 Available action kinds:
+- inspect_workspace_artifact: inspect one non-script workspace artifact by UUID
+- list_workspace_artifacts: list/search non-script workspace artifacts
+- create_workspace_artifact: create a note, runbook, scratchpad, or task list
+- update_workspace_artifact: replace a non-script workspace artifact with provenance
+- list_workspace_scripts: list/search workspace scripts
+- inspect_workspace_script: inspect workspace script metadata and bounded content
+- create_workspace_script: create a governed workspace script
+- append_workspace_script_version: append an auditable script version
+- list_workspace_script_runs: inspect bounded script run history
+- upsert_scheduled_foreground_task: create or update future foreground work
+- request_background_job: request bounded background maintenance work
 - run_subprocess: execute a bounded shell command
 - run_workspace_script: run a registered workspace script by its script_id UUID
 - web_fetch: perform an HTTP GET request to a URL (requires network: "enabled"; automatically routed for approval)
@@ -626,6 +637,15 @@ Block format (wrap all proposals in {"actions": [...]}):
 
 Alternate payload shape for run_workspace_script:
 - "payload": { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
+
+Harness-native payload examples:
+- "payload": { "kind": "list_workspace_artifacts", "value": { "artifact_kind": null, "status": "active", "query": null, "limit": 10 } }
+- "payload": { "kind": "inspect_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null } }
+- "payload": { "kind": "create_workspace_artifact", "value": { "artifact_kind": "scratchpad", "title": "...", "content_text": "...", "provenance": "conversation" } }
+- "payload": { "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
+- "payload": { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
+- "payload": { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
+- For harness-native payloads, capability_scope.filesystem read_roots/write_roots must be [], network must be "disabled", environment allow_variables must be [], and execution values may be 0.
 
 Alternate payload shape for web_fetch:
 - "payload": { "kind": "web_fetch", "value": { "url": "https://...", "timeout_ms": 10000, "max_response_bytes": 524288 } }
@@ -698,6 +718,20 @@ fn governed_action_block_bounds(model_text: &str) -> Option<(usize, usize, usize
 fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static str {
     match kind {
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        contracts::GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        contracts::GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        contracts::GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        contracts::GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        contracts::GovernedActionKind::AppendWorkspaceScriptVersion => {
+            "append_workspace_script_version"
+        }
+        contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
+            "upsert_scheduled_foreground_task"
+        }
+        contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",

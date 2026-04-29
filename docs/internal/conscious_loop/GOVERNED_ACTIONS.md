@@ -4,11 +4,15 @@
 
 ## 1. Overview
 
-The governed action system is the mechanism by which the conscious agent proposes side-effecting operations — running shell commands, executing workspace scripts — without using native API tool-use.
+The governed action system is the conscious loop's proposal-only tool surface.
+The model emits plain text plus, when needed, one fenced JSON proposal block.
+The harness parses the proposal, validates the requested scope, classifies risk,
+persists an auditable execution record, optionally requests approval, and only
+then executes the action through harness-owned services.
 
-Instead of emitting a tool-call in the model response format, the agent appends a structured JSON block to its text output. The harness extracts this block, validates the capability scope, classifies the risk tier, optionally routes it through the approval workflow, and then executes it. Observations from execution are fed back to the agent in the next model call within the same episode, allowing multi-step turns. Approval-triggered follow-up episodes also persist the harness observation with the assistant follow-up text so later foreground turns can recover the approved action result from recent history.
-
-This design keeps the agent's output plain text and makes all side-effects auditable and policy-governed before they reach the OS.
+This keeps the conscious worker away from direct OS, workspace, schedule,
+background-job, and wake-signal mutation. Model-usable tools are represented as
+governed actions unless a bounded context summary is safer than a query action.
 
 ---
 
@@ -18,215 +22,185 @@ This design keeps the agent's output plain text and makes all side-effects audit
 
 | File | Relevant symbol |
 |---|---|
-| `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 656), `governed_action_observation_summary()` (line 641), `GOVERNED_ACTIONS_BLOCK_TAG` (line 24) |
-| `crates/harness/src/governed_actions.rs` | `validate_capability_scope()` (line 696), `execute_governed_action()` (line 435), `execute_web_fetch_governed_action()` (line 1398), `web_fetch_execution_summary()` (line 1560) |
-| `crates/harness/src/fetched_content.rs` | `FetchedContentInput` (line 4), `FetchedContentFormatter` (line 20), `DefaultFetchedContentFormatter` (line 25), `HtmlMarkdownFormatter` (line 38), `remove_non_content_html_blocks()` (line 133), `extract_first_tag_content()` (line 161) |
-| `crates/harness/src/tool_execution.rs` | `WebFetchOutcome` (line 275), `execute_web_fetch()` (line 281) |
-| `crates/harness/src/foreground_orchestration.rs` | `orchestrate_telegram_approval_resolution_trigger()` (line 244), `orchestrate_telegram_foreground_trigger()` (line 791), `approval_resolution_message()` (line 1882), `approval_follow_up_episode_text()` (line 1899), `approval_follow_up_delivery_text()` (line 1916), `foreground_assistant_delivery_text()` (line 1925), `emit_typing_chat_action()` (line 1948) |
-| `crates/harness/src/telegram.rs` | `TelegramChatAction` (line 111), `TelegramDelivery::send_chat_action()` (line 162), `ReqwestTelegramDelivery::send_chat_action()` (line 402), `render_telegram_html_message()` (line 550) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()`, `governed_action_requires_approval()` |
-| `crates/contracts/src/lib.rs` | `GovernedActionProposal` (line 722), `CapabilityScope` (line 705), `GovernedActionPayload` (line 761) |
-| `config/default.toml` | `[governed_actions]` section |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 714), payload structs (line 739), `GovernedActionPayload` (line 867) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 24), `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 676), `governed_action_kind_as_str()` (line 718) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 442), `execute_inspect_workspace_artifact()` (line 773), `execute_create_workspace_script()` (line 1090), `execute_request_background_job()` (line 1290), `validate_capability_scope()` (line 1370), `governed_action_kind_as_str()` (line 2795), `CanonicalGovernedActionPayload` (line 2917) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 168), `governed_action_requires_approval()` (line 207) |
+| `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1314) |
+| `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
+| `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
+| `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
+| `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
+| `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for new action-kind strings |
 
-### Tool Policy
+### Model-Facing Action Kinds
 
-The conscious worker always uses `ToolPolicy::ProposalOnly` (`main.rs:441`). The agent cannot invoke tools natively through Claude/API tool-use. The governed action JSON block is the only way for the agent to trigger side effects.
+The live governed-action enum contains these model-usable kinds:
 
-### Block Format and Parsing
+| Action kind | Purpose | Default risk |
+|---|---|---|
+| `inspect_workspace_artifact` | Inspect one active non-script workspace artifact | Tier 0 |
+| `list_workspace_artifacts` | List/search non-script workspace artifacts | Tier 0 |
+| `create_workspace_artifact` | Create a note, runbook, scratchpad, or task list | Tier 1 |
+| `update_workspace_artifact` | Replace a non-script artifact with optimistic conflict checking | Tier 1 |
+| `list_workspace_scripts` | List/search registered workspace scripts | Tier 0 |
+| `inspect_workspace_script` | Inspect script metadata and bounded version content | Tier 0 |
+| `create_workspace_script` | Create a script artifact and initial append-only version | Tier 2 |
+| `append_workspace_script_version` | Append an auditable script version with conflict checking | Tier 2 |
+| `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
+| `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
+| `request_background_job` | Request bounded background maintenance work | Tier 1 |
+| `run_subprocess` | Execute a bounded subprocess | Tier 1-3 by scope |
+| `run_workspace_script` | Execute a registered script version | Tier 1-3 by scope |
+| `web_fetch` | Fetch one HTTP/HTTPS URL with bounded response capture | Tier 2 |
 
-The agent appends a fenced code block tagged `blue-lagoon-governed-actions` after its user-visible response text. The schema message (injected as the last Developer-role message — see `CONTEXT_ASSEMBLY.md`) defines this format for the agent.
+### Proposal Format
 
-````
+The worker injects the schema as a Developer message. The model may append one
+block tagged `blue-lagoon-governed-actions`:
+
+````json
 ```blue-lagoon-governed-actions
-{
-  "actions": [...]
-}
-```
-````
-
-`build_governed_action_proposals()` extracts the block using `rfind` on the full response text (`main.rs:673`), so the **last** occurrence wins if the model emits multiple blocks. `strip_governed_action_block()` removes the block from the text before the assistant turn is stored.
-
-### Full Proposal JSON Schema
-
-Contract type: `GovernedActionProposal` (`contracts/src/lib.rs:721`).
-
-```json
 {
   "actions": [
     {
-      "proposal_id": "<UUID v4>",
+      "proposal_id": "<uuid>",
       "title": "<one-line description>",
-      "rationale": "<why needed, or null>",
-      "action_kind": "run_subprocess | run_workspace_script | web_fetch",
+      "rationale": "<why needed>",
+      "action_kind": "list_workspace_artifacts",
       "requested_risk_tier": null,
       "capability_scope": {
-        "filesystem": {
-          "read_roots": ["<absolute path>"],
-          "write_roots": []
-        },
-        "network": "disabled | allowlisted | enabled",
-        "environment": {
-          "allow_variables": []
-        },
-        "execution": {
-          "timeout_ms": 30000,
-          "max_stdout_bytes": 16384,
-          "max_stderr_bytes": 8192
-        }
+        "filesystem": { "read_roots": [], "write_roots": [] },
+        "network": "disabled",
+        "environment": { "allow_variables": [] },
+        "execution": { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 }
       },
-      "payload": { ... }
+      "payload": {
+        "kind": "list_workspace_artifacts",
+        "value": { "artifact_kind": null, "status": "active", "query": null, "limit": 10 }
+      }
     }
   ]
 }
 ```
+````
 
-Notes:
-- `rationale` is `Option<String>` — may be `null`.
-- `requested_risk_tier` is advisory only; the harness re-classifies using `classify_governed_action_risk()`.
-- The schema message instructs the agent to propose at most one action per turn.
+`build_governed_action_proposals()` extracts the last matching block. The
+orchestrator currently processes at most one action per immediate model turn.
 
-### Payload Shapes
+### Payload Families
 
-**`run_subprocess`:**
+Workspace artifact payloads:
+
 ```json
-{
-  "kind": "run_subprocess",
-  "value": {
-    "command": "<executable>",
-    "args": ["<arg1>", "<arg2>"],
-    "working_directory": "<absolute path or null>"
-  }
-}
+{ "kind": "inspect_workspace_artifact", "value": { "artifact_id": "<uuid>", "artifact_kind": "scratchpad" } }
+{ "kind": "list_workspace_artifacts", "value": { "artifact_kind": null, "status": "active", "query": null, "limit": 10 } }
+{ "kind": "create_workspace_artifact", "value": { "artifact_kind": "note", "title": "...", "content_text": "...", "provenance": "conversation" } }
+{ "kind": "update_workspace_artifact", "value": { "artifact_id": "<uuid>", "expected_updated_at": "2026-04-29T10:00:00Z", "title": null, "content_text": "...", "change_summary": "..." } }
 ```
 
-**`run_workspace_script`:**
+Workspace script payloads:
+
 ```json
-{
-  "kind": "run_workspace_script",
-  "value": {
-    "script_id": "<uuid>",
-    "script_version_id": null,
-    "args": []
-  }
-}
+{ "kind": "list_workspace_scripts", "value": { "status": "active", "language": null, "query": null, "limit": 10 } }
+{ "kind": "inspect_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null } }
+{ "kind": "create_workspace_script", "value": { "title": "...", "language": "python", "content_text": "...", "description": "...", "requested_capabilities": [] } }
+{ "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
+{ "kind": "list_workspace_script_runs", "value": { "script_id": "<uuid>", "status": null, "limit": 10 } }
+{ "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
 ```
 
-**`web_fetch`:**
+Schedule, background, subprocess, and fetch payloads:
+
 ```json
-{
-  "kind": "web_fetch",
-  "value": {
-    "url": "https://...",
-    "timeout_ms": 10000,
-    "max_response_bytes": 524288
-  }
-}
+{ "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
+{ "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
+{ "kind": "run_subprocess", "value": { "command": "<executable>", "args": [], "working_directory": "<absolute path or null>" } }
+{ "kind": "web_fetch", "value": { "url": "https://example.com", "timeout_ms": 10000, "max_response_bytes": 524288 } }
 ```
-
-For `web_fetch`: set `capability_scope.filesystem` to `{"read_roots": [], "write_roots": []}`, `capability_scope.network` to `"enabled"` (required — validation rejects any other value), and `capability_scope.execution` to `{"timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0}` (ignored for web_fetch; limits live in the payload). Every web_fetch proposal is routed for approval (always Tier 2).
-
-> **NOT IMPLEMENTED:** `InspectWorkspaceArtifact` exists as a `GovernedActionKind` enum variant and in the contracts but always returns `GovernedActionStatus::Blocked` at execution time with summary `"workspace inspection execution is not implemented in the first governed backend"` (`governed_actions.rs:523–526`). Do not expose this action kind to the agent.
 
 ### Observation Feedback
 
-After execution, the harness feeds results back to the agent in the next model call within the same episode as a Developer-role message (instead of the schema):
+Execution produces a `GovernedActionObservation` and feeds it into the next
+model call as a bounded Developer message. Workspace artifact and script
+inspection previews are capped at 2,000 characters. Web fetch previews are
+capped at 1,500 characters after content formatting. Full raw fetch bodies and
+harness-native payload details are stored in execution records, not injected
+unbounded into conscious context.
 
-```
-Harness governed-action observations: {kind}:{status}:{summary} | ...
-Continue the foreground turn using these outcomes. This immediate follow-up cannot execute another governed action; if another fetch or command is still required, say exactly what is missing and ask the user to request it in the next turn. Do not claim that you will perform another action now.
-```
+Approval-triggered action execution persists the model follow-up text first,
+then appends the harness observation to durable assistant history. Telegram
+delivery sends only user-facing text.
 
-Format produced by `governed_action_observation_summary()` (`crates/workers/src/main.rs:641`). Multiple observations are joined with ` | `.
+### Recovery Posture
 
-For `web_fetch`, the execution summary includes the target URL, response
-content type, formatter kind, and a formatter-produced preview capped at 1,500
-characters (`crates/harness/src/governed_actions.rs:1560`). The raw fetched
-body is still stored in the execution record payload together with formatter
-metadata: `formatted_preview`, `formatter_kind`, `preview_truncated`, and
-`content_type`.
+Read-only harness-native actions are replay-safe after a worker interruption:
+`inspect_workspace_artifact`, `list_workspace_artifacts`,
+`list_workspace_scripts`, `inspect_workspace_script`, and
+`list_workspace_script_runs`.
 
-Formatter selection is isolated behind `FetchedContentFormatter` in
-`crates/harness/src/fetched_content.rs:20`. The default implementation routes
-HTML content to `HtmlMarkdownFormatter`, which first removes non-content
-`script`, `style`, `noscript`, and `svg` blocks. If a `<pre>` block is present,
-the formatter treats the page as terminal-style HTML, extracts that text, strips
-tags, decodes common HTML entities, removes terminal escape sequences, replaces
-box-drawing table rules, normalizes whitespace by line, and preserves readable
-line breaks. Other HTML is converted through `html2md`. Non-HTML content uses
-the same plain-text sanitizer. If the response was byte-truncated by the
-configured `max_response_bytes`, or if the model-facing preview was
-character-truncated, the summary explicitly says so.
-
-For approval-triggered action execution, `approval_resolution_message()` (`crates/harness/src/foreground_orchestration.rs:1882`) sends only the approval decision acknowledgement and request title. After an approved action executes, `approval_follow_up_episode_text()` (`crates/harness/src/foreground_orchestration.rs:1899`) stores the model follow-up text first, then appends `Harness governed-action observation: {kind}:{summary}` to the stored assistant follow-up message. This keeps the model's user-facing commitment visible when later context assembly truncates recent-history messages, while still making the action result visible in `recent_history` on subsequent foreground turns. Telegram delivery uses `approval_follow_up_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1916`), which sends only the model's user-facing follow-up text and falls back to `"Approved action completed."` when the model text is empty.
-
-Normal foreground Telegram delivery also passes through `foreground_assistant_delivery_text()` (`crates/harness/src/foreground_orchestration.rs:1925`). If the model text is empty after one or more approval prompts were created, the delivered and stored assistant text becomes an explicit approval-pending fallback instead of an empty string. This prevents Telegram `sendMessage` HTTP 400 failures from leaving the original ingress in `processing` state and replaying it during restart recovery.
-
-Foreground processing and approval resolution emit best-effort Telegram `typing` chat actions through `emit_typing_chat_action()` (`crates/harness/src/foreground_orchestration.rs:1948`) and `TelegramDelivery::send_chat_action()` (`crates/harness/src/telegram.rs:162`). Chat action failures are logged and do not fail the foreground turn; the actual `sendMessage` path remains authoritative for delivery.
+Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
+produce side effects are classified as ambiguous or nonrepeatable during
+governed-action recovery. Recovery must not automatically retry them unless
+durable completion evidence proves the original action already reached a
+terminal state.
 
 ---
 
 ## 3. Configuration & Extension
 
-### `capability_scope` Validation Rules
+### Capability Scope Rules
 
-Enforced by `validate_capability_scope()` in `governed_actions.rs:692`. All limits are read from `RuntimeConfig` (`config/default.toml: [governed_actions]`).
+| Rule | Applies to |
+|---|---|
+| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, schedule, and background request actions |
+| At least one filesystem root | `run_subprocess`, `run_workspace_script` |
+| Non-empty execution limits within configured maxima | `run_subprocess`, `run_workspace_script` |
+| Network must be enabled; execution budget fields may be zero | `web_fetch` |
+| Environment variables must be allowlisted | actions that request environment access |
 
-| Rule | Applies to | Default limit | Config key |
-|---|---|---|---|
-| At least one filesystem root (`read_roots` + `write_roots`) | subprocess, workspace_script | — | — |
-| Max filesystem roots total | all | 4 | `max_filesystem_roots_per_action` |
-| No empty root strings | all | — | — |
-| `timeout_ms > 0` | subprocess, workspace_script | — | — |
-| `timeout_ms ≤ max` | subprocess, workspace_script | 120,000 ms | `max_subprocess_timeout_ms` |
-| `max_stdout_bytes > 0` | subprocess, workspace_script | — | — |
-| `max_stderr_bytes > 0` | subprocess, workspace_script | — | — |
-| Output byte limits (both) | subprocess, workspace_script | 65,536 bytes | `max_captured_output_bytes` |
-| Each env variable must be allowlisted | all | `["BLUE_LAGOON_DATABASE_URL"]` | `allowlisted_environment_variables` |
-| Max env variables | all | 8 | `max_environment_variables_per_action` |
-| URL must be non-empty and http/https | web_fetch | — | — |
-| `payload.timeout_ms > 0` and `≤ max` | web_fetch | 15,000 ms | `max_web_fetch_timeout_ms` |
-| `payload.max_response_bytes > 0` and `≤ max` | web_fetch | 524,288 bytes | `max_web_fetch_response_bytes` |
-| `capability_scope.network` must be `"enabled"` | web_fetch | — | — |
+Config defaults live in `config/default.toml` under `[governed_actions]`:
 
-Filesystem root and subprocess execution budget checks are **skipped** for `web_fetch` — limits are in the payload instead. To raise or lower any limit, edit `config/local.toml` under `[governed_actions]`.
+| Key | Default |
+|---|---|
+| `approval_required_min_risk_tier` | `"tier_2"` |
+| `default_subprocess_timeout_ms` | `30000` |
+| `max_subprocess_timeout_ms` | `120000` |
+| `max_filesystem_roots_per_action` | `4` |
+| `default_network_access` | `"disabled"` |
+| `allowlisted_environment_variables` | `["BLUE_LAGOON_DATABASE_URL"]` |
+| `max_environment_variables_per_action` | `8` |
+| `max_captured_output_bytes` | `65536` |
+| `max_web_fetch_timeout_ms` | `15000` |
+| `max_web_fetch_response_bytes` | `524288` |
 
-### Risk Tiers and Approval
+`requested_risk_tier` may raise the final tier, but it cannot lower the
+intrinsic tier computed by `policy::classify_governed_action_risk()`.
 
-Config key: `governed_actions.approval_required_min_risk_tier` (default `"tier_2"`).
+### Extension Checklist
 
-| Tier | Value | Requires approval (default) |
-|---|---|---|
-| Tier 0 | `"tier_0"` | No |
-| Tier 1 | `"tier_1"` | No |
-| Tier 2 | `"tier_2"` | Yes |
-| Tier 3 | `"tier_3"` | Yes |
+Use `docs/internal/harness/TOOL_IMPLEMENTATION.md` for the full E2E workflow.
+The short version is:
 
-Risk tier is classified by `policy::classify_governed_action_risk()` — the agent's `requested_risk_tier` field does not override this. To change the approval threshold, update `approval_required_min_risk_tier` in `config/local.toml`.
-
-### Adding a New Action Kind
-
-1. Add a new variant to `GovernedActionKind` and `GovernedActionPayload` in `crates/contracts/src/lib.rs`.
-2. Add a parsing arm in `parse_governed_action_kind()` (`governed_actions.rs`).
-3. Add a `WebFetch`-style variant to `CanonicalGovernedActionPayload` and its `From` impl in `governed_actions.rs`.
-4. Add an execution arm in the `execute_governed_action()` dispatch and implement the backend function.
-5. Add a risk-classification arm in `policy::classify_governed_action_risk()`.
-6. Update validation in `validate_capability_scope()` and `validate_proposal_shape()` in `governed_actions.rs`.
-7. Update `governed_action_schema_message()` in `workers/src/main.rs` to expose the new kind to the agent. **The alternate payload description must show the complete `capability_scope` object, not a diff — every field (`filesystem`, `network`, `environment`, `execution`) must be present, or the model will omit fields and deserialization will fail.**
-8. Add WebFetch arms to all other `GovernedActionKind` match expressions (currently: `approval.rs`, `management.rs`, `recovery.rs`, `workers/src/main.rs`).
-9. Add tests in `governed_actions_component` and `governed_actions_integration` test suites.
-10. Update all `GovernedActionsConfig` test constructors with any new config fields.
-11. **Write a new migration** (`migrations/NNNN__<name>.sql`) that drops and recreates the `action_kind` check constraints on `governed_action_executions` and `approval_requests` to include the new kind string. `action_kind` is a constrained `TEXT` column in the DB — the Rust enum alone is not enough. Verify the exact constraint names against the existing migration before writing the `DROP CONSTRAINT` statement.
+- Add contract enum and payload variants.
+- Add the migration for constrained `action_kind` columns.
+- Add shape validation, scope validation, risk classification, canonical
+  fingerprinting, execution dispatch, observation formatting, and audit payloads.
+- Update worker schema text and every exhaustive action-kind match.
+- Add component tests for planning, validation, execution, and DB constraints.
+- Update this document and restamp the verified date.
 
 ---
 
 ## 4. Further Reading
 
-- `docs/internal/conscious_loop/CONTEXT_ASSEMBLY.md` — how the schema message is injected into the message array, and how observation feedback is positioned relative to other Developer messages.
-- `docs/LOOP_ARCHITECTURE.md` — canonical description of the foreground turn lifecycle and the harness's role as executor and auditor.
-- `docs/IMPLEMENTATION_DESIGN.md` — design rationale for the proposal-only tool policy and the two-process model.
-- `crates/harness/src/policy.rs` — risk classification logic and approval routing.
-- `crates/harness/src/approval.rs` — approval request lifecycle.
+- `docs/internal/conscious_loop/CONTEXT_ASSEMBLY.md`: how observations and schema
+  messages are positioned in conscious context.
+- `docs/internal/harness/TOOL_IMPLEMENTATION.md`: exact implementation workflow
+  for adding a governed tool.
+- `docs/LOOP_ARCHITECTURE.md`: canonical conscious/unconscious boundary.
+- `docs/IMPLEMENTATION_DESIGN.md`: canonical runtime design constraints.
 
 ---
 
-*Last verified: branch `usage-improvements`, session 2026-04-28.*
+*Last verified: branch `usage-improvements`, session 2026-04-29.*

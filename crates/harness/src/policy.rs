@@ -166,10 +166,6 @@ pub fn evaluate_synthetic_smoke(config: &RuntimeConfig) -> PolicyDecision {
 }
 
 pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> GovernedActionRiskTier {
-    if let Some(requested) = proposal.requested_risk_tier {
-        return requested;
-    }
-
     let has_write_scope = !proposal.capability_scope.filesystem.write_roots.is_empty();
     let has_env_scope = !proposal
         .capability_scope
@@ -178,8 +174,18 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         .is_empty();
     let has_network = proposal.capability_scope.network != NetworkAccessPosture::Disabled;
 
-    match proposal.action_kind {
-        GovernedActionKind::InspectWorkspaceArtifact => GovernedActionRiskTier::Tier0,
+    let intrinsic = match proposal.action_kind {
+        GovernedActionKind::InspectWorkspaceArtifact
+        | GovernedActionKind::ListWorkspaceArtifacts
+        | GovernedActionKind::ListWorkspaceScripts
+        | GovernedActionKind::InspectWorkspaceScript
+        | GovernedActionKind::ListWorkspaceScriptRuns => GovernedActionRiskTier::Tier0,
+        GovernedActionKind::CreateWorkspaceArtifact
+        | GovernedActionKind::UpdateWorkspaceArtifact
+        | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,
+        GovernedActionKind::CreateWorkspaceScript
+        | GovernedActionKind::AppendWorkspaceScriptVersion
+        | GovernedActionKind::UpsertScheduledForegroundTask => GovernedActionRiskTier::Tier2,
         GovernedActionKind::WebFetch => GovernedActionRiskTier::Tier2,
         GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
             if has_network && has_write_scope {
@@ -190,7 +196,12 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
                 GovernedActionRiskTier::Tier1
             }
         }
-    }
+    };
+
+    proposal
+        .requested_risk_tier
+        .filter(|requested| *requested > intrinsic)
+        .unwrap_or(intrinsic)
 }
 
 pub fn governed_action_requires_approval(

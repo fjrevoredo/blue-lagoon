@@ -324,7 +324,7 @@ mod tests {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(migrations[0].name, "runtime_foundation");
         assert_eq!(migrations[1].name, "foreground_loop");
         assert_eq!(migrations[3].name, "canonical_continuity");
@@ -333,6 +333,7 @@ mod tests {
         assert_eq!(migrations[6].name, "recovery_hardening");
         assert_eq!(migrations[7].name, "scheduled_foreground_tasks");
         assert_eq!(migrations[8].name, "web_fetch_action_kind");
+        assert_eq!(migrations[9].name, "conscious_tool_action_kinds");
     }
 
     #[test]
