@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result, bail};
 use chrono::{Duration, Utc};
 use serde_json::json;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
     governed_actions,
     model_gateway::ModelProviderTransport,
     policy, proposal, recovery,
-    telegram::{self, TelegramDelivery, TelegramOutboundMessage},
+    telegram::{self, TelegramChatAction, TelegramDelivery, TelegramOutboundMessage},
     worker,
 };
 
@@ -124,9 +125,11 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            model_gateway_config,
             trigger,
             parsed_resolution,
             delivery,
+            transport,
         )
         .await;
     }
@@ -194,9 +197,11 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            model_gateway_config,
             trigger,
             parsed_resolution,
             delivery,
+            transport,
         )
         .await;
     }
@@ -236,16 +241,26 @@ where
     .await
 }
 
-async fn orchestrate_telegram_approval_resolution_trigger<D>(
+async fn orchestrate_telegram_approval_resolution_trigger<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    model_gateway_config: &ResolvedModelGatewayConfig,
     trigger: contracts::ForegroundTrigger,
     parsed_resolution: ParsedApprovalResolutionIngress,
     delivery: &mut D,
+    transport: &T,
 ) -> Result<TelegramForegroundOrchestrationOutcome>
 where
+    T: ModelProviderTransport,
     D: TelegramDelivery,
 {
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        ingress_id = %trigger.ingress.ingress_id,
+        approval_token = %parsed_resolution.approval_token,
+        "resolving telegram approval trigger"
+    );
     let approval_request = match approval::get_approval_request_by_token(
         pool,
         &parsed_resolution.approval_token,
@@ -303,64 +318,13 @@ where
             .await;
         }
     };
-
-    let action_execution =
-        match governed_actions::get_governed_action_execution_by_approval_request_id(
-            pool,
-            resolution.request.approval_request_id,
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                let synced = match governed_actions::sync_status_from_approval_resolution(
-                    pool,
-                    record.governed_action_execution_id,
-                    resolution.event.decision,
-                    Some(trigger.execution_id),
-                    resolution.event.reason.as_deref(),
-                )
-                .await
-                {
-                    Ok(record) => record,
-                    Err(error) => {
-                        return record_and_return_approval_resolution_failure(
-                            pool,
-                            &trigger,
-                            ForegroundFailureKind::PersistenceFailure,
-                            error,
-                        )
-                        .await;
-                    }
-                };
-
-                if resolution.event.decision == contracts::ApprovalResolutionDecision::Approved {
-                    match governed_actions::execute_governed_action(config, pool, &synced).await {
-                        Ok(executed) => Some(executed),
-                        Err(error) => {
-                            return record_and_return_approval_resolution_failure(
-                                pool,
-                                &trigger,
-                                ForegroundFailureKind::WorkerProtocolFailure,
-                                error,
-                            )
-                            .await;
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-            Ok(None) => None,
-            Err(error) => {
-                return record_and_return_approval_resolution_failure(
-                    pool,
-                    &trigger,
-                    ForegroundFailureKind::PersistenceFailure,
-                    error,
-                )
-                .await;
-            }
-        };
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        approval_request_id = %resolution.request.approval_request_id,
+        decision = ?resolution.event.decision,
+        "approval request resolved"
+    );
 
     let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
         Ok(chat_id) => chat_id,
@@ -386,11 +350,102 @@ where
             .await;
         }
     };
+    emit_typing_chat_action(
+        delivery,
+        chat_id,
+        trigger.trace_id,
+        trigger.execution_id,
+        "approval_resolution",
+    )
+    .await;
+
+    let action_execution =
+        match governed_actions::get_governed_action_execution_by_approval_request_id(
+            pool,
+            resolution.request.approval_request_id,
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                info!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    approval_request_id = %resolution.request.approval_request_id,
+                    governed_action_execution_id = %record.governed_action_execution_id,
+                    "approval resolution matched governed action execution"
+                );
+                let synced = match governed_actions::sync_status_from_approval_resolution(
+                    pool,
+                    record.governed_action_execution_id,
+                    resolution.event.decision,
+                    Some(trigger.execution_id),
+                    resolution.event.reason.as_deref(),
+                )
+                .await
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return record_and_return_approval_resolution_failure(
+                            pool,
+                            &trigger,
+                            ForegroundFailureKind::PersistenceFailure,
+                            error,
+                        )
+                        .await;
+                    }
+                };
+
+                if resolution.event.decision == contracts::ApprovalResolutionDecision::Approved {
+                    match governed_actions::execute_governed_action(config, pool, &synced).await {
+                        Ok(executed) => {
+                            info!(
+                                trace_id = %trigger.trace_id,
+                                execution_id = %trigger.execution_id,
+                                governed_action_execution_id = %executed.record.governed_action_execution_id,
+                                status = ?executed.outcome.status,
+                                output_ref = ?executed.outcome.output_ref,
+                                "approved governed action executed"
+                            );
+                            Some(executed)
+                        }
+                        Err(error) => {
+                            return record_and_return_approval_resolution_failure(
+                                pool,
+                                &trigger,
+                                ForegroundFailureKind::WorkerProtocolFailure,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    approval_request_id = %resolution.request.approval_request_id,
+                    "approval resolution had no linked governed action execution"
+                );
+                None
+            }
+            Err(error) => {
+                return record_and_return_approval_resolution_failure(
+                    pool,
+                    &trigger,
+                    ForegroundFailureKind::PersistenceFailure,
+                    error,
+                )
+                .await;
+            }
+        };
 
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
-            text: approval_resolution_message(&resolution, action_execution.as_ref()),
+            text: approval_resolution_message(&resolution),
             reply_to_message_id,
             reply_markup: None,
         })
@@ -407,6 +462,205 @@ where
             .await;
         }
     };
+
+    if let Some(ref executed) = action_execution {
+        emit_typing_chat_action(
+            delivery,
+            chat_id,
+            trigger.trace_id,
+            trigger.execution_id,
+            "approval_follow_up",
+        )
+        .await;
+
+        let follow_up_episode_id = Uuid::now_v7();
+        let (episode_trigger_kind, episode_trigger_source) =
+            episode_trigger_metadata(trigger.trigger_kind);
+
+        let episode_inserted = match foreground::insert_episode(
+            pool,
+            &NewEpisode {
+                episode_id: follow_up_episode_id,
+                trace_id: trigger.trace_id,
+                execution_id: trigger.execution_id,
+                ingress_id: Some(trigger.ingress.ingress_id),
+                internal_principal_ref: trigger.ingress.internal_principal_ref.clone(),
+                internal_conversation_ref: trigger.ingress.internal_conversation_ref.clone(),
+                trigger_kind: episode_trigger_kind.to_string(),
+                trigger_source: episode_trigger_source.to_string(),
+                status: "started".to_string(),
+                started_at: trigger.received_at,
+            },
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: "conscious".to_string(),
+                        subsystem: "foreground_orchestration".to_string(),
+                        event_kind: "approval_follow_up_failed".to_string(),
+                        severity: "warning".to_string(),
+                        trace_id: trigger.trace_id,
+                        execution_id: Some(trigger.execution_id),
+                        worker_pid: None,
+                        payload: json!({
+                            "step": "insert_episode",
+                            "error": format_error_chain(&error),
+                        }),
+                    },
+                )
+                .await;
+                false
+            }
+        };
+
+        if episode_inserted {
+            let follow_up_result: Result<()> = async {
+                let mut assembly = context::assemble_foreground_context(
+                    pool,
+                    config,
+                    trigger.clone(),
+                    context::ContextAssemblyOptions {
+                        episode_id: Some(follow_up_episode_id),
+                        ..context::ContextAssemblyOptions::default()
+                    },
+                )
+                .await?;
+                assembly.context.governed_action_observations = vec![executed.observation.clone()];
+
+                let follow_up_request = contracts::WorkerRequest::conscious(
+                    trigger.trace_id,
+                    trigger.execution_id,
+                    assembly.context.clone(),
+                );
+                let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+                let follow_up_response = launch_leased_conscious_worker(
+                    pool,
+                    config,
+                    model_gateway_config,
+                    &trigger,
+                    &follow_up_request,
+                    transport,
+                    foreground_timeout_ms,
+                )
+                .await?;
+
+                let contracts::WorkerResult::Conscious(follow_up_conscious_result) =
+                    &follow_up_response.result
+                else {
+                    bail!("conscious approval follow-up worker returned a non-conscious result");
+                };
+                let persisted_follow_up_text = approval_follow_up_episode_text(
+                    &executed.observation,
+                    &follow_up_conscious_result.assistant_output.text,
+                );
+                let delivered_follow_up_text = approval_follow_up_delivery_text(
+                    &follow_up_conscious_result.assistant_output.text,
+                );
+
+                let follow_up_message_id = Uuid::now_v7();
+                foreground::insert_episode_message(
+                    pool,
+                    &NewEpisodeMessage {
+                        episode_message_id: follow_up_message_id,
+                        episode_id: follow_up_episode_id,
+                        trace_id: trigger.trace_id,
+                        execution_id: trigger.execution_id,
+                        message_order: 0,
+                        message_role: "assistant".to_string(),
+                        channel_kind: follow_up_conscious_result.assistant_output.channel_kind,
+                        text_body: Some(persisted_follow_up_text.clone()),
+                        external_message_id: None,
+                    },
+                )
+                .await?;
+
+                proposal::apply_candidate_proposals(
+                    pool,
+                    config,
+                    &proposal::ProposalProcessingContext {
+                        trace_id: trigger.trace_id,
+                        execution_id: trigger.execution_id,
+                        episode_id: Some(follow_up_episode_id),
+                        source_ingress_id: Some(trigger.ingress.ingress_id),
+                        source_loop_kind: "conscious".to_string(),
+                    },
+                    "foreground_orchestration",
+                    None,
+                    &follow_up_conscious_result.candidate_proposals,
+                )
+                .await?;
+
+                let follow_up_receipt = delivery
+                    .send_message(&TelegramOutboundMessage {
+                        chat_id,
+                        text: delivered_follow_up_text,
+                        reply_to_message_id,
+                        reply_markup: None,
+                    })
+                    .await?;
+
+                foreground::update_episode_message_external_message_id(
+                    pool,
+                    follow_up_message_id,
+                    &follow_up_receipt.message_id.to_string(),
+                )
+                .await?;
+
+                foreground::mark_episode_completed(
+                    pool,
+                    follow_up_episode_id,
+                    "completed",
+                    &persisted_follow_up_text
+                        .chars()
+                        .take(120)
+                        .collect::<String>(),
+                )
+                .await?;
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = follow_up_result {
+                let error_message = format_error_chain(&error);
+                warn!(
+                    trace_id = %trigger.trace_id,
+                    execution_id = %trigger.execution_id,
+                    follow_up_episode_id = %follow_up_episode_id,
+                    error = %error_message,
+                    "approval follow-up worker failed after governed action execution"
+                );
+                let _ = foreground::mark_episode_failed(
+                    pool,
+                    follow_up_episode_id,
+                    "follow_up_failed",
+                    &error_message,
+                )
+                .await;
+                let _ = audit::insert(
+                    pool,
+                    &NewAuditEvent {
+                        loop_kind: "conscious".to_string(),
+                        subsystem: "foreground_orchestration".to_string(),
+                        event_kind: "approval_follow_up_failed".to_string(),
+                        severity: "warning".to_string(),
+                        trace_id: trigger.trace_id,
+                        execution_id: Some(trigger.execution_id),
+                        worker_pid: None,
+                        payload: json!({
+                            "follow_up_episode_id": follow_up_episode_id,
+                            "error": error_message,
+                        }),
+                    },
+                )
+                .await;
+            }
+        }
+    }
 
     let response_payload = json!({
         "kind": "approval_resolution",
@@ -614,6 +868,43 @@ where
         }
     }
 
+    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
+        Ok(chat_id) => chat_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
+        Ok(reply_to_message_id) => reply_to_message_id,
+        Err(error) => {
+            return record_and_return_failure(
+                pool,
+                trigger.trace_id,
+                trigger.execution_id,
+                recorded_episode_id,
+                ForegroundFailureKind::TelegramDeliveryFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    emit_typing_chat_action(
+        delivery,
+        chat_id,
+        trigger.trace_id,
+        trigger.execution_id,
+        "foreground_start",
+    )
+    .await;
+
     let assembly = match context::assemble_foreground_context(
         pool,
         config,
@@ -753,6 +1044,14 @@ where
     let (response, result) = if !governed_action_summary.observations.is_empty()
         && governed_action_summary.pending_approval_count == 0
     {
+        emit_typing_chat_action(
+            delivery,
+            chat_id,
+            trigger.trace_id,
+            trigger.execution_id,
+            "foreground_follow_up",
+        )
+        .await;
         let mut follow_up_context = assembly.context.clone();
         follow_up_context.governed_action_observations =
             governed_action_summary.observations.clone();
@@ -808,6 +1107,8 @@ where
         (initial_response.clone(), initial_result.clone())
     };
 
+    let assistant_text =
+        foreground_assistant_delivery_text(&result.assistant_output.text, &governed_action_summary);
     let assistant_episode_message_id = Uuid::now_v7();
     if let Err(error) = foreground::insert_episode_message(
         pool,
@@ -819,7 +1120,7 @@ where
             message_order: user_messages.len() as i32,
             message_role: "assistant".to_string(),
             channel_kind: result.assistant_output.channel_kind,
-            text_body: Some(result.assistant_output.text.clone()),
+            text_body: Some(assistant_text.clone()),
             external_message_id: None,
         },
     )
@@ -836,39 +1137,10 @@ where
         .await;
     }
 
-    let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
-        Ok(chat_id) => chat_id,
-        Err(error) => {
-            return record_and_return_failure(
-                pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
-    let reply_to_message_id = match parse_telegram_reply_target(&trigger.ingress) {
-        Ok(reply_to_message_id) => reply_to_message_id,
-        Err(error) => {
-            return record_and_return_failure(
-                pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::TelegramDeliveryFailure,
-                error,
-            )
-            .await;
-        }
-    };
-
     let delivery_receipt = match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
-            text: result.assistant_output.text.clone(),
+            text: assistant_text.clone(),
             reply_to_message_id,
             reply_markup: None,
         })
@@ -1607,11 +1879,8 @@ fn parse_approval_callback_decision(
     }
 }
 
-fn approval_resolution_message(
-    resolution: &approval::ApprovalResolutionResult,
-    action_execution: Option<&governed_actions::GovernedActionExecutionResult>,
-) -> String {
-    let base_message = match resolution.event.decision {
+fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) -> String {
+    match resolution.event.decision {
         contracts::ApprovalResolutionDecision::Approved => {
             format!("Approved: {}", resolution.request.title)
         }
@@ -1624,9 +1893,183 @@ fn approval_resolution_message(
         contracts::ApprovalResolutionDecision::Invalidated => {
             "Approval request is no longer valid because the requested action changed.".to_string()
         }
-    };
-    match action_execution {
-        Some(action_execution) => format!("{}. {}", base_message, action_execution.outcome.summary),
-        None => base_message,
+    }
+}
+
+fn approval_follow_up_episode_text(
+    observation: &contracts::GovernedActionObservation,
+    model_text: &str,
+) -> String {
+    let observation_text = format!(
+        "Harness governed-action observation: {}:{}",
+        governed_action_kind_label(observation.action_kind),
+        observation.outcome.summary
+    );
+    let trimmed_model_text = model_text.trim();
+    if trimmed_model_text.is_empty() {
+        observation_text
+    } else {
+        format!("{trimmed_model_text}\n\n{observation_text}")
+    }
+}
+
+fn approval_follow_up_delivery_text(model_text: &str) -> String {
+    let trimmed = model_text.trim();
+    if trimmed.is_empty() {
+        "Approved action completed.".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn foreground_assistant_delivery_text(
+    model_text: &str,
+    governed_action_summary: &GovernedActionProcessingSummary,
+) -> String {
+    let trimmed = model_text.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    if governed_action_summary.pending_approval_count > 0 {
+        return if governed_action_summary.pending_approval_count == 1 {
+            "Approval requested. Use the approval prompt above to continue.".to_string()
+        } else {
+            format!(
+                "{} approvals requested. Use the approval prompts above to continue.",
+                governed_action_summary.pending_approval_count
+            )
+        };
+    }
+
+    "No assistant response was generated.".to_string()
+}
+
+async fn emit_typing_chat_action<D>(
+    delivery: &mut D,
+    chat_id: i64,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    phase: &'static str,
+) where
+    D: TelegramDelivery,
+{
+    match delivery
+        .send_chat_action(chat_id, TelegramChatAction::Typing)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                chat_id,
+                phase,
+                "telegram typing chat action sent"
+            );
+        }
+        Err(error) => {
+            warn!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                chat_id,
+                phase,
+                error = %format_error_chain(&error),
+                "telegram typing chat action failed"
+            );
+        }
+    }
+}
+
+fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static str {
+    match kind {
+        contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
+        contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        contracts::GovernedActionKind::WebFetch => "web_fetch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_follow_up_delivery_uses_model_text_only() {
+        let delivered = approval_follow_up_delivery_text(
+            "  The fetch completed and the current rate is available.  ",
+        );
+
+        assert_eq!(
+            delivered,
+            "The fetch completed and the current rate is available."
+        );
+    }
+
+    #[test]
+    fn approval_follow_up_episode_text_keeps_model_text_first_for_history() {
+        let observation = contracts::GovernedActionObservation {
+            observation_id: Uuid::now_v7(),
+            action_kind: contracts::GovernedActionKind::WebFetch,
+            outcome: contracts::GovernedActionExecutionOutcome {
+                status: contracts::GovernedActionStatus::Executed,
+                summary: "web fetch completed for https://example.com/; preview: very long"
+                    .to_string(),
+                fingerprint: None,
+                output_ref: None,
+            },
+        };
+
+        let stored =
+            approval_follow_up_episode_text(&observation, "I found the page. Let me summarize it.");
+
+        assert!(stored.starts_with("I found the page. Let me summarize it."));
+        assert!(stored.contains("Harness governed-action observation: web_fetch:"));
+    }
+
+    #[test]
+    fn approval_follow_up_delivery_falls_back_when_model_text_is_empty() {
+        assert_eq!(
+            approval_follow_up_delivery_text(" \n\t "),
+            "Approved action completed."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_uses_model_text_when_present() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 1,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary),
+            "Waiting on approval."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_single_pending_approval() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 1,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text("", &summary),
+            "Approval requested. Use the approval prompt above to continue."
+        );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_multiple_pending_approvals() {
+        let summary = GovernedActionProcessingSummary {
+            pending_approval_count: 2,
+            ..GovernedActionProcessingSummary::default()
+        };
+
+        assert_eq!(
+            foreground_assistant_delivery_text(" \n", &summary),
+            "2 approvals requested. Use the approval prompts above to continue."
+        );
     }
 }

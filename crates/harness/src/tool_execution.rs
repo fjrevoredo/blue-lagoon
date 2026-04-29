@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use contracts::{CapabilityScope, NetworkAccessPosture, SubprocessAction};
+use contracts::{CapabilityScope, NetworkAccessPosture, SubprocessAction, WebFetchAction};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use crate::config::RuntimeConfig;
@@ -272,6 +272,45 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: u64) -> String {
     String::from_utf8_lossy(slice).to_string()
 }
 
+pub struct WebFetchOutcome {
+    pub body: String,
+    pub content_type: Option<String>,
+    pub truncated: bool,
+}
+
+pub async fn execute_web_fetch(action: &WebFetchAction) -> Result<WebFetchOutcome> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(action.timeout_ms))
+        .build()
+        .context("failed to build HTTP client for web fetch")?;
+
+    let response = client
+        .get(&action.url)
+        .send()
+        .await
+        .with_context(|| format!("HTTP GET failed for '{}'", action.url))?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read HTTP response body from '{}'", action.url))?;
+
+    let max = usize::try_from(action.max_response_bytes).unwrap_or(usize::MAX);
+    let truncated = bytes.len() > max;
+    let body = truncate_utf8_lossy(&bytes, action.max_response_bytes);
+
+    Ok(WebFetchOutcome {
+        body,
+        content_type,
+        truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +403,8 @@ mod tests {
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
                 max_environment_variables_per_action: 8,
                 max_captured_output_bytes: 65_536,
+                max_web_fetch_timeout_ms: 15_000,
+                max_web_fetch_response_bytes: 524_288,
             },
             worker: WorkerConfig {
                 timeout_ms: 20_000,

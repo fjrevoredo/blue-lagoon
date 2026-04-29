@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundRecoveryContext, ForegroundTrigger};
 use serde::Serialize;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     self_model::{self, InternalStateSeed},
 };
 
-pub const DEFAULT_RECENT_HISTORY_LIMIT: i64 = 3;
+pub const DEFAULT_RECENT_HISTORY_LIMIT: i64 = 8;
 pub const DEFAULT_TRIGGER_TEXT_CHAR_LIMIT: usize = 2_000;
 pub const DEFAULT_HISTORY_MESSAGE_CHAR_LIMIT: usize = 400;
 
@@ -141,6 +142,19 @@ pub async fn assemble_foreground_context(
         truncated_history_message_count,
     };
 
+    info!(
+        source_ingress_id = %metadata.source_ingress_id,
+        foreground_execution_mode = %metadata.foreground_execution_mode,
+        recent_history_limit = metadata.recent_history_limit,
+        selected_recent_history_count = metadata.selected_recent_history_count,
+        selected_recent_history_episode_ids = ?metadata.selected_recent_history_episode_ids,
+        selected_retrieved_context_count = metadata.selected_retrieved_context_count,
+        selected_retrieved_context_item_ids = ?metadata.selected_retrieved_context_item_ids,
+        truncated_history_message_count = metadata.truncated_history_message_count,
+        trigger_text_truncated = metadata.trigger_text_truncated,
+        "assembled foreground context"
+    );
+
     Ok(ContextAssemblyResult {
         context: ConsciousContext {
             context_id: Uuid::now_v7(),
@@ -267,6 +281,11 @@ mod tests {
         .validate()
         .expect_err("zero history message limit should fail");
         assert!(error.to_string().contains("history_message_char_limit"));
+    }
+
+    #[test]
+    fn default_context_limits_keep_more_than_short_approval_window() {
+        assert_eq!(ContextAssemblyLimits::default().recent_history_limit, 8);
     }
 
     #[test]

@@ -633,6 +633,10 @@ async fn approval_callback_orchestration_resolves_request_and_replies() -> Resul
 
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
+            delivery.sent_chat_actions(),
+            &[(42, telegram::TelegramChatAction::Typing)]
+        );
+        assert_eq!(
             delivery.sent_messages()[0].text,
             "Approved: Run scoped callback action"
         );
@@ -1774,6 +1778,10 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
         );
 
         assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_chat_actions(),
+            &[(42, telegram::TelegramChatAction::Typing)]
+        );
         assert_eq!(delivery.sent_messages()[0].chat_id, 42);
         assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(42));
         assert_eq!(

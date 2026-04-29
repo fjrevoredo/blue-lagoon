@@ -1316,9 +1316,9 @@ fn governed_action_recovery_action_classification(
 ) -> RecoveryActionClassification {
     match record.action_kind {
         GovernedActionKind::InspectWorkspaceArtifact => RecoveryActionClassification::SafeReplay,
-        GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
-            RecoveryActionClassification::AmbiguousOrNonrepeatable
-        }
+        GovernedActionKind::RunSubprocess
+        | GovernedActionKind::RunWorkspaceScript
+        | GovernedActionKind::WebFetch => RecoveryActionClassification::AmbiguousOrNonrepeatable,
     }
 }
 

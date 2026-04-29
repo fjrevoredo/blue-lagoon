@@ -1,6 +1,6 @@
 mod support;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use contracts::{
     ApprovalRequestStatus, ApprovalResolutionDecision, CapabilityScope, EnvironmentCapabilityScope,
@@ -22,6 +22,17 @@ use harness::{
         WorkspaceArtifactStatus,
     },
 };
+
+/// Exhaustive match — adding a GovernedActionKind variant without adding an arm here
+/// is a compile error, forcing the developer to also provide the DB string and write a migration.
+fn kind_str(kind: GovernedActionKind) -> &'static str {
+    match kind {
+        GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        GovernedActionKind::RunSubprocess => "run_subprocess",
+        GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        GovernedActionKind::WebFetch => "web_fetch",
+    }
+}
 
 #[tokio::test]
 #[serial]
@@ -808,6 +819,335 @@ fn execution_capability_scope() -> CapabilityScope {
             max_stderr_bytes: 32_768,
         },
     }
+}
+
+fn web_fetch_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Enabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 0,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: 0,
+        },
+    }
+}
+
+fn sample_web_fetch_action() -> contracts::WebFetchAction {
+    contracts::WebFetchAction {
+        url: "https://example.com".to_string(),
+        timeout_ms: 10_000,
+        max_response_bytes: 65_536,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_proposal_is_planned_with_tier2_and_requires_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch example.com".to_string(),
+                    rationale: Some("Verify web fetch planning.".to_string()),
+                    action_kind: GovernedActionKind::RunSubprocess,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(sample_web_fetch_action()),
+                },
+            },
+        )
+        .await;
+        assert!(
+            planned.is_err(),
+            "web_fetch payload with run_subprocess kind should be rejected"
+        );
+        Ok(())
+    })
+    .await?;
+
+    support::with_migrated_database(|ctx| async move {
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch example.com".to_string(),
+                    rationale: Some("Verify web fetch planning.".to_string()),
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(sample_web_fetch_action()),
+                },
+            },
+        )
+        .await?;
+
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned web fetch, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+        assert_eq!(planned.record.risk_tier, GovernedActionRiskTier::Tier2);
+        assert_eq!(
+            planned.record.status,
+            contracts::GovernedActionStatus::AwaitingApproval
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_validation_rejects_invalid_url() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut action = sample_web_fetch_action();
+        action.url = "not-a-url".to_string();
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch invalid".to_string(),
+                    rationale: None,
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(action),
+                },
+            },
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+            ),
+            "invalid URL should produce a blocked outcome"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_validation_rejects_non_http_scheme() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut action = sample_web_fetch_action();
+        action.url = "ftp://example.com/file.txt".to_string();
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch ftp".to_string(),
+                    rationale: None,
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(action),
+                },
+            },
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+            ),
+            "non-http/https scheme should produce a blocked outcome"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_validation_rejects_disabled_network() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut scope = web_fetch_capability_scope();
+        scope.network = NetworkAccessPosture::Disabled;
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch with disabled network".to_string(),
+                    rationale: None,
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: scope,
+                    payload: contracts::GovernedActionPayload::WebFetch(sample_web_fetch_action()),
+                },
+            },
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+            ),
+            "web fetch with disabled network should be blocked"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_validation_rejects_oversized_timeout() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut action = sample_web_fetch_action();
+        action.timeout_ms = ctx.config.governed_actions.max_web_fetch_timeout_ms + 1;
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch with oversized timeout".to_string(),
+                    rationale: None,
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(action),
+                },
+            },
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+            ),
+            "timeout exceeding max should produce a blocked outcome"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_validation_rejects_oversized_response_bytes() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut action = sample_web_fetch_action();
+        action.max_response_bytes = ctx.config.governed_actions.max_web_fetch_response_bytes + 1;
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch with oversized response limit".to_string(),
+                    rationale: None,
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(action),
+                },
+            },
+        )
+        .await?;
+        assert!(
+            matches!(
+                outcome,
+                governed_actions::GovernedActionPlanningOutcome::Blocked(_)
+            ),
+            "max_response_bytes exceeding max should produce a blocked outcome"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        // Must stay in sync with kind_str() above — add new variants here too.
+        let all_kinds = [
+            GovernedActionKind::InspectWorkspaceArtifact,
+            GovernedActionKind::RunSubprocess,
+            GovernedActionKind::RunWorkspaceScript,
+            GovernedActionKind::WebFetch,
+        ];
+
+        let targets = [
+            (
+                "governed_action_executions",
+                "governed_action_executions_action_kind_check",
+            ),
+            ("approval_requests", "approval_requests_action_kind_check"),
+        ];
+
+        for (table, constraint) in targets {
+            let def: String = sqlx::query_scalar(
+                "SELECT pg_get_constraintdef(oid) \
+                 FROM pg_constraint \
+                 WHERE conrelid = $1::regclass AND conname = $2",
+            )
+            .bind(table)
+            .bind(constraint)
+            .fetch_one(&ctx.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "constraint '{constraint}' not found on '{table}' \
+                     — was the migration applied?"
+                )
+            })?;
+
+            for kind in all_kinds {
+                let s = kind_str(kind);
+                assert!(
+                    def.contains(s),
+                    "action_kind '{s}' missing from constraint '{constraint}' on '{table}' \
+                     — write a migration adding '{s}' to the CHECK IN list"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn platform_echo_action(message: &str) -> contracts::SubprocessAction {

@@ -10,6 +10,7 @@ use crate::config::{ApprovalPromptMode, ResolvedTelegramConfig};
 
 const DEFAULT_TELEGRAM_HTTP_TIMEOUT_MS: u64 = 10_000;
 const TELEGRAM_MAX_CALLBACK_DATA_BYTES: usize = 64;
+const TELEGRAM_PARSE_MODE_HTML: &str = "HTML";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TelegramUpdate {
@@ -106,6 +107,19 @@ pub struct TelegramDeliveryReceipt {
     pub message_id: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramChatAction {
+    Typing,
+}
+
+impl TelegramChatAction {
+    fn as_telegram_api_value(self) -> &'static str {
+        match self {
+            TelegramChatAction::Typing => "typing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramApprovalPrompt {
     pub token: String,
@@ -144,6 +158,8 @@ pub trait TelegramDelivery {
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt>;
+
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()>;
 }
 
 pub struct TelegramAdapter<S, D> {
@@ -218,12 +234,17 @@ impl TelegramUpdateSource for FixtureTelegramSource {
 #[derive(Debug, Default, Clone)]
 pub struct FakeTelegramDelivery {
     sent_messages: Vec<TelegramOutboundMessage>,
+    sent_chat_actions: Vec<(i64, TelegramChatAction)>,
     next_message_id: i64,
 }
 
 impl FakeTelegramDelivery {
     pub fn sent_messages(&self) -> &[TelegramOutboundMessage] {
         &self.sent_messages
+    }
+
+    pub fn sent_chat_actions(&self) -> &[(i64, TelegramChatAction)] {
+        &self.sent_chat_actions
     }
 }
 
@@ -238,6 +259,11 @@ impl TelegramDelivery for FakeTelegramDelivery {
             chat_id: message.chat_id,
             message_id: self.next_message_id,
         })
+    }
+
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()> {
+        self.sent_chat_actions.push((chat_id, action));
+        Ok(())
     }
 }
 
@@ -322,10 +348,12 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
         &mut self,
         message: &TelegramOutboundMessage,
     ) -> Result<TelegramDeliveryReceipt> {
+        let rendered_message = render_telegram_html_message(&message.text);
         let request_body = {
             let mut body = serde_json::Map::new();
             body.insert("chat_id".to_string(), json!(message.chat_id));
-            body.insert("text".to_string(), json!(message.text));
+            body.insert("text".to_string(), json!(rendered_message));
+            body.insert("parse_mode".to_string(), json!(TELEGRAM_PARSE_MODE_HTML));
             if let Some(reply_to_message_id) = message.reply_to_message_id {
                 body.insert(
                     "reply_to_message_id".to_string(),
@@ -350,7 +378,11 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
             .context("failed to call Telegram sendMessage")?;
         let status = response.status();
         if !status.is_success() {
-            bail!("Telegram sendMessage returned HTTP {status}");
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            bail!("Telegram sendMessage returned HTTP {status}: {body}");
         }
 
         let body: TelegramApiResponse<TelegramSendMessageResult> = response
@@ -365,6 +397,41 @@ impl TelegramDelivery for ReqwestTelegramDelivery {
             chat_id: body.result.chat.id,
             message_id: body.result.message_id,
         })
+    }
+
+    async fn send_chat_action(&mut self, chat_id: i64, action: TelegramChatAction) -> Result<()> {
+        let request_body = json!({
+            "chat_id": chat_id,
+            "action": action.as_telegram_api_value(),
+        });
+        let response = self
+            .client
+            .post(telegram_api_url(&self.config, "sendChatAction"))
+            .json(&request_body)
+            .send()
+            .await
+            .context("failed to call Telegram sendChatAction")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            bail!("Telegram sendChatAction returned HTTP {status}: {body}");
+        }
+
+        let body: TelegramApiResponse<bool> = response
+            .json()
+            .await
+            .context("failed to decode Telegram sendChatAction response")?;
+        if !body.ok {
+            bail!("Telegram sendChatAction response marked itself as not ok");
+        }
+        if !body.result {
+            bail!("Telegram sendChatAction response result was false");
+        }
+
+        Ok(())
     }
 }
 
@@ -480,6 +547,64 @@ fn governed_action_risk_tier_label(risk_tier: GovernedActionRiskTier) -> &'stati
     }
 }
 
+fn render_telegram_html_message(text: &str) -> String {
+    render_inline_markdownish_html(text)
+}
+
+fn render_inline_markdownish_html(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let remainder = &text[cursor..];
+        if let Some(inner_start) = remainder.strip_prefix("**") {
+            if let Some(end_offset) = inner_start.find("**") {
+                let inner = &inner_start[..end_offset];
+                output.push_str("<b>");
+                output.push_str(&escape_telegram_html(inner));
+                output.push_str("</b>");
+                cursor += 2 + end_offset + 2;
+                continue;
+            }
+        }
+        if let Some(inner_start) = remainder.strip_prefix('`') {
+            if let Some(end_offset) = inner_start.find('`') {
+                let inner = &inner_start[..end_offset];
+                output.push_str("<code>");
+                output.push_str(&escape_telegram_html(inner));
+                output.push_str("</code>");
+                cursor += 1 + end_offset + 1;
+                continue;
+            }
+        }
+
+        let ch = remainder
+            .chars()
+            .next()
+            .expect("cursor is inside a non-empty string");
+        push_escaped_telegram_html_char(&mut output, ch);
+        cursor += ch.len_utf8();
+    }
+    output
+}
+
+fn escape_telegram_html(text: &str) -> String {
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        push_escaped_telegram_html_char(&mut escaped, ch);
+    }
+    escaped
+}
+
+fn push_escaped_telegram_html_char(output: &mut String, ch: char) {
+    match ch {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '"' => output.push_str("&quot;"),
+        _ => output.push(ch),
+    }
+}
+
 pub fn load_fixture_updates(path: &Path) -> Result<Vec<TelegramUpdate>> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read Telegram fixture {}", path.display()))?;
@@ -592,6 +717,21 @@ mod tests {
         assert_eq!(delivery.sent_messages()[0].reply_markup, None);
     }
 
+    #[tokio::test]
+    async fn fake_delivery_captures_chat_actions() {
+        let mut delivery = FakeTelegramDelivery::default();
+
+        delivery
+            .send_chat_action(42, TelegramChatAction::Typing)
+            .await
+            .expect("chat action should succeed");
+
+        assert_eq!(
+            delivery.sent_chat_actions(),
+            &[(42, TelegramChatAction::Typing)]
+        );
+    }
+
     #[test]
     fn approval_prompt_message_renders_inline_buttons_and_fallback_text() {
         let prompt = TelegramApprovalPrompt {
@@ -651,6 +791,25 @@ mod tests {
         assert_eq!(message.reply_markup, None);
         assert!(message.text.contains("/approve"));
         assert!(message.text.contains(&long_token));
+    }
+
+    #[test]
+    fn telegram_html_renderer_handles_common_model_markdown() {
+        let rendered = render_telegram_html_message(
+            "**rate.sx** — A cryptocurrency site.\n- **Market Cap:** ~$2.5T\nUse `BTC & ETH` <now>.",
+        );
+
+        assert_eq!(
+            rendered,
+            "<b>rate.sx</b> — A cryptocurrency site.\n- <b>Market Cap:</b> ~$2.5T\nUse <code>BTC &amp; ETH</code> &lt;now&gt;."
+        );
+    }
+
+    #[test]
+    fn telegram_html_renderer_leaves_unmatched_markdown_escaped() {
+        let rendered = render_telegram_html_message("Unmatched **bold and <raw> HTML");
+
+        assert_eq!(rendered, "Unmatched **bold and &lt;raw&gt; HTML");
     }
 
     #[tokio::test]
@@ -721,7 +880,7 @@ mod tests {
         let receipt = delivery
             .send_message(&TelegramOutboundMessage {
                 chat_id: 42,
-                text: "reply".to_string(),
+                text: "**reply** <ok>".to_string(),
                 reply_to_message_id: Some(7),
                 reply_markup: Some(TelegramReplyMarkup::InlineKeyboard(
                     TelegramInlineKeyboardMarkup {
@@ -741,12 +900,42 @@ mod tests {
         assert!(request.contains("POST /botsecret/sendMessage HTTP/1.1"));
         assert!(request.contains("\"chat_id\":42"));
         assert!(request.contains("\"reply_to_message_id\":7"));
-        assert!(request.contains("\"text\":\"reply\""));
+        assert!(request.contains("\"parse_mode\":\"HTML\""));
+        assert!(request.contains("\"text\":\"<b>reply</b> &lt;ok&gt;\""));
         assert!(request.contains("\"reply_markup\""));
         assert!(request.contains("\"inline_keyboard\""));
         assert!(request.contains("\"callback_data\":\"approve:42\""));
         assert_eq!(receipt.chat_id, 42);
         assert_eq!(receipt.message_id, 99);
+    }
+
+    #[tokio::test]
+    async fn reqwest_delivery_sends_chat_action_to_telegram_api() {
+        let (api_base_url, receiver, handle) = spawn_single_use_http_server(serde_json::json!({
+            "ok": true,
+            "result": true
+        }));
+        let mut delivery = ReqwestTelegramDelivery::new(ResolvedTelegramConfig {
+            api_base_url,
+            bot_token: "secret".to_string(),
+            allowed_user_id: 42,
+            allowed_chat_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            poll_limit: 10,
+        });
+
+        delivery
+            .send_chat_action(42, TelegramChatAction::Typing)
+            .await
+            .expect("chat action should send");
+
+        let request = receiver.recv().expect("request should be captured");
+        handle.join().expect("server thread should join");
+
+        assert!(request.contains("POST /botsecret/sendChatAction HTTP/1.1"));
+        assert!(request.contains("\"chat_id\":42"));
+        assert!(request.contains("\"action\":\"typing\""));
     }
 
     fn spawn_single_use_http_server(

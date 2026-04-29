@@ -8,6 +8,7 @@ pub mod context;
 pub mod continuity;
 pub mod db;
 pub mod execution;
+pub mod fetched_content;
 pub mod foreground;
 pub mod foreground_orchestration;
 pub mod governed_actions;

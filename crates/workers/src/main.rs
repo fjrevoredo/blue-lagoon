@@ -534,42 +534,108 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         messages.push(ModelInputMessage {
             role: ModelMessageRole::Developer,
             content: format!(
-                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. Do not repeat the same action proposal unless the previous action failed and a materially different retry is required.",
+                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. This immediate follow-up cannot execute another governed action; if another fetch or command is still required, say exactly what is missing and ask the user to request it in the next turn. Do not claim that you will perform another action now.",
                 governed_action_observation_summary(&context.governed_action_observations)
             ),
         });
     } else {
         messages.push(ModelInputMessage {
             role: ModelMessageRole::Developer,
-            content: format!(
-                "If you need a governed action, append exactly one fenced ```{} block containing JSON with an 'actions' array of governed-action proposals. Keep all user-facing text outside that block. If no governed action is needed, do not emit the block.",
-                GOVERNED_ACTIONS_BLOCK_TAG
-            ),
+            content: governed_action_schema_message(),
         });
     }
 
+    let subgoals_fragment = if context.self_model.current_subgoals.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Active subgoals: {}.",
+            join_or_none(&context.self_model.current_subgoals)
+        )
+    };
+    let active_conditions_fragment = if context.internal_state.active_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Active conditions: {}.",
+            join_or_none(&context.internal_state.active_conditions)
+        )
+    };
+
+    let current_time = context
+        .assembled_at
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string();
+
     ModelInput {
         system_prompt: format!(
-            "You are {}. Role: {}. Communication style: {}. Capabilities: {}. Constraints: {}. Preferences: {}. Current goals: {}. Current subgoals: {}. Internal state: load_pct={}, health_pct={}, reliability_pct={}, resource_pressure_pct={}, confidence_pct={}, connection_quality_pct={}, active_conditions={}. Execution mode: {}.",
-            context.self_model.stable_identity,
-            context.self_model.role,
-            context.self_model.communication_style,
-            join_or_none(&context.self_model.capabilities),
-            join_or_none(&context.self_model.constraints),
-            join_or_none(&context.self_model.preferences),
-            join_or_none(&context.self_model.current_goals),
-            join_or_none(&context.self_model.current_subgoals),
-            context.internal_state.load_pct,
-            context.internal_state.health_pct,
-            context.internal_state.reliability_pct,
-            context.internal_state.resource_pressure_pct,
-            context.internal_state.confidence_pct,
-            context.internal_state.connection_quality_pct,
-            join_or_none(&context.internal_state.active_conditions),
-            foreground_execution_mode_as_str(context.recovery_context.mode),
+            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
+            name = context.self_model.stable_identity,
+            role = context.self_model.role,
+            style = context.self_model.communication_style,
+            preferences = join_or_none(&context.self_model.preferences),
+            capabilities = join_or_none(&context.self_model.capabilities),
+            constraints = join_or_none(&context.self_model.constraints),
+            goals = join_or_none(&context.self_model.current_goals),
+            subgoals = subgoals_fragment,
+            conditions = active_conditions_fragment,
+            current_time = current_time,
+            load = context.internal_state.load_pct,
+            health = context.internal_state.health_pct,
+            confidence = context.internal_state.confidence_pct,
+            mode = foreground_execution_mode_as_str(context.recovery_context.mode),
         ),
         messages,
     }
+}
+
+fn governed_action_schema_message() -> String {
+    let template = r#"GOVERNED ACTION SYSTEM
+
+To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block.
+
+Available action kinds:
+- run_subprocess: execute a bounded shell command
+- run_workspace_script: run a registered workspace script by its script_id UUID
+- web_fetch: perform an HTTP GET request to a URL (requires network: "enabled"; automatically routed for approval)
+
+Block format (wrap all proposals in {"actions": [...]}):
+```TAG
+{
+  "actions": [
+    {
+      "proposal_id": "<generate a fresh UUID v4>",
+      "title": "<one-line description>",
+      "rationale": "<why this action is needed>",
+      "action_kind": "run_subprocess",
+      "requested_risk_tier": null,
+      "capability_scope": {
+        "filesystem": { "read_roots": ["<absolute path>"], "write_roots": [] },
+        "network": "disabled",
+        "environment": { "allow_variables": [] },
+        "execution": { "timeout_ms": 30000, "max_stdout_bytes": 16384, "max_stderr_bytes": 8192 }
+      },
+      "payload": {
+        "kind": "run_subprocess",
+        "value": { "command": "<executable>", "args": ["<arg1>", "<arg2>"], "working_directory": "<absolute path or null>" }
+      }
+    }
+  ]
+}
+```
+
+Alternate payload shape for run_workspace_script:
+- "payload": { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
+
+Alternate payload shape for web_fetch:
+- "payload": { "kind": "web_fetch", "value": { "url": "https://...", "timeout_ms": 10000, "max_response_bytes": 524288 } }
+- capability_scope.filesystem: { "read_roots": [], "write_roots": [] } (no filesystem access needed)
+- capability_scope.network must be "enabled" (triggers approval flow)
+- capability_scope.environment: { "allow_variables": [] }
+- capability_scope.execution: { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 } (ignored for web_fetch)
+
+Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action per turn."#;
+    template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
 fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
@@ -634,6 +700,7 @@ fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static 
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
 }
 
@@ -1359,13 +1426,8 @@ mod tests {
                 .system_prompt
                 .contains("reply_to_current_message")
         );
-        assert!(model_request.input.system_prompt.contains("load_pct=15"));
-        assert!(
-            model_request
-                .input
-                .system_prompt
-                .contains("confidence_pct=80")
-        );
+        assert!(model_request.input.system_prompt.contains("load=15%"));
+        assert!(model_request.input.system_prompt.contains("confidence=80%"));
         assert!(model_request.input.messages.iter().any(|message| {
             message.content == "remember that I prefer concise replies and be direct"
         }));
@@ -1375,6 +1437,50 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| { message.content.contains(GOVERNED_ACTIONS_BLOCK_TAG) })
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_observation_follow_up_forbids_new_action_promises() {
+        let mut context = sample_context();
+        context.governed_action_observations = vec![contracts::GovernedActionObservation {
+            observation_id: uuid::Uuid::now_v7(),
+            action_kind: contracts::GovernedActionKind::WebFetch,
+            outcome: contracts::GovernedActionExecutionOutcome {
+                status: contracts::GovernedActionStatus::Executed,
+                summary: "web fetch completed for https://example.com/; preview truncated"
+                    .to_string(),
+                fingerprint: None,
+                output_ref: Some("execution_record:test".to_string()),
+            },
+        }];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let developer_message = model_request
+            .input
+            .messages
+            .iter()
+            .find(|message| message.role == ModelMessageRole::Developer)
+            .expect("developer message should exist");
+
+        assert!(
+            developer_message
+                .content
+                .contains("cannot execute another governed action")
+        );
+        assert!(
+            developer_message
+                .content
+                .contains("Do not claim that you will perform another action now")
+        );
+        assert!(
+            !developer_message
+                .content
+                .contains(GOVERNED_ACTIONS_BLOCK_TAG)
         );
     }
 

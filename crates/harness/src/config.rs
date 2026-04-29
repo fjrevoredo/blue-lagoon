@@ -146,6 +146,8 @@ pub struct GovernedActionsConfig {
     pub allowlisted_environment_variables: Vec<String>,
     pub max_environment_variables_per_action: u32,
     pub max_captured_output_bytes: u64,
+    pub max_web_fetch_timeout_ms: u64,
+    pub max_web_fetch_response_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1031,6 +1033,8 @@ mod tests {
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
                 max_environment_variables_per_action: 8,
                 max_captured_output_bytes: 65_536,
+                max_web_fetch_timeout_ms: 15_000,
+                max_web_fetch_response_bytes: 524_288,
             },
             worker: WorkerConfig {
                 timeout_ms: 5_000,
@@ -1140,6 +1144,8 @@ default_network_access = "disabled"
 allowlisted_environment_variables = ["BLUE_LAGOON_DATABASE_URL"]
 max_environment_variables_per_action = 8
 max_captured_output_bytes = 65536
+max_web_fetch_timeout_ms = 15000
+max_web_fetch_response_bytes = 524288
 
 [worker]
 timeout_ms = 10000

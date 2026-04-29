@@ -879,6 +879,7 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
+        GovernedActionKind::WebFetch => "web_fetch",
     }
 }
 
@@ -887,6 +888,7 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "inspect_workspace_artifact" => Ok(GovernedActionKind::InspectWorkspaceArtifact),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
+        "web_fetch" => Ok(GovernedActionKind::WebFetch),
         other => bail!("unrecognized governed action kind '{other}'"),
     }
 }

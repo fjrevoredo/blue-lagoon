@@ -227,10 +227,14 @@ async fn approval_resolution_executes_linked_governed_action_after_approval() ->
             contracts::GovernedActionStatus::Executed
         );
         assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Approval-gated subprocess"
+        );
         assert!(
-            delivery.sent_messages()[0]
-                .text
-                .contains("bounded subprocess completed successfully")
+            delivery
+                .sent_chat_actions()
+                .contains(&(42, telegram::TelegramChatAction::Typing))
         );
         Ok(())
     })
@@ -455,6 +459,127 @@ async fn execute_governed_action_routes_policy_recheck_failure_through_recovery(
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+#[serial]
+async fn web_fetch_proposal_plans_with_approval_and_execution_is_attempted() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Fetch example.com".to_string(),
+            rationale: Some("Integration test for web fetch governed action.".to_string()),
+            action_kind: GovernedActionKind::WebFetch,
+            requested_risk_tier: None,
+            capability_scope: web_fetch_scope(),
+            payload: contracts::GovernedActionPayload::WebFetch(contracts::WebFetchAction {
+                url: "https://example.com".to_string(),
+                timeout_ms: 10_000,
+                max_response_bytes: 65_536,
+            }),
+        };
+
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: proposal.clone(),
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected approval-gated web fetch, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+        assert_eq!(
+            planned.record.risk_tier,
+            contracts::GovernedActionRiskTier::Tier2
+        );
+
+        let approval_request = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: proposal.title.clone(),
+                consequence_summary: "Fetch example.com for integration test.".to_string(),
+                capability_scope: proposal.capability_scope,
+                requested_by: "telegram:primary-user".to_string(),
+                token: "web-fetch-test-token".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+
+        approval::resolve_approval_request(
+            &ctx.pool,
+            &approval::ApprovalResolutionAttempt {
+                token: approval_request.token.clone(),
+                actor_ref: "telegram:primary-user".to_string(),
+                expected_action_fingerprint: planned.record.action_fingerprint.clone(),
+                decision: contracts::ApprovalResolutionDecision::Approved,
+                reason: Some("integration test approval".to_string()),
+                resolved_at: Utc::now(),
+            },
+        )
+        .await?;
+
+        let synced = governed_actions::sync_status_from_approval_resolution(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            contracts::ApprovalResolutionDecision::Approved,
+            None,
+            Some("integration test approval"),
+        )
+        .await?;
+
+        let outcome =
+            governed_actions::execute_governed_action(&ctx.config, &ctx.pool, &synced).await?;
+
+        assert!(
+            outcome.record.status == contracts::GovernedActionStatus::Executed
+                || outcome.record.status == contracts::GovernedActionStatus::Failed,
+            "web fetch execution should reach Executed or Failed (not Blocked), got {:?}",
+            outcome.record.status
+        );
+        Ok(())
+    })
+    .await
+}
+
+fn web_fetch_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Enabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 0,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: 0,
+        },
+    }
 }
 
 fn provider_response(message: &str) -> ProviderHttpResponse {
