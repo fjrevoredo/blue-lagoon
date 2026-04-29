@@ -227,10 +227,14 @@ async fn approval_resolution_executes_linked_governed_action_after_approval() ->
             contracts::GovernedActionStatus::Executed
         );
         assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approved: Approval-gated subprocess"
+        );
         assert!(
-            delivery.sent_messages()[0]
-                .text
-                .contains("bounded subprocess completed successfully")
+            delivery
+                .sent_chat_actions()
+                .contains(&(42, telegram::TelegramChatAction::Typing))
         );
         Ok(())
     })
