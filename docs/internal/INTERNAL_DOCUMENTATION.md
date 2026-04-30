@@ -19,9 +19,12 @@ Internal docs must never contradict canonical docs. If a conflict is found, the 
 ```
 docs/internal/
 ├── INTERNAL_DOCUMENTATION.md      ← this file (meta-doc, template, conventions)
-└── conscious_loop/
-    ├── CONTEXT_ASSEMBLY.md         ← pipeline, limits, message layering, token budget
-    └── GOVERNED_ACTIONS.md         ← JSON schema, capability_scope, validation, risk tiers
+├── conscious_loop/
+│   ├── CONTEXT_ASSEMBLY.md         ← pipeline, limits, message layering, token budget
+│   └── GOVERNED_ACTIONS.md         ← JSON schema, capability_scope, validation, risk tiers
+└── harness/
+    ├── TRACE_EXPLORER.md           ← trace CLI, model-call records, causal links
+    └── TOOL_IMPLEMENTATION.md      ← E2E guide for architecture-compliant tools
 ```
 
 Planned additions (not yet written):

@@ -388,6 +388,9 @@ mod tests {
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
             },
+            observability: crate::config::ObservabilityConfig {
+                model_call_payload_retention_days: 30,
+            },
             approvals: ApprovalsConfig {
                 default_ttl_seconds: 900,
                 max_pending_requests: 32,
@@ -478,12 +481,7 @@ mod tests {
                     "-Command".to_string(),
                     format!("Write-Output '{}'", message.replace('\'', "''")),
                 ],
-                working_directory: Some(
-                    env::current_dir()
-                        .expect("current dir should resolve")
-                        .display()
-                        .to_string(),
-                ),
+                working_directory: Some(env!("CARGO_MANIFEST_DIR").to_string()),
             }
         } else {
             SubprocessAction {
@@ -492,12 +490,7 @@ mod tests {
                     "-c".to_string(),
                     format!("printf '%s\\n' '{}'", message.replace('\'', "'\\''")),
                 ],
-                working_directory: Some(
-                    env::current_dir()
-                        .expect("current dir should resolve")
-                        .display()
-                        .to_string(),
-                ),
+                working_directory: Some(env!("CARGO_MANIFEST_DIR").to_string()),
             }
         }
     }
@@ -511,23 +504,13 @@ mod tests {
                     "-Command".to_string(),
                     "Start-Sleep -Milliseconds 250".to_string(),
                 ],
-                working_directory: Some(
-                    env::current_dir()
-                        .expect("current dir should resolve")
-                        .display()
-                        .to_string(),
-                ),
+                working_directory: Some(env!("CARGO_MANIFEST_DIR").to_string()),
             }
         } else {
             SubprocessAction {
                 command: "sh".to_string(),
                 args: vec!["-c".to_string(), "sleep 0.25".to_string()],
-                working_directory: Some(
-                    env::current_dir()
-                        .expect("current dir should resolve")
-                        .display()
-                        .to_string(),
-                ),
+                working_directory: Some(env!("CARGO_MANIFEST_DIR").to_string()),
             }
         }
     }

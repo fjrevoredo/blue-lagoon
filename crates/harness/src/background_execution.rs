@@ -14,6 +14,7 @@ use crate::{
         self, BackgroundJobRecord, BackgroundJobRunStatus, BackgroundJobStatus,
         NewBackgroundJobRun, UpdateBackgroundJobRunStatus, UpdateBackgroundJobStatus,
     },
+    causal_links::{self, NewCausalLink},
     config::{ResolvedModelGatewayConfig, RuntimeConfig},
     execution::{self, NewExecutionRecord},
     foreground::{self, StagedForegroundIngressOutcome},
@@ -643,6 +644,23 @@ async fn persist_wake_signals(
         .await?;
 
         let recorded_signal = background::get_wake_signal(pool, signal.signal_id).await?;
+        causal_links::insert(
+            pool,
+            &NewCausalLink {
+                trace_id: leased.job.trace_id,
+                source_kind: "background_job_run".to_string(),
+                source_id: leased.background_job_run_id,
+                target_kind: "wake_signal".to_string(),
+                target_id: recorded_signal.wake_signal_id,
+                edge_kind: "recorded_wake_signal".to_string(),
+                payload: json!({
+                    "background_job_id": leased.job.background_job_id,
+                    "reason_code": recorded_signal.signal.reason_code,
+                    "priority": recorded_signal.signal.priority,
+                }),
+            },
+        )
+        .await?;
         audit::insert(
             pool,
             &NewAuditEvent {
@@ -1073,6 +1091,9 @@ mod tests {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
+            },
+            observability: crate::config::ObservabilityConfig {
+                model_call_payload_retention_days: 30,
             },
             approvals: crate::config::ApprovalsConfig {
                 default_ttl_seconds: 900,

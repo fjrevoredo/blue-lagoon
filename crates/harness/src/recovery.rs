@@ -1315,8 +1315,18 @@ fn governed_action_recovery_action_classification(
     record: &governed_actions::GovernedActionExecutionRecord,
 ) -> RecoveryActionClassification {
     match record.action_kind {
-        GovernedActionKind::InspectWorkspaceArtifact => RecoveryActionClassification::SafeReplay,
-        GovernedActionKind::RunSubprocess
+        GovernedActionKind::InspectWorkspaceArtifact
+        | GovernedActionKind::ListWorkspaceArtifacts
+        | GovernedActionKind::ListWorkspaceScripts
+        | GovernedActionKind::InspectWorkspaceScript
+        | GovernedActionKind::ListWorkspaceScriptRuns => RecoveryActionClassification::SafeReplay,
+        GovernedActionKind::CreateWorkspaceArtifact
+        | GovernedActionKind::UpdateWorkspaceArtifact
+        | GovernedActionKind::CreateWorkspaceScript
+        | GovernedActionKind::AppendWorkspaceScriptVersion
+        | GovernedActionKind::UpsertScheduledForegroundTask
+        | GovernedActionKind::RequestBackgroundJob
+        | GovernedActionKind::RunSubprocess
         | GovernedActionKind::RunWorkspaceScript
         | GovernedActionKind::WebFetch => RecoveryActionClassification::AmbiguousOrNonrepeatable,
     }
@@ -2879,6 +2889,43 @@ mod tests {
     }
 
     #[test]
+    fn governed_action_recovery_classifies_only_read_only_tools_as_safe_replay() {
+        for action_kind in [
+            GovernedActionKind::InspectWorkspaceArtifact,
+            GovernedActionKind::ListWorkspaceArtifacts,
+            GovernedActionKind::ListWorkspaceScripts,
+            GovernedActionKind::InspectWorkspaceScript,
+            GovernedActionKind::ListWorkspaceScriptRuns,
+        ] {
+            let record = governed_action_record_for_classification(action_kind);
+            assert_eq!(
+                governed_action_recovery_action_classification(&record),
+                RecoveryActionClassification::SafeReplay,
+                "{action_kind:?} should be replay-safe"
+            );
+        }
+
+        for action_kind in [
+            GovernedActionKind::CreateWorkspaceArtifact,
+            GovernedActionKind::UpdateWorkspaceArtifact,
+            GovernedActionKind::CreateWorkspaceScript,
+            GovernedActionKind::AppendWorkspaceScriptVersion,
+            GovernedActionKind::UpsertScheduledForegroundTask,
+            GovernedActionKind::RequestBackgroundJob,
+            GovernedActionKind::RunSubprocess,
+            GovernedActionKind::RunWorkspaceScript,
+            GovernedActionKind::WebFetch,
+        ] {
+            let record = governed_action_record_for_classification(action_kind);
+            assert_eq!(
+                governed_action_recovery_action_classification(&record),
+                RecoveryActionClassification::AmbiguousOrNonrepeatable,
+                "{action_kind:?} should not be retried automatically"
+            );
+        }
+    }
+
+    #[test]
     fn worker_lease_supervision_classifies_soft_warning_and_hard_expiry() {
         let acquired_at = Utc::now();
         let lease = WorkerLeaseRecord {
@@ -2990,6 +3037,53 @@ mod tests {
             policy_state: RecoveryPolicyState::Valid,
             recovery_budget_remaining: 1,
             clarification_available: false,
+        }
+    }
+
+    fn governed_action_record_for_classification(
+        action_kind: GovernedActionKind,
+    ) -> governed_actions::GovernedActionExecutionRecord {
+        let now = Utc::now();
+        governed_actions::GovernedActionExecutionRecord {
+            governed_action_execution_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            approval_request_id: None,
+            action_proposal_id: Uuid::now_v7(),
+            action_fingerprint: contracts::GovernedActionFingerprint {
+                value: "sha256:test".to_string(),
+            },
+            action_kind,
+            risk_tier: contracts::GovernedActionRiskTier::Tier0,
+            status: GovernedActionStatus::Proposed,
+            capability_scope: contracts::CapabilityScope {
+                filesystem: contracts::FilesystemCapabilityScope {
+                    read_roots: Vec::new(),
+                    write_roots: Vec::new(),
+                },
+                network: contracts::NetworkAccessPosture::Disabled,
+                environment: contracts::EnvironmentCapabilityScope {
+                    allow_variables: Vec::new(),
+                },
+                execution: contracts::ExecutionCapabilityBudget {
+                    timeout_ms: 0,
+                    max_stdout_bytes: 0,
+                    max_stderr_bytes: 0,
+                },
+            },
+            payload: contracts::GovernedActionPayload::RunSubprocess(contracts::SubprocessAction {
+                command: "true".to_string(),
+                args: Vec::new(),
+                working_directory: None,
+            }),
+            workspace_script_id: None,
+            workspace_script_version_id: None,
+            blocked_reason: None,
+            output_ref: None,
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 }

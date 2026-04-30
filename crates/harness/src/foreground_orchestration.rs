@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     approval,
     audit::{self, NewAuditEvent},
+    causal_links::{self, NewCausalLink},
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
@@ -838,6 +839,34 @@ where
         .await;
     }
     recorded_episode_id = Some(episode_id);
+    if let Err(error) = causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: trigger.trace_id,
+            source_kind: "execution_record".to_string(),
+            source_id: trigger.execution_id,
+            target_kind: "episode".to_string(),
+            target_id: episode_id,
+            edge_kind: "opened_episode".to_string(),
+            payload: json!({
+                "ingress_id": trigger.ingress.ingress_id,
+                "trigger_kind": episode_trigger_kind,
+                "trigger_source": episode_trigger_source,
+            }),
+        },
+    )
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
+            error,
+        )
+        .await;
+    }
 
     for (index, user_message) in user_messages.iter().enumerate() {
         if let Err(error) = foreground::insert_episode_message(
@@ -1983,6 +2012,20 @@ async fn emit_typing_chat_action<D>(
 fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static str {
     match kind {
         contracts::GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        contracts::GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        contracts::GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        contracts::GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        contracts::GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        contracts::GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        contracts::GovernedActionKind::AppendWorkspaceScriptVersion => {
+            "append_workspace_script_version"
+        }
+        contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
+            "upsert_scheduled_foreground_task"
+        }
+        contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",

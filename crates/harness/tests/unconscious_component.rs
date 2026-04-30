@@ -991,8 +991,46 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
         assert!(
             ingress_row
                 .get::<String, _>("text_body")
-                .contains("policy-approved maintenance wake signal")
+            .contains("policy-approved maintenance wake signal")
         );
+
+        let background_to_wake_link_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM causal_links
+            WHERE trace_id = $1
+              AND source_kind = 'background_job_run'
+              AND source_id = $2
+              AND target_kind = 'wake_signal'
+              AND target_id = $3
+              AND edge_kind = 'recorded_wake_signal'
+            "#,
+        )
+        .bind(outcome.trace_id)
+        .bind(outcome.background_job_run_id)
+        .bind(wake_signal_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(background_to_wake_link_count, 1);
+
+        let wake_to_ingress_link_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM causal_links
+            WHERE trace_id = $1
+              AND source_kind = 'wake_signal'
+              AND source_id = $2
+              AND target_kind = 'ingress_event'
+              AND target_id = $3
+              AND edge_kind = 'staged_foreground_trigger'
+            "#,
+        )
+        .bind(outcome.trace_id)
+        .bind(wake_signal_id)
+        .bind(staged_ingress_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(wake_to_ingress_link_count, 1);
 
         let normalized_ingress =
             foreground::load_normalized_ingress(&ctx.pool, staged_ingress_id).await?;

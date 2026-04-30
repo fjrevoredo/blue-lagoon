@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use contracts::{
     ConsciousWorkerInboundMessage, ConsciousWorkerOutboundMessage, WorkerRequest, WorkerResponse,
     WorkerResult,
@@ -13,6 +14,7 @@ use tokio::{
 
 use crate::{
     config::{ResolvedModelGatewayConfig, RuntimeConfig},
+    db, model_calls,
     model_gateway::{self, ModelProviderTransport},
 };
 
@@ -165,6 +167,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         })
     });
     let mut stdout_lines = BufReader::new(stdout).lines();
+    let pool = db::connect(config).await?;
 
     let operation = async {
         write_json_line(&mut stdin, request).await?;
@@ -188,10 +191,50 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
             }
         };
 
+        let model_call_started_at = Utc::now();
+        let model_call_id = match model_calls::insert_pending_model_call_record(
+            &pool,
+            gateway,
+            &model_request,
+            model_call_started_at,
+            config.observability.model_call_payload_retention_days,
+        )
+        .await
+        {
+            Ok(model_call_id) => Some(model_call_id),
+            Err(error) if model_calls::is_missing_model_call_schema(&error) => None,
+            Err(error) => return Err(error),
+        };
         let model_response =
-            model_gateway::execute_foreground_model_call(gateway, &model_request, transport)
+            match model_gateway::execute_foreground_model_call(gateway, &model_request, transport)
                 .await
-                .context("conscious worker model-call execution failed in the harness")?;
+            {
+                Ok(model_response) => {
+                    if let Some(model_call_id) = model_call_id {
+                        model_calls::mark_model_call_succeeded(
+                            &pool,
+                            model_call_id,
+                            &model_response,
+                            Utc::now(),
+                        )
+                        .await?;
+                    }
+                    model_response
+                }
+                Err(error) => {
+                    if let Some(model_call_id) = model_call_id {
+                        model_calls::mark_model_call_failed(
+                            &pool,
+                            model_call_id,
+                            &error.to_string(),
+                            Utc::now(),
+                        )
+                        .await?;
+                    }
+                    return Err(error)
+                        .context("conscious worker model-call execution failed in the harness");
+                }
+            };
         write_json_line(
             &mut stdin,
             &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),
@@ -304,6 +347,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         })
     });
     let mut stdout_lines = BufReader::new(stdout).lines();
+    let pool = db::connect(config).await?;
 
     let operation = async {
         write_json_line(&mut stdin, request).await?;
@@ -327,10 +371,50 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
             }
         };
 
+        let model_call_started_at = Utc::now();
+        let model_call_id = match model_calls::insert_pending_model_call_record(
+            &pool,
+            gateway,
+            &model_request,
+            model_call_started_at,
+            config.observability.model_call_payload_retention_days,
+        )
+        .await
+        {
+            Ok(model_call_id) => Some(model_call_id),
+            Err(error) if model_calls::is_missing_model_call_schema(&error) => None,
+            Err(error) => return Err(error),
+        };
         let model_response =
-            model_gateway::execute_background_model_call(gateway, &model_request, transport)
+            match model_gateway::execute_background_model_call(gateway, &model_request, transport)
                 .await
-                .context("unconscious worker model-call execution failed in the harness")?;
+            {
+                Ok(model_response) => {
+                    if let Some(model_call_id) = model_call_id {
+                        model_calls::mark_model_call_succeeded(
+                            &pool,
+                            model_call_id,
+                            &model_response,
+                            Utc::now(),
+                        )
+                        .await?;
+                    }
+                    model_response
+                }
+                Err(error) => {
+                    if let Some(model_call_id) = model_call_id {
+                        model_calls::mark_model_call_failed(
+                            &pool,
+                            model_call_id,
+                            &error.to_string(),
+                            Utc::now(),
+                        )
+                        .await?;
+                    }
+                    return Err(error)
+                        .context("unconscious worker model-call execution failed in the harness");
+                }
+            };
         write_json_line(
             &mut stdin,
             &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),

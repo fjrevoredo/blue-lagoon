@@ -28,6 +28,16 @@ use harness::{
 fn kind_str(kind: GovernedActionKind) -> &'static str {
     match kind {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
+        GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
+        GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         GovernedActionKind::WebFetch => "web_fetch",
@@ -785,6 +795,290 @@ async fn governed_action_execution_blocks_unsupported_network_enabled_backend() 
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn governed_action_workspace_and_script_tools_execute_through_harness() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let created_artifact = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::CreateWorkspaceArtifact,
+            contracts::GovernedActionPayload::CreateWorkspaceArtifact(
+                contracts::CreateWorkspaceArtifactAction {
+                    artifact_kind: WorkspaceArtifactKind::Scratchpad,
+                    title: "Governed scratchpad".to_string(),
+                    content_text: "first content".to_string(),
+                    provenance: Some("component test".to_string()),
+                },
+            ),
+        )
+        .await?;
+        assert_eq!(
+            created_artifact.record.status,
+            contracts::GovernedActionStatus::Executed
+        );
+        let artifact_id = created_artifact.outcome.summary.split_whitespace().nth(3);
+        assert!(artifact_id.is_some());
+
+        let artifacts = workspace::list_workspace_artifacts(&ctx.pool, 10).await?;
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.title == "Governed scratchpad")
+            .expect("created artifact should be persisted");
+
+        let inspected = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::InspectWorkspaceArtifact,
+            contracts::GovernedActionPayload::InspectWorkspaceArtifact(
+                contracts::InspectWorkspaceArtifactAction {
+                    artifact_id: artifact.workspace_artifact_id,
+                    artifact_kind: WorkspaceArtifactKind::Scratchpad,
+                },
+            ),
+        )
+        .await?;
+        assert!(inspected.outcome.summary.contains("first content"));
+
+        let listed = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::ListWorkspaceArtifacts,
+            contracts::GovernedActionPayload::ListWorkspaceArtifacts(
+                contracts::ListWorkspaceArtifactsAction {
+                    artifact_kind: Some(WorkspaceArtifactKind::Scratchpad),
+                    status: contracts::WorkspaceArtifactStatusFilter::Active,
+                    query: Some("first".to_string()),
+                    limit: 5,
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            listed
+                .outcome
+                .summary
+                .contains("listed 1 workspace artifacts")
+        );
+
+        let updated = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::UpdateWorkspaceArtifact,
+            contracts::GovernedActionPayload::UpdateWorkspaceArtifact(
+                contracts::UpdateWorkspaceArtifactAction {
+                    artifact_id: artifact.workspace_artifact_id,
+                    expected_updated_at: Some(artifact.updated_at),
+                    title: Some("Governed scratchpad updated".to_string()),
+                    content_text: "second content".to_string(),
+                    change_summary: "replace content".to_string(),
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            updated
+                .outcome
+                .summary
+                .contains("updated workspace artifact")
+        );
+
+        let created_script = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::CreateWorkspaceScript,
+            contracts::GovernedActionPayload::CreateWorkspaceScript(
+                contracts::CreateWorkspaceScriptAction {
+                    title: "Governed script".to_string(),
+                    language: "python".to_string(),
+                    content_text: "print('v1')".to_string(),
+                    description: Some("component test".to_string()),
+                    requested_capabilities: Vec::new(),
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            created_script
+                .outcome
+                .summary
+                .contains("created workspace script")
+        );
+
+        let scripts = workspace::list_workspace_scripts(&ctx.pool, 10).await?;
+        let script = scripts
+            .iter()
+            .find(|script| script.language == "python")
+            .expect("created script should be persisted");
+        let latest = workspace::get_latest_workspace_script_version(&ctx.pool, script.script_id)
+            .await?
+            .expect("script should have initial version");
+
+        let inspected_script = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::InspectWorkspaceScript,
+            contracts::GovernedActionPayload::InspectWorkspaceScript(
+                contracts::InspectWorkspaceScriptAction {
+                    script_id: script.script_id,
+                    script_version_id: None,
+                },
+            ),
+        )
+        .await?;
+        assert!(inspected_script.outcome.summary.contains("print('v1')"));
+
+        let appended = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::AppendWorkspaceScriptVersion,
+            contracts::GovernedActionPayload::AppendWorkspaceScriptVersion(
+                contracts::AppendWorkspaceScriptVersionAction {
+                    script_id: script.script_id,
+                    expected_latest_version_id: Some(latest.workspace_script_version_id),
+                    expected_content_sha256: Some(latest.content_sha256),
+                    language: "python".to_string(),
+                    content_text: "print('v2')".to_string(),
+                    change_summary: "version two".to_string(),
+                },
+            ),
+        )
+        .await?;
+        assert!(appended.outcome.summary.contains("version 2"));
+
+        let listed_scripts = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::ListWorkspaceScripts,
+            contracts::GovernedActionPayload::ListWorkspaceScripts(
+                contracts::ListWorkspaceScriptsAction {
+                    status: contracts::WorkspaceArtifactStatusFilter::Active,
+                    language: Some("python".to_string()),
+                    query: Some("Governed script".to_string()),
+                    limit: 5,
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            listed_scripts
+                .outcome
+                .summary
+                .contains("listed 1 workspace scripts")
+        );
+
+        workspace::record_workspace_script_run(
+            &ctx.pool,
+            &NewWorkspaceScriptRun {
+                workspace_script_run_id: Uuid::now_v7(),
+                workspace_script_id: script.script_id,
+                workspace_script_version_id: latest.workspace_script_version_id,
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                governed_action_execution_id: None,
+                approval_request_id: None,
+                status: WorkspaceScriptRunStatus::Completed,
+                risk_tier: GovernedActionRiskTier::Tier1,
+                args: Vec::new(),
+                output_ref: Some("execution_record:test".to_string()),
+                failure_summary: None,
+                started_at: Some(Utc::now()),
+                completed_at: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let listed_runs = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::ListWorkspaceScriptRuns,
+            contracts::GovernedActionPayload::ListWorkspaceScriptRuns(
+                contracts::ListWorkspaceScriptRunsAction {
+                    script_id: script.script_id,
+                    status: Some(WorkspaceScriptRunStatus::Completed),
+                    limit: 5,
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            listed_runs
+                .outcome
+                .summary
+                .contains("listed 1 workspace script runs")
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_action_schedule_and_background_tools_execute_through_harness() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let scheduled = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::UpsertScheduledForegroundTask,
+            contracts::GovernedActionPayload::UpsertScheduledForegroundTask(
+                contracts::UpsertScheduledForegroundTaskAction {
+                    task_key: "component_check_in".to_string(),
+                    title: "Component check in".to_string(),
+                    user_facing_prompt: "Check in from component test".to_string(),
+                    next_due_at_utc: Some(Utc::now() + Duration::minutes(10)),
+                    cadence_seconds: ctx.config.scheduled_foreground.min_cadence_seconds,
+                    cooldown_seconds: Some(
+                        ctx.config.scheduled_foreground.default_cooldown_seconds,
+                    ),
+                    internal_principal_ref: "primary-user".to_string(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                    active: true,
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            scheduled
+                .outcome
+                .summary
+                .contains("scheduled foreground task")
+        );
+
+        let task =
+            harness::scheduled_foreground::get_task_by_key(&ctx.pool, "component_check_in").await?;
+        assert!(task.is_some());
+
+        let background = execute_test_action(
+            &ctx.config,
+            &ctx.pool,
+            GovernedActionKind::RequestBackgroundJob,
+            contracts::GovernedActionPayload::RequestBackgroundJob(
+                contracts::RequestBackgroundJobAction {
+                    job_kind: contracts::UnconsciousJobKind::MemoryConsolidation,
+                    rationale: "component test background request".to_string(),
+                    input_scope_ref: Some("component-test".to_string()),
+                    urgency: Some("normal".to_string()),
+                    wake_preference: None,
+                    internal_conversation_ref: Some("telegram-primary".to_string()),
+                },
+            ),
+        )
+        .await?;
+        assert!(
+            background
+                .outcome
+                .summary
+                .contains("accepted background job request")
+                || background
+                    .outcome
+                    .summary
+                    .contains("suppressed duplicate background job request")
+        );
+        Ok(())
+    })
+    .await
+}
+
 fn sample_capability_scope() -> CapabilityScope {
     CapabilityScope {
         filesystem: FilesystemCapabilityScope {
@@ -837,6 +1131,56 @@ fn web_fetch_capability_scope() -> CapabilityScope {
             max_stderr_bytes: 0,
         },
     }
+}
+
+fn harness_native_capability_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 0,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: 0,
+        },
+    }
+}
+
+async fn execute_test_action(
+    config: &harness::config::RuntimeConfig,
+    pool: &sqlx::PgPool,
+    action_kind: GovernedActionKind,
+    payload: contracts::GovernedActionPayload,
+) -> Result<governed_actions::GovernedActionExecutionResult> {
+    let planned = governed_actions::plan_governed_action(
+        config,
+        pool,
+        &governed_actions::GovernedActionPlanningRequest {
+            governed_action_execution_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            proposal: contracts::GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: format!("{action_kind:?}"),
+                rationale: Some("component test".to_string()),
+                action_kind,
+                requested_risk_tier: Some(GovernedActionRiskTier::Tier0),
+                capability_scope: harness_native_capability_scope(),
+                payload,
+            },
+        },
+    )
+    .await?;
+    let planned = match planned {
+        GovernedActionPlanningOutcome::Planned(planned) => planned,
+        other => panic!("expected planned governed action, got {other:?}"),
+    };
+    governed_actions::execute_governed_action(config, pool, &planned.record).await
 }
 
 fn sample_web_fetch_action() -> contracts::WebFetchAction {
@@ -1106,6 +1450,16 @@ async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
         // Must stay in sync with kind_str() above — add new variants here too.
         let all_kinds = [
             GovernedActionKind::InspectWorkspaceArtifact,
+            GovernedActionKind::ListWorkspaceArtifacts,
+            GovernedActionKind::CreateWorkspaceArtifact,
+            GovernedActionKind::UpdateWorkspaceArtifact,
+            GovernedActionKind::ListWorkspaceScripts,
+            GovernedActionKind::InspectWorkspaceScript,
+            GovernedActionKind::CreateWorkspaceScript,
+            GovernedActionKind::AppendWorkspaceScriptVersion,
+            GovernedActionKind::ListWorkspaceScriptRuns,
+            GovernedActionKind::UpsertScheduledForegroundTask,
+            GovernedActionKind::RequestBackgroundJob,
             GovernedActionKind::RunSubprocess,
             GovernedActionKind::RunWorkspaceScript,
             GovernedActionKind::WebFetch,

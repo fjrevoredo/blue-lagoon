@@ -3,10 +3,14 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use contracts::{
-    CapabilityScope, GovernedActionExecutionOutcome, GovernedActionFingerprint, GovernedActionKind,
-    GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
+    AppendWorkspaceScriptVersionAction, CapabilityScope, CreateWorkspaceArtifactAction,
+    CreateWorkspaceScriptAction, GovernedActionExecutionOutcome, GovernedActionFingerprint,
+    GovernedActionKind, GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
     GovernedActionRiskTier, GovernedActionStatus, InspectWorkspaceArtifactAction,
-    NetworkAccessPosture, SubprocessAction, WebFetchAction, WorkspaceScriptAction,
+    InspectWorkspaceScriptAction, ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction,
+    ListWorkspaceScriptsAction, NetworkAccessPosture, RequestBackgroundJobAction, SubprocessAction,
+    UpdateWorkspaceArtifactAction, UpsertScheduledForegroundTaskAction, WebFetchAction,
+    WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
     WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
@@ -18,18 +22,22 @@ use uuid::Uuid;
 
 use crate::{
     audit::{self, NewAuditEvent},
+    background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
+    causal_links::{self, NewCausalLink},
     config::RuntimeConfig,
     execution,
     fetched_content::{
         DefaultFetchedContentFormatter, FetchedContentFormatter, FetchedContentInput,
     },
-    policy, recovery, tool_execution,
+    policy, recovery, scheduled_foreground, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
 };
 
 const WEB_FETCH_OBSERVATION_PREVIEW_CHARS: usize = 1_500;
+const WORKSPACE_OBSERVATION_PREVIEW_CHARS: usize = 2_000;
+const GOVERNED_ACTION_LIST_LIMIT_MAX: u32 = 25;
 
 #[derive(Debug, Clone)]
 pub struct GovernedActionPlanningRequest {
@@ -120,6 +128,25 @@ pub async fn plan_governed_action(
     .await?;
 
     let record = get_governed_action_execution(pool, request.governed_action_execution_id).await?;
+    if let Some(execution_id) = request.execution_id {
+        causal_links::insert(
+            pool,
+            &NewCausalLink {
+                trace_id: request.trace_id,
+                source_kind: "execution_record".to_string(),
+                source_id: execution_id,
+                target_kind: "governed_action_execution".to_string(),
+                target_id: record.governed_action_execution_id,
+                edge_kind: "planned_action".to_string(),
+                payload: json!({
+                    "action_kind": governed_action_kind_as_str(record.action_kind),
+                    "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+                    "status": governed_action_status_as_str(record.status),
+                }),
+            },
+        )
+        .await?;
+    }
 
     let (event_kind, severity) = match status {
         GovernedActionStatus::Blocked => ("governed_action_blocked", "warn"),
@@ -391,7 +418,25 @@ pub async fn attach_approval_request(
     .await
     .context("failed to attach approval request to governed action execution")?;
 
-    get_governed_action_execution(pool, governed_action_execution_id).await
+    let record = get_governed_action_execution(pool, governed_action_execution_id).await?;
+    causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: record.trace_id,
+            source_kind: "governed_action_execution".to_string(),
+            source_id: governed_action_execution_id,
+            target_kind: "approval_request".to_string(),
+            target_id: approval_request_id,
+            edge_kind: "required_approval".to_string(),
+            payload: json!({
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+            }),
+        },
+    )
+    .await?;
+
+    Ok(record)
 }
 
 pub async fn sync_status_from_approval_resolution(
@@ -529,6 +574,19 @@ pub async fn execute_governed_action(
 
     let effective_timeout_ms = match &started_record.payload {
         GovernedActionPayload::WebFetch(action) => action.timeout_ms,
+        GovernedActionPayload::InspectWorkspaceArtifact(_)
+        | GovernedActionPayload::ListWorkspaceArtifacts(_)
+        | GovernedActionPayload::CreateWorkspaceArtifact(_)
+        | GovernedActionPayload::UpdateWorkspaceArtifact(_)
+        | GovernedActionPayload::ListWorkspaceScripts(_)
+        | GovernedActionPayload::InspectWorkspaceScript(_)
+        | GovernedActionPayload::CreateWorkspaceScript(_)
+        | GovernedActionPayload::AppendWorkspaceScriptVersion(_)
+        | GovernedActionPayload::ListWorkspaceScriptRuns(_)
+        | GovernedActionPayload::UpsertScheduledForegroundTask(_)
+        | GovernedActionPayload::RequestBackgroundJob(_) => {
+            config.governed_actions.default_subprocess_timeout_ms
+        }
         _ => started_record.capability_scope.execution.timeout_ms,
     };
     let worker_lease = create_governed_action_worker_lease(
@@ -548,55 +606,38 @@ pub async fn execute_governed_action(
         GovernedActionPayload::WebFetch(action) => {
             execute_web_fetch_governed_action(pool, &started_record, action).await
         }
-        GovernedActionPayload::InspectWorkspaceArtifact(_) => {
-            let summary =
-                "workspace inspection execution is not implemented in the first governed backend"
-                    .to_string();
-            let failed_record = update_governed_action_execution(
-                pool,
-                GovernedActionExecutionUpdate {
-                    governed_action_execution_id: started_record.governed_action_execution_id,
-                    status: GovernedActionStatus::Blocked,
-                    execution_id: Some(execution_id),
-                    output_ref: None,
-                    blocked_reason: Some(&summary),
-                    approval_request_id: None,
-                    started_at: Some(started_at),
-                    completed_at: Some(Utc::now()),
-                },
-            )
-            .await?;
-            execution::mark_failed(
-                pool,
-                execution_id,
-                &json!({
-                    "status": "blocked",
-                    "summary": summary,
-                }),
-            )
-            .await?;
-            write_governed_action_audit_event(
-                pool,
-                &failed_record,
-                "governed_action_execution_blocked",
-                "warn",
-                json!({
-                    "reason": summary,
-                    "phase": "backend",
-                }),
-            )
-            .await?;
-            let outcome = GovernedActionExecutionOutcome {
-                status: GovernedActionStatus::Blocked,
-                summary,
-                fingerprint: Some(failed_record.action_fingerprint.clone()),
-                output_ref: failed_record.output_ref.clone(),
-            };
-            Ok(governed_action_execution_result(
-                failed_record,
-                outcome,
-                None,
-            ))
+        GovernedActionPayload::InspectWorkspaceArtifact(action) => {
+            execute_inspect_workspace_artifact(pool, &started_record, action).await
+        }
+        GovernedActionPayload::ListWorkspaceArtifacts(action) => {
+            execute_list_workspace_artifacts(pool, &started_record, action).await
+        }
+        GovernedActionPayload::CreateWorkspaceArtifact(action) => {
+            execute_create_workspace_artifact(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::UpdateWorkspaceArtifact(action) => {
+            execute_update_workspace_artifact(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::ListWorkspaceScripts(action) => {
+            execute_list_workspace_scripts(pool, &started_record, action).await
+        }
+        GovernedActionPayload::InspectWorkspaceScript(action) => {
+            execute_inspect_workspace_script(pool, &started_record, action).await
+        }
+        GovernedActionPayload::CreateWorkspaceScript(action) => {
+            execute_create_workspace_script(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::AppendWorkspaceScriptVersion(action) => {
+            execute_append_workspace_script_version(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::ListWorkspaceScriptRuns(action) => {
+            execute_list_workspace_script_runs(pool, &started_record, action).await
+        }
+        GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
+            execute_upsert_scheduled_foreground_task(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::RequestBackgroundJob(action) => {
+            execute_request_background_job(config, pool, &started_record, action).await
         }
     };
     let lease_completion_result = if result.as_ref().is_ok_and(governed_action_result_is_timeout) {
@@ -674,6 +715,695 @@ async fn create_governed_action_worker_lease(
     .await
 }
 
+async fn complete_harness_native_action(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    summary: String,
+    payload: serde_json::Value,
+) -> Result<GovernedActionExecutionResult> {
+    let execution_id = record
+        .execution_id
+        .context("harness-native governed action requires an execution record")?;
+    let output_ref = format!("execution_record:{execution_id}");
+    execution::mark_succeeded(
+        pool,
+        execution_id,
+        "governed_action",
+        0,
+        &json!({
+            "status": "completed",
+            "summary": summary,
+            "payload": payload,
+        }),
+    )
+    .await?;
+    let updated_record = update_governed_action_execution(
+        pool,
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id: record.governed_action_execution_id,
+            status: GovernedActionStatus::Executed,
+            execution_id: Some(execution_id),
+            output_ref: Some(&output_ref),
+            blocked_reason: None,
+            approval_request_id: None,
+            started_at: record.started_at,
+            completed_at: Some(Utc::now()),
+        },
+    )
+    .await?;
+    write_governed_action_audit_event(
+        pool,
+        &updated_record,
+        "governed_action_execution_completed",
+        "info",
+        payload,
+    )
+    .await?;
+    let outcome = GovernedActionExecutionOutcome {
+        status: GovernedActionStatus::Executed,
+        summary,
+        fingerprint: Some(updated_record.action_fingerprint.clone()),
+        output_ref: Some(output_ref),
+    };
+    Ok(governed_action_execution_result(
+        updated_record,
+        outcome,
+        None,
+    ))
+}
+
+fn preview_text(content: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = content.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (preview, truncated)
+}
+
+fn artifact_status_matches(
+    status: workspace::WorkspaceArtifactStatus,
+    filter: WorkspaceArtifactStatusFilter,
+) -> bool {
+    match filter {
+        WorkspaceArtifactStatusFilter::Active => {
+            status == workspace::WorkspaceArtifactStatus::Active
+        }
+        WorkspaceArtifactStatusFilter::Archived => {
+            status == workspace::WorkspaceArtifactStatus::Archived
+        }
+        WorkspaceArtifactStatusFilter::Any => true,
+    }
+}
+
+fn workspace_artifact_status_label(status: workspace::WorkspaceArtifactStatus) -> &'static str {
+    match status {
+        workspace::WorkspaceArtifactStatus::Active => "active",
+        workspace::WorkspaceArtifactStatus::Archived => "archived",
+    }
+}
+
+fn script_run_status_matches(
+    status: WorkspaceScriptRunStatus,
+    filter: Option<WorkspaceScriptRunStatus>,
+) -> bool {
+    filter.is_none_or(|filter| filter == status)
+}
+
+async fn execute_inspect_workspace_artifact(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &InspectWorkspaceArtifactAction,
+) -> Result<GovernedActionExecutionResult> {
+    let artifact = workspace::get_workspace_artifact(pool, action.artifact_id).await?;
+    if artifact.artifact_kind != action.artifact_kind {
+        bail!("workspace artifact kind does not match requested kind");
+    }
+    if artifact.artifact_kind == WorkspaceArtifactKind::Script {
+        bail!("script artifacts must be inspected with inspect_workspace_script");
+    }
+    if artifact.status != workspace::WorkspaceArtifactStatus::Active {
+        bail!("workspace artifact is archived");
+    }
+    let content = artifact.content_text.clone().unwrap_or_default();
+    let (preview, truncated) = preview_text(&content, WORKSPACE_OBSERVATION_PREVIEW_CHARS);
+    let summary = format!(
+        "workspace artifact {} '{}' inspected; kind={:?}; preview:\n{}{}",
+        artifact.workspace_artifact_id,
+        artifact.title,
+        artifact.artifact_kind,
+        preview,
+        if truncated {
+            "\n[preview truncated]"
+        } else {
+            ""
+        }
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_artifact_id": artifact.workspace_artifact_id,
+            "artifact_kind": artifact.artifact_kind,
+            "title": artifact.title,
+            "status": workspace_artifact_status_label(artifact.status),
+            "preview": preview,
+            "preview_truncated": truncated,
+            "content_chars": content.chars().count(),
+            "updated_at": artifact.updated_at,
+        }),
+    )
+    .await
+}
+
+async fn execute_list_workspace_artifacts(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ListWorkspaceArtifactsAction,
+) -> Result<GovernedActionExecutionResult> {
+    let artifacts = workspace::list_workspace_artifacts(pool, i64::from(action.limit * 4)).await?;
+    let query = action
+        .query
+        .as_ref()
+        .map(|query| query.to_ascii_lowercase());
+    let mut selected = Vec::new();
+    for artifact in artifacts {
+        if selected.len() >= action.limit as usize {
+            break;
+        }
+        if !artifact_status_matches(artifact.status, action.status) {
+            continue;
+        }
+        if artifact.artifact_kind == WorkspaceArtifactKind::Script {
+            continue;
+        }
+        if let Some(kind) = action.artifact_kind {
+            if artifact.artifact_kind != kind {
+                continue;
+            }
+        }
+        if let Some(query) = &query {
+            let haystack = format!(
+                "{}\n{}",
+                artifact.title,
+                artifact.content_text.clone().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if !haystack.contains(query) {
+                continue;
+            }
+        }
+        let content = artifact.content_text.clone().unwrap_or_default();
+        let (snippet, truncated) = preview_text(&content, 240);
+        selected.push(json!({
+            "workspace_artifact_id": artifact.workspace_artifact_id,
+            "artifact_kind": artifact.artifact_kind,
+            "title": artifact.title,
+            "status": workspace_artifact_status_label(artifact.status),
+            "updated_at": artifact.updated_at,
+            "snippet": snippet,
+            "snippet_truncated": truncated,
+        }));
+    }
+    let summary = format!("listed {} workspace artifacts", selected.len());
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "items": selected,
+            "limit": action.limit,
+        }),
+    )
+    .await
+}
+
+async fn execute_create_workspace_artifact(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &CreateWorkspaceArtifactAction,
+) -> Result<GovernedActionExecutionResult> {
+    let artifact = workspace::create_workspace_artifact(
+        config,
+        pool,
+        &workspace::NewWorkspaceArtifact {
+            workspace_artifact_id: Uuid::now_v7(),
+            trace_id: Some(record.trace_id),
+            execution_id: record.execution_id,
+            artifact_kind: action.artifact_kind,
+            title: action.title.trim().to_string(),
+            content_text: Some(action.content_text.clone()),
+            metadata: json!({
+                "source": "governed_action",
+                "governed_action_execution_id": record.governed_action_execution_id,
+                "provenance": action.provenance,
+            }),
+        },
+    )
+    .await?;
+    let summary = format!(
+        "created workspace artifact {} '{}'",
+        artifact.workspace_artifact_id, artifact.title
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_artifact_id": artifact.workspace_artifact_id,
+            "artifact_kind": artifact.artifact_kind,
+            "title": artifact.title,
+            "updated_at": artifact.updated_at,
+        }),
+    )
+    .await
+}
+
+async fn execute_update_workspace_artifact(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &contracts::UpdateWorkspaceArtifactAction,
+) -> Result<GovernedActionExecutionResult> {
+    let current = workspace::get_workspace_artifact(pool, action.artifact_id).await?;
+    if current.artifact_kind == WorkspaceArtifactKind::Script {
+        bail!("script artifacts must be updated with append_workspace_script_version");
+    }
+    if current.status != workspace::WorkspaceArtifactStatus::Active {
+        bail!("workspace artifact is archived");
+    }
+    if let Some(expected) = action.expected_updated_at {
+        if current.updated_at != expected {
+            bail!("workspace artifact update conflict: updated_at does not match expected value");
+        }
+    }
+    let updated = workspace::update_workspace_artifact(
+        config,
+        pool,
+        &workspace::UpdateWorkspaceArtifact {
+            workspace_artifact_id: action.artifact_id,
+            title: action
+                .title
+                .clone()
+                .unwrap_or_else(|| current.title.clone())
+                .trim()
+                .to_string(),
+            content_text: Some(action.content_text.clone()),
+            status: workspace::WorkspaceArtifactStatus::Active,
+            metadata: json!({
+                "source": "governed_action",
+                "governed_action_execution_id": record.governed_action_execution_id,
+                "previous_metadata": current.metadata,
+                "change_summary": action.change_summary,
+            }),
+        },
+    )
+    .await?;
+    let summary = format!(
+        "updated workspace artifact {} '{}'",
+        updated.workspace_artifact_id, updated.title
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_artifact_id": updated.workspace_artifact_id,
+            "title": updated.title,
+            "updated_at": updated.updated_at,
+        }),
+    )
+    .await
+}
+
+async fn execute_list_workspace_scripts(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ListWorkspaceScriptsAction,
+) -> Result<GovernedActionExecutionResult> {
+    let scripts = workspace::list_workspace_scripts(pool, i64::from(action.limit * 4)).await?;
+    let query = action
+        .query
+        .as_ref()
+        .map(|query| query.to_ascii_lowercase());
+    let mut selected = Vec::new();
+    for script in scripts {
+        if selected.len() >= action.limit as usize {
+            break;
+        }
+        if let Some(language) = &action.language {
+            if !script.language.eq_ignore_ascii_case(language.trim()) {
+                continue;
+            }
+        }
+        let artifact =
+            workspace::get_workspace_artifact(pool, script.workspace_artifact_id).await?;
+        if !artifact_status_matches(artifact.status, action.status) {
+            continue;
+        }
+        if let Some(query) = &query {
+            let haystack =
+                format!("{}\n{}", artifact.title, artifact.metadata).to_ascii_lowercase();
+            if !haystack.contains(query) {
+                continue;
+            }
+        }
+        selected.push(json!({
+            "workspace_script_id": script.script_id,
+            "workspace_artifact_id": script.workspace_artifact_id,
+            "title": artifact.title,
+            "language": script.language,
+            "status": workspace_artifact_status_label(artifact.status),
+            "latest_version": script.latest_version,
+            "updated_at": script.updated_at,
+        }));
+    }
+    let summary = format!("listed {} workspace scripts", selected.len());
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "items": selected,
+            "limit": action.limit,
+        }),
+    )
+    .await
+}
+
+async fn execute_inspect_workspace_script(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &InspectWorkspaceScriptAction,
+) -> Result<GovernedActionExecutionResult> {
+    let script = workspace::get_workspace_script(pool, action.script_id).await?;
+    let artifact = workspace::get_workspace_artifact(pool, script.workspace_artifact_id).await?;
+    if artifact.status != workspace::WorkspaceArtifactStatus::Active {
+        bail!("workspace script is archived");
+    }
+    let version = match action.script_version_id {
+        Some(version_id) => workspace::get_workspace_script_version(pool, version_id).await?,
+        None => workspace::get_latest_workspace_script_version(pool, action.script_id)
+            .await?
+            .context("workspace script has no versions")?,
+    };
+    if version.workspace_script_id != action.script_id {
+        bail!("workspace script version does not belong to requested script");
+    }
+    let (preview, truncated) =
+        preview_text(&version.content_text, WORKSPACE_OBSERVATION_PREVIEW_CHARS);
+    let summary = format!(
+        "workspace script {} '{}' inspected; language={}; version={}; preview:\n{}{}",
+        script.workspace_script_id,
+        artifact.title,
+        script.language,
+        version.version,
+        preview,
+        if truncated {
+            "\n[preview truncated]"
+        } else {
+            ""
+        }
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_script_id": script.workspace_script_id,
+            "workspace_artifact_id": script.workspace_artifact_id,
+            "title": artifact.title,
+            "language": script.language,
+            "latest_version": script.latest_version,
+            "workspace_script_version_id": version.workspace_script_version_id,
+            "version": version.version,
+            "content_sha256": version.content_sha256,
+            "preview": preview,
+            "preview_truncated": truncated,
+        }),
+    )
+    .await
+}
+
+async fn execute_create_workspace_script(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &CreateWorkspaceScriptAction,
+) -> Result<GovernedActionExecutionResult> {
+    let script = workspace::create_workspace_script(
+        config,
+        pool,
+        &workspace::NewWorkspaceScript {
+            workspace_script_id: Uuid::now_v7(),
+            workspace_artifact_id: Uuid::now_v7(),
+            workspace_script_version_id: Uuid::now_v7(),
+            trace_id: Some(record.trace_id),
+            execution_id: record.execution_id,
+            title: action.title.trim().to_string(),
+            metadata: json!({
+                "source": "governed_action",
+                "governed_action_execution_id": record.governed_action_execution_id,
+                "description": action.description,
+                "requested_capabilities": action.requested_capabilities,
+            }),
+            language: action.language.trim().to_ascii_lowercase(),
+            entrypoint: None,
+            content_text: action.content_text.clone(),
+            change_summary: Some("initial governed script version".to_string()),
+        },
+    )
+    .await?;
+    let summary = format!(
+        "created workspace script {} '{}' version {}",
+        script.script.workspace_script_id, script.artifact.title, script.initial_version.version
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_script_id": script.script.workspace_script_id,
+            "workspace_artifact_id": script.artifact.workspace_artifact_id,
+            "workspace_script_version_id": script.initial_version.workspace_script_version_id,
+            "language": script.script.language,
+            "version": script.initial_version.version,
+            "content_sha256": script.initial_version.content_sha256,
+        }),
+    )
+    .await
+}
+
+async fn execute_append_workspace_script_version(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &AppendWorkspaceScriptVersionAction,
+) -> Result<GovernedActionExecutionResult> {
+    let script = workspace::get_workspace_script(pool, action.script_id).await?;
+    if !script.language.eq_ignore_ascii_case(action.language.trim()) {
+        bail!("workspace script language mismatch");
+    }
+    let artifact = workspace::get_workspace_artifact(pool, script.workspace_artifact_id).await?;
+    if artifact.status != workspace::WorkspaceArtifactStatus::Active {
+        bail!("workspace script is archived");
+    }
+    let latest = workspace::get_latest_workspace_script_version(pool, action.script_id)
+        .await?
+        .context("workspace script has no versions")?;
+    if let Some(expected) = action.expected_latest_version_id {
+        if latest.workspace_script_version_id != expected {
+            bail!("workspace script version conflict: latest version id changed");
+        }
+    }
+    if let Some(expected_hash) = &action.expected_content_sha256 {
+        if latest.content_sha256 != *expected_hash {
+            bail!("workspace script version conflict: latest content hash changed");
+        }
+    }
+    let version = workspace::append_workspace_script_version(
+        config,
+        pool,
+        &workspace::NewWorkspaceScriptVersion {
+            workspace_script_version_id: Uuid::now_v7(),
+            workspace_script_id: action.script_id,
+            content_text: action.content_text.clone(),
+            change_summary: Some(action.change_summary.clone()),
+        },
+    )
+    .await?;
+    let summary = format!(
+        "appended workspace script {} version {}",
+        version.workspace_script_id, version.version
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "workspace_script_id": version.workspace_script_id,
+            "workspace_script_version_id": version.workspace_script_version_id,
+            "version": version.version,
+            "content_sha256": version.content_sha256,
+        }),
+    )
+    .await
+}
+
+async fn execute_list_workspace_script_runs(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ListWorkspaceScriptRunsAction,
+) -> Result<GovernedActionExecutionResult> {
+    let runs = workspace::list_workspace_script_run_records(
+        pool,
+        Some(action.script_id),
+        i64::from(action.limit * 4),
+    )
+    .await?;
+    let selected = runs
+        .into_iter()
+        .filter(|run| script_run_status_matches(run.status, action.status))
+        .take(action.limit as usize)
+        .map(|run| {
+            json!({
+                "workspace_script_run_id": run.workspace_script_run_id,
+                "workspace_script_id": run.workspace_script_id,
+                "workspace_script_version_id": run.workspace_script_version_id,
+                "status": run.status,
+                "risk_tier": run.risk_tier,
+                "started_at": run.started_at,
+                "completed_at": run.completed_at,
+                "output_ref": run.output_ref,
+                "failure_summary": run.failure_summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary = format!("listed {} workspace script runs", selected.len());
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "items": selected,
+            "limit": action.limit,
+        }),
+    )
+    .await
+}
+
+async fn execute_upsert_scheduled_foreground_task(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &UpsertScheduledForegroundTaskAction,
+) -> Result<GovernedActionExecutionResult> {
+    let status = if action.active {
+        contracts::ScheduledForegroundTaskStatus::Active
+    } else {
+        contracts::ScheduledForegroundTaskStatus::Paused
+    };
+    let result = scheduled_foreground::upsert_task(
+        pool,
+        config,
+        &scheduled_foreground::UpsertScheduledForegroundTask {
+            task_key: action.task_key.trim().to_string(),
+            internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+            internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+            message_text: action.user_facing_prompt.clone(),
+            cadence_seconds: action.cadence_seconds,
+            cooldown_seconds: action.cooldown_seconds,
+            next_due_at: action.next_due_at_utc,
+            status,
+            actor_ref: "conscious-governed-action".to_string(),
+        },
+    )
+    .await?;
+    let write_action = match result.action {
+        scheduled_foreground::ScheduledForegroundTaskWriteAction::Created => "created",
+        scheduled_foreground::ScheduledForegroundTaskWriteAction::Updated => "updated",
+    };
+    let summary = format!(
+        "{write_action} scheduled foreground task '{}' due at {}",
+        result.record.task_key, result.record.next_due_at
+    );
+    causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: record.trace_id,
+            source_kind: "governed_action_execution".to_string(),
+            source_id: record.governed_action_execution_id,
+            target_kind: "scheduled_foreground_task".to_string(),
+            target_id: result.record.scheduled_foreground_task_id,
+            edge_kind: "mutated_scheduled_task".to_string(),
+            payload: json!({
+                "action": write_action,
+                "task_key": result.record.task_key,
+                "next_due_at": result.record.next_due_at,
+                "status": result.record.status,
+            }),
+        },
+    )
+    .await?;
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "action": write_action,
+            "scheduled_foreground_task_id": result.record.scheduled_foreground_task_id,
+            "task_key": result.record.task_key,
+            "title": action.title,
+            "next_due_at": result.record.next_due_at,
+            "cadence_seconds": result.record.cadence_seconds,
+            "cooldown_seconds": result.record.cooldown_seconds,
+            "status": result.record.status,
+        }),
+    )
+    .await
+}
+
+async fn execute_request_background_job(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &RequestBackgroundJobAction,
+) -> Result<GovernedActionExecutionResult> {
+    let trigger = contracts::BackgroundTrigger {
+        trigger_id: Uuid::now_v7(),
+        trigger_kind: contracts::BackgroundTriggerKind::ForegroundDelegation,
+        requested_at: Utc::now(),
+        reason_summary: action.rationale.clone(),
+        payload_ref: action.input_scope_ref.clone(),
+    };
+    let decision = background_planning::plan_background_job(
+        pool,
+        config,
+        BackgroundPlanningRequest {
+            trace_id: record.trace_id,
+            job_kind: action.job_kind,
+            trigger,
+            internal_conversation_ref: action.internal_conversation_ref.clone(),
+            available_at: Utc::now(),
+        },
+    )
+    .await?;
+    let (summary, payload) = match decision {
+        BackgroundPlanningDecision::Planned(job) => (
+            format!("accepted background job request {}", job.background_job_id),
+            json!({
+                "status": "accepted",
+                "background_job_id": job.background_job_id,
+                "deduplication_key": job.deduplication_key,
+                "scope_summary": job.scope.summary,
+                "urgency": action.urgency,
+                "wake_preference": action.wake_preference,
+            }),
+        ),
+        BackgroundPlanningDecision::SuppressedDuplicate {
+            existing_job_id,
+            deduplication_key,
+            reason,
+        } => (
+            format!("suppressed duplicate background job request: {reason}"),
+            json!({
+                "status": "suppressed_duplicate",
+                "existing_background_job_id": existing_job_id,
+                "deduplication_key": deduplication_key,
+                "reason": reason,
+            }),
+        ),
+        BackgroundPlanningDecision::Rejected { reason } => (
+            format!("rejected background job request: {reason}"),
+            json!({
+                "status": "rejected",
+                "reason": reason,
+            }),
+        ),
+    };
+    complete_harness_native_action(pool, record, summary, payload).await
+}
+
 pub fn fingerprint_governed_action(
     proposal: &GovernedActionProposal,
 ) -> Result<GovernedActionFingerprint> {
@@ -700,10 +1430,21 @@ pub fn validate_capability_scope(
     let scope = &proposal.capability_scope;
     let filesystem_roots = normalized_filesystem_roots(scope);
     let is_web_fetch = proposal.action_kind == GovernedActionKind::WebFetch;
-    if filesystem_roots.is_empty()
-        && proposal.action_kind != GovernedActionKind::InspectWorkspaceArtifact
-        && !is_web_fetch
-    {
+    let is_harness_native = matches!(
+        proposal.action_kind,
+        GovernedActionKind::InspectWorkspaceArtifact
+            | GovernedActionKind::ListWorkspaceArtifacts
+            | GovernedActionKind::CreateWorkspaceArtifact
+            | GovernedActionKind::UpdateWorkspaceArtifact
+            | GovernedActionKind::ListWorkspaceScripts
+            | GovernedActionKind::InspectWorkspaceScript
+            | GovernedActionKind::CreateWorkspaceScript
+            | GovernedActionKind::AppendWorkspaceScriptVersion
+            | GovernedActionKind::ListWorkspaceScriptRuns
+            | GovernedActionKind::UpsertScheduledForegroundTask
+            | GovernedActionKind::RequestBackgroundJob
+    );
+    if filesystem_roots.is_empty() && !is_harness_native && !is_web_fetch {
         bail!("governed actions must request at least one filesystem root");
     }
     if filesystem_roots.len() > config.governed_actions.max_filesystem_roots_per_action as usize {
@@ -725,7 +1466,7 @@ pub fn validate_capability_scope(
         }
     }
 
-    if !is_web_fetch {
+    if !is_web_fetch && !is_harness_native {
         if scope.execution.timeout_ms == 0 {
             bail!("governed action timeout must be greater than zero");
         }
@@ -777,15 +1518,67 @@ pub fn validate_capability_scope(
             GovernedActionKind::InspectWorkspaceArtifact,
             GovernedActionPayload::InspectWorkspaceArtifact(_),
         ) => {
-            if !scope.filesystem.write_roots.is_empty() {
-                bail!("workspace inspection proposals must not request filesystem write scope");
-            }
-            if !scope.environment.allow_variables.is_empty() {
-                bail!("workspace inspection proposals must not request environment variable scope");
-            }
-            if scope.network != NetworkAccessPosture::Disabled {
-                bail!("workspace inspection proposals must not request network access");
-            }
+            validate_harness_native_scope(scope, "workspace inspection")?;
+        }
+        (
+            GovernedActionKind::ListWorkspaceArtifacts,
+            GovernedActionPayload::ListWorkspaceArtifacts(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace artifact listing")?;
+        }
+        (
+            GovernedActionKind::CreateWorkspaceArtifact,
+            GovernedActionPayload::CreateWorkspaceArtifact(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace artifact creation")?;
+        }
+        (
+            GovernedActionKind::UpdateWorkspaceArtifact,
+            GovernedActionPayload::UpdateWorkspaceArtifact(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace artifact update")?;
+        }
+        (
+            GovernedActionKind::ListWorkspaceScripts,
+            GovernedActionPayload::ListWorkspaceScripts(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace script listing")?;
+        }
+        (
+            GovernedActionKind::InspectWorkspaceScript,
+            GovernedActionPayload::InspectWorkspaceScript(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace script inspection")?;
+        }
+        (
+            GovernedActionKind::CreateWorkspaceScript,
+            GovernedActionPayload::CreateWorkspaceScript(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace script creation")?;
+        }
+        (
+            GovernedActionKind::AppendWorkspaceScriptVersion,
+            GovernedActionPayload::AppendWorkspaceScriptVersion(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace script version append")?;
+        }
+        (
+            GovernedActionKind::ListWorkspaceScriptRuns,
+            GovernedActionPayload::ListWorkspaceScriptRuns(_),
+        ) => {
+            validate_harness_native_scope(scope, "workspace script run listing")?;
+        }
+        (
+            GovernedActionKind::UpsertScheduledForegroundTask,
+            GovernedActionPayload::UpsertScheduledForegroundTask(_),
+        ) => {
+            validate_harness_native_scope(scope, "scheduled foreground task upsert")?;
+        }
+        (
+            GovernedActionKind::RequestBackgroundJob,
+            GovernedActionPayload::RequestBackgroundJob(_),
+        ) => {
+            validate_harness_native_scope(scope, "background job request")?;
         }
         (GovernedActionKind::RunSubprocess, GovernedActionPayload::RunSubprocess(action)) => {
             if action.command.trim().is_empty() {
@@ -816,6 +1609,46 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::InspectWorkspaceArtifact,
             GovernedActionPayload::InspectWorkspaceArtifact(action),
         ) => validate_workspace_inspection_action(action),
+        (
+            GovernedActionKind::ListWorkspaceArtifacts,
+            GovernedActionPayload::ListWorkspaceArtifacts(action),
+        ) => validate_list_workspace_artifacts_action(action),
+        (
+            GovernedActionKind::CreateWorkspaceArtifact,
+            GovernedActionPayload::CreateWorkspaceArtifact(action),
+        ) => validate_create_workspace_artifact_action(action),
+        (
+            GovernedActionKind::UpdateWorkspaceArtifact,
+            GovernedActionPayload::UpdateWorkspaceArtifact(action),
+        ) => validate_update_workspace_artifact_action(action),
+        (
+            GovernedActionKind::ListWorkspaceScripts,
+            GovernedActionPayload::ListWorkspaceScripts(action),
+        ) => validate_list_workspace_scripts_action(action),
+        (
+            GovernedActionKind::InspectWorkspaceScript,
+            GovernedActionPayload::InspectWorkspaceScript(action),
+        ) => validate_inspect_workspace_script_action(action),
+        (
+            GovernedActionKind::CreateWorkspaceScript,
+            GovernedActionPayload::CreateWorkspaceScript(action),
+        ) => validate_create_workspace_script_action(action),
+        (
+            GovernedActionKind::AppendWorkspaceScriptVersion,
+            GovernedActionPayload::AppendWorkspaceScriptVersion(action),
+        ) => validate_append_workspace_script_version_action(action),
+        (
+            GovernedActionKind::ListWorkspaceScriptRuns,
+            GovernedActionPayload::ListWorkspaceScriptRuns(action),
+        ) => validate_list_workspace_script_runs_action(action),
+        (
+            GovernedActionKind::UpsertScheduledForegroundTask,
+            GovernedActionPayload::UpsertScheduledForegroundTask(action),
+        ) => validate_upsert_scheduled_foreground_task_action(action),
+        (
+            GovernedActionKind::RequestBackgroundJob,
+            GovernedActionPayload::RequestBackgroundJob(action),
+        ) => validate_request_background_job_action(action),
         (GovernedActionKind::RunSubprocess, GovernedActionPayload::RunSubprocess(action)) => {
             validate_subprocess_action(action)
         }
@@ -831,8 +1664,153 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
 }
 
 fn validate_workspace_inspection_action(action: &InspectWorkspaceArtifactAction) -> Result<()> {
+    if action.artifact_id.is_nil() {
+        bail!("workspace artifact inspection artifact_id must not be nil");
+    }
     if action.artifact_kind == contracts::WorkspaceArtifactKind::Script {
-        bail!("workspace inspection proposals must use run_workspace_script for scripts");
+        bail!("workspace inspection proposals must use inspect_workspace_script for scripts");
+    }
+    Ok(())
+}
+
+fn validate_harness_native_scope(scope: &CapabilityScope, label: &str) -> Result<()> {
+    if !scope.filesystem.read_roots.is_empty() || !scope.filesystem.write_roots.is_empty() {
+        bail!("{label} proposals must not request filesystem scope");
+    }
+    if !scope.environment.allow_variables.is_empty() {
+        bail!("{label} proposals must not request environment variable scope");
+    }
+    if scope.network != NetworkAccessPosture::Disabled {
+        bail!("{label} proposals must not request network access");
+    }
+    Ok(())
+}
+
+fn validate_limit(limit: u32, label: &str) -> Result<()> {
+    if limit == 0 {
+        bail!("{label} limit must be greater than zero");
+    }
+    if limit > GOVERNED_ACTION_LIST_LIMIT_MAX {
+        bail!("{label} limit exceeds maximum of {GOVERNED_ACTION_LIST_LIMIT_MAX}");
+    }
+    Ok(())
+}
+
+fn validate_list_workspace_artifacts_action(action: &ListWorkspaceArtifactsAction) -> Result<()> {
+    validate_limit(action.limit, "workspace artifact listing")?;
+    if matches!(action.artifact_kind, Some(WorkspaceArtifactKind::Script)) {
+        bail!("workspace artifact listing must use list_workspace_scripts for scripts");
+    }
+    Ok(())
+}
+
+fn validate_create_workspace_artifact_action(action: &CreateWorkspaceArtifactAction) -> Result<()> {
+    if action.artifact_kind == WorkspaceArtifactKind::Script {
+        bail!("script artifacts must use create_workspace_script");
+    }
+    if action.title.trim().is_empty() {
+        bail!("workspace artifact creation title must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_update_workspace_artifact_action(action: &UpdateWorkspaceArtifactAction) -> Result<()> {
+    if action.artifact_id.is_nil() {
+        bail!("workspace artifact update artifact_id must not be nil");
+    }
+    if action
+        .title
+        .as_ref()
+        .is_some_and(|title| title.trim().is_empty())
+    {
+        bail!("workspace artifact update title must not be empty");
+    }
+    if action.change_summary.trim().is_empty() {
+        bail!("workspace artifact update change_summary must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_list_workspace_scripts_action(action: &ListWorkspaceScriptsAction) -> Result<()> {
+    validate_limit(action.limit, "workspace script listing")
+}
+
+fn validate_inspect_workspace_script_action(action: &InspectWorkspaceScriptAction) -> Result<()> {
+    if action.script_id.is_nil() {
+        bail!("workspace script inspection script_id must not be nil");
+    }
+    Ok(())
+}
+
+fn validate_create_workspace_script_action(action: &CreateWorkspaceScriptAction) -> Result<()> {
+    if action.title.trim().is_empty() {
+        bail!("workspace script creation title must not be empty");
+    }
+    validate_workspace_script_language(&action.language)?;
+    if action.content_text.trim().is_empty() {
+        bail!("workspace script creation content_text must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_append_workspace_script_version_action(
+    action: &AppendWorkspaceScriptVersionAction,
+) -> Result<()> {
+    if action.script_id.is_nil() {
+        bail!("workspace script version script_id must not be nil");
+    }
+    validate_workspace_script_language(&action.language)?;
+    if action.content_text.trim().is_empty() {
+        bail!("workspace script version content_text must not be empty");
+    }
+    if action.change_summary.trim().is_empty() {
+        bail!("workspace script version change_summary must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_workspace_script_language(language: &str) -> Result<()> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "powershell" | "pwsh" | "sh" | "bash" | "python" => Ok(()),
+        other => bail!("workspace script language '{other}' is not supported"),
+    }
+}
+
+fn validate_list_workspace_script_runs_action(
+    action: &ListWorkspaceScriptRunsAction,
+) -> Result<()> {
+    if action.script_id.is_nil() {
+        bail!("workspace script run listing script_id must not be nil");
+    }
+    validate_limit(action.limit, "workspace script run listing")
+}
+
+fn validate_upsert_scheduled_foreground_task_action(
+    action: &UpsertScheduledForegroundTaskAction,
+) -> Result<()> {
+    if action.task_key.trim().is_empty() {
+        bail!("scheduled foreground task_key must not be empty");
+    }
+    if action.title.trim().is_empty() {
+        bail!("scheduled foreground task title must not be empty");
+    }
+    if action.user_facing_prompt.trim().is_empty() {
+        bail!("scheduled foreground prompt must not be empty");
+    }
+    if action.cadence_seconds == 0 {
+        bail!("scheduled foreground cadence_seconds must be greater than zero");
+    }
+    if action.internal_principal_ref.trim().is_empty()
+        || action.internal_conversation_ref.trim().is_empty()
+    {
+        bail!("scheduled foreground conversation binding fields must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_request_background_job_action(action: &RequestBackgroundJobAction) -> Result<()> {
+    if action.rationale.trim().is_empty() {
+        bail!("background job request rationale must not be empty");
     }
     Ok(())
 }
@@ -1764,6 +2742,14 @@ async fn persist_governed_action_execution(
         GovernedActionPayload::RunWorkspaceScript(action) => {
             (Some(action.script_id), action.script_version_id)
         }
+        GovernedActionPayload::InspectWorkspaceScript(action) => {
+            (Some(action.script_id), action.script_version_id)
+        }
+        GovernedActionPayload::CreateWorkspaceScript(_) => (None, None),
+        GovernedActionPayload::AppendWorkspaceScriptVersion(action) => {
+            (Some(action.script_id), None)
+        }
+        GovernedActionPayload::ListWorkspaceScriptRuns(action) => (Some(action.script_id), None),
         _ => (None, None),
     };
 
@@ -1877,6 +2863,16 @@ fn normalized_filesystem_roots(scope: &CapabilityScope) -> Vec<String> {
 fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
     match kind {
         GovernedActionKind::InspectWorkspaceArtifact => "inspect_workspace_artifact",
+        GovernedActionKind::ListWorkspaceArtifacts => "list_workspace_artifacts",
+        GovernedActionKind::CreateWorkspaceArtifact => "create_workspace_artifact",
+        GovernedActionKind::UpdateWorkspaceArtifact => "update_workspace_artifact",
+        GovernedActionKind::ListWorkspaceScripts => "list_workspace_scripts",
+        GovernedActionKind::InspectWorkspaceScript => "inspect_workspace_script",
+        GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
+        GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
+        GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
+        GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         GovernedActionKind::WebFetch => "web_fetch",
@@ -1886,6 +2882,16 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
 fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
     match value {
         "inspect_workspace_artifact" => Ok(GovernedActionKind::InspectWorkspaceArtifact),
+        "list_workspace_artifacts" => Ok(GovernedActionKind::ListWorkspaceArtifacts),
+        "create_workspace_artifact" => Ok(GovernedActionKind::CreateWorkspaceArtifact),
+        "update_workspace_artifact" => Ok(GovernedActionKind::UpdateWorkspaceArtifact),
+        "list_workspace_scripts" => Ok(GovernedActionKind::ListWorkspaceScripts),
+        "inspect_workspace_script" => Ok(GovernedActionKind::InspectWorkspaceScript),
+        "create_workspace_script" => Ok(GovernedActionKind::CreateWorkspaceScript),
+        "append_workspace_script_version" => Ok(GovernedActionKind::AppendWorkspaceScriptVersion),
+        "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
+        "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
+        "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
         "web_fetch" => Ok(GovernedActionKind::WebFetch),
@@ -1981,6 +2987,74 @@ enum CanonicalGovernedActionPayload {
         artifact_id: Uuid,
         artifact_kind: contracts::WorkspaceArtifactKind,
     },
+    ListWorkspaceArtifacts {
+        artifact_kind: Option<contracts::WorkspaceArtifactKind>,
+        status: WorkspaceArtifactStatusFilter,
+        query: Option<String>,
+        limit: u32,
+    },
+    CreateWorkspaceArtifact {
+        artifact_kind: contracts::WorkspaceArtifactKind,
+        title: String,
+        content_text: String,
+        provenance: Option<String>,
+    },
+    UpdateWorkspaceArtifact {
+        artifact_id: Uuid,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        content_text: String,
+        change_summary: String,
+    },
+    ListWorkspaceScripts {
+        status: WorkspaceArtifactStatusFilter,
+        language: Option<String>,
+        query: Option<String>,
+        limit: u32,
+    },
+    InspectWorkspaceScript {
+        script_id: Uuid,
+        script_version_id: Option<Uuid>,
+    },
+    CreateWorkspaceScript {
+        title: String,
+        language: String,
+        content_text: String,
+        description: Option<String>,
+        requested_capabilities: Vec<String>,
+    },
+    AppendWorkspaceScriptVersion {
+        script_id: Uuid,
+        expected_latest_version_id: Option<Uuid>,
+        expected_content_sha256: Option<String>,
+        language: String,
+        content_text: String,
+        change_summary: String,
+    },
+    ListWorkspaceScriptRuns {
+        script_id: Uuid,
+        status: Option<WorkspaceScriptRunStatus>,
+        limit: u32,
+    },
+    UpsertScheduledForegroundTask {
+        task_key: String,
+        title: String,
+        user_facing_prompt: String,
+        next_due_at_utc: Option<chrono::DateTime<chrono::Utc>>,
+        cadence_seconds: u64,
+        cooldown_seconds: Option<u64>,
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        active: bool,
+    },
+    RequestBackgroundJob {
+        job_kind: contracts::UnconsciousJobKind,
+        rationale: String,
+        input_scope_ref: Option<String>,
+        urgency: Option<String>,
+        wake_preference: Option<String>,
+        internal_conversation_ref: Option<String>,
+    },
     RunSubprocess {
         command: String,
         args: Vec<String>,
@@ -2007,6 +3081,108 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                     artifact_kind: action.artifact_kind,
                 }
             }
+            GovernedActionPayload::ListWorkspaceArtifacts(action) => Self::ListWorkspaceArtifacts {
+                artifact_kind: action.artifact_kind,
+                status: action.status,
+                query: action.query.as_ref().map(|value| value.trim().to_string()),
+                limit: action.limit,
+            },
+            GovernedActionPayload::CreateWorkspaceArtifact(action) => {
+                Self::CreateWorkspaceArtifact {
+                    artifact_kind: action.artifact_kind,
+                    title: action.title.trim().to_string(),
+                    content_text: action.content_text.clone(),
+                    provenance: action
+                        .provenance
+                        .as_ref()
+                        .map(|value| value.trim().to_string()),
+                }
+            }
+            GovernedActionPayload::UpdateWorkspaceArtifact(action) => {
+                Self::UpdateWorkspaceArtifact {
+                    artifact_id: action.artifact_id,
+                    expected_updated_at: action.expected_updated_at,
+                    title: action.title.as_ref().map(|value| value.trim().to_string()),
+                    content_text: action.content_text.clone(),
+                    change_summary: action.change_summary.trim().to_string(),
+                }
+            }
+            GovernedActionPayload::ListWorkspaceScripts(action) => Self::ListWorkspaceScripts {
+                status: action.status,
+                language: action
+                    .language
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                query: action.query.as_ref().map(|value| value.trim().to_string()),
+                limit: action.limit,
+            },
+            GovernedActionPayload::InspectWorkspaceScript(action) => Self::InspectWorkspaceScript {
+                script_id: action.script_id,
+                script_version_id: action.script_version_id,
+            },
+            GovernedActionPayload::CreateWorkspaceScript(action) => Self::CreateWorkspaceScript {
+                title: action.title.trim().to_string(),
+                language: action.language.trim().to_ascii_lowercase(),
+                content_text: action.content_text.clone(),
+                description: action
+                    .description
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                requested_capabilities: normalized_path_list(&action.requested_capabilities),
+            },
+            GovernedActionPayload::AppendWorkspaceScriptVersion(action) => {
+                Self::AppendWorkspaceScriptVersion {
+                    script_id: action.script_id,
+                    expected_latest_version_id: action.expected_latest_version_id,
+                    expected_content_sha256: action
+                        .expected_content_sha256
+                        .as_ref()
+                        .map(|value| value.trim().to_string()),
+                    language: action.language.trim().to_ascii_lowercase(),
+                    content_text: action.content_text.clone(),
+                    change_summary: action.change_summary.trim().to_string(),
+                }
+            }
+            GovernedActionPayload::ListWorkspaceScriptRuns(action) => {
+                Self::ListWorkspaceScriptRuns {
+                    script_id: action.script_id,
+                    status: action.status,
+                    limit: action.limit,
+                }
+            }
+            GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
+                Self::UpsertScheduledForegroundTask {
+                    task_key: action.task_key.trim().to_string(),
+                    title: action.title.trim().to_string(),
+                    user_facing_prompt: action.user_facing_prompt.trim().to_string(),
+                    next_due_at_utc: action.next_due_at_utc,
+                    cadence_seconds: action.cadence_seconds,
+                    cooldown_seconds: action.cooldown_seconds,
+                    internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                    internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                    active: action.active,
+                }
+            }
+            GovernedActionPayload::RequestBackgroundJob(action) => Self::RequestBackgroundJob {
+                job_kind: action.job_kind,
+                rationale: action.rationale.trim().to_string(),
+                input_scope_ref: action
+                    .input_scope_ref
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                urgency: action
+                    .urgency
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                wake_preference: action
+                    .wake_preference
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                internal_conversation_ref: action
+                    .internal_conversation_ref
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+            },
             GovernedActionPayload::RunSubprocess(action) => Self::RunSubprocess {
                 command: action.command.trim().to_string(),
                 args: action.args.clone(),
@@ -2108,6 +3284,9 @@ mod tests {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
+            },
+            observability: crate::config::ObservabilityConfig {
+                model_call_payload_retention_days: 30,
             },
             approvals: crate::config::ApprovalsConfig {
                 default_ttl_seconds: 900,
@@ -2243,10 +3422,11 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("must not request filesystem write scope")
+                .contains("must not request filesystem scope")
         );
 
         proposal.capability_scope.filesystem.write_roots.clear();
+        proposal.capability_scope.filesystem.read_roots.clear();
         proposal.capability_scope.network = NetworkAccessPosture::Enabled;
         let network_error = validate_capability_scope(&sample_config(), &proposal)
             .expect_err("network-scoped inspection should be rejected");

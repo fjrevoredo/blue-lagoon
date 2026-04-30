@@ -524,7 +524,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
         config.worker.command = worker_binary.to_string_lossy().into_owned();
         config.worker.args = vec!["unconscious-worker".to_string()];
 
-        // Conversation binding is required for foreground delivery in Phase 2
+        // Conversation binding is required for foreground delivery.
         foreground::upsert_conversation_binding(
             &ctx.pool,
             &foreground::NewConversationBinding {
@@ -546,7 +546,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
         .await?;
 
         let transport = model_gateway::FakeModelProviderTransport::new();
-        // Response for Phase 1 (background SelfModelReflection job)
+        // Response for the background SelfModelReflection job.
         transport.push_response(Ok(ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
@@ -558,7 +558,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
             }),
         }));
 
-        // Phase 1: run background job; expect wake signal to be staged
+        // Run background job; expect wake signal to be staged.
         let outcome = with_env_var(
             "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
             Some("test-key"),
@@ -583,7 +583,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
             ..
         } = outcome
         else {
-            panic!("expected background completion outcome for UC6 phase 1");
+            panic!("expected background completion outcome for UC6 background step");
         };
         assert_eq!(completed_job_id, background_job_id);
 
@@ -608,7 +608,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
             "staged wake signal should appear as a pending ingress event"
         );
 
-        // Phase 2: foreground pickup — an unsupported update triggers the backlog scan which
+        // Foreground pickup: an unsupported update triggers the backlog scan which
         // picks up the pending wake-signal ingress targeting "telegram-primary"
         let mut config2 = ctx.config.clone();
         config2.self_model = Some(SelfModelConfig {
@@ -619,7 +619,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
         config2.worker.command = worker_binary.to_string_lossy().into_owned();
         config2.worker.args = vec!["conscious-worker".to_string()];
 
-        // Response for Phase 2 (foreground delivery of the wake signal)
+        // Response for foreground delivery of the wake signal.
         transport.push_response(Ok(ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({

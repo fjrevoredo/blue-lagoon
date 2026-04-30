@@ -28,7 +28,66 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .stdout(predicate::str::contains("approvals"))
         .stdout(predicate::str::contains("actions"))
         .stdout(predicate::str::contains("workspace"))
+        .stdout(predicate::str::contains("trace"))
         .stdout(predicate::str::contains("wake-signals"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_help_lists_operator_commands() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command.arg("admin").arg("trace").arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("recent"))
+        .stdout(predicate::str::contains("render"))
+        .stdout(predicate::str::contains("cleanup-model-payloads"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_show_help_lists_lookup_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command.arg("admin").arg("trace").arg("show").arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--execution-id"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_render_help_lists_visual_export_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("trace")
+        .arg("render")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--format"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_cleanup_help_lists_json_argument() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("trace")
+        .arg("cleanup-model-payloads")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
     Ok(())
 }
 

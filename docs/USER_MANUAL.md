@@ -139,6 +139,28 @@ For fixture replay:
 cargo run -p runtime -- telegram --fixture crates/harness/tests/fixtures/telegram/private_text_message.json
 ```
 
+### Assistant-managed tools
+
+The assistant can now use the harness-governed foreground path to inspect,
+create, and update workspace notes, runbooks, scratchpads, task lists, and
+scripts. It can also list script run history, propose scheduled foreground
+tasks, request bounded background maintenance, run approved workspace scripts,
+and fetch web pages through the approval-gated `web_fetch` action.
+
+These capabilities are not native provider tool calls. The model proposes a
+governed action, the harness validates and audits it, and higher-risk actions
+are routed through the normal approval flow before execution. Operators can
+inspect the resulting state with:
+
+```bash
+cargo run -p runtime -- admin actions list
+cargo run -p runtime -- admin workspace artifacts list
+cargo run -p runtime -- admin workspace scripts list
+cargo run -p runtime -- admin workspace runs list
+cargo run -p runtime -- admin foreground schedules list
+cargo run -p runtime -- admin background list
+```
+
 ### Managing scheduled foreground tasks
 
 Create or update a schedule:

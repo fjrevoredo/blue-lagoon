@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     background,
+    causal_links::{self, NewCausalLink},
     config::{ResolvedTelegramConfig, RuntimeConfig, TelegramForegroundBindingConfig},
     execution::{self, NewExecutionRecord},
     policy::{self, PolicyDecision},
@@ -1015,6 +1016,30 @@ pub async fn plan_pending_foreground_execution(
             },
         )
         .await?;
+        causal_links::insert(
+            &mut *tx,
+            &NewCausalLink {
+                trace_id,
+                source_kind: "ingress_event".to_string(),
+                source_id: ingress.ingress_id,
+                target_kind: "execution_record".to_string(),
+                target_id: execution_id,
+                edge_kind: "triggered_execution".to_string(),
+                payload: json!({
+                    "link_role": if ingress.ingress_id == primary_ingress.ingress_id {
+                        "primary"
+                    } else {
+                        "batch_member"
+                    },
+                    "sequence_index": index,
+                    "planning_mode": match decision.mode {
+                        ForegroundExecutionMode::SingleIngress => "single_ingress",
+                        ForegroundExecutionMode::BacklogRecovery => "backlog_recovery",
+                    },
+                }),
+            },
+        )
+        .await?;
     }
 
     audit::insert(
@@ -1764,6 +1789,24 @@ pub async fn stage_approved_wake_signal_foreground_ingress(
             execution_id: None,
             status: "accepted".to_string(),
             rejection_reason: None,
+        },
+    )
+    .await?;
+
+    causal_links::insert(
+        &mut *tx,
+        &NewCausalLink {
+            trace_id: wake_signal.trace_id,
+            source_kind: "wake_signal".to_string(),
+            source_id: wake_signal.wake_signal_id,
+            target_kind: "ingress_event".to_string(),
+            target_id: ingress.ingress_id,
+            edge_kind: "staged_foreground_trigger".to_string(),
+            payload: json!({
+                "reason_code": wake_signal.signal.reason_code,
+                "background_job_id": wake_signal.background_job_id,
+                "background_job_run_id": wake_signal.background_job_run_id,
+            }),
         },
     )
     .await?;

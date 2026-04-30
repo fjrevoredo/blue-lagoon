@@ -3,3 +3,8 @@ allowed_user_id = 123456789
 allowed_chat_id = 123456789
 internal_principal_ref = "primary-user"
 internal_conversation_ref = "telegram-primary"
+
+# Optional local override. The committed default keeps full model-call prompt
+# and response payloads for 30 days before cleanup clears bulky text fields.
+[observability]
+model_call_payload_retention_days = 30
