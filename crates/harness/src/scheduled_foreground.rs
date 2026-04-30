@@ -9,6 +9,7 @@ use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{
+    causal_links::{self, NewCausalLink},
     config::RuntimeConfig,
     execution::{self, NewExecutionRecord},
     foreground::{self, ConversationBindingRecord, NewIngressEvent},
@@ -346,6 +347,24 @@ pub async fn claim_next_due_task(
     .await
     .context("failed to insert execution record for scheduled foreground task claim")?;
 
+    causal_links::insert(
+        &mut *tx,
+        &NewCausalLink {
+            trace_id,
+            source_kind: "scheduled_foreground_task".to_string(),
+            source_id: task.scheduled_foreground_task_id,
+            target_kind: "execution_record".to_string(),
+            target_id: execution_id,
+            edge_kind: "triggered_execution".to_string(),
+            payload: json!({
+                "task_key": task.task_key,
+                "trigger_kind": "scheduled_foreground",
+                "claimed_at": claimed_at,
+            }),
+        },
+    )
+    .await?;
+
     let binding = find_conversation_binding_locked(&mut tx, &task.internal_conversation_ref)
         .await
         .with_context(|| {
@@ -382,6 +401,38 @@ pub async fn claim_next_due_task(
                     task.task_key
                 )
             })?;
+        causal_links::insert(
+            &mut *tx,
+            &NewCausalLink {
+                trace_id,
+                source_kind: "scheduled_foreground_task".to_string(),
+                source_id: task.scheduled_foreground_task_id,
+                target_kind: "ingress_event".to_string(),
+                target_id: ingress.ingress_id,
+                edge_kind: "staged_foreground_trigger".to_string(),
+                payload: json!({
+                    "task_key": task.task_key,
+                    "external_event_id": ingress.external_event_id,
+                }),
+            },
+        )
+        .await?;
+        causal_links::insert(
+            &mut *tx,
+            &NewCausalLink {
+                trace_id,
+                source_kind: "ingress_event".to_string(),
+                source_id: ingress.ingress_id,
+                target_kind: "execution_record".to_string(),
+                target_id: execution_id,
+                edge_kind: "triggered_execution".to_string(),
+                payload: json!({
+                    "link_role": "scheduled_task",
+                    "task_key": task.task_key,
+                }),
+            },
+        )
+        .await?;
         Some(ingress)
     } else {
         None

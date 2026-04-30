@@ -53,6 +53,9 @@ root_dir = "."
 max_artifact_bytes = 1048576
 max_script_bytes = 262144
 
+[observability]
+model_call_payload_retention_days = 30
+
 [approvals]
 default_ttl_seconds = 900
 max_pending_requests = 32

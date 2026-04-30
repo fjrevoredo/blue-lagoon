@@ -12,8 +12,9 @@ use harness::{
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
         ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
-        SuperviseWorkerLeasesRequest, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
-        WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
+        SuperviseWorkerLeasesRequest, TraceLookupRequest, TraceReport, TraceSummary,
+        UpsertScheduledForegroundTaskRequest, WakeSignalSummary, WorkerLeaseInspectionSummary,
+        WorkspaceScriptRunSummary,
     },
 };
 
@@ -35,6 +36,7 @@ pub enum AdminSubcommand {
     Approvals(ApprovalsCommand),
     Actions(ActionsCommand),
     Workspace(WorkspaceCommand),
+    Trace(TraceCommand),
     #[command(name = "wake-signals")]
     WakeSignals(WakeSignalsCommand),
 }
@@ -65,6 +67,57 @@ pub struct DiagnosticsCommand {
 #[derive(Debug, Subcommand)]
 pub enum DiagnosticsSubcommand {
     List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct TraceCommand {
+    #[command(subcommand)]
+    pub command: TraceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TraceSubcommand {
+    Show(TraceShowCommand),
+    Recent(TraceRecentCommand),
+    Render(TraceRenderCommand),
+    CleanupModelPayloads(TraceCleanupModelPayloadsCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TraceShowCommand {
+    #[arg(long, conflicts_with = "execution_id")]
+    pub trace_id: Option<String>,
+    #[arg(long, conflicts_with = "trace_id")]
+    pub execution_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TraceRecentCommand {
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TraceRenderCommand {
+    #[arg(long)]
+    pub trace_id: String,
+    #[arg(long, value_enum, default_value_t = TraceRenderFormatArg::Mermaid)]
+    pub format: TraceRenderFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TraceRenderFormatArg {
+    Mermaid,
+}
+
+#[derive(Debug, Args)]
+pub struct TraceCleanupModelPayloadsCommand {
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -707,6 +760,52 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 }
             },
         },
+        AdminSubcommand::Trace(command) => match command.command {
+            TraceSubcommand::Show(command) => {
+                let report = management::load_trace_report(
+                    config,
+                    TraceLookupRequest {
+                        trace_id: command.trace_id.map(|value| value.parse()).transpose()?,
+                        execution_id: command
+                            .execution_id
+                            .map(|value| value.parse())
+                            .transpose()?,
+                    },
+                )
+                .await?;
+                print_trace_report(report, command.json)?;
+            }
+            TraceSubcommand::Recent(command) => {
+                let traces = management::list_recent_traces(config, command.limit).await?;
+                print_trace_summaries(traces, command.json)?;
+            }
+            TraceSubcommand::Render(command) => {
+                let report = management::load_trace_report(
+                    config,
+                    TraceLookupRequest {
+                        trace_id: Some(command.trace_id.parse()?),
+                        execution_id: None,
+                    },
+                )
+                .await?;
+                match command.format {
+                    TraceRenderFormatArg::Mermaid => println!("{}", render_trace_mermaid(&report)),
+                }
+            }
+            TraceSubcommand::CleanupModelPayloads(command) => {
+                let cleared_count = management::clear_expired_model_call_payloads(config).await?;
+                if command.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "cleared_model_call_payload_count": cleared_count })
+                        )?
+                    );
+                } else {
+                    println!("Cleared {cleared_count} expired model-call payload record(s).");
+                }
+            }
+        },
         AdminSubcommand::WakeSignals(command) => match command.command {
             WakeSignalsSubcommand::List(command) => {
                 let signals = management::list_wake_signals(config, command.limit).await?;
@@ -1057,6 +1156,185 @@ fn print_workspace_runs(runs: Vec<WorkspaceScriptRunSummary>, json: bool) -> Res
 
     println!("{}", render_workspace_runs_text(&runs));
     Ok(())
+}
+
+fn print_trace_report(report: TraceReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_trace_report_text(&report));
+    Ok(())
+}
+
+fn print_trace_summaries(summaries: Vec<TraceSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+
+    println!("{}", render_trace_summaries_text(&summaries));
+    Ok(())
+}
+
+fn render_trace_report_text(report: &TraceReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Trace {} | nodes={} | edges={} | root_execution_id={}",
+        report.trace_id,
+        report.node_count,
+        report.edge_count,
+        report
+            .root_execution_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    if !report.nodes.is_empty() {
+        let _ = writeln!(output, "Timeline");
+        for node in &report.nodes {
+            let _ = writeln!(
+                output,
+                "  {} | {} | {} | status={} | {}",
+                node.occurred_at,
+                node.node_kind,
+                node.source_id,
+                node.status.as_deref().unwrap_or("none"),
+                node.title
+            );
+            if !node.summary.is_empty() {
+                let _ = writeln!(output, "    {}", node.summary);
+            }
+        }
+    }
+
+    if !report.edges.is_empty() {
+        let _ = writeln!(output, "Edges");
+        for edge in &report.edges {
+            let _ = writeln!(
+                output,
+                "  {} -> {} | {} | {}",
+                edge.source_node_id, edge.target_node_id, edge.edge_kind, edge.inference
+            );
+            if let Some(detail) = edge.detail.as_deref() {
+                let _ = writeln!(output, "    {detail}");
+            }
+        }
+    }
+
+    if !report.scheduling.is_empty() {
+        let _ = writeln!(output, "Scheduling");
+        for item in &report.scheduling {
+            let _ = writeln!(
+                output,
+                "  {} | task={} | status={} | next_due_at={} | cadence={}s | cooldown={}s | current_execution_id={} | last_execution_id={} | last_outcome={}",
+                item.scheduled_foreground_task_id,
+                item.task_key,
+                item.status,
+                item.next_due_at,
+                item.cadence_seconds,
+                item.cooldown_seconds,
+                item.current_execution_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                item.last_execution_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                item.last_outcome.as_deref().unwrap_or("none")
+            );
+            if let Some(reason) = item.last_outcome_reason.as_deref() {
+                let _ = writeln!(output, "    reason={reason}");
+            }
+            if let Some(summary) = item.last_outcome_summary.as_deref() {
+                let _ = writeln!(output, "    summary={summary}");
+            }
+        }
+    }
+
+    if !report.notes.is_empty() {
+        let _ = writeln!(output, "Notes");
+        for note in &report.notes {
+            let _ = writeln!(output, "  {}: {}", note.note_kind, note.message);
+        }
+    }
+
+    output.trim_end().to_string()
+}
+
+fn render_trace_summaries_text(summaries: &[TraceSummary]) -> String {
+    if summaries.is_empty() {
+        return "No recent traces.".to_string();
+    }
+
+    let mut output = String::new();
+    for summary in summaries {
+        let _ = writeln!(
+            output,
+            "{} | executions={} audit_events={} | latest_execution_id={} | trigger={} | status={} | first_seen={} | last_seen={}",
+            summary.trace_id,
+            summary.execution_count,
+            summary.audit_event_count,
+            summary
+                .latest_execution_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            summary.latest_trigger_kind.as_deref().unwrap_or("none"),
+            summary.latest_status.as_deref().unwrap_or("none"),
+            summary.first_seen_at,
+            summary.last_seen_at
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn render_trace_mermaid(report: &TraceReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "flowchart TD");
+    if report.nodes.is_empty() {
+        let _ = writeln!(output, "  empty[\"No trace records\"]");
+        return output.trim_end().to_string();
+    }
+    for node in &report.nodes {
+        let _ = writeln!(
+            output,
+            "  {}[\"{}\"]",
+            mermaid_node_key(&node.node_id),
+            mermaid_escape(&format!(
+                "{}\\n{}\\n{}",
+                node.node_kind,
+                node.status.as_deref().unwrap_or("none"),
+                node.title
+            ))
+        );
+    }
+    for edge in &report.edges {
+        let _ = writeln!(
+            output,
+            "  {} -->|{}| {}",
+            mermaid_node_key(&edge.source_node_id),
+            mermaid_escape(&edge.edge_kind),
+            mermaid_node_key(&edge.target_node_id)
+        );
+    }
+    output.trim_end().to_string()
+}
+
+fn mermaid_node_key(node_id: &str) -> String {
+    let mut key = String::from("n_");
+    for ch in node_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch);
+        } else {
+            key.push('_');
+        }
+    }
+    key
+}
+
+fn mermaid_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn render_scheduled_foreground_tasks_text(tasks: &[ScheduledForegroundTaskSummary]) -> String {

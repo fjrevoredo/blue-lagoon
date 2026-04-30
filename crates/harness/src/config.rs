@@ -21,6 +21,7 @@ pub struct RuntimeConfig {
     pub background: BackgroundConfig,
     pub continuity: ContinuityConfig,
     pub workspace: WorkspaceConfig,
+    pub observability: ObservabilityConfig,
     pub approvals: ApprovalsConfig,
     pub governed_actions: GovernedActionsConfig,
     pub worker: WorkerConfig,
@@ -119,6 +120,11 @@ pub struct WorkspaceConfig {
     pub root_dir: PathBuf,
     pub max_artifact_bytes: u64,
     pub max_script_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ObservabilityConfig {
+    pub model_call_payload_retention_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -250,6 +256,7 @@ struct FileConfig {
     background: BackgroundConfig,
     continuity: ContinuityConfig,
     workspace: WorkspaceConfig,
+    observability: ObservabilityConfig,
     approvals: ApprovalsConfig,
     governed_actions: GovernedActionsConfig,
     worker: WorkerConfig,
@@ -329,6 +336,7 @@ impl RuntimeConfig {
             background: file_config.background,
             continuity: file_config.continuity,
             workspace: file_config.workspace,
+            observability: file_config.observability,
             approvals: file_config.approvals,
             governed_actions: file_config.governed_actions,
             worker: WorkerConfig {
@@ -368,6 +376,7 @@ impl RuntimeConfig {
         self.background.validate()?;
         self.continuity.validate()?;
         self.workspace.validate()?;
+        self.observability.validate()?;
         self.approvals.validate()?;
         self.governed_actions.validate()?;
         if self.worker.timeout_ms == 0 {
@@ -572,6 +581,15 @@ impl WorkspaceConfig {
         }
         if self.max_script_bytes > self.max_artifact_bytes {
             bail!("workspace.max_script_bytes must not exceed workspace.max_artifact_bytes");
+        }
+        Ok(())
+    }
+}
+
+impl ObservabilityConfig {
+    fn validate(&self) -> Result<()> {
+        if self.model_call_payload_retention_days == 0 {
+            bail!("observability.model_call_payload_retention_days must be greater than zero");
         }
         Ok(())
     }
@@ -1018,6 +1036,9 @@ mod tests {
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
             },
+            observability: ObservabilityConfig {
+                model_call_payload_retention_days: 30,
+            },
             approvals: ApprovalsConfig {
                 default_ttl_seconds: 900,
                 max_pending_requests: 32,
@@ -1128,6 +1149,9 @@ max_recovery_batch_size = 8
 root_dir = "."
 max_artifact_bytes = 1048576
 max_script_bytes = 262144
+
+[observability]
+model_call_payload_retention_days = 30
 
 [approvals]
 default_ttl_seconds = 900
@@ -1357,6 +1381,18 @@ args = []
     }
 
     #[test]
+    fn validate_rejects_invalid_observability_settings() {
+        let mut config = sample_config();
+        config.observability.model_call_payload_retention_days = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("observability.model_call_payload_retention_days")
+        );
+    }
+
+    #[test]
     fn load_reads_background_sections_from_file_config() {
         let _env_lock = env_lock();
         let temp_root = write_test_root(minimal_file_config(), None, None);
@@ -1371,6 +1407,7 @@ args = []
         assert_eq!(loaded.background.scheduler.max_due_jobs_per_iteration, 4);
         assert_eq!(loaded.background.execution.default_token_budget, 6_000);
         assert!(loaded.background.wake_signals.allow_foreground_conversion);
+        assert_eq!(loaded.observability.model_call_payload_retention_days, 30);
 
         match original_database_url {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },

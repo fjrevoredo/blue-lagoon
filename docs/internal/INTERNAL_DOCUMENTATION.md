@@ -23,6 +23,7 @@ docs/internal/
 │   ├── CONTEXT_ASSEMBLY.md         ← pipeline, limits, message layering, token budget
 │   └── GOVERNED_ACTIONS.md         ← JSON schema, capability_scope, validation, risk tiers
 └── harness/
+    ├── TRACE_EXPLORER.md           ← trace CLI, model-call records, causal links
     └── TOOL_IMPLEMENTATION.md      ← E2E guide for architecture-compliant tools
 ```
 

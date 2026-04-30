@@ -13,6 +13,9 @@ then executes the action through harness-owned services.
 This keeps the conscious worker away from direct OS, workspace, schedule,
 background-job, and wake-signal mutation. Model-usable tools are represented as
 governed actions unless a bounded context summary is safer than a query action.
+Trace explorer causal links connect planned governed actions to their source
+execution, approval request, and scheduled-task mutations when those records are
+created.
 
 ---
 
@@ -31,6 +34,7 @@ governed actions unless a bounded context summary is safer than a query action.
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
 | `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
+| `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
 | `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for new action-kind strings |
 
 ### Model-Facing Action Kinds
@@ -198,9 +202,11 @@ The short version is:
   messages are positioned in conscious context.
 - `docs/internal/harness/TOOL_IMPLEMENTATION.md`: exact implementation workflow
   for adding a governed tool.
+- `docs/internal/harness/TRACE_EXPLORER.md`: operator trace graph and causal
+  links for governed-action planning, approvals, and scheduled-task changes.
 - `docs/LOOP_ARCHITECTURE.md`: canonical conscious/unconscious boundary.
 - `docs/IMPLEMENTATION_DESIGN.md`: canonical runtime design constraints.
 
 ---
 
-*Last verified: branch `usage-improvements`, session 2026-04-29.*
+*Last verified: branch `codex/causal-trace-explorer`, session 2026-04-30.*

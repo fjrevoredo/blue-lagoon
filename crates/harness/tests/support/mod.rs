@@ -188,6 +188,9 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
             max_artifact_bytes: 1_048_576,
             max_script_bytes: 262_144,
         },
+        observability: harness::config::ObservabilityConfig {
+            model_call_payload_retention_days: 30,
+        },
         approvals: harness::config::ApprovalsConfig {
             default_ttl_seconds: 900,
             max_pending_requests: 32,

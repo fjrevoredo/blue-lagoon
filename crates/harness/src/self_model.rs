@@ -389,8 +389,8 @@ mod tests {
         AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
         BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
         BacklogRecoveryConfig, ContinuityConfig, DatabaseConfig, GovernedActionsConfig,
-        HarnessConfig, RetrievalConfig, ScheduledForegroundConfig, SelfModelConfig, TelegramConfig,
-        WakeSignalPolicyConfig, WorkerConfig, WorkspaceConfig,
+        HarnessConfig, ObservabilityConfig, RetrievalConfig, ScheduledForegroundConfig,
+        SelfModelConfig, TelegramConfig, WakeSignalPolicyConfig, WorkerConfig, WorkspaceConfig,
     };
     use uuid::Uuid;
 
@@ -455,6 +455,9 @@ mod tests {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
+            },
+            observability: ObservabilityConfig {
+                model_call_payload_retention_days: 30,
             },
             approvals: ApprovalsConfig {
                 default_ttl_seconds: 900,

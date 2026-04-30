@@ -388,6 +388,9 @@ mod tests {
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
             },
+            observability: crate::config::ObservabilityConfig {
+                model_call_payload_retention_days: 30,
+            },
             approvals: ApprovalsConfig {
                 default_ttl_seconds: 900,
                 max_pending_requests: 32,

@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     approval,
     audit::{self, NewAuditEvent},
+    causal_links::{self, NewCausalLink},
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
@@ -838,6 +839,34 @@ where
         .await;
     }
     recorded_episode_id = Some(episode_id);
+    if let Err(error) = causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: trigger.trace_id,
+            source_kind: "execution_record".to_string(),
+            source_id: trigger.execution_id,
+            target_kind: "episode".to_string(),
+            target_id: episode_id,
+            edge_kind: "opened_episode".to_string(),
+            payload: json!({
+                "ingress_id": trigger.ingress.ingress_id,
+                "trigger_kind": episode_trigger_kind,
+                "trigger_source": episode_trigger_source,
+            }),
+        },
+    )
+    .await
+    {
+        return record_and_return_failure(
+            pool,
+            trigger.trace_id,
+            trigger.execution_id,
+            recorded_episode_id,
+            ForegroundFailureKind::PersistenceFailure,
+            error,
+        )
+        .await;
+    }
 
     for (index, user_message) in user_messages.iter().enumerate() {
         if let Err(error) = foreground::insert_episode_message(

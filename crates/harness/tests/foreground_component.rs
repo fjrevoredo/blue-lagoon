@@ -2681,6 +2681,24 @@ async fn scheduled_foreground_recovery_clears_stranded_in_progress_task() -> Res
         .await?
         .expect("scheduled task should be claimable");
         assert!(claimed.ingress.is_some());
+        let scheduled_causal_link_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM causal_links
+            WHERE trace_id = $1
+              AND source_kind = 'scheduled_foreground_task'
+              AND source_id = $2
+              AND target_kind = 'execution_record'
+              AND target_id = $3
+              AND edge_kind = 'triggered_execution'
+            "#,
+        )
+        .bind(trace_id)
+        .bind(claimed.task.scheduled_foreground_task_id)
+        .bind(execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(scheduled_causal_link_count, 1);
         sqlx::query(
             r#"
             UPDATE scheduled_foreground_tasks

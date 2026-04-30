@@ -2,11 +2,11 @@
 
 ## Metadata
 
-- Plan Status: READY FOR APPROVAL
+- Plan Status: COMPLETED
 - Created: 2026-04-29
 - Last Updated: 2026-04-30
 - Owner: Coding agent
-- Approval: PENDING
+- Approval: APPROVED
 
 ## Status Legend
 
@@ -57,13 +57,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 1: Existing-Data Trace CLI
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Deliver a useful troubleshooting tool quickly by normalizing existing durable records into one timeline, without waiting for schema changes.
 - Exit Criteria: An operator can run trace commands against existing data and see a coherent timeline for foreground ingress, execution records, episodes, audit events, governed actions, approvals, wake signals, and scheduled task runs when those records exist.
 
 #### Task 1.1: Define Trace Domain Types
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add a typed in-memory trace representation that can support text, JSON, and future graph rendering.
 - Steps:
   1. Add trace domain structs in `crates/harness/src/management.rs` or a focused `crates/harness/src/management_trace.rs` module following existing harness management patterns.
@@ -75,7 +75,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 1.2: Implement Existing-Table Trace Query
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Build a management query that assembles trace nodes and inferred edges from current tables.
 - Steps:
   1. Query `execution_records` by `trace_id` or `execution_id`.
@@ -89,7 +89,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 1.3: Add Admin Trace CLI Commands
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Expose trace lookup through the runtime admin CLI.
 - Steps:
   1. Add `admin trace show --trace-id <uuid>`.
@@ -102,13 +102,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 2: Durable Model-Call Records
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Persist exact model-call inputs and outputs so operators can inspect what the model saw and what it returned without relying on provider logs or Docker logs, while bounding storage growth with configurable retention.
 - Exit Criteria: Foreground and background model invocations create redacted durable model-call records linked to trace and execution IDs, trace output includes them, and bulky text payload retention defaults to one month with operator configuration.
 
 #### Task 2.1: Add Model Call Migration
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add reviewed SQL schema for durable model invocation records.
 - Steps:
   1. Create a migration after the current latest reviewed migration, currently `0010__conscious_tool_action_kinds.sql`.
@@ -120,7 +120,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 2.2: Persist Model Calls At The Gateway Boundary
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Capture model-call records around actual provider invocation.
 - Steps:
   1. Extend contracts or harness/worker request types as needed to carry a model-call ID or trace metadata to the gateway boundary.
@@ -133,7 +133,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 2.3: Link Model Calls Into Trace Output
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Show model invocation records in trace timelines.
 - Steps:
   1. Fetch `model_call_records` during trace assembly by trace ID and execution ID.
@@ -146,7 +146,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 2.4: Add Configurable Model Payload Retention
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Bound storage growth for exact model request/response text while keeping recent traces richly inspectable.
 - Steps:
   1. Add operator configuration for model-call payload retention with a default of one month.
@@ -160,13 +160,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 3: Explicit Causal Links
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Replace fragile inference with durable graph edges for relationships that matter operationally.
 - Exit Criteria: New flows write causal links as they run, and the trace explorer prefers explicit links while retaining inferred links for historical records.
 
 #### Task 3.1: Add Causal Links Migration
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add reviewed SQL schema for durable causal graph edges.
 - Steps:
   1. Add a migration after the latest reviewed migration at implementation time.
@@ -178,7 +178,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 3.2: Write Links In Foreground Flow
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Persist explicit causal links for Telegram and scheduled foreground execution.
 - Steps:
   1. Link `ingress_event -> execution_record` as `triggered_execution`.
@@ -192,7 +192,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 3.3: Write Links In Background And Wake-Signal Flow
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Persist explicit causal links for background maintenance and wake-signal conversion into foreground work.
 - Steps:
   1. Link `background_job_run -> model_call_record` as `invoked_model`.
@@ -204,7 +204,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 3.4: Prefer Explicit Links In Trace Assembly
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Use durable causal links as the primary graph source while preserving historical trace usefulness.
 - Steps:
   1. Fetch explicit causal links by trace ID.
@@ -217,13 +217,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 4: Scheduling Troubleshooting View
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Address the immediate scheduling pain point with a focused trace projection that explains why scheduling did or did not happen.
 - Exit Criteria: An operator can inspect a scheduling-related request or scheduled task run and see proposal, policy, approval, task mutation, scheduler claim, foreground execution, and delivery outcome.
 
 #### Task 4.1: Add Scheduling Trace Projection
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add scheduling-specific summaries on top of the generic trace graph.
 - Steps:
   1. Detect scheduling governed actions and scheduled foreground task records in trace assembly.
@@ -235,7 +235,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 4.2: Add Operator-Facing Examples
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Document concrete commands for diagnosing scheduling failures.
 - Steps:
   1. Add examples to the relevant internal documentation or management CLI docs.
@@ -246,13 +246,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 5: Visual Export
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Make causal flows easier to scan visually after the underlying trace model is reliable.
 - Exit Criteria: A trace can be exported as a local HTML or Mermaid artifact that shows timeline and graph relationships without needing a running web service, and the renderer consumes the same normalized trace model that a future read-only web UI could reuse.
 
 #### Task 5.1: Add Mermaid Or HTML Trace Export
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Render a local visual representation of a trace.
 - Steps:
   1. Add `admin trace render --trace-id <uuid> --format mermaid` or `--format html`, choosing the smallest option that fits existing CLI conventions.
@@ -266,7 +266,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 5.2: Add JSON Contract Stability Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Keep machine-readable trace output stable enough for future UI reuse.
 - Steps:
   1. Add snapshot-like tests or explicit JSON shape assertions for representative traces.
@@ -277,13 +277,13 @@ The end state is an auditable management surface that can answer: what triggered
 
 ### Milestone 6: Documentation And Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Ensure implementation, docs, tests, and repository hygiene are complete.
 - Exit Criteria: Internal docs reflect live behavior, temporary artifacts are removed, and final verification passes or any blocker is explicitly recorded.
 
 #### Task 6.1: Update Internal Documentation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Document the new trace explorer, model-call persistence, and causal link behavior.
 - Steps:
   1. Update `docs/internal/INTERNAL_DOCUMENTATION.md` if a new internal doc is added.
@@ -296,7 +296,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 6.2: Cleanup Intermediate Artifacts
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Remove artifacts created only to support implementation.
 - Steps:
   1. Inspect the worktree for temporary documentation, scratch scripts, generated trace exports, debug logs, one-off fixtures, and obsolete plan fragments.
@@ -307,7 +307,7 @@ The end state is an auditable management surface that can answer: what triggered
 
 #### Task 6.3: Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Validate the integrated change after cleanup.
 - Steps:
   1. Run `cargo fmt --all --check`.
@@ -324,9 +324,9 @@ The end state is an auditable management surface that can answer: what triggered
 
 ## Approval Gate
 
-Implementation must not start until the user approves this plan.
+Implementation started after user approval on 2026-04-30.
 
-Approval can be explicit, for example: `approve this plan` or `start implementing`.
+Approval was given explicitly: `the plan is approved, you can implement it`.
 
 ## Plan Self-Check
 
@@ -349,4 +349,25 @@ Approval can be explicit, for example: `approve this plan` or `start implementin
 - Update milestone and task status before starting and after validation.
 - Update each task to COMPLETED immediately after its validation passes.
 - Mark tasks or milestones BLOCKED with a short reason when progress cannot continue.
-- Do not begin implementation until this plan is approved.
+- Implementation is in progress after approval.
+- Final verification completed on 2026-04-30:
+  - `cargo fmt --all --check`
+  - `cargo check --workspace`
+  - `cargo test -p runtime --test admin_cli -- --nocapture`
+  - `cargo test -p runtime --bin runtime -- --nocapture`
+  - `cargo test -p harness --test management_component -- --nocapture`
+  - `cargo test -p harness --test management_integration -- --nocapture`
+  - `cargo test -p harness --test migration_component -- --nocapture`
+  - `cargo test -p harness --test foreground_component -- --nocapture`
+  - `cargo test -p harness --test governed_actions_component -- --nocapture`
+  - `cargo test -p harness --test governed_actions_integration -- --nocapture`
+  - `cargo test -p harness --test unconscious_component -- --nocapture`
+  - `cargo test -p harness --test unconscious_integration -- --nocapture`
+  - `cargo test -p harness config::tests:: --lib -- --nocapture`
+  - `cargo test -p workers -- --nocapture`
+- Post-implementation self-check completed on 2026-04-30:
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - Rechecked trace assembly for causal-link-only scheduled task nodes.
+  - Fixed `load_trace_scheduled_task_nodes()` so governed-action schedule mutations are visible even before a task has a current or last execution.
+  - Added `admin trace cleanup-model-payloads` so the model-call payload retention policy has an operator-reachable cleanup path.
+  - Reran `cargo fmt --all --check`, `cargo check --workspace`, `cargo test -p harness --test management_component -- --nocapture`, and `cargo test -p runtime --test admin_cli -- --nocapture`.

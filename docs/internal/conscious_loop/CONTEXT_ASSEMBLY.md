@@ -38,6 +38,13 @@ Two fields passed to the model gateway:
 1. **`system_prompt`** — single formatted string (see System Prompt Template below).
 2. **`messages`** — ordered `Vec<ModelInputMessage { role, content }>` (see Message Array Ordering below).
 
+The harness now persists the exact `ModelCallRequest` material at the worker
+gateway boundary before provider invocation. Recent retained trace reports can
+therefore show the system prompt and message array that were available to the
+model for a foreground or background turn. See
+`docs/internal/harness/TRACE_EXPLORER.md` for retention and trace lookup
+details.
+
 ### Token Budget
 
 Computed in `build_model_call_request()` (`main.rs:417`):
@@ -160,10 +167,11 @@ To feed a new data source into the model input:
 ## 4. Further Reading
 
 - `docs/internal/conscious_loop/GOVERNED_ACTIONS.md` — how the governed action schema message (the last Developer message in the array) is constructed and parsed.
+- `docs/internal/harness/TRACE_EXPLORER.md` — how retained model-call inputs and outputs are surfaced for operator debugging.
 - `docs/LOOP_ARCHITECTURE.md` — canonical description of the conscious loop and its relationship to the harness.
 - `docs/IMPLEMENTATION_DESIGN.md` — design rationale for the two-process model and the worker protocol.
 - `crates/harness/src/retrieval.rs` — retrieval ranking algorithm that produces `retrieved_context`.
 
 ---
 
-*Last verified: branch `usage-improvements`, session 2026-04-28.*
+*Last verified: branch `codex/causal-trace-explorer`, session 2026-04-30.*

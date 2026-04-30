@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::{
     audit::{self, NewAuditEvent},
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
+    causal_links::{self, NewCausalLink},
     config::RuntimeConfig,
     execution,
     fetched_content::{
@@ -127,6 +128,25 @@ pub async fn plan_governed_action(
     .await?;
 
     let record = get_governed_action_execution(pool, request.governed_action_execution_id).await?;
+    if let Some(execution_id) = request.execution_id {
+        causal_links::insert(
+            pool,
+            &NewCausalLink {
+                trace_id: request.trace_id,
+                source_kind: "execution_record".to_string(),
+                source_id: execution_id,
+                target_kind: "governed_action_execution".to_string(),
+                target_id: record.governed_action_execution_id,
+                edge_kind: "planned_action".to_string(),
+                payload: json!({
+                    "action_kind": governed_action_kind_as_str(record.action_kind),
+                    "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+                    "status": governed_action_status_as_str(record.status),
+                }),
+            },
+        )
+        .await?;
+    }
 
     let (event_kind, severity) = match status {
         GovernedActionStatus::Blocked => ("governed_action_blocked", "warn"),
@@ -398,7 +418,25 @@ pub async fn attach_approval_request(
     .await
     .context("failed to attach approval request to governed action execution")?;
 
-    get_governed_action_execution(pool, governed_action_execution_id).await
+    let record = get_governed_action_execution(pool, governed_action_execution_id).await?;
+    causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: record.trace_id,
+            source_kind: "governed_action_execution".to_string(),
+            source_id: governed_action_execution_id,
+            target_kind: "approval_request".to_string(),
+            target_id: approval_request_id,
+            edge_kind: "required_approval".to_string(),
+            payload: json!({
+                "action_kind": governed_action_kind_as_str(record.action_kind),
+                "risk_tier": governed_action_risk_tier_as_str(record.risk_tier),
+            }),
+        },
+    )
+    .await?;
+
+    Ok(record)
 }
 
 pub async fn sync_status_from_approval_resolution(
@@ -1269,6 +1307,24 @@ async fn execute_upsert_scheduled_foreground_task(
         "{write_action} scheduled foreground task '{}' due at {}",
         result.record.task_key, result.record.next_due_at
     );
+    causal_links::insert(
+        pool,
+        &NewCausalLink {
+            trace_id: record.trace_id,
+            source_kind: "governed_action_execution".to_string(),
+            source_id: record.governed_action_execution_id,
+            target_kind: "scheduled_foreground_task".to_string(),
+            target_id: result.record.scheduled_foreground_task_id,
+            edge_kind: "mutated_scheduled_task".to_string(),
+            payload: json!({
+                "action": write_action,
+                "task_key": result.record.task_key,
+                "next_due_at": result.record.next_due_at,
+                "status": result.record.status,
+            }),
+        },
+    )
+    .await?;
     complete_harness_native_action(
         pool,
         record,
@@ -3228,6 +3284,9 @@ mod tests {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
+            },
+            observability: crate::config::ObservabilityConfig {
+                model_call_payload_retention_days: 30,
             },
             approvals: crate::config::ApprovalsConfig {
                 default_ttl_seconds: 900,

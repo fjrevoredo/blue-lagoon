@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -7,7 +11,7 @@ use contracts::{
     ScheduledForegroundTaskStatus, UnconsciousJobKind,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -16,8 +20,9 @@ use crate::{
     audit::{self, NewAuditEvent},
     background_execution,
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
+    causal_links,
     config::RuntimeConfig,
-    db, governed_actions, migration, model_gateway, recovery, scheduled_foreground,
+    db, governed_actions, migration, model_calls, model_gateway, recovery, scheduled_foreground,
     schema::{self, SchemaCompatibility, SchemaPolicy},
     worker, workspace,
 };
@@ -375,6 +380,85 @@ pub struct WorkspaceScriptRunSummary {
     pub failure_summary: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceLookupRequest {
+    pub trace_id: Option<Uuid>,
+    pub execution_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceReport {
+    pub trace_id: Uuid,
+    pub root_execution_id: Option<Uuid>,
+    pub generated_at: DateTime<Utc>,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub nodes: Vec<TraceNode>,
+    pub edges: Vec<TraceEdge>,
+    pub scheduling: Vec<SchedulingTraceSummary>,
+    pub notes: Vec<TraceNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulingTraceSummary {
+    pub scheduled_foreground_task_id: Uuid,
+    pub task_key: String,
+    pub status: String,
+    pub message_text: String,
+    pub cadence_seconds: i64,
+    pub cooldown_seconds: i64,
+    pub next_due_at: DateTime<Utc>,
+    pub current_execution_id: Option<Uuid>,
+    pub current_run_started_at: Option<DateTime<Utc>>,
+    pub last_execution_id: Option<Uuid>,
+    pub last_run_started_at: Option<DateTime<Utc>>,
+    pub last_run_completed_at: Option<DateTime<Utc>>,
+    pub last_outcome: Option<String>,
+    pub last_outcome_reason: Option<String>,
+    pub last_outcome_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceSummary {
+    pub trace_id: Uuid,
+    pub latest_execution_id: Option<Uuid>,
+    pub latest_trigger_kind: Option<String>,
+    pub latest_status: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub execution_count: u32,
+    pub audit_event_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceNode {
+    pub node_id: String,
+    pub node_kind: String,
+    pub source_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub status: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub payload: JsonValue,
+    pub related_ids: BTreeMap<String, Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEdge {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub edge_kind: String,
+    pub occurred_at: DateTime<Utc>,
+    pub detail: Option<String>,
+    pub inference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceNote {
+    pub note_kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1298,6 +1382,95 @@ pub async fn list_governed_actions(
         .collect()
 }
 
+pub async fn load_trace_report(
+    config: &RuntimeConfig,
+    request: TraceLookupRequest,
+) -> Result<TraceReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let trace_id = resolve_trace_lookup(&pool, &request).await?;
+    let mut builder = TraceReportBuilder::new(trace_id, request.execution_id);
+
+    load_trace_execution_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_ingress_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_episode_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_audit_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_model_call_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_background_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_wake_signal_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_approval_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_governed_action_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_scheduled_task_nodes(&pool, trace_id, &mut builder).await?;
+    load_trace_explicit_causal_links(&pool, trace_id, &mut builder).await?;
+
+    Ok(builder.finish())
+}
+
+pub async fn list_recent_traces(config: &RuntimeConfig, limit: u32) -> Result<Vec<TraceSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let rows = sqlx::query(
+        r#"
+        WITH execution_rollup AS (
+            SELECT
+                trace_id,
+                COUNT(*)::INT AS execution_count,
+                MIN(created_at) AS first_seen_at,
+                MAX(COALESCE(completed_at, updated_at, created_at)) AS last_seen_at,
+                (ARRAY_AGG(execution_id ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, execution_id DESC))[1] AS latest_execution_id,
+                (ARRAY_AGG(trigger_kind ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, execution_id DESC))[1] AS latest_trigger_kind,
+                (ARRAY_AGG(status ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, execution_id DESC))[1] AS latest_status
+            FROM execution_records
+            GROUP BY trace_id
+        ),
+        audit_rollup AS (
+            SELECT trace_id, COUNT(*)::INT AS audit_event_count
+            FROM audit_events
+            GROUP BY trace_id
+        )
+        SELECT
+            execution_rollup.trace_id,
+            latest_execution_id,
+            latest_trigger_kind,
+            latest_status,
+            first_seen_at,
+            last_seen_at,
+            execution_count,
+            COALESCE(audit_event_count, 0)::INT AS audit_event_count
+        FROM execution_rollup
+        LEFT JOIN audit_rollup USING (trace_id)
+        ORDER BY last_seen_at DESC, trace_id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list recent traces for management CLI")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TraceSummary {
+            trace_id: row.get("trace_id"),
+            latest_execution_id: row.get("latest_execution_id"),
+            latest_trigger_kind: row.get("latest_trigger_kind"),
+            latest_status: row.get("latest_status"),
+            first_seen_at: row.get("first_seen_at"),
+            last_seen_at: row.get("last_seen_at"),
+            execution_count: row.get::<i32, _>("execution_count") as u32,
+            audit_event_count: row.get::<i32, _>("audit_event_count") as u32,
+        })
+        .collect())
+}
+
+pub async fn clear_expired_model_call_payloads(config: &RuntimeConfig) -> Result<u64> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    model_calls::clear_expired_model_call_payloads(&pool, Utc::now()).await
+}
+
 pub async fn list_workspace_artifact_summaries(
     config: &RuntimeConfig,
     limit: u32,
@@ -1325,6 +1498,1150 @@ pub async fn list_workspace_script_runs(
         .into_iter()
         .map(|record| Ok(workspace_script_run_summary(&record)))
         .collect()
+}
+
+struct TraceReportBuilder {
+    trace_id: Uuid,
+    root_execution_id: Option<Uuid>,
+    nodes: Vec<TraceNode>,
+    edges: Vec<TraceEdge>,
+    scheduling: Vec<SchedulingTraceSummary>,
+    notes: Vec<TraceNote>,
+    node_ids: BTreeSet<String>,
+    edge_ids: BTreeSet<String>,
+    execution_ids: BTreeSet<Uuid>,
+    episode_ids: BTreeSet<Uuid>,
+}
+
+impl TraceReportBuilder {
+    fn new(trace_id: Uuid, root_execution_id: Option<Uuid>) -> Self {
+        Self {
+            trace_id,
+            root_execution_id,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            scheduling: Vec::new(),
+            notes: Vec::new(),
+            node_ids: BTreeSet::new(),
+            edge_ids: BTreeSet::new(),
+            execution_ids: BTreeSet::new(),
+            episode_ids: BTreeSet::new(),
+        }
+    }
+
+    fn add_node(&mut self, node: TraceNode) {
+        if node.node_kind == "execution" {
+            self.execution_ids.insert(node.source_id);
+        }
+        if node.node_kind == "episode" {
+            self.episode_ids.insert(node.source_id);
+        }
+        if self.node_ids.insert(node.node_id.clone()) {
+            self.nodes.push(node);
+        }
+    }
+
+    fn add_edge(&mut self, edge: TraceEdge) {
+        let edge_id = format!(
+            "{}|{}|{}",
+            edge.source_node_id, edge.target_node_id, edge.edge_kind
+        );
+        if self.edge_ids.insert(edge_id) {
+            self.edges.push(edge);
+        } else if edge.inference == "explicit" {
+            if let Some(existing) = self.edges.iter_mut().find(|existing| {
+                existing.source_node_id == edge.source_node_id
+                    && existing.target_node_id == edge.target_node_id
+                    && existing.edge_kind == edge.edge_kind
+            }) {
+                *existing = edge;
+            }
+        }
+    }
+
+    fn add_note(&mut self, note_kind: impl Into<String>, message: impl Into<String>) {
+        self.notes.push(TraceNote {
+            note_kind: note_kind.into(),
+            message: message.into(),
+        });
+    }
+
+    fn add_scheduling_summary(&mut self, summary: SchedulingTraceSummary) {
+        self.scheduling.push(summary);
+    }
+
+    fn finish(mut self) -> TraceReport {
+        self.nodes.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.node_kind.cmp(&right.node_kind))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        self.edges.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+                .then_with(|| left.source_node_id.cmp(&right.source_node_id))
+                .then_with(|| left.target_node_id.cmp(&right.target_node_id))
+        });
+        if self.nodes.is_empty() {
+            self.add_note(
+                "empty_trace",
+                "No durable records were found for this trace identifier.",
+            );
+        }
+        TraceReport {
+            trace_id: self.trace_id,
+            root_execution_id: self.root_execution_id,
+            generated_at: Utc::now(),
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+            nodes: self.nodes,
+            edges: self.edges,
+            scheduling: self.scheduling,
+            notes: self.notes,
+        }
+    }
+}
+
+async fn resolve_trace_lookup(pool: &PgPool, request: &TraceLookupRequest) -> Result<Uuid> {
+    match (request.trace_id, request.execution_id) {
+        (Some(trace_id), Some(execution_id)) => {
+            let record_trace_id = sqlx::query_scalar::<_, Uuid>(
+                "SELECT trace_id FROM execution_records WHERE execution_id = $1",
+            )
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await
+            .context("failed to resolve execution trace for trace lookup")?;
+            match record_trace_id {
+                Some(record_trace_id) if record_trace_id == trace_id => Ok(trace_id),
+                Some(record_trace_id) => bail!(
+                    "execution_id {execution_id} belongs to trace_id {record_trace_id}, not {trace_id}"
+                ),
+                None => bail!("execution_id {execution_id} was not found"),
+            }
+        }
+        (Some(trace_id), None) => Ok(trace_id),
+        (None, Some(execution_id)) => sqlx::query_scalar::<_, Uuid>(
+            "SELECT trace_id FROM execution_records WHERE execution_id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await
+        .context("failed to resolve trace from execution_id")?
+        .with_context(|| format!("execution_id {execution_id} was not found")),
+        (None, None) => bail!("either trace_id or execution_id is required"),
+    }
+}
+
+async fn load_trace_execution_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT execution_id, trigger_kind, synthetic_trigger, status, worker_kind, worker_pid,
+               request_payload, response_payload, created_at, updated_at, completed_at
+        FROM execution_records
+        WHERE trace_id = $1
+        ORDER BY created_at ASC, execution_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load execution records for trace")?;
+
+    for row in rows {
+        let execution_id: Uuid = row.get("execution_id");
+        let trigger_kind: String = row.get("trigger_kind");
+        let status: String = row.get("status");
+        let worker_kind: Option<String> = row.get("worker_kind");
+        let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("execution", execution_id),
+            node_kind: "execution".to_string(),
+            source_id: execution_id,
+            occurred_at: created_at,
+            status: Some(status.clone()),
+            title: format!("Execution {trigger_kind}"),
+            summary: format!(
+                "status={status} worker={} completed_at={}",
+                worker_kind.as_deref().unwrap_or("none"),
+                completed_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            payload: json!({
+                "trigger_kind": trigger_kind,
+                "synthetic_trigger": row.get::<Option<String>, _>("synthetic_trigger"),
+                "worker_kind": worker_kind,
+                "worker_pid": row.get::<Option<i32>, _>("worker_pid"),
+                "request_payload": row.get::<JsonValue, _>("request_payload"),
+                "response_payload": row.get::<Option<JsonValue>, _>("response_payload"),
+                "updated_at": row.get::<DateTime<Utc>, _>("updated_at"),
+                "completed_at": completed_at,
+            }),
+            related_ids: BTreeMap::new(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn load_trace_ingress_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT ingress_id, execution_id, channel_kind, external_user_id, external_conversation_id,
+               external_event_id, external_message_id, internal_principal_ref,
+               internal_conversation_ref, event_kind, occurred_at, received_at, status,
+               rejection_reason, text_body, reply_to_external_message_id, attachment_count,
+               command_name, raw_payload_ref
+        FROM ingress_events
+        WHERE trace_id = $1
+        ORDER BY occurred_at ASC, ingress_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load ingress events for trace")?;
+
+    for row in rows {
+        let ingress_id: Uuid = row.get("ingress_id");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let event_kind: String = row.get("event_kind");
+        let channel_kind: String = row.get("channel_kind");
+        let status: String = row.get("status");
+        let occurred_at: DateTime<Utc> = row.get("occurred_at");
+        let text_body: Option<String> = row.get("text_body");
+        let mut related_ids = BTreeMap::new();
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("ingress", ingress_id),
+            node_kind: "ingress".to_string(),
+            source_id: ingress_id,
+            occurred_at,
+            status: Some(status.clone()),
+            title: format!("{channel_kind} {event_kind}"),
+            summary: text_body
+                .as_deref()
+                .map(short_trace_text)
+                .unwrap_or_else(|| format!("status={status}")),
+            payload: json!({
+                "channel_kind": channel_kind,
+                "external_user_id": row.get::<String, _>("external_user_id"),
+                "external_conversation_id": row.get::<String, _>("external_conversation_id"),
+                "external_event_id": row.get::<String, _>("external_event_id"),
+                "external_message_id": row.get::<Option<String>, _>("external_message_id"),
+                "internal_principal_ref": row.get::<Option<String>, _>("internal_principal_ref"),
+                "internal_conversation_ref": row.get::<Option<String>, _>("internal_conversation_ref"),
+                "event_kind": event_kind,
+                "received_at": row.get::<DateTime<Utc>, _>("received_at"),
+                "rejection_reason": row.get::<Option<String>, _>("rejection_reason"),
+                "text_body": text_body,
+                "reply_to_external_message_id": row.get::<Option<String>, _>("reply_to_external_message_id"),
+                "attachment_count": row.get::<i32, _>("attachment_count"),
+                "command_name": row.get::<Option<String>, _>("command_name"),
+                "raw_payload_ref": row.get::<Option<String>, _>("raw_payload_ref"),
+            }),
+            related_ids,
+        });
+
+        if let Some(execution_id) = execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("ingress", ingress_id),
+                target_node_id: trace_node_id("execution", execution_id),
+                edge_kind: "triggered_execution".to_string(),
+                occurred_at,
+                detail: Some("ingress_events.execution_id".to_string()),
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    load_trace_execution_ingress_edges(pool, builder).await
+}
+
+async fn load_trace_execution_ingress_edges(
+    pool: &PgPool,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    if builder.execution_ids.is_empty() {
+        return Ok(());
+    }
+    let execution_ids: Vec<Uuid> = builder.execution_ids.iter().copied().collect();
+    let rows = sqlx::query(
+        r#"
+        SELECT execution_id, ingress_id, link_role, created_at
+        FROM execution_ingress_links
+        WHERE execution_id = ANY($1)
+        ORDER BY created_at ASC, sequence_index ASC
+        "#,
+    )
+    .bind(&execution_ids)
+    .fetch_all(pool)
+    .await
+    .context("failed to load execution ingress links for trace")?;
+
+    for row in rows {
+        let ingress_id: Uuid = row.get("ingress_id");
+        let execution_id: Uuid = row.get("execution_id");
+        builder.add_edge(TraceEdge {
+            source_node_id: trace_node_id("ingress", ingress_id),
+            target_node_id: trace_node_id("execution", execution_id),
+            edge_kind: "linked_to_execution".to_string(),
+            occurred_at: row.get("created_at"),
+            detail: Some(row.get("link_role")),
+            inference: "inferred".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn load_trace_episode_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT episode_id, execution_id, ingress_id, internal_principal_ref,
+               internal_conversation_ref, trigger_kind, trigger_source, status,
+               started_at, completed_at, outcome, summary
+        FROM episodes
+        WHERE trace_id = $1
+        ORDER BY started_at ASC, episode_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load episodes for trace")?;
+
+    for row in rows {
+        let episode_id: Uuid = row.get("episode_id");
+        let execution_id: Uuid = row.get("execution_id");
+        let ingress_id: Option<Uuid> = row.get("ingress_id");
+        let status: String = row.get("status");
+        let started_at: DateTime<Utc> = row.get("started_at");
+        let summary: Option<String> = row.get("summary");
+        let mut related_ids = BTreeMap::new();
+        related_ids.insert("execution_id".to_string(), execution_id);
+        if let Some(ingress_id) = ingress_id {
+            related_ids.insert("ingress_id".to_string(), ingress_id);
+        }
+
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("episode", episode_id),
+            node_kind: "episode".to_string(),
+            source_id: episode_id,
+            occurred_at: started_at,
+            status: Some(status.clone()),
+            title: "Foreground episode".to_string(),
+            summary: summary
+                .as_deref()
+                .map(short_trace_text)
+                .unwrap_or_else(|| format!("status={status}")),
+            payload: json!({
+                "execution_id": execution_id,
+                "ingress_id": ingress_id,
+                "internal_principal_ref": row.get::<String, _>("internal_principal_ref"),
+                "internal_conversation_ref": row.get::<String, _>("internal_conversation_ref"),
+                "trigger_kind": row.get::<String, _>("trigger_kind"),
+                "trigger_source": row.get::<String, _>("trigger_source"),
+                "completed_at": row.get::<Option<DateTime<Utc>>, _>("completed_at"),
+                "outcome": row.get::<Option<String>, _>("outcome"),
+                "summary": summary,
+            }),
+            related_ids,
+        });
+        builder.add_edge(TraceEdge {
+            source_node_id: trace_node_id("execution", execution_id),
+            target_node_id: trace_node_id("episode", episode_id),
+            edge_kind: "opened_episode".to_string(),
+            occurred_at: started_at,
+            detail: None,
+            inference: "inferred".to_string(),
+        });
+        if let Some(ingress_id) = ingress_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("ingress", ingress_id),
+                target_node_id: trace_node_id("episode", episode_id),
+                edge_kind: "opened_episode".to_string(),
+                occurred_at: started_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    load_trace_episode_message_nodes(pool, trace_id, builder).await
+}
+
+async fn load_trace_episode_message_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT episode_message_id, episode_id, execution_id, message_order, message_role,
+               channel_kind, text_body, external_message_id, created_at
+        FROM episode_messages
+        WHERE trace_id = $1
+        ORDER BY created_at ASC, message_order ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load episode messages for trace")?;
+
+    for row in rows {
+        let episode_message_id: Uuid = row.get("episode_message_id");
+        let episode_id: Uuid = row.get("episode_id");
+        let execution_id: Uuid = row.get("execution_id");
+        let message_role: String = row.get("message_role");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let text_body: Option<String> = row.get("text_body");
+        let mut related_ids = BTreeMap::new();
+        related_ids.insert("episode_id".to_string(), episode_id);
+        related_ids.insert("execution_id".to_string(), execution_id);
+
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("episode_message", episode_message_id),
+            node_kind: "episode_message".to_string(),
+            source_id: episode_message_id,
+            occurred_at: created_at,
+            status: None,
+            title: format!("Episode message {message_role}"),
+            summary: text_body
+                .as_deref()
+                .map(short_trace_text)
+                .unwrap_or_else(|| "no text body".to_string()),
+            payload: json!({
+                "episode_id": episode_id,
+                "execution_id": execution_id,
+                "message_order": row.get::<i32, _>("message_order"),
+                "message_role": message_role,
+                "channel_kind": row.get::<String, _>("channel_kind"),
+                "text_body": text_body,
+                "external_message_id": row.get::<Option<String>, _>("external_message_id"),
+            }),
+            related_ids,
+        });
+        builder.add_edge(TraceEdge {
+            source_node_id: trace_node_id("episode", episode_id),
+            target_node_id: trace_node_id("episode_message", episode_message_id),
+            edge_kind: "contains_message".to_string(),
+            occurred_at: created_at,
+            detail: Some(row.get::<i32, _>("message_order").to_string()),
+            inference: "inferred".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn load_trace_audit_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, occurred_at, loop_kind, subsystem, event_kind, severity,
+               execution_id, model_tier, payload
+        FROM audit_events
+        WHERE trace_id = $1
+        ORDER BY occurred_at ASC, event_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load audit events for trace")?;
+
+    for row in rows {
+        let event_id: Uuid = row.get("event_id");
+        let occurred_at: DateTime<Utc> = row.get("occurred_at");
+        let subsystem: String = row.get("subsystem");
+        let event_kind: String = row.get("event_kind");
+        let severity: String = row.get("severity");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let payload: JsonValue = row.get("payload");
+        let mut related_ids = BTreeMap::new();
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("audit_event", event_id),
+            node_kind: "audit_event".to_string(),
+            source_id: event_id,
+            occurred_at,
+            status: Some(severity.clone()),
+            title: format!("{subsystem}.{event_kind}"),
+            summary: audit_payload_summary(&payload).unwrap_or_else(|| severity.clone()),
+            payload: json!({
+                "loop_kind": row.get::<String, _>("loop_kind"),
+                "subsystem": subsystem,
+                "event_kind": event_kind,
+                "severity": severity,
+                "execution_id": execution_id,
+                "model_tier": row.get::<Option<String>, _>("model_tier"),
+                "payload": payload,
+            }),
+            related_ids,
+        });
+        if let Some(execution_id) = execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("execution", execution_id),
+                target_node_id: trace_node_id("audit_event", event_id),
+                edge_kind: "emitted_audit_event".to_string(),
+                occurred_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_model_call_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let records = model_calls::list_model_call_records_for_trace(pool, trace_id).await?;
+    for record in records {
+        let mut related_ids = BTreeMap::new();
+        if let Some(execution_id) = record.execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("model_call", record.model_call_id),
+            node_kind: "model_call".to_string(),
+            source_id: record.model_call_id,
+            occurred_at: record.started_at,
+            status: Some(record.status.clone()),
+            title: format!("Model call {}", record.purpose),
+            summary: format!(
+                "provider={} model={} task_class={} input_tokens={} output_tokens={} finish_reason={}",
+                record.provider,
+                record.model,
+                record.task_class.as_deref().unwrap_or("none"),
+                record
+                    .input_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                record
+                    .output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                record.finish_reason.as_deref().unwrap_or("none")
+            ),
+            payload: json!({
+                "trace_id": record.trace_id,
+                "execution_id": record.execution_id,
+                "loop_kind": record.loop_kind,
+                "purpose": record.purpose,
+                "task_class": record.task_class,
+                "provider": record.provider,
+                "model": record.model,
+                "request_payload_json": record.request_payload_json,
+                "response_payload_json": record.response_payload_json,
+                "system_prompt_text": record.system_prompt_text,
+                "messages_json": record.messages_json,
+                "input_tokens": record.input_tokens,
+                "output_tokens": record.output_tokens,
+                "finish_reason": record.finish_reason,
+                "error_summary": record.error_summary,
+                "completed_at": record.completed_at,
+                "payload_retention_expires_at": record.payload_retention_expires_at,
+                "payload_cleared_at": record.payload_cleared_at,
+                "payload_retention_reason": record.payload_retention_reason,
+            }),
+            related_ids,
+        });
+        if let Some(execution_id) = record.execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("execution", execution_id),
+                target_node_id: trace_node_id("model_call", record.model_call_id),
+                edge_kind: "invoked_model".to_string(),
+                occurred_at: record.started_at,
+                detail: Some(record.purpose),
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_background_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let jobs = sqlx::query(
+        r#"
+        SELECT background_job_id, job_kind, trigger_kind, trigger_reason_summary,
+               status, created_at, updated_at
+        FROM background_jobs
+        WHERE trace_id = $1
+        ORDER BY created_at ASC, background_job_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load background jobs for trace")?;
+
+    for row in jobs {
+        let background_job_id: Uuid = row.get("background_job_id");
+        let job_kind: String = row.get("job_kind");
+        let status: String = row.get("status");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("background_job", background_job_id),
+            node_kind: "background_job".to_string(),
+            source_id: background_job_id,
+            occurred_at: created_at,
+            status: Some(status.clone()),
+            title: format!("Background job {job_kind}"),
+            summary: row.get("trigger_reason_summary"),
+            payload: json!({
+                "job_kind": job_kind,
+                "trigger_kind": row.get::<String, _>("trigger_kind"),
+                "status": status,
+                "updated_at": row.get::<DateTime<Utc>, _>("updated_at"),
+            }),
+            related_ids: BTreeMap::new(),
+        });
+    }
+
+    let runs = sqlx::query(
+        r#"
+        SELECT background_job_run_id, background_job_id, execution_id, status,
+               started_at, completed_at, result_payload, failure_payload, created_at
+        FROM background_job_runs
+        WHERE trace_id = $1
+        ORDER BY created_at ASC, background_job_run_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load background job runs for trace")?;
+
+    for row in runs {
+        let background_job_run_id: Uuid = row.get("background_job_run_id");
+        let background_job_id: Uuid = row.get("background_job_id");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let status: String = row.get("status");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let mut related_ids = BTreeMap::new();
+        related_ids.insert("background_job_id".to_string(), background_job_id);
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("background_job_run", background_job_run_id),
+            node_kind: "background_job_run".to_string(),
+            source_id: background_job_run_id,
+            occurred_at: created_at,
+            status: Some(status.clone()),
+            title: "Background job run".to_string(),
+            summary: format!("status={status}"),
+            payload: json!({
+                "background_job_id": background_job_id,
+                "execution_id": execution_id,
+                "started_at": row.get::<Option<DateTime<Utc>>, _>("started_at"),
+                "completed_at": row.get::<Option<DateTime<Utc>>, _>("completed_at"),
+                "result_payload": row.get::<Option<JsonValue>, _>("result_payload"),
+                "failure_payload": row.get::<Option<JsonValue>, _>("failure_payload"),
+            }),
+            related_ids,
+        });
+        builder.add_edge(TraceEdge {
+            source_node_id: trace_node_id("background_job", background_job_id),
+            target_node_id: trace_node_id("background_job_run", background_job_run_id),
+            edge_kind: "started_run".to_string(),
+            occurred_at: created_at,
+            detail: None,
+            inference: "inferred".to_string(),
+        });
+        if let Some(execution_id) = execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("background_job_run", background_job_run_id),
+                target_node_id: trace_node_id("execution", execution_id),
+                edge_kind: "used_execution".to_string(),
+                occurred_at: created_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_wake_signal_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT wake_signal_id, background_job_id, background_job_run_id, execution_id,
+               reason, priority, reason_code, summary, payload_ref, status,
+               decision_kind, decision_reason, requested_at, reviewed_at
+        FROM wake_signals
+        WHERE trace_id = $1
+        ORDER BY requested_at ASC, wake_signal_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load wake signals for trace")?;
+
+    for row in rows {
+        let wake_signal_id: Uuid = row.get("wake_signal_id");
+        let background_job_id: Uuid = row.get("background_job_id");
+        let background_job_run_id: Option<Uuid> = row.get("background_job_run_id");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let status: String = row.get("status");
+        let requested_at: DateTime<Utc> = row.get("requested_at");
+        let mut related_ids = BTreeMap::new();
+        related_ids.insert("background_job_id".to_string(), background_job_id);
+        if let Some(background_job_run_id) = background_job_run_id {
+            related_ids.insert("background_job_run_id".to_string(), background_job_run_id);
+        }
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("wake_signal", wake_signal_id),
+            node_kind: "wake_signal".to_string(),
+            source_id: wake_signal_id,
+            occurred_at: requested_at,
+            status: Some(status),
+            title: format!("Wake signal {}", row.get::<String, _>("reason_code")),
+            summary: row.get("summary"),
+            payload: json!({
+                "background_job_id": background_job_id,
+                "background_job_run_id": background_job_run_id,
+                "execution_id": execution_id,
+                "reason": row.get::<String, _>("reason"),
+                "priority": row.get::<String, _>("priority"),
+                "reason_code": row.get::<String, _>("reason_code"),
+                "payload_ref": row.get::<Option<String>, _>("payload_ref"),
+                "decision_kind": row.get::<Option<String>, _>("decision_kind"),
+                "decision_reason": row.get::<Option<String>, _>("decision_reason"),
+                "reviewed_at": row.get::<Option<DateTime<Utc>>, _>("reviewed_at"),
+            }),
+            related_ids,
+        });
+        if let Some(background_job_run_id) = background_job_run_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("background_job_run", background_job_run_id),
+                target_node_id: trace_node_id("wake_signal", wake_signal_id),
+                edge_kind: "recorded_wake_signal".to_string(),
+                occurred_at: requested_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_approval_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT approval_request_id, execution_id, action_proposal_id, action_fingerprint,
+               action_kind, risk_tier, title, consequence_summary, status, requested_by,
+               requested_at, expires_at, resolved_at, resolution_kind, resolved_by,
+               resolution_reason
+        FROM approval_requests
+        WHERE trace_id = $1
+        ORDER BY requested_at ASC, approval_request_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load approval requests for trace")?;
+
+    for row in rows {
+        let approval_request_id: Uuid = row.get("approval_request_id");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let status: String = row.get("status");
+        let requested_at: DateTime<Utc> = row.get("requested_at");
+        let mut related_ids = BTreeMap::new();
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("approval_request", approval_request_id),
+            node_kind: "approval_request".to_string(),
+            source_id: approval_request_id,
+            occurred_at: requested_at,
+            status: Some(status),
+            title: row.get("title"),
+            summary: row.get("consequence_summary"),
+            payload: json!({
+                "execution_id": execution_id,
+                "action_proposal_id": row.get::<Uuid, _>("action_proposal_id"),
+                "action_fingerprint": row.get::<String, _>("action_fingerprint"),
+                "action_kind": row.get::<String, _>("action_kind"),
+                "risk_tier": row.get::<String, _>("risk_tier"),
+                "requested_by": row.get::<String, _>("requested_by"),
+                "expires_at": row.get::<DateTime<Utc>, _>("expires_at"),
+                "resolved_at": row.get::<Option<DateTime<Utc>>, _>("resolved_at"),
+                "resolution_kind": row.get::<Option<String>, _>("resolution_kind"),
+                "resolved_by": row.get::<Option<String>, _>("resolved_by"),
+                "resolution_reason": row.get::<Option<String>, _>("resolution_reason"),
+            }),
+            related_ids,
+        });
+        if let Some(execution_id) = execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("execution", execution_id),
+                target_node_id: trace_node_id("approval_request", approval_request_id),
+                edge_kind: "requested_approval".to_string(),
+                occurred_at: requested_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_governed_action_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT governed_action_execution_id, execution_id, approval_request_id,
+               action_proposal_id, action_fingerprint, action_kind, risk_tier,
+               status, payload_json, blocked_reason, output_ref, started_at,
+               completed_at, created_at
+        FROM governed_action_executions
+        WHERE trace_id = $1
+        ORDER BY created_at ASC, governed_action_execution_id ASC
+        "#,
+    )
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load governed actions for trace")?;
+
+    for row in rows {
+        let governed_action_execution_id: Uuid = row.get("governed_action_execution_id");
+        let execution_id: Option<Uuid> = row.get("execution_id");
+        let approval_request_id: Option<Uuid> = row.get("approval_request_id");
+        let action_kind: String = row.get("action_kind");
+        let status: String = row.get("status");
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let mut related_ids = BTreeMap::new();
+        if let Some(execution_id) = execution_id {
+            related_ids.insert("execution_id".to_string(), execution_id);
+        }
+        if let Some(approval_request_id) = approval_request_id {
+            related_ids.insert("approval_request_id".to_string(), approval_request_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("governed_action", governed_action_execution_id),
+            node_kind: "governed_action".to_string(),
+            source_id: governed_action_execution_id,
+            occurred_at: created_at,
+            status: Some(status.clone()),
+            title: format!("Governed action {action_kind}"),
+            summary: row
+                .get::<Option<String>, _>("blocked_reason")
+                .unwrap_or_else(|| format!("status={status}")),
+            payload: json!({
+                "execution_id": execution_id,
+                "approval_request_id": approval_request_id,
+                "action_proposal_id": row.get::<Uuid, _>("action_proposal_id"),
+                "action_fingerprint": row.get::<String, _>("action_fingerprint"),
+                "action_kind": action_kind,
+                "risk_tier": row.get::<String, _>("risk_tier"),
+                "payload_json": row.get::<JsonValue, _>("payload_json"),
+                "blocked_reason": row.get::<Option<String>, _>("blocked_reason"),
+                "output_ref": row.get::<Option<String>, _>("output_ref"),
+                "started_at": row.get::<Option<DateTime<Utc>>, _>("started_at"),
+                "completed_at": row.get::<Option<DateTime<Utc>>, _>("completed_at"),
+            }),
+            related_ids,
+        });
+        if let Some(execution_id) = execution_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("execution", execution_id),
+                target_node_id: trace_node_id("governed_action", governed_action_execution_id),
+                edge_kind: "proposed_action".to_string(),
+                occurred_at: created_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+        if let Some(approval_request_id) = approval_request_id {
+            builder.add_edge(TraceEdge {
+                source_node_id: trace_node_id("governed_action", governed_action_execution_id),
+                target_node_id: trace_node_id("approval_request", approval_request_id),
+                edge_kind: "required_approval".to_string(),
+                occurred_at: created_at,
+                detail: None,
+                inference: "inferred".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_scheduled_task_nodes(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    let execution_ids: Vec<Uuid> = builder.execution_ids.iter().copied().collect();
+    let rows = sqlx::query(
+        r#"
+        SELECT scheduled_foreground_task_id, task_key, channel_kind, status,
+               internal_principal_ref, internal_conversation_ref, message_text,
+               cadence_seconds, cooldown_seconds, next_due_at, current_execution_id,
+               current_run_started_at, last_execution_id, last_run_started_at,
+               last_run_completed_at, last_outcome, last_outcome_reason,
+               last_outcome_summary, created_by, updated_by, created_at, updated_at
+        FROM scheduled_foreground_tasks
+        WHERE current_execution_id = ANY($1)
+           OR last_execution_id = ANY($1)
+           OR scheduled_foreground_task_id IN (
+                SELECT target_id
+                FROM causal_links
+                WHERE trace_id = $2
+                  AND target_kind = 'scheduled_foreground_task'
+           )
+           OR scheduled_foreground_task_id IN (
+                SELECT source_id
+                FROM causal_links
+                WHERE trace_id = $2
+                  AND source_kind = 'scheduled_foreground_task'
+           )
+        ORDER BY updated_at ASC, scheduled_foreground_task_id ASC
+        "#,
+    )
+    .bind(&execution_ids)
+    .bind(trace_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load scheduled foreground tasks for trace")?;
+
+    for row in rows {
+        let scheduled_foreground_task_id: Uuid = row.get("scheduled_foreground_task_id");
+        let current_execution_id: Option<Uuid> = row.get("current_execution_id");
+        let last_execution_id: Option<Uuid> = row.get("last_execution_id");
+        let status: String = row.get("status");
+        let updated_at: DateTime<Utc> = row.get("updated_at");
+        let task_key: String = row.get("task_key");
+        let message_text: String = row.get("message_text");
+        let cadence_seconds: i64 = row.get("cadence_seconds");
+        let cooldown_seconds: i64 = row.get("cooldown_seconds");
+        let next_due_at: DateTime<Utc> = row.get("next_due_at");
+        let current_run_started_at: Option<DateTime<Utc>> = row.get("current_run_started_at");
+        let last_run_started_at: Option<DateTime<Utc>> = row.get("last_run_started_at");
+        let last_run_completed_at: Option<DateTime<Utc>> = row.get("last_run_completed_at");
+        let last_outcome: Option<String> = row.get("last_outcome");
+        let last_outcome_reason: Option<String> = row.get("last_outcome_reason");
+        let last_outcome_summary: Option<String> = row.get("last_outcome_summary");
+        let mut related_ids = BTreeMap::new();
+        if let Some(current_execution_id) = current_execution_id {
+            related_ids.insert("current_execution_id".to_string(), current_execution_id);
+        }
+        if let Some(last_execution_id) = last_execution_id {
+            related_ids.insert("last_execution_id".to_string(), last_execution_id);
+        }
+        builder.add_node(TraceNode {
+            node_id: trace_node_id("scheduled_foreground_task", scheduled_foreground_task_id),
+            node_kind: "scheduled_foreground_task".to_string(),
+            source_id: scheduled_foreground_task_id,
+            occurred_at: updated_at,
+            status: Some(status.clone()),
+            title: format!("Scheduled task {task_key}"),
+            summary: message_text.clone(),
+            payload: json!({
+                "task_key": task_key,
+                "channel_kind": row.get::<String, _>("channel_kind"),
+                "internal_principal_ref": row.get::<String, _>("internal_principal_ref"),
+                "internal_conversation_ref": row.get::<String, _>("internal_conversation_ref"),
+                "cadence_seconds": cadence_seconds,
+                "cooldown_seconds": cooldown_seconds,
+                "next_due_at": next_due_at,
+                "current_execution_id": current_execution_id,
+                "current_run_started_at": current_run_started_at,
+                "last_execution_id": last_execution_id,
+                "last_run_started_at": last_run_started_at,
+                "last_run_completed_at": last_run_completed_at,
+                "last_outcome": last_outcome,
+                "last_outcome_reason": last_outcome_reason,
+                "last_outcome_summary": last_outcome_summary,
+                "created_by": row.get::<String, _>("created_by"),
+                "updated_by": row.get::<String, _>("updated_by"),
+                "created_at": row.get::<DateTime<Utc>, _>("created_at"),
+            }),
+            related_ids,
+        });
+        builder.add_scheduling_summary(SchedulingTraceSummary {
+            scheduled_foreground_task_id,
+            task_key,
+            status,
+            message_text,
+            cadence_seconds,
+            cooldown_seconds,
+            next_due_at,
+            current_execution_id,
+            current_run_started_at,
+            last_execution_id,
+            last_run_started_at,
+            last_run_completed_at,
+            last_outcome,
+            last_outcome_reason,
+            last_outcome_summary,
+        });
+        for (edge_kind, execution_id) in [
+            ("current_scheduled_execution", current_execution_id),
+            ("last_scheduled_execution", last_execution_id),
+        ] {
+            if let Some(execution_id) = execution_id {
+                builder.add_edge(TraceEdge {
+                    source_node_id: trace_node_id(
+                        "scheduled_foreground_task",
+                        scheduled_foreground_task_id,
+                    ),
+                    target_node_id: trace_node_id("execution", execution_id),
+                    edge_kind: edge_kind.to_string(),
+                    occurred_at: updated_at,
+                    detail: None,
+                    inference: "inferred".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_trace_explicit_causal_links(
+    pool: &PgPool,
+    trace_id: Uuid,
+    builder: &mut TraceReportBuilder,
+) -> Result<()> {
+    for link in causal_links::list_for_trace(pool, trace_id).await? {
+        let source_node_id = match trace_node_kind_for_causal_kind(&link.source_kind) {
+            Some(kind) => trace_node_id(kind, link.source_id),
+            None => {
+                builder.add_note(
+                    "unknown_causal_source_kind",
+                    format!(
+                        "causal link {} used unknown source kind {}",
+                        link.causal_link_id, link.source_kind
+                    ),
+                );
+                continue;
+            }
+        };
+        let target_node_id = match trace_node_kind_for_causal_kind(&link.target_kind) {
+            Some(kind) => trace_node_id(kind, link.target_id),
+            None => {
+                builder.add_note(
+                    "unknown_causal_target_kind",
+                    format!(
+                        "causal link {} used unknown target kind {}",
+                        link.causal_link_id, link.target_kind
+                    ),
+                );
+                continue;
+            }
+        };
+        builder.add_edge(TraceEdge {
+            source_node_id,
+            target_node_id,
+            edge_kind: link.edge_kind,
+            occurred_at: link.created_at,
+            detail: Some(link.payload.to_string()),
+            inference: "explicit".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn trace_node_kind_for_causal_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "execution_record" => Some("execution"),
+        "ingress_event" => Some("ingress"),
+        "episode" => Some("episode"),
+        "episode_message" => Some("episode_message"),
+        "audit_event" => Some("audit_event"),
+        "background_job" => Some("background_job"),
+        "background_job_run" => Some("background_job_run"),
+        "wake_signal" => Some("wake_signal"),
+        "approval_request" => Some("approval_request"),
+        "governed_action_execution" => Some("governed_action"),
+        "model_call_record" => Some("model_call"),
+        "scheduled_foreground_task" => Some("scheduled_foreground_task"),
+        _ => None,
+    }
+}
+
+fn trace_node_id(kind: &str, id: Uuid) -> String {
+    format!("{kind}:{id}")
+}
+
+fn short_trace_text(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        normalized
+    } else {
+        let mut truncated = normalized.chars().take(MAX_CHARS).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+fn audit_payload_summary(payload: &JsonValue) -> Option<String> {
+    payload
+        .get("summary")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("reason").and_then(JsonValue::as_str))
+        .or_else(|| payload.get("reason_code").and_then(JsonValue::as_str))
+        .map(short_trace_text)
 }
 
 pub fn default_list_limit() -> u32 {
@@ -2507,7 +3824,7 @@ mod tests {
         AppConfig, ApprovalPromptMode, ApprovalsConfig, BackgroundConfig,
         BackgroundExecutionConfig, BackgroundSchedulerConfig, BackgroundThresholdsConfig,
         ContinuityConfig, DatabaseConfig, GovernedActionsConfig, HarnessConfig, ModelGatewayConfig,
-        ScheduledForegroundConfig, SelfModelConfig, TelegramConfig,
+        ObservabilityConfig, ScheduledForegroundConfig, SelfModelConfig, TelegramConfig,
         TelegramForegroundBindingConfig, WakeSignalPolicyConfig, WorkerConfig, WorkspaceConfig,
     };
     use std::path::PathBuf;
@@ -2573,6 +3890,9 @@ mod tests {
                 root_dir: ".".into(),
                 max_artifact_bytes: 1_048_576,
                 max_script_bytes: 262_144,
+            },
+            observability: ObservabilityConfig {
+                model_call_payload_retention_days: 30,
             },
             approvals: ApprovalsConfig {
                 default_ttl_seconds: 900,
