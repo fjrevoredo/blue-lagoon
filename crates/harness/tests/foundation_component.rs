@@ -5,6 +5,7 @@ use chrono::Utc;
 use futures_util::FutureExt;
 use serde_json::json;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Row};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -215,6 +216,50 @@ async fn migrate_normalizes_schema_migration_names_to_capability_labels() -> Res
             .map(|migration| (migration.version, migration.name))
             .collect::<Vec<_>>();
         assert_eq!(names, expected_names);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn migrate_normalizes_legacy_line_ending_checksums() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let migration = migration::load_migrations()?
+            .into_iter()
+            .find(|migration| migration.version == 10)
+            .expect("reviewed migration 10 should exist");
+        let crlf_sql = migration.sql.replace("\r\n", "\n").replace('\n', "\r\n");
+        let legacy_raw_checksum = hex::encode(Sha256::digest(crlf_sql.as_bytes()));
+
+        sqlx::query(
+            r#"
+            UPDATE schema_migrations
+            SET checksum = $2
+            WHERE version = $1
+            "#,
+        )
+        .bind(migration.version)
+        .bind(&legacy_raw_checksum)
+        .execute(&ctx.pool)
+        .await?;
+
+        let summary =
+            migration::apply_pending_migrations(&ctx.pool, env!("CARGO_PKG_VERSION")).await?;
+        assert!(summary.applied_versions.is_empty());
+
+        let row = sqlx::query(
+            r#"
+            SELECT checksum
+            FROM schema_migrations
+            WHERE version = $1
+            "#,
+        )
+        .bind(migration.version)
+        .fetch_one(&ctx.pool)
+        .await?;
+
+        assert_eq!(row.get::<String, _>("checksum"), migration.checksum);
         Ok(())
     })
     .await

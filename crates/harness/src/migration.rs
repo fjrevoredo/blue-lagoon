@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::Instant,
@@ -63,7 +64,7 @@ pub fn load_migrations() -> Result<Vec<Migration>> {
         let (version, parsed_name) = parse_migration_name(file_name)?;
         let sql = fs::read_to_string(&path)
             .with_context(|| format!("failed to read migration {}", path.display()))?;
-        let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
+        let checksum = migration_checksum(&sql);
         migrations.push(Migration {
             version,
             name: canonical_migration_name(version, &parsed_name),
@@ -109,7 +110,7 @@ pub async fn apply_pending_migrations(
 ) -> Result<MigrationSummary> {
     ensure_schema_migrations_table(pool).await?;
     let migrations = load_migrations()?;
-    normalize_applied_migration_names(pool, &migrations).await?;
+    normalize_applied_migration_metadata(pool, &migrations).await?;
     let applied = applied_versions(pool).await?;
     validate_applied_history(&migrations, &load_applied_migrations(pool).await?)?;
     let applied_set = applied
@@ -200,7 +201,7 @@ pub async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<AppliedMigrati
         .collect())
 }
 
-pub async fn normalize_applied_migration_names(
+pub async fn normalize_applied_migration_metadata(
     pool: &PgPool,
     discovered: &[Migration],
 ) -> Result<()> {
@@ -208,26 +209,31 @@ pub async fn normalize_applied_migration_names(
     let mut transaction = pool
         .begin()
         .await
-        .context("failed to begin migration-name normalization transaction")?;
+        .context("failed to begin migration metadata normalization transaction")?;
 
     for migration in discovered {
+        let compatible_checksums = compatible_migration_checksums(migration)
+            .into_iter()
+            .collect::<Vec<_>>();
         sqlx::query(
             r#"
             UPDATE schema_migrations
-            SET name = $2
+            SET name = $2,
+                checksum = $3
             WHERE version = $1
-              AND checksum = $3
-              AND name <> $2
+              AND checksum = ANY($4)
+              AND (name <> $2 OR checksum <> $3)
             "#,
         )
         .bind(migration.version)
         .bind(&migration.name)
         .bind(&migration.checksum)
+        .bind(&compatible_checksums)
         .execute(&mut *transaction)
         .await
         .with_context(|| {
             format!(
-                "failed to normalize applied migration name for version {}",
+                "failed to normalize applied migration metadata for version {}",
                 migration.version
             )
         })?;
@@ -236,7 +242,7 @@ pub async fn normalize_applied_migration_names(
     transaction
         .commit()
         .await
-        .context("failed to commit migration-name normalization transaction")?;
+        .context("failed to commit migration metadata normalization transaction")?;
     Ok(())
 }
 
@@ -262,7 +268,7 @@ pub fn validate_applied_history(
             );
         }
 
-        if applied_migration.checksum != expected.checksum {
+        if !checksum_matches_migration(expected, &applied_migration.checksum) {
             bail!(
                 "applied migration {} checksum does not match the reviewed migration file",
                 applied_migration.version
@@ -297,6 +303,26 @@ fn canonical_migration_name(version: i64, parsed_name: &str) -> String {
         2 => "foreground_loop".to_string(),
         _ => parsed_name.to_string(),
     }
+}
+
+fn migration_checksum(sql: &str) -> String {
+    hex::encode(Sha256::digest(normalize_sql_for_checksum(sql).as_bytes()))
+}
+
+fn compatible_migration_checksums(migration: &Migration) -> BTreeSet<String> {
+    let mut checksums = BTreeSet::from([migration.checksum.clone()]);
+    checksums.insert(hex::encode(Sha256::digest(migration.sql.as_bytes())));
+    let crlf_sql = normalize_sql_for_checksum(&migration.sql).replace('\n', "\r\n");
+    checksums.insert(hex::encode(Sha256::digest(crlf_sql.as_bytes())));
+    checksums
+}
+
+fn checksum_matches_migration(migration: &Migration, checksum: &str) -> bool {
+    compatible_migration_checksums(migration).contains(checksum)
+}
+
+fn normalize_sql_for_checksum(sql: &str) -> String {
+    sql.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn applied_by() -> String {
@@ -373,5 +399,33 @@ mod tests {
 
         validate_applied_history(&discovered, &applied)
             .expect("legacy names should remain compatible when version and checksum match");
+    }
+
+    #[test]
+    fn migration_checksums_are_stable_across_line_endings() {
+        let lf_sql = "SELECT 1;\nSELECT 2;\n";
+        let crlf_sql = "SELECT 1;\r\nSELECT 2;\r\n";
+        assert_eq!(migration_checksum(lf_sql), migration_checksum(crlf_sql));
+    }
+
+    #[test]
+    fn validate_applied_history_accepts_legacy_raw_line_ending_checksum() {
+        let sql = "SELECT 1;\nSELECT 2;\n".to_string();
+        let crlf_sql = sql.replace('\n', "\r\n");
+        let legacy_raw_checksum = hex::encode(Sha256::digest(crlf_sql.as_bytes()));
+        let discovered = vec![Migration {
+            version: 1,
+            name: "runtime_foundation".to_string(),
+            checksum: migration_checksum(&sql),
+            sql,
+        }];
+        let applied = vec![AppliedMigration {
+            version: 1,
+            name: "runtime_foundation".to_string(),
+            checksum: legacy_raw_checksum,
+        }];
+
+        validate_applied_history(&discovered, &applied)
+            .expect("line-ending-only checksum variants should remain compatible");
     }
 }

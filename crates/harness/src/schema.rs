@@ -102,7 +102,7 @@ pub async fn assess_upgrade_path(
     policy: SchemaPolicy,
 ) -> Result<SchemaUpgradeAssessment> {
     let discovered = migration::load_migrations()?;
-    migration::normalize_applied_migration_names(pool, &discovered).await?;
+    migration::normalize_applied_migration_metadata(pool, &discovered).await?;
     let applied = migration::load_applied_migrations(pool).await?;
     let discovered_versions = discovered
         .iter()
