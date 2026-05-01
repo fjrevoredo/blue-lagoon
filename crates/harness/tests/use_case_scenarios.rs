@@ -4,21 +4,27 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
     ApprovalResolutionDecision, BackgroundExecutionBudget, BackgroundTrigger,
-    BackgroundTriggerKind, ChannelKind, GovernedActionFingerprint, ModelProviderKind,
-    ScheduledForegroundLastOutcome, ScheduledForegroundTaskStatus, UnconsciousJobKind,
-    UnconsciousScope,
+    BackgroundTriggerKind, CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload,
+    CanonicalTargetKind, ChannelKind, ForegroundBudget, ForegroundTrigger, ForegroundTriggerKind,
+    GovernedActionFingerprint, IdentityDeltaProposal, IdentityInterviewAnswer,
+    IdentityKickstartAction, IdentityKickstartActionKind, IdentityLifecycleState, IngressEventKind,
+    ModelProviderKind, NormalizedIngress, ProposalConflictPosture, ProposalProvenance,
+    ProposalProvenanceKind, ScheduledForegroundLastOutcome, ScheduledForegroundTaskStatus,
+    UnconsciousJobKind, UnconsciousScope, predefined_identity_delta,
 };
 use harness::{
     approval, background,
     config::{
         ForegroundModelRouteConfig, ModelGatewayConfig, ResolvedForegroundModelRouteConfig,
-        ResolvedModelGatewayConfig, ResolvedTelegramConfig, SelfModelConfig, TelegramConfig,
-        TelegramForegroundBindingConfig, ZAiProviderConfig,
+        ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig, SelfModelConfig,
+        TelegramConfig, TelegramForegroundBindingConfig, ZAiProviderConfig,
     },
+    context::{self, ContextAssemblyOptions},
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
-    foreground_orchestration, governed_actions, ingress,
+    foreground_orchestration, governed_actions, identity, ingress, management,
     model_gateway::{self, ProviderHttpResponse},
+    proposal,
     runtime::{self, HarnessOptions},
     scheduled_foreground, telegram,
 };
@@ -551,7 +557,21 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during maintenance." },
+                    "message": {
+                        "content": serde_json::json!({
+                            "identity_delta": null,
+                            "no_change_rationale": "No durable identity change is warranted from this maintenance review.",
+                            "diagnostics": [],
+                            "wake_signals": [{
+                                "signal_id": "018f0000-0000-7000-8000-000000000606",
+                                "reason": "maintenance_insight_ready",
+                                "priority": "normal",
+                                "reason_code": "maintenance_review_ready",
+                                "summary": "Background maintenance found an update worth surfacing.",
+                                "payload_ref": "background_job:self_model_reflection"
+                            }]
+                        }).to_string()
+                    },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 16, "completion_tokens": 8 }
@@ -864,7 +884,365 @@ async fn uc8_worker_crash_creates_checkpoint_and_task_is_clean_after_recovery() 
     .await
 }
 
+// --- UC-Identity: First Identity Kickstart Lifecycle ---
+
+#[tokio::test]
+#[serial]
+async fn uc_identity_kickstart_lifecycle_covers_selection_interview_resume_and_reset() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        let bootstrap_context =
+            assemble_identity_context(&ctx.pool, &config, "choose an identity").await?;
+        assert_eq!(
+            bootstrap_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+        let bootstrap_kickstart = bootstrap_context
+            .context
+            .self_model
+            .identity_lifecycle
+            .kickstart
+            .expect("bootstrap state should expose identity kickstart");
+        assert!(
+            bootstrap_kickstart
+                .available_actions
+                .contains(&IdentityKickstartActionKind::SelectPredefinedTemplate)
+        );
+        assert!(
+            bootstrap_kickstart
+                .available_actions
+                .contains(&IdentityKickstartActionKind::StartCustomInterview)
+        );
+        assert_eq!(bootstrap_kickstart.predefined_templates.len(), 3);
+
+        let predefined_context = proposal_context(&ctx.pool).await?;
+        let predefined_summary = proposal::apply_candidate_proposals(
+            &ctx.pool,
+            &config,
+            &predefined_context,
+            "use_case_identity_predefined",
+            None,
+            &[identity_delta_proposal(
+                predefined_identity_delta("continuity_operator", Utc::now())
+                    .expect("predefined template should exist"),
+                "predefined identity selection",
+            )],
+        )
+        .await?;
+        assert_eq!(predefined_summary.accepted_count, 1);
+
+        let completed_context =
+            assemble_identity_context(&ctx.pool, &config, "identity complete").await?;
+        assert_eq!(
+            completed_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .state,
+            IdentityLifecycleState::CompleteIdentityActive
+        );
+        assert!(
+            !completed_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+        assert!(
+            completed_context
+                .context
+                .self_model
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.identity_summary == "Blue Lagoon")
+        );
+
+        let reset_report = management::reset_identity(
+            &config,
+            management::IdentityResetRequest {
+                actor_ref: "cli:primary-user".to_string(),
+                reason: Some("use-case reset".to_string()),
+                force: true,
+            },
+        )
+        .await?;
+        assert_eq!(
+            reset_report.previous_lifecycle_state.as_deref(),
+            Some("complete_identity_active")
+        );
+
+        let reset_context = assemble_identity_context(&ctx.pool, &config, "start over").await?;
+        assert_eq!(
+            reset_context.context.self_model.identity_lifecycle.state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+        assert!(
+            reset_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+
+        let start_context = proposal_context(&ctx.pool).await?;
+        let start_summary = proposal::apply_candidate_proposals(
+            &ctx.pool,
+            &config,
+            &start_context,
+            "use_case_identity_custom_start",
+            None,
+            &[identity_delta_proposal(
+                IdentityDeltaProposal {
+                    lifecycle_state: IdentityLifecycleState::BootstrapSeedOnly,
+                    item_deltas: Vec::new(),
+                    self_description_delta: None,
+                    interview_action: Some(IdentityKickstartAction::StartCustomInterview),
+                    rationale: "Start custom identity interview.".to_string(),
+                },
+                "start custom identity interview",
+            )],
+        )
+        .await?;
+        assert_eq!(start_summary.accepted_count, 1);
+
+        let in_progress_context =
+            assemble_identity_context(&ctx.pool, &config, "custom identity").await?;
+        assert_eq!(
+            in_progress_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .state,
+            IdentityLifecycleState::IdentityKickstartInProgress
+        );
+        let in_progress_kickstart = in_progress_context
+            .context
+            .self_model
+            .identity_lifecycle
+            .kickstart
+            .expect("in-progress state should expose interview actions");
+        assert!(
+            in_progress_kickstart
+                .available_actions
+                .contains(&IdentityKickstartActionKind::AnswerCustomInterview)
+        );
+        assert_eq!(in_progress_kickstart.next_step.as_deref(), Some("name"));
+
+        let answer_context = proposal_context(&ctx.pool).await?;
+        let first_answer = proposal::apply_candidate_proposals(
+            &ctx.pool,
+            &config,
+            &answer_context,
+            "use_case_identity_custom_answer",
+            None,
+            &[custom_identity_answer_proposal("name", "Lagoon Forge")],
+        )
+        .await?;
+        assert_eq!(first_answer.accepted_count, 1);
+
+        let resume_context =
+            assemble_identity_context(&ctx.pool, &config, "resume custom identity").await?;
+        assert_eq!(
+            resume_context
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart
+                .as_ref()
+                .and_then(|kickstart| kickstart.next_step.as_deref()),
+            Some("identity_form")
+        );
+
+        for (step_key, answer_text) in custom_identity_remaining_answers() {
+            let summary = proposal::apply_candidate_proposals(
+                &ctx.pool,
+                &config,
+                &answer_context,
+                "use_case_identity_custom_answer",
+                None,
+                &[custom_identity_answer_proposal(step_key, answer_text)],
+            )
+            .await?;
+            assert_eq!(summary.accepted_count, 1);
+        }
+
+        let final_lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should be current");
+        assert_eq!(final_lifecycle.lifecycle_state, "complete_identity_active");
+        assert_eq!(final_lifecycle.active_interview_id, None);
+        let compact_identity =
+            identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert_eq!(compact_identity.identity_summary, "Lagoon Forge");
+        assert!(compact_identity.stable_items.len() >= 10);
+        assert!(compact_identity.evolving_items.len() >= 6);
+
+        Ok(())
+    })
+    .await
+}
+
 // --- Helper functions ---
+
+async fn assemble_identity_context(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    text_body: &str,
+) -> Result<context::ContextAssemblyResult> {
+    let trace_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    seed_execution_with_id(pool, trace_id, execution_id, "user_ingress").await?;
+    context::assemble_foreground_context(
+        pool,
+        config,
+        sample_foreground_trigger(text_body, trace_id, execution_id),
+        ContextAssemblyOptions::default(),
+    )
+    .await
+}
+
+fn sample_foreground_trigger(
+    text_body: &str,
+    trace_id: Uuid,
+    execution_id: Uuid,
+) -> ForegroundTrigger {
+    let ingress_id = Uuid::now_v7();
+    ForegroundTrigger {
+        trigger_id: Uuid::now_v7(),
+        trace_id,
+        execution_id,
+        trigger_kind: ForegroundTriggerKind::UserIngress,
+        ingress: NormalizedIngress {
+            ingress_id,
+            channel_kind: ChannelKind::Telegram,
+            external_user_id: "42".to_string(),
+            external_conversation_id: "42".to_string(),
+            external_event_id: format!("event-{ingress_id}"),
+            external_message_id: Some(format!("message-{ingress_id}")),
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            event_kind: IngressEventKind::MessageCreated,
+            occurred_at: Utc::now(),
+            text_body: Some(text_body.to_string()),
+            reply_to: None,
+            attachments: Vec::new(),
+            command_hint: None,
+            approval_payload: None,
+            raw_payload_ref: None,
+        },
+        received_at: Utc::now(),
+        deduplication_key: format!("test:{ingress_id}"),
+        budget: ForegroundBudget {
+            iteration_budget: 1,
+            wall_clock_budget_ms: 30_000,
+            token_budget: 4_000,
+        },
+    }
+}
+
+async fn seed_execution_with_id(
+    pool: &sqlx::PgPool,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    trigger_kind: &str,
+) -> Result<()> {
+    execution::insert(
+        pool,
+        &NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: trigger_kind.to_string(),
+            synthetic_trigger: None,
+            status: "started".to_string(),
+            request_payload: json!({
+                "request_id": Uuid::now_v7(),
+                "sent_at": Utc::now(),
+                "worker_kind": "foreground"
+            }),
+        },
+    )
+    .await
+}
+
+async fn proposal_context(pool: &sqlx::PgPool) -> Result<proposal::ProposalProcessingContext> {
+    let trace_id = Uuid::now_v7();
+    let execution_id = seed_execution(pool, trace_id).await?;
+    Ok(proposal::ProposalProcessingContext {
+        trace_id,
+        execution_id,
+        episode_id: None,
+        source_ingress_id: None,
+        source_loop_kind: "use_case".to_string(),
+    })
+}
+
+fn identity_delta_proposal(payload: IdentityDeltaProposal, rationale: &str) -> CanonicalProposal {
+    CanonicalProposal {
+        proposal_id: Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: 100,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(rationale.to_string()),
+        valid_from: Some(Utc::now()),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![Uuid::now_v7()],
+            source_episode_id: None,
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(payload),
+    }
+}
+
+fn custom_identity_answer_proposal(step_key: &str, answer_text: &str) -> CanonicalProposal {
+    identity_delta_proposal(
+        IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::IdentityKickstartInProgress,
+            item_deltas: Vec::new(),
+            self_description_delta: None,
+            interview_action: Some(IdentityKickstartAction::AnswerCustomInterview(
+                IdentityInterviewAnswer {
+                    step_key: step_key.to_string(),
+                    answer_text: answer_text.to_string(),
+                },
+            )),
+            rationale: format!("Persist custom identity interview answer for {step_key}."),
+        },
+        "custom identity interview answer",
+    )
+}
+
+fn custom_identity_remaining_answers() -> [(&'static str, &'static str); 13] {
+    [
+        ("identity_form", "focused AI workshop companion"),
+        ("archetype_role", "pragmatic builder"),
+        ("temperament", "steady, exact, and calm"),
+        ("communication_style", "brief and implementation-focused"),
+        ("backstory", "formed from long-running engineering sessions"),
+        ("age_framing", "new but accumulating durable experience"),
+        ("likes", "clear tasks and verified outcomes"),
+        ("dislikes", "performative uncertainty"),
+        ("values", "clarity and usefulness"),
+        ("boundaries", "never hide skipped checks"),
+        ("tendencies", "summarize state before changing direction"),
+        ("goals", "help finish correct work"),
+        ("relationship_to_user", "trusted technical copilot"),
+    ]
+}
 
 fn telegram_fixture(name: &str) -> std::path::PathBuf {
     support::workspace_root()

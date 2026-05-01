@@ -148,6 +148,8 @@ fn sample_context() -> ConsciousContext {
             preferences: vec!["concise".to_string()],
             current_goals: vec!["support_the_user".to_string()],
             current_subgoals: vec!["reply_to_current_message".to_string()],
+            identity: None,
+            identity_lifecycle: Default::default(),
         },
         internal_state: InternalStateSnapshot {
             load_pct: 15,

@@ -5,9 +5,9 @@ use chrono::{Duration, Utc};
 use contracts::{
     ApprovalRequestStatus, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
     ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
-    GovernedActionKind, GovernedActionRiskTier, LoopKind, ModelCallPurpose, ModelCallRequest,
-    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, NetworkAccessPosture,
-    ToolPolicy,
+    GovernedActionKind, GovernedActionRiskTier, IdentityLifecycleState, LoopKind, ModelCallPurpose,
+    ModelCallRequest, ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode,
+    NetworkAccessPosture, ToolPolicy,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
@@ -16,8 +16,8 @@ use harness::{
         ForegroundModelRouteConfig, ModelGatewayConfig, ResolvedForegroundModelRouteConfig,
         ResolvedModelGatewayConfig, ResolvedTelegramConfig, SelfModelConfig,
     },
-    context, continuity, execution, foreground, foreground_orchestration, ingress, model_gateway,
-    runtime, scheduled_foreground, telegram, worker,
+    context, continuity, execution, foreground, foreground_orchestration, identity, ingress,
+    model_gateway, runtime, scheduled_foreground, telegram, worker,
 };
 use serial_test::serial;
 use sqlx::{Connection, PgConnection, Row};
@@ -1411,6 +1411,42 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
 
         assert_eq!(assembled.context.self_model.stable_identity, "blue-lagoon");
         assert_eq!(
+            assembled.context.self_model.identity_lifecycle.state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+        assert_eq!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart
+                .as_ref()
+                .expect("seed-only state should expose kickstart context")
+                .predefined_templates
+                .len(),
+            3
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity
+                .as_ref()
+                .is_some_and(|identity| !identity.stable_items.is_empty())
+        );
+        assert_eq!(
+            assembled.metadata.identity_lifecycle_state,
+            "bootstrap_seed_only"
+        );
+        assert!(assembled.metadata.identity_kickstart_available);
+        assert_eq!(
             assembled.context.trigger.ingress.text_body.as_deref(),
             Some("trigger text")
         );
@@ -1437,6 +1473,147 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
         assert!(assembled.metadata.trigger_text_truncated);
         assert_eq!(assembled.metadata.selected_recent_history_count, 2);
         assert_eq!(assembled.metadata.truncated_history_message_count, 4);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn context_assembly_uses_complete_identity_lifecycle_snapshot() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        identity::record_lifecycle_transition(
+            &ctx.pool,
+            &identity::NewIdentityLifecycle {
+                identity_lifecycle_id: Uuid::now_v7(),
+                status: "current".to_string(),
+                lifecycle_state: "complete_identity_active".to_string(),
+                active_self_model_artifact_id: None,
+                active_interview_id: None,
+                transition_reason: "component test complete identity".to_string(),
+                transitioned_by: "test".to_string(),
+                kickstart_started_at: None,
+                kickstart_completed_at: Some(Utc::now()),
+                reset_at: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: None,
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Lagoon Complete".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "component_test".to_string(),
+                source_kind: "custom_interview".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: serde_json::json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: None,
+                stability_class: "stable".to_string(),
+                category: "foundational_value".to_string(),
+                item_key: "value:clarity".to_string(),
+                value_text: "clarity".to_string(),
+                confidence: 0.95,
+                weight: Some(0.9),
+                provenance_kind: "component_test".to_string(),
+                source_kind: "custom_interview".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: serde_json::json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+
+        let mut trigger = sample_conscious_context().trigger;
+        trigger.received_at = Utc::now();
+        trigger.ingress.occurred_at = trigger.received_at;
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id: trigger.execution_id,
+                trace_id: trigger.trace_id,
+                trigger_kind: "identity_context_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "identity_context_test" }),
+            },
+        )
+        .await?;
+
+        let assembled = context::assemble_foreground_context(
+            &ctx.pool,
+            &config,
+            trigger,
+            context::ContextAssemblyOptions::default(),
+        )
+        .await?;
+
+        assert_eq!(
+            assembled.context.self_model.identity_lifecycle.state,
+            IdentityLifecycleState::CompleteIdentityActive
+        );
+        assert!(
+            !assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart
+                .is_none()
+        );
+
+        let identity = assembled
+            .context
+            .self_model
+            .identity
+            .as_ref()
+            .expect("complete identity should inject compact identity snapshot");
+        assert_eq!(identity.identity_summary, "Lagoon Complete");
+        assert_eq!(identity.values, vec!["clarity".to_string()]);
+        assert_eq!(
+            assembled.metadata.identity_lifecycle_state,
+            "complete_identity_active"
+        );
+        assert!(!assembled.metadata.identity_kickstart_available);
         Ok(())
     })
     .await
@@ -2962,6 +3139,8 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
             preferences: vec!["concise".to_string()],
             current_goals: vec!["support_the_user".to_string()],
             current_subgoals: vec!["reply_to_current_message".to_string()],
+            identity: None,
+            identity_lifecycle: Default::default(),
         },
         internal_state: contracts::InternalStateSnapshot {
             load_pct: 15,

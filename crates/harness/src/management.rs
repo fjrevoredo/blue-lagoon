@@ -7,8 +7,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{
-    BackgroundTrigger, BackgroundTriggerKind, ChannelKind, ScheduledForegroundLastOutcome,
-    ScheduledForegroundTaskStatus, UnconsciousJobKind,
+    BackgroundTrigger, BackgroundTriggerKind, CanonicalProposal, CanonicalProposalKind,
+    CanonicalProposalPayload, CanonicalTargetKind, ChannelKind, CompactIdentitySnapshot,
+    IdentityDeltaOperation, IdentityDeltaProposal, IdentityEvidenceRef, IdentityItemCategory,
+    IdentityItemDelta, IdentityItemSource, IdentityLifecycleState, IdentityMergePolicy,
+    IdentityStabilityClass, ProposalConflictPosture, ProposalEvaluationOutcome, ProposalProvenance,
+    ProposalProvenanceKind, ScheduledForegroundLastOutcome, ScheduledForegroundTaskStatus,
+    UnconsciousJobKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -22,7 +27,8 @@ use crate::{
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     causal_links,
     config::RuntimeConfig,
-    db, governed_actions, migration, model_calls, model_gateway, recovery, scheduled_foreground,
+    continuity, db, execution, governed_actions, identity, migration, model_calls, model_gateway,
+    proposal, recovery, scheduled_foreground,
     schema::{self, SchemaCompatibility, SchemaPolicy},
     worker, workspace,
 };
@@ -491,6 +497,132 @@ pub struct SuperviseWorkerLeasesRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct IdentityResetRequest {
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResetReport {
+    pub trace_id: Uuid,
+    pub reset_at: DateTime<Utc>,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub previous_lifecycle_state: Option<String>,
+    pub lifecycle_state: String,
+    pub superseded_identity_item_count: u32,
+    pub cancelled_interview_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityStatusReport {
+    pub lifecycle_state: String,
+    pub lifecycle_status: Option<String>,
+    pub lifecycle_transition_reason: Option<String>,
+    pub kickstart_available: bool,
+    pub active_item_count: u32,
+    pub stable_item_count: u32,
+    pub evolving_item_count: u32,
+    pub boundary_count: u32,
+    pub value_count: u32,
+    pub self_description_present: bool,
+    pub compact_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityShowReport {
+    pub status: IdentityStatusReport,
+    pub compact_identity: CompactIdentitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityHistorySummary {
+    pub identity_item_id: Uuid,
+    pub proposal_id: Option<Uuid>,
+    pub trace_id: Option<Uuid>,
+    pub stability_class: String,
+    pub category: String,
+    pub item_key: String,
+    pub value_text: String,
+    pub status: String,
+    pub supersedes_item_id: Option<Uuid>,
+    pub superseded_by_item_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityDiagnosticSummary {
+    pub identity_diagnostic_id: Uuid,
+    pub diagnostic_kind: String,
+    pub severity: String,
+    pub status: String,
+    pub identity_item_id: Option<Uuid>,
+    pub proposal_id: Option<Uuid>,
+    pub trace_id: Option<Uuid>,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityEditProposalRequest {
+    pub actor_ref: String,
+    pub reason: String,
+    pub operation: String,
+    pub stability_class: String,
+    pub category: String,
+    pub item_key: String,
+    pub value: String,
+    pub confidence_pct: u8,
+    pub weight_pct: Option<u8>,
+    pub target_identity_item_id: Option<Uuid>,
+    pub confirm_stable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityEditResolutionRequest {
+    pub proposal_id: Uuid,
+    pub actor_ref: String,
+    pub decision: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditProposalReport {
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub proposal_id: Uuid,
+    pub status: String,
+    pub validation_reason: String,
+    pub stable_identity_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditProposalSummary {
+    pub proposal_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub status: String,
+    pub confidence_pct: u8,
+    pub category: Option<String>,
+    pub item_key: Option<String>,
+    pub value_text: String,
+    pub rationale: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditResolutionReport {
+    pub proposal_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub decision: String,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpsertScheduledForegroundTaskRequest {
     pub task_key: String,
     pub internal_principal_ref: String,
@@ -558,6 +690,386 @@ pub async fn load_schema_upgrade_assessment(
 ) -> Result<SchemaUpgradeAssessmentReport> {
     let pool = db::connect(config).await?;
     inspect_schema_upgrade_assessment(&pool, config).await
+}
+
+pub async fn load_identity_status(config: &RuntimeConfig) -> Result<IdentityStatusReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    load_identity_status_from_pool(&pool).await
+}
+
+pub async fn load_identity_show(config: &RuntimeConfig) -> Result<IdentityShowReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let status = load_identity_status_from_pool(&pool).await?;
+    let compact_identity = identity::reconstruct_compact_identity_snapshot(&pool, 64).await?;
+    Ok(IdentityShowReport {
+        status,
+        compact_identity,
+    })
+}
+
+pub async fn list_identity_history(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityHistorySummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT identity_item_id, proposal_id, trace_id, stability_class, category, item_key,
+               value_text, status, supersedes_item_id, superseded_by_item_id, created_at,
+               updated_at
+        FROM identity_items
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(IdentityHistorySummary {
+                identity_item_id: row.try_get("identity_item_id")?,
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                stability_class: row.try_get("stability_class")?,
+                category: row.try_get("category")?,
+                item_key: row.try_get("item_key")?,
+                value_text: row.try_get("value_text")?,
+                status: row.try_get("status")?,
+                supersedes_item_id: row.try_get("supersedes_item_id")?,
+                superseded_by_item_id: row.try_get("superseded_by_item_id")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn list_identity_diagnostics(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityDiagnosticSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT identity_diagnostic_id, diagnostic_kind, severity, status, identity_item_id,
+               proposal_id, trace_id, message, created_at
+        FROM identity_diagnostics
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(IdentityDiagnosticSummary {
+                identity_diagnostic_id: row.try_get("identity_diagnostic_id")?,
+                diagnostic_kind: row.try_get("diagnostic_kind")?,
+                severity: row.try_get("severity")?,
+                status: row.try_get("status")?,
+                identity_item_id: row.try_get("identity_item_id")?,
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                message: row.try_get("message")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn propose_identity_edit(
+    config: &RuntimeConfig,
+    request: IdentityEditProposalRequest,
+) -> Result<IdentityEditProposalReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity edit actor_ref must not be empty");
+    }
+    let reason = request.reason.trim();
+    if reason.is_empty() {
+        bail!("identity edit reason must not be empty");
+    }
+
+    let stability_class = parse_identity_stability_class(&request.stability_class)?;
+    let stable_identity_change = matches!(stability_class, IdentityStabilityClass::Stable);
+    if stable_identity_change && !request.confirm_stable {
+        bail!("stable identity edit proposals require --confirm-stable");
+    }
+
+    let operation = parse_identity_delta_operation(&request.operation)?;
+    let category = parse_identity_item_category(&request.category)?;
+    let now = Utc::now();
+    let trace_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    let proposal_id = Uuid::now_v7();
+    let proposal = CanonicalProposal {
+        proposal_id,
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: request.confidence_pct,
+        conflict_posture: match operation {
+            IdentityDeltaOperation::Revise => ProposalConflictPosture::Revises,
+            IdentityDeltaOperation::Supersede => ProposalConflictPosture::Supersedes,
+            _ => ProposalConflictPosture::Independent,
+        },
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(reason.to_string()),
+        valid_from: Some(now),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![trace_id],
+            source_episode_id: None,
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+            item_deltas: vec![IdentityItemDelta {
+                operation,
+                stability_class,
+                category,
+                item_key: request.item_key.trim().to_string(),
+                value: request.value.trim().to_string(),
+                confidence_pct: request.confidence_pct,
+                weight_pct: request.weight_pct,
+                source: IdentityItemSource::OperatorAuthored,
+                merge_policy: if stable_identity_change {
+                    IdentityMergePolicy::ApprovalRequired
+                } else {
+                    IdentityMergePolicy::Revisable
+                },
+                evidence_refs: vec![IdentityEvidenceRef {
+                    source_kind: "operator".to_string(),
+                    source_id: None,
+                    summary: reason.to_string(),
+                }],
+                valid_from: Some(now),
+                valid_to: None,
+                target_identity_item_id: request.target_identity_item_id,
+            }],
+            self_description_delta: None,
+            interview_action: None,
+            rationale: reason.to_string(),
+        }),
+    };
+
+    let validation = proposal::validate_proposal(&proposal);
+    if validation.outcome == ProposalEvaluationOutcome::Rejected {
+        bail!(validation.reason);
+    }
+
+    execution::insert(
+        &pool,
+        &execution::NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "operator_identity_edit".to_string(),
+            synthetic_trigger: Some("identity_edit_proposal".to_string()),
+            status: "completed".to_string(),
+            request_payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason,
+                "proposal_id": proposal_id,
+            }),
+        },
+    )
+    .await?;
+    continuity::insert_proposal(
+        &pool,
+        &continuity::NewProposalRecord {
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            source_ingress_id: None,
+            source_loop_kind: "operator".to_string(),
+            proposal_kind: "identity_delta".to_string(),
+            canonical_target: "identity_items".to_string(),
+            status: "pending_operator_review".to_string(),
+            confidence: f64::from(request.confidence_pct) / 100.0,
+            conflict_posture: conflict_posture_as_str(proposal.conflict_posture).to_string(),
+            subject_ref: proposal.subject_ref.clone(),
+            content_text: request.value.trim().to_string(),
+            rationale: proposal.rationale.clone(),
+            valid_from: proposal.valid_from,
+            valid_to: None,
+            supersedes_artifact_id: None,
+            supersedes_artifact_kind: None,
+            payload: serde_json::to_value(&proposal.payload)?,
+        },
+    )
+    .await?;
+    continuity::insert_merge_decision(
+        &pool,
+        &continuity::NewMergeDecision {
+            merge_decision_id: Uuid::now_v7(),
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            decision_kind: "pending_operator_review".to_string(),
+            decision_reason: validation.reason.clone(),
+            accepted_memory_artifact_id: None,
+            accepted_self_model_artifact_id: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "stable_identity_change": stable_identity_change,
+            }),
+        },
+    )
+    .await?;
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_edit_proposed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "proposal_id": proposal_id,
+                "stable_identity_change": stable_identity_change,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(IdentityEditProposalReport {
+        trace_id,
+        execution_id,
+        proposal_id,
+        status: "pending_operator_review".to_string(),
+        validation_reason: validation.reason,
+        stable_identity_change,
+    })
+}
+
+pub async fn list_identity_edit_proposals(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityEditProposalSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT proposal_id, trace_id, execution_id, status, confidence, content_text,
+               rationale, payload_json, created_at
+        FROM proposals
+        WHERE proposal_kind = 'identity_delta'
+          AND canonical_target = 'identity_items'
+          AND source_loop_kind = 'operator'
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let payload: JsonValue = row.try_get("payload_json")?;
+            Ok(IdentityEditProposalSummary {
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                execution_id: row.try_get("execution_id")?,
+                status: row.try_get("status")?,
+                confidence_pct: pct_from_f64(row.try_get::<f64, _>("confidence")?),
+                category: payload
+                    .pointer("/value/item_deltas/0/category")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                item_key: payload
+                    .pointer("/value/item_deltas/0/item_key")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                value_text: row.try_get("content_text")?,
+                rationale: row.try_get("rationale")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn resolve_identity_edit_proposal(
+    config: &RuntimeConfig,
+    request: IdentityEditResolutionRequest,
+) -> Result<IdentityEditResolutionReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity edit resolution actor_ref must not be empty");
+    }
+    let decision = request.decision.trim();
+    if decision != "approve" && decision != "reject" {
+        bail!("identity edit resolution decision must be approve or reject");
+    }
+
+    let proposal = load_identity_edit_proposal(&pool, request.proposal_id).await?;
+    let reason = request
+        .reason
+        .unwrap_or_else(|| format!("operator {decision}"));
+
+    if decision == "reject" {
+        sqlx::query("UPDATE proposals SET status = 'rejected' WHERE proposal_id = $1")
+            .bind(request.proposal_id)
+            .execute(&pool)
+            .await?;
+        continuity::update_merge_decision_outcome(&pool, request.proposal_id, "rejected", &reason)
+            .await?;
+        return Ok(IdentityEditResolutionReport {
+            proposal_id: request.proposal_id,
+            trace_id: proposal.0.trace_id,
+            execution_id: proposal.0.execution_id,
+            decision: decision.to_string(),
+            status: "rejected".to_string(),
+            reason,
+        });
+    }
+
+    let context = proposal::ProposalProcessingContext {
+        trace_id: proposal.0.trace_id,
+        execution_id: proposal.0.execution_id,
+        episode_id: None,
+        source_ingress_id: None,
+        source_loop_kind: "operator".to_string(),
+    };
+    let evaluation =
+        identity::apply_identity_delta_proposal_merge(&pool, &context, &proposal.1).await?;
+    let status = if evaluation.outcome == ProposalEvaluationOutcome::Accepted {
+        "merged"
+    } else {
+        "rejected"
+    };
+    sqlx::query("UPDATE proposals SET status = $2 WHERE proposal_id = $1")
+        .bind(request.proposal_id)
+        .bind(status)
+        .execute(&pool)
+        .await?;
+
+    Ok(IdentityEditResolutionReport {
+        proposal_id: request.proposal_id,
+        trace_id: proposal.0.trace_id,
+        execution_id: proposal.0.execution_id,
+        decision: decision.to_string(),
+        status: status.to_string(),
+        reason: evaluation.reason,
+    })
 }
 
 pub async fn load_operational_health_summary(
@@ -686,6 +1198,155 @@ pub async fn supervise_worker_leases(
             .into_iter()
             .map(recovered_worker_lease_summary)
             .collect(),
+    })
+}
+
+pub async fn reset_identity(
+    config: &RuntimeConfig,
+    request: IdentityResetRequest,
+) -> Result<IdentityResetReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    if !request.force {
+        bail!("identity reset requires --force");
+    }
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity reset actor_ref must not be empty");
+    }
+
+    let trace_id = Uuid::now_v7();
+    let reason = request.reason.clone();
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_reset_requested".to_string(),
+            severity: "warn".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "force": request.force,
+            }),
+        },
+    )
+    .await?;
+
+    let outcome =
+        match identity::reset_to_bootstrap(&pool, trace_id, actor_ref, reason.as_deref()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = audit::insert(
+                    &pool,
+                    &NewAuditEvent {
+                        loop_kind: "operator".to_string(),
+                        subsystem: "management".to_string(),
+                        event_kind: "management_identity_reset_failed".to_string(),
+                        severity: "error".to_string(),
+                        trace_id,
+                        execution_id: None,
+                        worker_pid: None,
+                        payload: json!({
+                            "actor_ref": actor_ref,
+                            "reason": reason.clone(),
+                            "error": error.to_string(),
+                        }),
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        };
+
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_reset_completed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "previous_lifecycle_state": outcome.previous_lifecycle_state.clone(),
+                "lifecycle_state": "bootstrap_seed_only",
+                "superseded_identity_item_count": outcome.superseded_identity_item_count,
+                "cancelled_interview_count": outcome.cancelled_interview_count,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(IdentityResetReport {
+        trace_id,
+        reset_at: outcome.reset_at,
+        actor_ref: actor_ref.to_string(),
+        reason,
+        previous_lifecycle_state: outcome.previous_lifecycle_state,
+        lifecycle_state: "bootstrap_seed_only".to_string(),
+        superseded_identity_item_count: outcome.superseded_identity_item_count,
+        cancelled_interview_count: outcome.cancelled_interview_count,
+    })
+}
+
+async fn load_identity_status_from_pool(pool: &PgPool) -> Result<IdentityStatusReport> {
+    let lifecycle = identity::get_current_lifecycle(pool).await?;
+    let compact_identity = identity::reconstruct_compact_identity_snapshot(pool, 64).await?;
+    let active_item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active'")
+            .fetch_one(pool)
+            .await?;
+    let stable_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active' AND stability_class = 'stable'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let evolving_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active' AND stability_class = 'evolving'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let lifecycle_state = lifecycle
+        .as_ref()
+        .map(|record| record.lifecycle_state.clone())
+        .unwrap_or_else(|| "bootstrap_seed_only".to_string());
+    let compact_summary = if compact_identity.identity_summary.trim().is_empty() {
+        "(not formed)".to_string()
+    } else {
+        compact_identity.identity_summary.clone()
+    };
+
+    Ok(IdentityStatusReport {
+        kickstart_available: matches!(
+            lifecycle_state.as_str(),
+            "bootstrap_seed_only" | "identity_kickstart_in_progress"
+        ),
+        lifecycle_status: lifecycle.as_ref().map(|record| record.status.clone()),
+        lifecycle_transition_reason: lifecycle
+            .as_ref()
+            .map(|record| record.transition_reason.clone()),
+        lifecycle_state,
+        active_item_count: active_item_count.try_into().unwrap_or(u32::MAX),
+        stable_item_count: stable_item_count.try_into().unwrap_or(u32::MAX),
+        evolving_item_count: evolving_item_count.try_into().unwrap_or(u32::MAX),
+        boundary_count: compact_identity
+            .boundaries
+            .len()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        value_count: compact_identity.values.len().try_into().unwrap_or(u32::MAX),
+        self_description_present: compact_identity.self_description.is_some(),
+        compact_summary,
     })
 }
 
@@ -2646,6 +3307,143 @@ fn audit_payload_summary(payload: &JsonValue) -> Option<String> {
 
 pub fn default_list_limit() -> u32 {
     DEFAULT_LIST_LIMIT
+}
+
+#[derive(Debug, Clone)]
+struct LoadedIdentityEditProposal {
+    trace_id: Uuid,
+    execution_id: Uuid,
+    confidence_pct: u8,
+    conflict_posture: ProposalConflictPosture,
+    subject_ref: String,
+    rationale: Option<String>,
+    valid_from: Option<DateTime<Utc>>,
+}
+
+async fn load_identity_edit_proposal(
+    pool: &PgPool,
+    proposal_id: Uuid,
+) -> Result<(LoadedIdentityEditProposal, CanonicalProposal)> {
+    let row = sqlx::query(
+        r#"
+        SELECT trace_id, execution_id, status, confidence, conflict_posture, subject_ref,
+               rationale, valid_from, payload_json
+        FROM proposals
+        WHERE proposal_id = $1
+          AND proposal_kind = 'identity_delta'
+          AND canonical_target = 'identity_items'
+          AND source_loop_kind = 'operator'
+        "#,
+    )
+    .bind(proposal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("identity edit proposal {proposal_id} was not found"))?;
+    let status: String = row.try_get("status")?;
+    if status != "pending_operator_review" {
+        bail!("identity edit proposal {proposal_id} is not pending operator review");
+    }
+    let payload: CanonicalProposalPayload = serde_json::from_value(row.try_get("payload_json")?)?;
+    let conflict_posture = parse_proposal_conflict_posture(row.try_get("conflict_posture")?)?;
+    let loaded = LoadedIdentityEditProposal {
+        trace_id: row.try_get("trace_id")?,
+        execution_id: row.try_get("execution_id")?,
+        confidence_pct: pct_from_f64(row.try_get("confidence")?),
+        conflict_posture,
+        subject_ref: row.try_get("subject_ref")?,
+        rationale: row.try_get("rationale")?,
+        valid_from: row.try_get("valid_from")?,
+    };
+    let proposal = CanonicalProposal {
+        proposal_id,
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: loaded.confidence_pct,
+        conflict_posture: loaded.conflict_posture,
+        subject_ref: loaded.subject_ref.clone(),
+        rationale: loaded.rationale.clone(),
+        valid_from: loaded.valid_from,
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![loaded.trace_id],
+            source_episode_id: None,
+        },
+        payload,
+    };
+    Ok((loaded, proposal))
+}
+
+fn parse_identity_delta_operation(value: &str) -> Result<IdentityDeltaOperation> {
+    match value {
+        "add" => Ok(IdentityDeltaOperation::Add),
+        "reinforce" => Ok(IdentityDeltaOperation::Reinforce),
+        "weaken" => Ok(IdentityDeltaOperation::Weaken),
+        "revise" => Ok(IdentityDeltaOperation::Revise),
+        "supersede" => Ok(IdentityDeltaOperation::Supersede),
+        "expire" => Ok(IdentityDeltaOperation::Expire),
+        _ => bail!("unsupported identity edit operation {value}"),
+    }
+}
+
+fn parse_identity_stability_class(value: &str) -> Result<IdentityStabilityClass> {
+    match value {
+        "stable" => Ok(IdentityStabilityClass::Stable),
+        "evolving" => Ok(IdentityStabilityClass::Evolving),
+        "transient_projection" => Ok(IdentityStabilityClass::TransientProjection),
+        _ => bail!("unsupported identity stability class {value}"),
+    }
+}
+
+fn parse_identity_item_category(value: &str) -> Result<IdentityItemCategory> {
+    match value {
+        "name" => Ok(IdentityItemCategory::Name),
+        "identity_form" => Ok(IdentityItemCategory::IdentityForm),
+        "role" => Ok(IdentityItemCategory::Role),
+        "archetype" => Ok(IdentityItemCategory::Archetype),
+        "origin_backstory" => Ok(IdentityItemCategory::OriginBackstory),
+        "age_framing" => Ok(IdentityItemCategory::AgeFraming),
+        "foundational_trait" => Ok(IdentityItemCategory::FoundationalTrait),
+        "foundational_value" => Ok(IdentityItemCategory::FoundationalValue),
+        "enduring_boundary" => Ok(IdentityItemCategory::EnduringBoundary),
+        "default_communication_style" => Ok(IdentityItemCategory::DefaultCommunicationStyle),
+        "preference" => Ok(IdentityItemCategory::Preference),
+        "like" => Ok(IdentityItemCategory::Like),
+        "dislike" => Ok(IdentityItemCategory::Dislike),
+        "habit" => Ok(IdentityItemCategory::Habit),
+        "routine" => Ok(IdentityItemCategory::Routine),
+        "learned_tendency" => Ok(IdentityItemCategory::LearnedTendency),
+        "autobiographical_refinement" => Ok(IdentityItemCategory::AutobiographicalRefinement),
+        "recurring_self_description" => Ok(IdentityItemCategory::RecurringSelfDescription),
+        "interaction_style_adaptation" => Ok(IdentityItemCategory::InteractionStyleAdaptation),
+        "goal" => Ok(IdentityItemCategory::Goal),
+        "subgoal" => Ok(IdentityItemCategory::Subgoal),
+        _ => bail!("unsupported identity item category {value}"),
+    }
+}
+
+fn parse_proposal_conflict_posture(value: String) -> Result<ProposalConflictPosture> {
+    match value.as_str() {
+        "independent" => Ok(ProposalConflictPosture::Independent),
+        "revises" => Ok(ProposalConflictPosture::Revises),
+        "supersedes" => Ok(ProposalConflictPosture::Supersedes),
+        "conflicts" => Ok(ProposalConflictPosture::Conflicts),
+        _ => bail!("unsupported proposal conflict posture {value}"),
+    }
+}
+
+fn conflict_posture_as_str(value: ProposalConflictPosture) -> &'static str {
+    match value {
+        ProposalConflictPosture::Independent => "independent",
+        ProposalConflictPosture::Revises => "revises",
+        ProposalConflictPosture::Supersedes => "supersedes",
+        ProposalConflictPosture::Conflicts => "conflicts",
+    }
+}
+
+fn pct_from_f64(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 fn inspect_worker_status(config: &RuntimeConfig) -> WorkerStatusReport {

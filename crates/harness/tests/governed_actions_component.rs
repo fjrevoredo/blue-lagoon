@@ -16,6 +16,7 @@ use harness::{
     approval::{self, ApprovalResolutionAttempt, NewApprovalRequestRecord},
     audit,
     governed_actions::{self, GovernedActionPlanningOutcome},
+    identity,
     workspace::{
         self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun,
         NewWorkspaceScriptVersion, UpdateWorkspaceArtifact, UpdateWorkspaceScriptRunStatus,
@@ -152,6 +153,72 @@ async fn governed_action_planning_persists_planned_and_blocked_outcomes() -> Res
         );
         assert_eq!(
             blocked.outcome.status,
+            contracts::GovernedActionStatus::Blocked
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_boundary_blocks_matching_governed_action_policy() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(Uuid::now_v7()),
+                stability_class: "stable".to_string(),
+                category: "enduring_boundary".to_string(),
+                item_key: "network_governance".to_string(),
+                value_text: "Do not use network access for governed actions.".to_string(),
+                confidence: 1.0,
+                weight: Some(1.0),
+                provenance_kind: "operator_authored".to_string(),
+                source_kind: "operator_authored".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({ "component_test": true }),
+            },
+        )
+        .await?;
+
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Fetch under identity boundary".to_string(),
+                    rationale: Some("Verify identity boundary policy.".to_string()),
+                    action_kind: GovernedActionKind::WebFetch,
+                    requested_risk_tier: None,
+                    capability_scope: web_fetch_capability_scope(),
+                    payload: contracts::GovernedActionPayload::WebFetch(sample_web_fetch_action()),
+                },
+            },
+        )
+        .await?;
+
+        let blocked = match outcome {
+            GovernedActionPlanningOutcome::Blocked(blocked) => blocked,
+            other => panic!("expected identity boundary to block action, got {other:?}"),
+        };
+        let reason = blocked.record.blocked_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("identity boundary"));
+        assert!(reason.contains("network access"));
+        assert_eq!(
+            blocked.record.status,
             contracts::GovernedActionStatus::Blocked
         );
         Ok(())

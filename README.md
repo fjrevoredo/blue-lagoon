@@ -120,6 +120,15 @@ cargo run -p runtime -- admin approvals resolve \
   --reason "approved by operator"
 ```
 
+Inspect and manage identity:
+
+```bash
+cargo run -p runtime -- admin identity status
+cargo run -p runtime -- admin identity show
+cargo run -p runtime -- admin identity history list
+cargo run -p runtime -- admin identity edit list
+```
+
 Inspect or run background maintenance:
 
 ```bash

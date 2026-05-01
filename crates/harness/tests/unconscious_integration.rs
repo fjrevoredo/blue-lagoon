@@ -341,7 +341,7 @@ async fn background_runtime_flows_wake_signal_to_foreground_conversion_end_to_en
             status: 200,
             body: json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "message": { "content": wake_signal_reflection_output_content() },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -419,11 +419,10 @@ async fn background_runtime_flows_wake_signal_to_foreground_conversion_end_to_en
 
         let active_self_model_artifacts =
             continuity::list_active_self_model_artifacts(&ctx.pool, 10).await?;
-        assert_eq!(active_self_model_artifacts.len(), 1);
-        assert!(active_self_model_artifacts[0]
-            .preferences
-            .iter()
-            .any(|value| value.contains("concise progress updates")));
+        assert!(active_self_model_artifacts.is_empty());
+
+        let proposals = continuity::list_proposals_for_execution(&ctx.pool, execution_id).await?;
+        assert!(proposals.is_empty());
 
         let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
         assert!(
@@ -436,6 +435,117 @@ async fn background_runtime_flows_wake_signal_to_foreground_conversion_end_to_en
                 .iter()
                 .any(|event| event.event_kind == "wake_signal_foreground_conversion_staged")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn background_runtime_defers_non_urgent_wake_signal_under_degraded_internal_state()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.telegram = Some(sample_telegram_config());
+        config.model_gateway = Some(sample_model_gateway_config(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_DEGRADED_WAKE_API_KEY",
+        ));
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": wake_signal_reflection_output_content() },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 16,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+
+        seed_critical_operational_diagnostics(&ctx.pool, 9).await?;
+        let background_job_id = seed_planned_background_job_with_kind(
+            &ctx.pool,
+            Utc::now() - ChronoDuration::seconds(1),
+            UnconsciousJobKind::SelfModelReflection,
+        )
+        .await?;
+
+        let outcome = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_DEGRADED_WAKE_API_KEY",
+            Some("test-unconscious-degraded-wake-key"),
+            || async {
+                runtime::run_harness_once_with_transport(
+                    &config,
+                    HarnessOptions {
+                        once: true,
+                        idle: false,
+                        background_once: true,
+                        synthetic_trigger: None,
+                    },
+                    &transport,
+                )
+                .await
+            },
+        )
+        .await?;
+        let execution_id = match outcome {
+            HarnessOutcome::BackgroundCompleted {
+                background_job_id: executed_job_id,
+                execution_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(executed_job_id, background_job_id);
+                assert!(summary.contains("wake_signals=1"));
+                assert!(summary.contains("deferred=1"));
+                execution_id
+            }
+            other => panic!("expected background completion outcome, got {other:?}"),
+        };
+
+        let signal_row = sqlx::query(
+            r#"
+            SELECT wake_signal_id
+            FROM wake_signals
+            WHERE execution_id = $1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let wake_signal_id: Uuid = signal_row.get("wake_signal_id");
+        let stored_signal = background::get_wake_signal(&ctx.pool, wake_signal_id).await?;
+        assert_eq!(stored_signal.status, background::WakeSignalStatus::Deferred);
+        assert!(
+            stored_signal
+                .decision
+                .expect("deferred signal should persist policy decision")
+                .reason
+                .contains("internal reliability")
+        );
+
+        let staged_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_events
+            WHERE external_event_id = $1
+            "#,
+        )
+        .bind(format!("wake-signal:{wake_signal_id}"))
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(staged_count, 0);
         Ok(())
     })
     .await
@@ -689,6 +799,31 @@ async fn seed_planned_background_job_with_kind(
     Ok(background_job_id)
 }
 
+async fn seed_critical_operational_diagnostics(pool: &sqlx::PgPool, count: usize) -> Result<()> {
+    let trace_id = Uuid::now_v7();
+    let execution_id = seed_execution(pool, trace_id).await?;
+    for index in 0..count {
+        recovery::insert_operational_diagnostic(
+            pool,
+            &recovery::NewOperationalDiagnostic {
+                operational_diagnostic_id: Uuid::now_v7(),
+                trace_id: Some(trace_id),
+                execution_id: Some(execution_id),
+                subsystem: "background_execution".to_string(),
+                severity: recovery::OperationalDiagnosticSeverity::Critical,
+                reason_code: "internal_state_degraded_test".to_string(),
+                summary: "critical diagnostic seeded for internal-state wake deferral".to_string(),
+                diagnostic_payload: json!({
+                    "source": "unconscious_integration",
+                    "index": index
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn sample_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
     ModelGatewayConfig {
         foreground: ForegroundModelRouteConfig {
@@ -717,6 +852,23 @@ fn sample_telegram_config() -> TelegramConfig {
             internal_conversation_ref: "telegram-primary".to_string(),
         }),
     }
+}
+
+fn wake_signal_reflection_output_content() -> String {
+    json!({
+        "identity_delta": null,
+        "no_change_rationale": "No identity delta was warranted; foreground attention is useful for maintenance insight review.",
+        "diagnostics": [],
+        "wake_signals": [{
+            "signal_id": Uuid::now_v7(),
+            "reason": "maintenance_insight_ready",
+            "priority": "low",
+            "reason_code": "maintenance_insight_ready",
+            "summary": "Background self-model reflection produced a maintenance insight.",
+            "payload_ref": "background_job:latest"
+        }]
+    })
+    .to_string()
 }
 
 async fn read_pid_file(path: &std::path::Path) -> Result<u32> {

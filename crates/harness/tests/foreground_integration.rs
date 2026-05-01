@@ -2,9 +2,12 @@ mod support;
 
 use anyhow::Result;
 use contracts::{
-    ApprovalRequestStatus, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
+    ApprovalRequestStatus, CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload,
+    CanonicalTargetKind, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
     ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
-    GovernedActionKind, GovernedActionRiskTier, ModelProviderKind, NetworkAccessPosture,
+    GovernedActionKind, GovernedActionRiskTier, IdentityDeltaProposal, IdentityInterviewAnswer,
+    IdentityKickstartAction, IdentityLifecycleState, ModelProviderKind, NetworkAccessPosture,
+    ProposalConflictPosture, ProposalProvenance, ProposalProvenanceKind,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
@@ -13,7 +16,8 @@ use harness::{
         ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, ResolvedTelegramConfig,
         SelfModelConfig,
     },
-    execution, foreground, model_gateway, runtime, scheduled_foreground, telegram,
+    execution, foreground, identity, model_gateway, proposal, runtime, scheduled_foreground,
+    telegram,
 };
 use serial_test::serial;
 use sqlx::Row;
@@ -121,6 +125,253 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
                 .iter()
                 .any(|event| event.event_kind == "foreground_execution_completed")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_fixture_runtime_run_applies_predefined_identity_selection() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let identity_block = serde_json::json!({
+            "action": "select_predefined_identity",
+            "template_key": "continuity_operator",
+            "answer": serde_json::Value::Null,
+            "cancel_reason": serde_json::Value::Null,
+        });
+        let model_text = format!(
+            "Continuity Operator selected.\n```blue-lagoon-identity-kickstart\n{}\n```",
+            identity_block
+        );
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": model_text },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 21,
+                    "completion_tokens": 9
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("private_text_message.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(delivery.sent_messages()[0].text, "Continuity Operator selected.");
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should be current");
+        assert_eq!(lifecycle.lifecycle_state, "complete_identity_active");
+
+        let active_item_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM identity_items
+            WHERE status = 'active'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert!(active_item_count >= 21);
+
+        let proposal_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM proposals
+            WHERE proposal_kind = 'identity_delta'
+              AND canonical_target = 'identity_items'
+              AND status = 'accepted'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(proposal_count, 1);
+
+        let audit_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'canonical_write_applied'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(audit_count, 1);
+
+        let compact_identity = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert_eq!(compact_identity.identity_summary, "Blue Lagoon");
+        assert_eq!(
+            compact_identity.self_description.as_deref(),
+            Some("I am a continuity-oriented assistant that keeps context organized, follows through on commitments, and stays direct about state, limits, and next actions.")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let start_block = serde_json::json!({
+            "action": "start_custom_identity_interview",
+            "template_key": serde_json::Value::Null,
+            "answer": serde_json::Value::Null,
+            "cancel_reason": serde_json::Value::Null,
+        });
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": format!(
+                            "Let's build a custom identity.\n```blue-lagoon-identity-kickstart\n{}\n```",
+                            start_block
+                        )
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 21,
+                    "completion_tokens": 9
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("private_text_message.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages()[0].text, "Let's build a custom identity.");
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should be current");
+        assert_eq!(lifecycle.lifecycle_state, "identity_kickstart_in_progress");
+        let interview_id = lifecycle
+            .active_interview_id
+            .expect("custom interview should be active");
+        let interview = identity::get_identity_interview(&ctx.pool, interview_id)
+            .await?
+            .expect("interview should persist");
+        assert_eq!(interview.current_step, "name");
+
+        let execution_row = sqlx::query(
+            r#"
+            SELECT execution_id, trace_id
+            FROM execution_records
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let processing_context = proposal::ProposalProcessingContext {
+            trace_id: execution_row.get("trace_id"),
+            execution_id: execution_row.get("execution_id"),
+            episode_id: None,
+            source_ingress_id: None,
+            source_loop_kind: "conscious".to_string(),
+        };
+
+        for (step_key, answer_text) in [
+            ("name", "Lagoon Forge"),
+            ("identity_form", "focused AI workshop companion"),
+            ("archetype_role", "pragmatic builder"),
+            ("temperament", "steady, exact, and calm"),
+            ("communication_style", "brief and implementation-focused"),
+            ("backstory", "formed from long-running engineering sessions"),
+            ("age_framing", "new but accumulating durable experience"),
+            ("likes", "clear tasks and verified outcomes"),
+            ("dislikes", "performative uncertainty"),
+            ("values", "clarity and usefulness"),
+            ("boundaries", "never hide skipped checks"),
+            ("tendencies", "summarize state before changing direction"),
+            ("goals", "help finish correct work"),
+            ("relationship_to_user", "trusted technical copilot"),
+        ] {
+            let candidate = custom_identity_answer_proposal(step_key, answer_text);
+            let summary = proposal::apply_candidate_proposals(
+                &ctx.pool,
+                &config,
+                &processing_context,
+                "foreground_identity_interview",
+                None,
+                &[candidate],
+            )
+            .await?;
+            assert_eq!(summary.rejected_count, 0);
+            assert_eq!(summary.accepted_count, 1);
+        }
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should remain current");
+        assert_eq!(lifecycle.lifecycle_state, "complete_identity_active");
+        assert_eq!(lifecycle.active_interview_id, None);
+
+        let completed_interview = identity::get_identity_interview(&ctx.pool, interview_id)
+            .await?
+            .expect("interview should remain queryable");
+        assert_eq!(completed_interview.status, "completed");
+        assert_eq!(completed_interview.current_step, "completed");
+
+        let compact_identity = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert_eq!(compact_identity.identity_summary, "Lagoon Forge");
+        assert!(
+            compact_identity
+                .self_description
+                .as_deref()
+                .is_some_and(|description| description.contains("Lagoon Forge"))
+        );
+        assert!(compact_identity.stable_items.len() >= 10);
+        assert!(compact_identity.evolving_items.len() >= 6);
         Ok(())
     })
     .await
@@ -796,5 +1047,37 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             api_key: "provider-secret".to_string(),
             timeout_ms: 30_000,
         },
+    }
+}
+
+fn custom_identity_answer_proposal(step_key: &str, answer_text: &str) -> CanonicalProposal {
+    CanonicalProposal {
+        proposal_id: Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: 100,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(format!("Custom identity interview answer for {step_key}.")),
+        valid_from: Some(chrono::Utc::now()),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![Uuid::now_v7()],
+            source_episode_id: None,
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::IdentityKickstartInProgress,
+            item_deltas: Vec::new(),
+            self_description_delta: None,
+            interview_action: Some(IdentityKickstartAction::AnswerCustomInterview(
+                IdentityInterviewAnswer {
+                    step_key: step_key.to_string(),
+                    answer_text: answer_text.to_string(),
+                },
+            )),
+            rationale: format!("Persist custom identity interview answer for {step_key}."),
+        }),
     }
 }

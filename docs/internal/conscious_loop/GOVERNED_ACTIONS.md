@@ -25,10 +25,10 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 714), payload structs (line 739), `GovernedActionPayload` (line 867) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 24), `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 676), `governed_action_kind_as_str()` (line 718) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 442), `execute_inspect_workspace_artifact()` (line 773), `execute_create_workspace_script()` (line 1090), `execute_request_background_job()` (line 1290), `validate_capability_scope()` (line 1370), `governed_action_kind_as_str()` (line 2795), `CanonicalGovernedActionPayload` (line 2917) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 168), `governed_action_requires_approval()` (line 207) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1352), payload structs (line 1377), `GovernedActionPayload` (line 1505) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 739), `build_governed_action_proposals()` (line 823), `governed_action_kind_as_str()` (line 1003) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 482), `execute_inspect_workspace_artifact()` (line 826), `execute_create_workspace_script()` (line 1143), `execute_request_background_job()` (line 1361), `validate_capability_scope()` (line 1441), `governed_action_kind_as_str()` (line 2878), `CanonicalGovernedActionPayload` (line 3000) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 210), `evaluate_governed_action_identity_boundaries()` (line 217) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1314) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
@@ -181,6 +181,17 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 `requested_risk_tier` may raise the final tier, but it cannot lower the
 intrinsic tier computed by `policy::classify_governed_action_risk()`.
 
+### Identity Boundary Rules
+
+After capability-scope validation, planning and execution both load the compact
+identity snapshot and evaluate active identity boundaries through
+`policy::evaluate_governed_action_identity_boundaries()`. A matching enduring
+boundary can deterministically block network access, subprocess execution, or
+workspace write effects before approval or execution proceeds. This is a
+harness policy decision, not a model preference: the model can propose an
+action, but identity boundaries are rechecked by the harness at planning time
+and again immediately before execution.
+
 ### Extension Checklist
 
 Use `docs/internal/harness/TOOL_IMPLEMENTATION.md` for the full E2E workflow.
@@ -209,4 +220,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/causal-trace-explorer`, session 2026-04-30.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-01.*

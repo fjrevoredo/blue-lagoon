@@ -1,13 +1,17 @@
 use anyhow::{Result, bail};
 use chrono::Utc;
-use contracts::{ConsciousContext, EpisodeExcerpt, ForegroundRecoveryContext, ForegroundTrigger};
+use contracts::{
+    ConsciousContext, EpisodeExcerpt, ForegroundRecoveryContext, ForegroundTrigger,
+    IdentityKickstartActionKind, IdentityKickstartContext, IdentityLifecycleContext,
+    IdentityLifecycleState, SelfModelSnapshot, predefined_identity_templates,
+};
 use serde::Serialize;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
     config::RuntimeConfig,
-    foreground, retrieval,
+    foreground, identity, retrieval,
     self_model::{self, InternalStateSeed},
 };
 
@@ -51,6 +55,8 @@ pub struct ContextAssemblyMetadata {
     pub self_model_source_kind: String,
     pub self_model_canonical_artifact_id: Option<Uuid>,
     pub self_model_bootstrap_performed: bool,
+    pub identity_lifecycle_state: String,
+    pub identity_kickstart_available: bool,
     pub recent_history_limit: i64,
     pub selected_recent_history_count: usize,
     pub selected_recent_history_episode_ids: Vec<Uuid>,
@@ -86,10 +92,15 @@ pub async fn assemble_foreground_context(
         },
     )
     .await?;
-    let internal_state = self_model::build_internal_state_snapshot(
+    let mut self_model_snapshot = loaded_self_model.snapshot;
+    apply_identity_lifecycle_context(pool, &mut self_model_snapshot).await?;
+
+    let internal_state = self_model::derive_live_internal_state_snapshot(
+        pool,
         options.internal_state_seed,
         options.active_conditions,
-    );
+    )
+    .await?;
     let (trigger, trigger_text_truncated) =
         shape_trigger(trigger, options.limits.trigger_text_char_limit);
 
@@ -124,6 +135,11 @@ pub async fn assemble_foreground_context(
         },
         self_model_canonical_artifact_id: loaded_self_model.canonical_artifact_id,
         self_model_bootstrap_performed: loaded_self_model.bootstrap_performed,
+        identity_lifecycle_state: identity_lifecycle_state_as_str(
+            self_model_snapshot.identity_lifecycle.state,
+        )
+        .to_string(),
+        identity_kickstart_available: self_model_snapshot.identity_lifecycle.kickstart_available,
         recent_history_limit: options.limits.recent_history_limit,
         selected_recent_history_count: recent_history.len(),
         selected_recent_history_episode_ids: recent_history
@@ -160,7 +176,7 @@ pub async fn assemble_foreground_context(
             context_id: Uuid::now_v7(),
             assembled_at: Utc::now(),
             trigger,
-            self_model: loaded_self_model.snapshot,
+            self_model: self_model_snapshot,
             internal_state,
             recent_history,
             retrieved_context,
@@ -183,6 +199,99 @@ impl ContextAssemblyLimits {
             bail!("context history_message_char_limit must be greater than zero");
         }
         Ok(())
+    }
+}
+
+async fn apply_identity_lifecycle_context(
+    pool: &sqlx::PgPool,
+    snapshot: &mut SelfModelSnapshot,
+) -> Result<()> {
+    let Some(lifecycle) = identity::get_current_lifecycle(pool).await? else {
+        if snapshot.identity_lifecycle.state == IdentityLifecycleState::BootstrapSeedOnly {
+            snapshot.identity_lifecycle =
+                identity_lifecycle_context(IdentityLifecycleState::BootstrapSeedOnly, None);
+        }
+        return Ok(());
+    };
+
+    let state = identity_lifecycle_state_from_str(&lifecycle.lifecycle_state)?;
+    snapshot.identity_lifecycle = identity_lifecycle_context(state, lifecycle.active_interview_id);
+    if state == IdentityLifecycleState::IdentityKickstartInProgress
+        && let Some(interview_id) = lifecycle.active_interview_id
+        && let Some(interview) = identity::get_identity_interview(pool, interview_id).await?
+        && let Some(kickstart) = &mut snapshot.identity_lifecycle.kickstart
+    {
+        kickstart.next_step = Some(interview.current_step);
+        kickstart.resume_summary = Some(format!(
+            "custom identity interview {} is waiting for the next answer",
+            interview.identity_interview_id
+        ));
+    }
+
+    if state == IdentityLifecycleState::CompleteIdentityActive {
+        let compact_identity = identity::reconstruct_compact_identity_snapshot(pool, 32).await?;
+        if !compact_identity.stable_items.is_empty()
+            || !compact_identity.evolving_items.is_empty()
+            || compact_identity.self_description.is_some()
+        {
+            snapshot.identity = Some(compact_identity);
+        }
+    }
+
+    Ok(())
+}
+
+fn identity_lifecycle_context(
+    state: IdentityLifecycleState,
+    active_interview_id: Option<Uuid>,
+) -> IdentityLifecycleContext {
+    let kickstart = match state {
+        IdentityLifecycleState::BootstrapSeedOnly => Some(IdentityKickstartContext {
+            available_actions: vec![
+                IdentityKickstartActionKind::SelectPredefinedTemplate,
+                IdentityKickstartActionKind::StartCustomInterview,
+            ],
+            next_step: Some("choose_predefined_identity_or_start_custom_interview".to_string()),
+            resume_summary: None,
+            predefined_templates: predefined_identity_templates(),
+        }),
+        IdentityLifecycleState::IdentityKickstartInProgress => Some(IdentityKickstartContext {
+            available_actions: vec![
+                IdentityKickstartActionKind::AnswerCustomInterview,
+                IdentityKickstartActionKind::Cancel,
+            ],
+            next_step: Some("resume_identity_interview".to_string()),
+            resume_summary: active_interview_id
+                .map(|interview_id| format!("identity interview {interview_id} is in progress")),
+            predefined_templates: Vec::new(),
+        }),
+        IdentityLifecycleState::CompleteIdentityActive
+        | IdentityLifecycleState::IdentityResetPending => None,
+    };
+
+    IdentityLifecycleContext {
+        state,
+        kickstart_available: kickstart.is_some(),
+        kickstart,
+    }
+}
+
+fn identity_lifecycle_state_from_str(value: &str) -> Result<IdentityLifecycleState> {
+    match value {
+        "bootstrap_seed_only" => Ok(IdentityLifecycleState::BootstrapSeedOnly),
+        "identity_kickstart_in_progress" => Ok(IdentityLifecycleState::IdentityKickstartInProgress),
+        "complete_identity_active" => Ok(IdentityLifecycleState::CompleteIdentityActive),
+        "identity_reset_pending" => Ok(IdentityLifecycleState::IdentityResetPending),
+        _ => bail!("unknown identity lifecycle state: {value}"),
+    }
+}
+
+fn identity_lifecycle_state_as_str(state: IdentityLifecycleState) -> &'static str {
+    match state {
+        IdentityLifecycleState::BootstrapSeedOnly => "bootstrap_seed_only",
+        IdentityLifecycleState::IdentityKickstartInProgress => "identity_kickstart_in_progress",
+        IdentityLifecycleState::CompleteIdentityActive => "complete_identity_active",
+        IdentityLifecycleState::IdentityResetPending => "identity_reset_pending",
     }
 }
 

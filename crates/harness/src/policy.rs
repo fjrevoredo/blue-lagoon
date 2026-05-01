@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use contracts::{
-    BackgroundExecutionBudget, ForegroundBudget, GovernedActionKind, GovernedActionProposal,
-    GovernedActionRiskTier, IngressEventKind, NetworkAccessPosture, NormalizedIngress, WakeSignal,
-    WakeSignalDecision, WakeSignalDecisionKind, WakeSignalPriority,
+    BackgroundExecutionBudget, ForegroundBudget, GovernedActionKind, GovernedActionPayload,
+    GovernedActionProposal, GovernedActionRiskTier, IngressEventKind, NetworkAccessPosture,
+    NormalizedIngress, WakeSignal, WakeSignalDecision, WakeSignalDecisionKind, WakeSignalPriority,
 };
 
 use crate::config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig};
@@ -20,11 +20,14 @@ pub enum PolicyDecision {
     Denied { reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSignalEvaluationContext {
     pub pending_signal_count: u32,
     pub cooldown_active: bool,
     pub foreground_channel_available: bool,
+    pub internal_resource_pressure_pct: u8,
+    pub internal_reliability_pct: u8,
+    pub identity_boundaries: Vec<String>,
 }
 
 pub fn default_foreground_budget(config: &RuntimeConfig) -> ForegroundBudget {
@@ -211,6 +214,95 @@ pub fn governed_action_requires_approval(
     risk_tier >= config.governed_actions.approval_required_min_risk_tier
 }
 
+pub fn evaluate_governed_action_identity_boundaries(
+    proposal: &GovernedActionProposal,
+    boundaries: &[String],
+) -> PolicyDecision {
+    for boundary in boundaries {
+        let normalized = boundary.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if boundary_blocks_network(&normalized)
+            && (proposal.capability_scope.network != NetworkAccessPosture::Disabled
+                || proposal.action_kind == GovernedActionKind::WebFetch)
+        {
+            return PolicyDecision::Denied {
+                reason: format!(
+                    "identity boundary blocks governed action network access: {}",
+                    boundary.trim()
+                ),
+            };
+        }
+
+        if boundary_blocks_subprocess(&normalized)
+            && matches!(proposal.action_kind, GovernedActionKind::RunSubprocess)
+        {
+            return PolicyDecision::Denied {
+                reason: format!(
+                    "identity boundary blocks subprocess governed actions: {}",
+                    boundary.trim()
+                ),
+            };
+        }
+
+        if boundary_blocks_workspace_writes(&normalized)
+            && governed_action_has_workspace_write_effect(proposal)
+        {
+            return PolicyDecision::Denied {
+                reason: format!(
+                    "identity boundary blocks workspace write governed actions: {}",
+                    boundary.trim()
+                ),
+            };
+        }
+    }
+
+    PolicyDecision::Allowed
+}
+
+fn boundary_blocks_network(normalized: &str) -> bool {
+    normalized.contains("no network")
+        || normalized.contains("do not use network")
+        || normalized.contains("never use network")
+        || normalized.contains("avoid network access")
+        || normalized.contains("network access is disabled")
+        || normalized.contains("without network access")
+}
+
+fn boundary_blocks_subprocess(normalized: &str) -> bool {
+    normalized.contains("no subprocess")
+        || normalized.contains("do not run subprocess")
+        || normalized.contains("never run subprocess")
+        || normalized.contains("avoid subprocess")
+        || normalized.contains("without subprocess")
+}
+
+fn boundary_blocks_workspace_writes(normalized: &str) -> bool {
+    normalized.contains("no workspace writes")
+        || normalized.contains("do not write")
+        || normalized.contains("never write")
+        || normalized.contains("avoid workspace writes")
+        || normalized.contains("read-only")
+}
+
+fn governed_action_has_workspace_write_effect(proposal: &GovernedActionProposal) -> bool {
+    if !proposal.capability_scope.filesystem.write_roots.is_empty() {
+        return true;
+    }
+
+    matches!(
+        &proposal.payload,
+        GovernedActionPayload::CreateWorkspaceArtifact(_)
+            | GovernedActionPayload::UpdateWorkspaceArtifact(_)
+            | GovernedActionPayload::CreateWorkspaceScript(_)
+            | GovernedActionPayload::AppendWorkspaceScriptVersion(_)
+            | GovernedActionPayload::UpsertScheduledForegroundTask(_)
+            | GovernedActionPayload::RequestBackgroundJob(_)
+    )
+}
+
 pub fn evaluate_wake_signal(
     config: &RuntimeConfig,
     signal: &WakeSignal,
@@ -230,6 +322,39 @@ pub fn evaluate_wake_signal(
             signal_id: signal.signal_id,
             decision: WakeSignalDecisionKind::Deferred,
             reason: "wake-signal foreground conversion is disabled by policy".to_string(),
+        };
+    }
+
+    if identity_boundary_defers_wake_signal(&context.identity_boundaries)
+        && signal.priority != WakeSignalPriority::High
+    {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: "identity boundary defers non-urgent proactive foreground wake signals"
+                .to_string(),
+        };
+    }
+
+    if context.internal_resource_pressure_pct >= 85 && signal.priority != WakeSignalPriority::High {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: format!(
+                "non-urgent wake signal deferred because internal resource pressure is {}%",
+                context.internal_resource_pressure_pct
+            ),
+        };
+    }
+
+    if context.internal_reliability_pct <= 35 && signal.priority != WakeSignalPriority::High {
+        return WakeSignalDecision {
+            signal_id: signal.signal_id,
+            decision: WakeSignalDecisionKind::Deferred,
+            reason: format!(
+                "non-urgent wake signal deferred because internal reliability is {}%",
+                context.internal_reliability_pct
+            ),
         };
     }
 
@@ -264,6 +389,16 @@ pub fn evaluate_wake_signal(
         decision: WakeSignalDecisionKind::Accepted,
         reason: "wake signal satisfies configured foreground conversion policy".to_string(),
     }
+}
+
+fn identity_boundary_defers_wake_signal(boundaries: &[String]) -> bool {
+    boundaries.iter().any(|boundary| {
+        let normalized = boundary.trim().to_ascii_lowercase();
+        normalized.contains("do not proactively wake")
+            || normalized.contains("no proactive wake")
+            || normalized.contains("avoid proactive wake")
+            || normalized.contains("defer proactive")
+    })
 }
 
 #[cfg(test)]
@@ -650,6 +785,9 @@ mod tests {
                 pending_signal_count: 1,
                 cooldown_active: false,
                 foreground_channel_available: true,
+                internal_resource_pressure_pct: 10,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
             },
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
@@ -664,6 +802,9 @@ mod tests {
                 pending_signal_count: 1,
                 cooldown_active: false,
                 foreground_channel_available: false,
+                internal_resource_pressure_pct: 10,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
             },
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Rejected);
@@ -683,6 +824,9 @@ mod tests {
                 pending_signal_count: 1,
                 cooldown_active: true,
                 foreground_channel_available: true,
+                internal_resource_pressure_pct: 10,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
             },
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Deferred);
@@ -698,6 +842,9 @@ mod tests {
                 pending_signal_count: 1,
                 cooldown_active: true,
                 foreground_channel_available: true,
+                internal_resource_pressure_pct: 10,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
             },
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Accepted);
@@ -712,10 +859,45 @@ mod tests {
                 pending_signal_count: 8,
                 cooldown_active: false,
                 foreground_channel_available: true,
+                internal_resource_pressure_pct: 10,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
             },
         );
         assert_eq!(decision.decision, WakeSignalDecisionKind::Suppressed);
         assert!(decision.reason.contains("configured limit"));
+    }
+
+    #[test]
+    fn wake_signal_policy_defers_non_urgent_signal_under_degraded_internal_state() {
+        let decision = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::Normal),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: true,
+                internal_resource_pressure_pct: 90,
+                internal_reliability_pct: 100,
+                identity_boundaries: Vec::new(),
+            },
+        );
+        assert_eq!(decision.decision, WakeSignalDecisionKind::Deferred);
+        assert!(decision.reason.contains("resource pressure"));
+
+        let high_priority = evaluate_wake_signal(
+            &config(true),
+            &wake_signal(WakeSignalPriority::High),
+            WakeSignalEvaluationContext {
+                pending_signal_count: 1,
+                cooldown_active: false,
+                foreground_channel_available: true,
+                internal_resource_pressure_pct: 90,
+                internal_reliability_pct: 20,
+                identity_boundaries: Vec::new(),
+            },
+        );
+        assert_eq!(high_priority.decision, WakeSignalDecisionKind::Accepted);
     }
 
     #[test]
@@ -760,5 +942,32 @@ mod tests {
             &config,
             GovernedActionRiskTier::Tier3
         ));
+    }
+
+    #[test]
+    fn identity_boundaries_block_matching_governed_action_capabilities() {
+        let mut networked = sample_governed_action_proposal();
+        networked.capability_scope.network = NetworkAccessPosture::Enabled;
+
+        match evaluate_governed_action_identity_boundaries(
+            &networked,
+            &["Do not use network access for governed actions.".to_string()],
+        ) {
+            PolicyDecision::Allowed => panic!("network boundary should block networked action"),
+            PolicyDecision::Denied { reason } => {
+                assert!(reason.contains("identity boundary"));
+                assert!(reason.contains("network"));
+            }
+        }
+
+        match evaluate_governed_action_identity_boundaries(
+            &sample_governed_action_proposal(),
+            &["No subprocess execution unless explicitly reset.".to_string()],
+        ) {
+            PolicyDecision::Allowed => panic!("subprocess boundary should block subprocess action"),
+            PolicyDecision::Denied { reason } => {
+                assert!(reason.contains("subprocess"));
+            }
+        }
     }
 }

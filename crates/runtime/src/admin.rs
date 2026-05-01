@@ -8,7 +8,11 @@ use harness::{
     management::{
         self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
         BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
-        GovernedActionSummary, OperationalDiagnosticSummary, OperationalHealthSummary,
+        GovernedActionSummary, IdentityDiagnosticSummary, IdentityEditProposalReport,
+        IdentityEditProposalRequest, IdentityEditProposalSummary, IdentityEditResolutionReport,
+        IdentityEditResolutionRequest, IdentityHistorySummary, IdentityResetReport,
+        IdentityResetRequest, IdentityShowReport, IdentityStatusReport,
+        OperationalDiagnosticSummary, OperationalHealthSummary,
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
         ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
@@ -33,6 +37,7 @@ pub enum AdminSubcommand {
     Schema(SchemaCommand),
     Foreground(ForegroundCommand),
     Background(BackgroundCommand),
+    Identity(IdentityCommand),
     Approvals(ApprovalsCommand),
     Actions(ActionsCommand),
     Workspace(WorkspaceCommand),
@@ -309,6 +314,111 @@ pub struct BackgroundEnqueueCommand {
 
 #[derive(Debug, Args)]
 pub struct RunNextCommand {
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct IdentityCommand {
+    #[command(subcommand)]
+    pub command: IdentitySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentitySubcommand {
+    Status(StatusCommand),
+    Show(StatusCommand),
+    History(IdentityHistoryCommand),
+    Diagnostics(IdentityDiagnosticsCommand),
+    Edit(IdentityEditCommand),
+    Reset(IdentityResetCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct IdentityHistoryCommand {
+    #[command(subcommand)]
+    pub command: IdentityHistorySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentityHistorySubcommand {
+    List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct IdentityDiagnosticsCommand {
+    #[command(subcommand)]
+    pub command: IdentityDiagnosticsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentityDiagnosticsSubcommand {
+    List(ListCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct IdentityEditCommand {
+    #[command(subcommand)]
+    pub command: IdentityEditSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentityEditSubcommand {
+    Propose(IdentityEditProposeCommand),
+    List(ListCommand),
+    Resolve(IdentityEditResolveCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct IdentityEditProposeCommand {
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long, default_value = "add")]
+    pub operation: String,
+    #[arg(long)]
+    pub stability_class: String,
+    #[arg(long)]
+    pub category: String,
+    #[arg(long)]
+    pub item_key: String,
+    #[arg(long)]
+    pub value: String,
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub confidence_pct: u8,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub weight_pct: Option<u8>,
+    #[arg(long)]
+    pub target_identity_item_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub confirm_stable: bool,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct IdentityEditResolveCommand {
+    #[arg(long)]
+    pub proposal_id: String,
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub decision: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct IdentityResetCommand {
+    #[arg(long)]
+    pub actor_ref: Option<String>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -698,6 +808,90 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
             BackgroundSubcommand::RunNext(command) => {
                 let outcome = management::run_next_background_job(config).await?;
                 print_background_run_next(outcome, command.json)?;
+            }
+        },
+        AdminSubcommand::Identity(command) => match command.command {
+            IdentitySubcommand::Status(command) => {
+                let report = management::load_identity_status(config).await?;
+                print_identity_status(report, command.json)?;
+            }
+            IdentitySubcommand::Show(command) => {
+                let report = management::load_identity_show(config).await?;
+                print_identity_show(report, command.json)?;
+            }
+            IdentitySubcommand::History(command) => match command.command {
+                IdentityHistorySubcommand::List(command) => {
+                    let history = management::list_identity_history(config, command.limit).await?;
+                    print_identity_history(history, command.json)?;
+                }
+            },
+            IdentitySubcommand::Diagnostics(command) => match command.command {
+                IdentityDiagnosticsSubcommand::List(command) => {
+                    let diagnostics =
+                        management::list_identity_diagnostics(config, command.limit).await?;
+                    print_identity_diagnostics(diagnostics, command.json)?;
+                }
+            },
+            IdentitySubcommand::Edit(command) => match command.command {
+                IdentityEditSubcommand::Propose(command) => {
+                    let report = management::propose_identity_edit(
+                        config,
+                        IdentityEditProposalRequest {
+                            actor_ref: command
+                                .actor_ref
+                                .unwrap_or_else(|| "cli:operator".to_string()),
+                            reason: command.reason,
+                            operation: command.operation,
+                            stability_class: command.stability_class,
+                            category: command.category,
+                            item_key: command.item_key,
+                            value: command.value,
+                            confidence_pct: command.confidence_pct,
+                            weight_pct: command.weight_pct,
+                            target_identity_item_id: command
+                                .target_identity_item_id
+                                .map(|value| value.parse())
+                                .transpose()?,
+                            confirm_stable: command.confirm_stable,
+                        },
+                    )
+                    .await?;
+                    print_identity_edit_proposal(report, command.json)?;
+                }
+                IdentityEditSubcommand::List(command) => {
+                    let proposals =
+                        management::list_identity_edit_proposals(config, command.limit).await?;
+                    print_identity_edit_proposals(proposals, command.json)?;
+                }
+                IdentityEditSubcommand::Resolve(command) => {
+                    let report = management::resolve_identity_edit_proposal(
+                        config,
+                        IdentityEditResolutionRequest {
+                            proposal_id: command.proposal_id.parse()?,
+                            actor_ref: command
+                                .actor_ref
+                                .unwrap_or_else(|| "cli:operator".to_string()),
+                            decision: command.decision,
+                            reason: command.reason,
+                        },
+                    )
+                    .await?;
+                    print_identity_edit_resolution(report, command.json)?;
+                }
+            },
+            IdentitySubcommand::Reset(command) => {
+                let report = management::reset_identity(
+                    config,
+                    IdentityResetRequest {
+                        actor_ref: command
+                            .actor_ref
+                            .unwrap_or_else(|| "cli:operator".to_string()),
+                        reason: command.reason,
+                        force: command.force,
+                    },
+                )
+                .await?;
+                print_identity_reset(report, command.json)?;
             }
         },
         AdminSubcommand::Approvals(command) => match command.command {
@@ -2006,6 +2200,265 @@ fn print_background_run_next(outcome: BackgroundRunNextOutcome, json: bool) -> R
     Ok(())
 }
 
+fn print_identity_status(report: IdentityStatusReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_identity_status_text(&report));
+    Ok(())
+}
+
+fn render_identity_status_text(report: &IdentityStatusReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Identity status | lifecycle_state={} | kickstart_available={} | active_items={}",
+        report.lifecycle_state,
+        yes_no(report.kickstart_available),
+        report.active_item_count
+    );
+    let _ = writeln!(
+        output,
+        "  stable_items={} | evolving_items={} | values={} | boundaries={} | self_description={}",
+        report.stable_item_count,
+        report.evolving_item_count,
+        report.value_count,
+        report.boundary_count,
+        presence_label(report.self_description_present)
+    );
+    let _ = writeln!(output, "  summary={}", report.compact_summary);
+    if let Some(reason) = &report.lifecycle_transition_reason {
+        let _ = writeln!(output, "  transition_reason={reason}");
+    }
+    output.trim_end().to_string()
+}
+
+fn print_identity_show(report: IdentityShowReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_identity_show_text(&report));
+    Ok(())
+}
+
+fn render_identity_show_text(report: &IdentityShowReport) -> String {
+    let mut output = render_identity_status_text(&report.status);
+    if let Some(description) = &report.compact_identity.self_description {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Self-description:");
+        let _ = writeln!(output, "  {description}");
+    }
+    if !report.compact_identity.values.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Values:");
+        for value in &report.compact_identity.values {
+            let _ = writeln!(output, "  - {value}");
+        }
+    }
+    if !report.compact_identity.boundaries.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Boundaries:");
+        for boundary in &report.compact_identity.boundaries {
+            let _ = writeln!(output, "  - {boundary}");
+        }
+    }
+    if !report.compact_identity.stable_items.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Stable identity:");
+        for item in &report.compact_identity.stable_items {
+            let _ = writeln!(
+                output,
+                "  - {:?}: {} (confidence={}%)",
+                item.category, item.value, item.confidence_pct
+            );
+        }
+    }
+    if !report.compact_identity.evolving_items.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Evolving identity:");
+        for item in &report.compact_identity.evolving_items {
+            let _ = writeln!(
+                output,
+                "  - {:?}: {} (confidence={}%)",
+                item.category, item.value, item.confidence_pct
+            );
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn print_identity_history(history: Vec<IdentityHistorySummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&history)?);
+        return Ok(());
+    }
+
+    if history.is_empty() {
+        println!("No identity history found.");
+        return Ok(());
+    }
+
+    for item in history {
+        println!(
+            "{} | {}:{} | status={} | stability={} | proposal={} | trace={} | updated_at={}",
+            item.identity_item_id,
+            item.category,
+            item.item_key,
+            item.status,
+            item.stability_class,
+            item.proposal_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            item.trace_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            item.updated_at
+        );
+        println!("  value={}", item.value_text);
+    }
+    Ok(())
+}
+
+fn print_identity_diagnostics(
+    diagnostics: Vec<IdentityDiagnosticSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        return Ok(());
+    }
+
+    if diagnostics.is_empty() {
+        println!("No identity diagnostics found.");
+        return Ok(());
+    }
+
+    for diagnostic in diagnostics {
+        println!(
+            "{} | {} | severity={} | status={} | item={} | proposal={} | trace={} | created_at={}",
+            diagnostic.identity_diagnostic_id,
+            diagnostic.diagnostic_kind,
+            diagnostic.severity,
+            diagnostic.status,
+            diagnostic
+                .identity_item_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic
+                .proposal_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic
+                .trace_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.created_at
+        );
+        println!("  message={}", diagnostic.message);
+    }
+    Ok(())
+}
+
+fn print_identity_edit_proposal(report: IdentityEditProposalReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Identity edit proposal {} | status={} | trace_id={} | stable_change={}",
+        report.proposal_id,
+        report.status,
+        report.trace_id,
+        yes_no(report.stable_identity_change)
+    );
+    println!("  validation={}", report.validation_reason);
+    Ok(())
+}
+
+fn print_identity_edit_proposals(
+    proposals: Vec<IdentityEditProposalSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&proposals)?);
+        return Ok(());
+    }
+
+    if proposals.is_empty() {
+        println!("No identity edit proposals found.");
+        return Ok(());
+    }
+
+    for proposal in proposals {
+        println!(
+            "{} | status={} | category={} | item_key={} | confidence={}% | created_at={}",
+            proposal.proposal_id,
+            proposal.status,
+            proposal.category.unwrap_or_else(|| "unknown".to_string()),
+            proposal.item_key.unwrap_or_else(|| "unknown".to_string()),
+            proposal.confidence_pct,
+            proposal.created_at
+        );
+        println!("  value={}", proposal.value_text);
+        if let Some(rationale) = proposal.rationale {
+            println!("  rationale={rationale}");
+        }
+    }
+    Ok(())
+}
+
+fn print_identity_edit_resolution(report: IdentityEditResolutionReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Identity edit proposal {} {} | status={} | trace_id={}",
+        report.proposal_id, report.decision, report.status, report.trace_id
+    );
+    println!("  reason={}", report.reason);
+    Ok(())
+}
+
+fn print_identity_reset(report: IdentityResetReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("{}", render_identity_reset_text(&report));
+    Ok(())
+}
+
+fn render_identity_reset_text(report: &IdentityResetReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Identity reset completed at {} | trace_id={} | actor_ref={} | lifecycle_state={}",
+        report.reset_at, report.trace_id, report.actor_ref, report.lifecycle_state
+    );
+    let _ = writeln!(
+        output,
+        "  previous_lifecycle_state={}",
+        report.previous_lifecycle_state.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(
+        output,
+        "  superseded_identity_items={} | cancelled_interviews={}",
+        report.superseded_identity_item_count, report.cancelled_interview_count
+    );
+    if let Some(reason) = &report.reason {
+        let _ = writeln!(output, "  reason={reason}");
+    }
+    output.trim_end().to_string()
+}
+
 fn print_wake_signals(signals: Vec<WakeSignalSummary>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&signals)?);
@@ -2052,6 +2505,263 @@ fn presence_label(present: bool) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_identity_reset_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "identity",
+            "reset",
+            "--force",
+            "--actor-ref",
+            "cli:primary-user",
+            "--reason",
+            "restart identity formation",
+            "--json",
+        ])
+        .expect("identity reset command should parse");
+
+        match command.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command: IdentitySubcommand::Reset(command),
+            }) => {
+                assert!(command.force);
+                assert!(command.json);
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:primary-user"));
+                assert_eq!(
+                    command.reason.as_deref(),
+                    Some("restart identity formation")
+                );
+            }
+            _ => panic!("expected identity reset command"),
+        }
+    }
+
+    #[test]
+    fn parses_identity_status_and_show_commands() {
+        let status = AdminCommand::try_parse_from(["runtime", "identity", "status", "--json"])
+            .expect("identity status command should parse");
+        match status.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command: IdentitySubcommand::Status(command),
+            }) => assert!(command.json),
+            _ => panic!("expected identity status command"),
+        }
+
+        let show = AdminCommand::try_parse_from(["runtime", "identity", "show", "--json"])
+            .expect("identity show command should parse");
+        match show.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command: IdentitySubcommand::Show(command),
+            }) => assert!(command.json),
+            _ => panic!("expected identity show command"),
+        }
+
+        let history = AdminCommand::try_parse_from([
+            "runtime", "identity", "history", "list", "--limit", "5", "--json",
+        ])
+        .expect("identity history list command should parse");
+        match history.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command:
+                    IdentitySubcommand::History(IdentityHistoryCommand {
+                        command: IdentityHistorySubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 5);
+                assert!(command.json);
+            }
+            _ => panic!("expected identity history list command"),
+        }
+
+        let diagnostics = AdminCommand::try_parse_from([
+            "runtime",
+            "identity",
+            "diagnostics",
+            "list",
+            "--limit",
+            "7",
+            "--json",
+        ])
+        .expect("identity diagnostics list command should parse");
+        match diagnostics.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command:
+                    IdentitySubcommand::Diagnostics(IdentityDiagnosticsCommand {
+                        command: IdentityDiagnosticsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 7);
+                assert!(command.json);
+            }
+            _ => panic!("expected identity diagnostics list command"),
+        }
+
+        let propose = AdminCommand::try_parse_from([
+            "runtime",
+            "identity",
+            "edit",
+            "propose",
+            "--actor-ref",
+            "cli:primary-user",
+            "--reason",
+            "reviewed preference",
+            "--stability-class",
+            "evolving",
+            "--category",
+            "preference",
+            "--item-key",
+            "concise",
+            "--value",
+            "Prefer concise summaries.",
+            "--confidence-pct",
+            "90",
+            "--weight-pct",
+            "80",
+            "--json",
+        ])
+        .expect("identity edit propose command should parse");
+        match propose.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command:
+                    IdentitySubcommand::Edit(IdentityEditCommand {
+                        command: IdentityEditSubcommand::Propose(command),
+                    }),
+            }) => {
+                assert_eq!(command.actor_ref.as_deref(), Some("cli:primary-user"));
+                assert_eq!(command.stability_class, "evolving");
+                assert_eq!(command.category, "preference");
+                assert_eq!(command.confidence_pct, 90);
+                assert_eq!(command.weight_pct, Some(80));
+                assert!(command.json);
+            }
+            _ => panic!("expected identity edit propose command"),
+        }
+
+        let resolve = AdminCommand::try_parse_from([
+            "runtime",
+            "identity",
+            "edit",
+            "resolve",
+            "--proposal-id",
+            "00000000-0000-0000-0000-000000000081",
+            "--decision",
+            "reject",
+            "--json",
+        ])
+        .expect("identity edit resolve command should parse");
+        match resolve.command {
+            AdminSubcommand::Identity(IdentityCommand {
+                command:
+                    IdentitySubcommand::Edit(IdentityEditCommand {
+                        command: IdentityEditSubcommand::Resolve(command),
+                    }),
+            }) => {
+                assert_eq!(command.decision, "reject");
+                assert!(command.json);
+            }
+            _ => panic!("expected identity edit resolve command"),
+        }
+    }
+
+    #[test]
+    fn render_identity_status_and_show_text_include_summary_and_items() {
+        let status = sample_identity_status_report();
+        let rendered_status = render_identity_status_text(&status);
+        assert!(rendered_status.contains("lifecycle_state=complete_identity_active"));
+        assert!(rendered_status.contains("active_items=4"));
+        assert!(rendered_status.contains("summary=Blue Lagoon"));
+
+        let rendered_show = render_identity_show_text(&sample_identity_show_report());
+        assert!(rendered_show.contains("Self-description:"));
+        assert!(rendered_show.contains("Values:"));
+        assert!(rendered_show.contains("Boundaries:"));
+        assert!(rendered_show.contains("Stable identity:"));
+        assert!(rendered_show.contains("Evolving identity:"));
+    }
+
+    #[test]
+    fn render_identity_reset_text_includes_counts_and_reason() {
+        let rendered = render_identity_reset_text(&sample_identity_reset_report());
+        assert!(rendered.contains("Identity reset completed"));
+        assert!(rendered.contains("lifecycle_state=bootstrap_seed_only"));
+        assert!(rendered.contains("previous_lifecycle_state=complete_identity_active"));
+        assert!(rendered.contains("superseded_identity_items=3"));
+        assert!(rendered.contains("cancelled_interviews=1"));
+        assert!(rendered.contains("reason=restart identity formation"));
+    }
+
+    fn sample_identity_reset_report() -> IdentityResetReport {
+        serde_json::from_value(json!({
+            "trace_id": "00000000-0000-0000-0000-000000000081",
+            "reset_at": "2026-04-25T10:00:00Z",
+            "actor_ref": "cli:primary-user",
+            "reason": "restart identity formation",
+            "previous_lifecycle_state": "complete_identity_active",
+            "lifecycle_state": "bootstrap_seed_only",
+            "superseded_identity_item_count": 3,
+            "cancelled_interview_count": 1
+        }))
+        .expect("sample identity reset report should deserialize")
+    }
+
+    fn sample_identity_status_report() -> IdentityStatusReport {
+        serde_json::from_value(json!({
+            "lifecycle_state": "complete_identity_active",
+            "lifecycle_status": "current",
+            "lifecycle_transition_reason": "template selected",
+            "kickstart_available": false,
+            "active_item_count": 4,
+            "stable_item_count": 3,
+            "evolving_item_count": 1,
+            "boundary_count": 1,
+            "value_count": 1,
+            "self_description_present": true,
+            "compact_summary": "Blue Lagoon"
+        }))
+        .expect("sample identity status report should deserialize")
+    }
+
+    fn sample_identity_show_report() -> IdentityShowReport {
+        serde_json::from_value(json!({
+            "status": sample_identity_status_report(),
+            "compact_identity": {
+                "identity_summary": "Blue Lagoon",
+                "stable_items": [
+                    {
+                        "category": "name",
+                        "value": "Blue Lagoon",
+                        "confidence_pct": 100,
+                        "weight_pct": null
+                    },
+                    {
+                        "category": "foundational_value",
+                        "value": "clarity",
+                        "confidence_pct": 100,
+                        "weight_pct": 100
+                    },
+                    {
+                        "category": "enduring_boundary",
+                        "value": "Do not claim hidden autonomy.",
+                        "confidence_pct": 100,
+                        "weight_pct": 100
+                    }
+                ],
+                "evolving_items": [
+                    {
+                        "category": "recurring_self_description",
+                        "value": "Blue Lagoon is a policy-bound assistant with continuity.",
+                        "confidence_pct": 100,
+                        "weight_pct": 100
+                    }
+                ],
+                "values": ["clarity"],
+                "boundaries": ["Do not claim hidden autonomy."],
+                "self_description": "Blue Lagoon is a policy-bound assistant with continuity."
+            }
+        }))
+        .expect("sample identity show report should deserialize")
+    }
 
     fn sample_approval_request_summary() -> ApprovalRequestSummary {
         serde_json::from_value(json!({

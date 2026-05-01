@@ -19,13 +19,15 @@ use harness::{
     },
     causal_links::{self, NewCausalLink},
     config::{ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig},
+    continuity,
     execution::{self, NewExecutionRecord},
     foreground::{self, NewConversationBinding, NewIngressEvent},
-    governed_actions, management, model_calls, recovery, scheduled_foreground,
+    governed_actions, identity, management, model_calls, recovery, scheduled_foreground,
     workspace::{self, NewWorkspaceArtifact, NewWorkspaceScript, NewWorkspaceScriptRun},
 };
 use serde_json::json;
 use serial_test::serial;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -39,6 +41,375 @@ async fn runtime_status_reports_supported_schema_and_empty_pending_work() -> Res
         assert_eq!(report.pending_work.pending_wake_signal_count, 0);
         assert!(!report.telegram.configured);
         assert!(!report.model_gateway.configured);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_reset_requires_force_and_archives_active_state() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let rejected = management::reset_identity(
+            &ctx.config,
+            management::IdentityResetRequest {
+                actor_ref: "cli:primary-user".to_string(),
+                reason: Some("missing confirmation".to_string()),
+                force: false,
+            },
+        )
+        .await;
+        assert!(
+            rejected
+                .expect_err("identity reset without force should fail")
+                .to_string()
+                .contains("--force")
+        );
+
+        let interview_id = Uuid::now_v7();
+        identity::insert_identity_interview(
+            &ctx.pool,
+            &identity::NewIdentityInterview {
+                identity_interview_id: interview_id,
+                status: "in_progress".to_string(),
+                current_step: "name".to_string(),
+                answered_fields: json!({}),
+                required_fields: json!(["name"]),
+                last_prompt_text: Some("What name should I use?".to_string()),
+                selected_template_id: None,
+                payload: json!({ "test": "identity_reset" }),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: None,
+                stability_class: "stable".to_string(),
+                category: "trait".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Lagoon".to_string(),
+                confidence: 1.0,
+                weight: Some(1.0),
+                provenance_kind: "operator_seed".to_string(),
+                source_kind: "identity_kickstart".to_string(),
+                merge_policy: "replace_key".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({ "test": "identity_reset" }),
+            },
+        )
+        .await?;
+        identity::record_lifecycle_transition(
+            &ctx.pool,
+            &identity::NewIdentityLifecycle {
+                identity_lifecycle_id: Uuid::now_v7(),
+                status: "current".to_string(),
+                lifecycle_state: "identity_kickstart_in_progress".to_string(),
+                active_self_model_artifact_id: None,
+                active_interview_id: Some(interview_id),
+                transition_reason: "component test seed".to_string(),
+                transitioned_by: "test".to_string(),
+                kickstart_started_at: Some(Utc::now()),
+                kickstart_completed_at: None,
+                reset_at: None,
+                payload: json!({ "test": "identity_reset" }),
+            },
+        )
+        .await?;
+
+        let report = management::reset_identity(
+            &ctx.config,
+            management::IdentityResetRequest {
+                actor_ref: "cli:primary-user".to_string(),
+                reason: Some("restart identity formation".to_string()),
+                force: true,
+            },
+        )
+        .await?;
+
+        assert_eq!(report.actor_ref, "cli:primary-user");
+        assert_eq!(
+            report.previous_lifecycle_state.as_deref(),
+            Some("identity_kickstart_in_progress")
+        );
+        assert_eq!(report.lifecycle_state, "bootstrap_seed_only");
+        assert_eq!(report.superseded_identity_item_count, 1);
+        assert_eq!(report.cancelled_interview_count, 1);
+
+        let active_item_count: i64 = sqlx::query(
+            "SELECT COUNT(*)::BIGINT AS count FROM identity_items WHERE status = 'active'",
+        )
+        .fetch_one(&ctx.pool)
+        .await?
+        .get("count");
+        assert_eq!(active_item_count, 0);
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("reset should write current lifecycle");
+        assert_eq!(lifecycle.lifecycle_state, "bootstrap_seed_only");
+        assert_eq!(lifecycle.transitioned_by, "cli:primary-user");
+
+        let interview = identity::get_identity_interview(&ctx.pool, interview_id)
+            .await?
+            .expect("seeded interview should remain available");
+        assert_eq!(interview.status, "cancelled");
+
+        let audit_events = audit::list_for_trace(&ctx.pool, report.trace_id).await?;
+        let event_kinds: Vec<_> = audit_events
+            .iter()
+            .map(|event| event.event_kind.as_str())
+            .collect();
+        assert!(event_kinds.contains(&"management_identity_reset_requested"));
+        assert!(event_kinds.contains(&"management_identity_reset_completed"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_status_and_show_surface_active_identity_summary() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        seed_identity_item(&ctx.pool, "stable", "name", "name", "Blue Lagoon").await?;
+        seed_identity_item(
+            &ctx.pool,
+            "stable",
+            "foundational_value",
+            "clarity",
+            "clarity",
+        )
+        .await?;
+        seed_identity_item(
+            &ctx.pool,
+            "stable",
+            "enduring_boundary",
+            "no_hidden_autonomy",
+            "Do not claim hidden autonomy.",
+        )
+        .await?;
+        seed_identity_item(
+            &ctx.pool,
+            "evolving",
+            "recurring_self_description",
+            "self_description",
+            "Blue Lagoon is a policy-bound assistant with continuity.",
+        )
+        .await?;
+        identity::record_lifecycle_transition(
+            &ctx.pool,
+            &identity::NewIdentityLifecycle {
+                identity_lifecycle_id: Uuid::now_v7(),
+                status: "current".to_string(),
+                lifecycle_state: "complete_identity_active".to_string(),
+                active_self_model_artifact_id: None,
+                active_interview_id: None,
+                transition_reason: "component test complete identity".to_string(),
+                transitioned_by: "test".to_string(),
+                kickstart_started_at: Some(Utc::now()),
+                kickstart_completed_at: Some(Utc::now()),
+                reset_at: None,
+                payload: json!({ "test": "identity_status" }),
+            },
+        )
+        .await?;
+
+        let status = management::load_identity_status(&ctx.config).await?;
+        assert_eq!(status.lifecycle_state, "complete_identity_active");
+        assert!(!status.kickstart_available);
+        assert_eq!(status.active_item_count, 4);
+        assert_eq!(status.stable_item_count, 3);
+        assert_eq!(status.evolving_item_count, 1);
+        assert_eq!(status.value_count, 1);
+        assert_eq!(status.boundary_count, 1);
+        assert!(status.self_description_present);
+        assert_eq!(status.compact_summary, "Blue Lagoon");
+
+        let show = management::load_identity_show(&ctx.config).await?;
+        assert_eq!(show.status.active_item_count, 4);
+        assert_eq!(
+            show.compact_identity.self_description.as_deref(),
+            Some("Blue Lagoon is a policy-bound assistant with continuity.")
+        );
+        assert_eq!(show.compact_identity.values, vec!["clarity".to_string()]);
+        assert_eq!(
+            show.compact_identity.boundaries,
+            vec!["Do not claim hidden autonomy.".to_string()]
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_history_and_diagnostics_surface_operator_follow_up_refs() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let proposal_id = Uuid::now_v7();
+        let execution_id = seed_execution(&ctx.pool, trace_id).await?;
+        continuity::insert_proposal(
+            &ctx.pool,
+            &continuity::NewProposalRecord {
+                proposal_id,
+                trace_id,
+                execution_id,
+                episode_id: None,
+                source_ingress_id: None,
+                source_loop_kind: "background".to_string(),
+                proposal_kind: "identity_delta".to_string(),
+                canonical_target: "identity_items".to_string(),
+                status: "accepted".to_string(),
+                confidence: 0.9,
+                conflict_posture: "independent".to_string(),
+                subject_ref: "self:blue-lagoon".to_string(),
+                content_text: "Do not bypass approval.".to_string(),
+                rationale: Some("component test proposal".to_string()),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_artifact_id: None,
+                supersedes_artifact_kind: None,
+                payload: json!({ "test": "identity_history" }),
+            },
+        )
+        .await?;
+        let identity_item_id = seed_identity_item(
+            &ctx.pool,
+            "stable",
+            "enduring_boundary",
+            "approval_boundary",
+            "Do not bypass approval.",
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE identity_items
+            SET proposal_id = $1, trace_id = $2
+            WHERE identity_item_id = $3
+            "#,
+        )
+        .bind(proposal_id)
+        .bind(trace_id)
+        .bind(identity_item_id)
+        .execute(&ctx.pool)
+        .await?;
+        identity::insert_identity_diagnostic(
+            &ctx.pool,
+            &identity::NewIdentityDiagnostic {
+                identity_diagnostic_id: Uuid::now_v7(),
+                diagnostic_kind: "drift".to_string(),
+                severity: "warning".to_string(),
+                status: "open".to_string(),
+                identity_item_id: Some(identity_item_id),
+                proposal_id: Some(proposal_id),
+                trace_id: Some(trace_id),
+                message: "Potential identity drift needs operator review.".to_string(),
+                evidence_refs: json!([{ "source": "component_test" }]),
+                payload: json!({ "test": "identity_diagnostics" }),
+            },
+        )
+        .await?;
+
+        let history = management::list_identity_history(&ctx.config, 10).await?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].identity_item_id, identity_item_id);
+        assert_eq!(history[0].proposal_id, Some(proposal_id));
+        assert_eq!(history[0].trace_id, Some(trace_id));
+        assert_eq!(history[0].category, "enduring_boundary");
+        assert_eq!(history[0].status, "active");
+
+        let diagnostics = management::list_identity_diagnostics(&ctx.config, 10).await?;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic_kind, "drift");
+        assert_eq!(diagnostics[0].identity_item_id, Some(identity_item_id));
+        assert_eq!(diagnostics[0].proposal_id, Some(proposal_id));
+        assert_eq!(diagnostics[0].trace_id, Some(trace_id));
+        assert!(diagnostics[0].message.contains("operator review"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_edit_proposal_workflow_requires_confirmation_and_merges_on_approval() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let rejected_stable = management::propose_identity_edit(
+            &ctx.config,
+            management::IdentityEditProposalRequest {
+                actor_ref: "cli:primary-user".to_string(),
+                reason: "stable change must be explicit".to_string(),
+                operation: "add".to_string(),
+                stability_class: "stable".to_string(),
+                category: "foundational_value".to_string(),
+                item_key: "clarity".to_string(),
+                value: "clarity".to_string(),
+                confidence_pct: 100,
+                weight_pct: Some(100),
+                target_identity_item_id: None,
+                confirm_stable: false,
+            },
+        )
+        .await;
+        assert!(
+            rejected_stable
+                .expect_err("stable identity edits require confirmation")
+                .to_string()
+                .contains("--confirm-stable")
+        );
+
+        let proposal = management::propose_identity_edit(
+            &ctx.config,
+            management::IdentityEditProposalRequest {
+                actor_ref: "cli:primary-user".to_string(),
+                reason: "operator reviewed evolving preference".to_string(),
+                operation: "add".to_string(),
+                stability_class: "evolving".to_string(),
+                category: "preference".to_string(),
+                item_key: "operator_reviewed_preference".to_string(),
+                value: "Prefer concise operator summaries.".to_string(),
+                confidence_pct: 90,
+                weight_pct: Some(80),
+                target_identity_item_id: None,
+                confirm_stable: false,
+            },
+        )
+        .await?;
+        assert_eq!(proposal.status, "pending_operator_review");
+        assert!(!proposal.stable_identity_change);
+
+        let proposals = management::list_identity_edit_proposals(&ctx.config, 10).await?;
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].proposal_id, proposal.proposal_id);
+        assert_eq!(proposals[0].status, "pending_operator_review");
+        assert_eq!(proposals[0].category.as_deref(), Some("preference"));
+
+        let resolution = management::resolve_identity_edit_proposal(
+            &ctx.config,
+            management::IdentityEditResolutionRequest {
+                proposal_id: proposal.proposal_id,
+                actor_ref: "cli:primary-user".to_string(),
+                decision: "approve".to_string(),
+                reason: Some("approved in component test".to_string()),
+            },
+        )
+        .await?;
+        assert_eq!(resolution.status, "merged");
+
+        let active_items = identity::list_active_identity_items(&ctx.pool, 10).await?;
+        assert!(active_items.iter().any(|item| {
+            item.proposal_id == Some(proposal.proposal_id)
+                && item.category == "preference"
+                && item.value_text == "Prefer concise operator summaries."
+        }));
         Ok(())
     })
     .await
@@ -1204,6 +1575,42 @@ fn sample_budget() -> contracts::BackgroundExecutionBudget {
         wall_clock_budget_ms: 120_000,
         token_budget: 6_000,
     }
+}
+
+async fn seed_identity_item(
+    pool: &PgPool,
+    stability_class: &str,
+    category: &str,
+    item_key: &str,
+    value_text: &str,
+) -> Result<Uuid> {
+    let identity_item_id = Uuid::now_v7();
+    identity::insert_identity_item(
+        pool,
+        &identity::NewIdentityItem {
+            identity_item_id,
+            self_model_artifact_id: None,
+            proposal_id: None,
+            trace_id: None,
+            stability_class: stability_class.to_string(),
+            category: category.to_string(),
+            item_key: item_key.to_string(),
+            value_text: value_text.to_string(),
+            confidence: 1.0,
+            weight: Some(1.0),
+            provenance_kind: "component_test".to_string(),
+            source_kind: "identity_kickstart".to_string(),
+            merge_policy: "replace_key".to_string(),
+            status: "active".to_string(),
+            evidence_refs: json!([]),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_item_id: None,
+            payload: json!({ "test": "management_identity_inspection" }),
+        },
+    )
+    .await?;
+    Ok(identity_item_id)
 }
 
 async fn seed_execution(pool: &sqlx::PgPool, trace_id: Uuid) -> Result<Uuid> {

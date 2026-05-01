@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{
-    DiagnosticAlert, DiagnosticSeverity, UnconsciousContext, WakeSignal, WakeSignalDecision,
-    WakeSignalDecisionKind, WorkerRequest, WorkerResult,
+    DiagnosticAlert, DiagnosticSeverity, RetrievedMemoryArtifactContext, UnconsciousContext,
+    UnconsciousEvidenceContext, UnconsciousJobKind, UnconsciousScope, WakeSignal,
+    WakeSignalDecision, WakeSignalDecisionKind, WorkerRequest, WorkerResult,
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -18,8 +19,9 @@ use crate::{
     config::{ResolvedModelGatewayConfig, RuntimeConfig},
     execution::{self, NewExecutionRecord},
     foreground::{self, StagedForegroundIngressOutcome},
+    identity,
     model_gateway::ModelProviderTransport,
-    policy, proposal, recovery, retrieval, worker,
+    policy, proposal, recovery, retrieval, self_model, worker,
 };
 
 #[derive(Debug, Clone)]
@@ -75,6 +77,7 @@ pub async fn lease_next_due_job(
             job_kind: job.job_kind,
             trigger: job.trigger.clone(),
             scope: job.scope.clone(),
+            evidence: assemble_unconscious_evidence(pool, job.job_kind, &job.scope).await?,
             budget: job.budget.clone(),
         },
     );
@@ -127,6 +130,90 @@ pub async fn lease_next_due_job(
         lease_expires_at,
         request,
     }))
+}
+
+async fn assemble_unconscious_evidence(
+    pool: &PgPool,
+    job_kind: UnconsciousJobKind,
+    scope: &UnconsciousScope,
+) -> Result<Option<UnconsciousEvidenceContext>> {
+    if job_kind != UnconsciousJobKind::SelfModelReflection {
+        return Ok(None);
+    }
+
+    let identity = identity::reconstruct_compact_identity_snapshot(pool, 16).await?;
+    let current_identity = (!identity.stable_items.is_empty()
+        || !identity.evolving_items.is_empty()
+        || identity.self_description.is_some())
+    .then_some(identity);
+
+    let recent_episodes = if let Some(internal_conversation_ref) = &scope.internal_conversation_ref
+    {
+        foreground::list_recent_episode_excerpts(pool, internal_conversation_ref, 6).await?
+    } else {
+        Vec::new()
+    };
+
+    let memory_artifacts = load_memory_artifact_evidence(pool, &scope.memory_artifact_ids).await?;
+    let internal_state = self_model::build_internal_state_snapshot(
+        self_model::InternalStateSeed::default(),
+        vec![format!("background_job_kind:{}", job_kind_as_str(job_kind))],
+    );
+
+    Ok(Some(UnconsciousEvidenceContext {
+        current_identity,
+        internal_state: Some(internal_state),
+        recent_episodes,
+        memory_artifacts,
+        scope_metadata: vec![
+            format!("episode_count:{}", scope.episode_ids.len()),
+            format!("memory_artifact_count:{}", scope.memory_artifact_ids.len()),
+            format!(
+                "retrieval_artifact_count:{}",
+                scope.retrieval_artifact_ids.len()
+            ),
+            format!(
+                "self_model_artifact_present:{}",
+                scope.self_model_artifact_id.is_some()
+            ),
+        ],
+    }))
+}
+
+async fn load_memory_artifact_evidence(
+    pool: &PgPool,
+    memory_artifact_ids: &[Uuid],
+) -> Result<Vec<RetrievedMemoryArtifactContext>> {
+    if memory_artifact_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT memory_artifact_id, artifact_kind, subject_ref, content_text, status
+        FROM memory_artifacts
+        WHERE memory_artifact_id = ANY($1)
+          AND status = 'active'
+        ORDER BY updated_at DESC, created_at DESC, memory_artifact_id DESC
+        LIMIT 8
+        "#,
+    )
+    .bind(memory_artifact_ids)
+    .fetch_all(pool)
+    .await
+    .context("failed to load memory artifact evidence for unconscious context")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| RetrievedMemoryArtifactContext {
+            memory_artifact_id: row.get("memory_artifact_id"),
+            artifact_kind: row.get("artifact_kind"),
+            subject_ref: row.get("subject_ref"),
+            content_text: row.get("content_text"),
+            validity_status: row.get("status"),
+            relevance_reason: "self_model_reflection_scope".to_string(),
+        })
+        .collect())
 }
 
 pub async fn execute_next_due_job<T: ModelProviderTransport>(
@@ -622,6 +709,7 @@ async fn persist_wake_signals(
         .telegram
         .as_ref()
         .and_then(|telegram| telegram.foreground_binding.as_ref());
+    let identity_snapshot = identity::reconstruct_compact_identity_snapshot(pool, 32).await?;
 
     for signal in wake_signals {
         validate_wake_signal(signal)?;
@@ -684,6 +772,12 @@ async fn persist_wake_signals(
         )
         .await?;
 
+        let internal_state = self_model::derive_live_internal_state_snapshot(
+            pool,
+            self_model::InternalStateSeed::default(),
+            vec!["wake_signal_review".to_string()],
+        )
+        .await?;
         let evaluation_context = policy::WakeSignalEvaluationContext {
             pending_signal_count: background::count_open_wake_signals(pool, requested_at).await?,
             cooldown_active: background::has_active_wake_signal_cooldown(
@@ -694,6 +788,9 @@ async fn persist_wake_signals(
             )
             .await?,
             foreground_channel_available: foreground_binding.is_some(),
+            internal_resource_pressure_pct: internal_state.resource_pressure_pct,
+            internal_reliability_pct: internal_state.reliability_pct,
+            identity_boundaries: identity_snapshot.boundaries.clone(),
         };
         let policy_decision =
             policy::evaluate_wake_signal(config, &recorded_signal.signal, evaluation_context);
@@ -947,6 +1044,7 @@ mod tests {
                     internal_conversation_ref: Some("telegram-primary".to_string()),
                     summary: "memory scope".to_string(),
                 },
+                evidence: None,
                 budget: BackgroundExecutionBudget {
                     iteration_budget: 2,
                     wall_clock_budget_ms: 120_000,

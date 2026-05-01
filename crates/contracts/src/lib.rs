@@ -376,7 +376,21 @@ pub struct UnconsciousContext {
     pub job_kind: UnconsciousJobKind,
     pub trigger: BackgroundTrigger,
     pub scope: UnconsciousScope,
+    #[serde(default)]
+    pub evidence: Option<UnconsciousEvidenceContext>,
     pub budget: BackgroundExecutionBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UnconsciousEvidenceContext {
+    pub current_identity: Option<CompactIdentitySnapshot>,
+    pub internal_state: Option<InternalStateSnapshot>,
+    #[serde(default)]
+    pub recent_episodes: Vec<EpisodeExcerpt>,
+    #[serde(default)]
+    pub memory_artifacts: Vec<RetrievedMemoryArtifactContext>,
+    #[serde(default)]
+    pub scope_metadata: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +416,626 @@ pub struct SelfModelSnapshot {
     pub preferences: Vec<String>,
     pub current_goals: Vec<String>,
     pub current_subgoals: Vec<String>,
+    #[serde(default)]
+    pub identity: Option<CompactIdentitySnapshot>,
+    #[serde(default)]
+    pub identity_lifecycle: IdentityLifecycleContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityLifecycleState {
+    #[default]
+    BootstrapSeedOnly,
+    IdentityKickstartInProgress,
+    CompleteIdentityActive,
+    IdentityResetPending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IdentityLifecycleContext {
+    pub state: IdentityLifecycleState,
+    pub kickstart_available: bool,
+    pub kickstart: Option<IdentityKickstartContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityKickstartContext {
+    pub available_actions: Vec<IdentityKickstartActionKind>,
+    pub next_step: Option<String>,
+    pub resume_summary: Option<String>,
+    pub predefined_templates: Vec<PredefinedIdentityTemplate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityKickstartActionKind {
+    SelectPredefinedTemplate,
+    StartCustomInterview,
+    AnswerCustomInterview,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum IdentityKickstartAction {
+    SelectPredefinedTemplate { template_key: String },
+    StartCustomInterview,
+    AnswerCustomInterview(IdentityInterviewAnswer),
+    Cancel { reason: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityInterviewAnswer {
+    pub step_key: String,
+    pub answer_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredefinedIdentityTemplate {
+    pub template_key: String,
+    pub display_name: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CompactIdentitySnapshot {
+    pub identity_summary: String,
+    pub stable_items: Vec<CompactIdentityItem>,
+    pub evolving_items: Vec<CompactIdentityItem>,
+    pub values: Vec<String>,
+    pub boundaries: Vec<String>,
+    pub self_description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactIdentityItem {
+    pub category: IdentityItemCategory,
+    pub value: String,
+    pub confidence_pct: u8,
+    pub weight_pct: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityStabilityClass {
+    Stable,
+    Evolving,
+    TransientProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityItemCategory {
+    Name,
+    IdentityForm,
+    Role,
+    Archetype,
+    OriginBackstory,
+    AgeFraming,
+    FoundationalTrait,
+    FoundationalValue,
+    EnduringBoundary,
+    DefaultCommunicationStyle,
+    Preference,
+    Like,
+    Dislike,
+    Habit,
+    Routine,
+    LearnedTendency,
+    AutobiographicalRefinement,
+    RecurringSelfDescription,
+    InteractionStyleAdaptation,
+    Goal,
+    Subgoal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityItemSource {
+    Seed,
+    PredefinedTemplate,
+    CustomInterview,
+    UserAuthored,
+    OperatorAuthored,
+    ModelInferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityMergePolicy {
+    ProtectedCore,
+    ApprovalRequired,
+    Reinforceable,
+    Revisable,
+    Expirable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityDeltaOperation {
+    Add,
+    Reinforce,
+    Weaken,
+    Revise,
+    Supersede,
+    Expire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityEvidenceRef {
+    pub source_kind: String,
+    pub source_id: Option<Uuid>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityItemDelta {
+    pub operation: IdentityDeltaOperation,
+    pub stability_class: IdentityStabilityClass,
+    pub category: IdentityItemCategory,
+    pub item_key: String,
+    pub value: String,
+    pub confidence_pct: u8,
+    pub weight_pct: Option<u8>,
+    pub source: IdentityItemSource,
+    pub merge_policy: IdentityMergePolicy,
+    pub evidence_refs: Vec<IdentityEvidenceRef>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub target_identity_item_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfDescriptionDelta {
+    pub operation: IdentityDeltaOperation,
+    pub description: String,
+    pub evidence_refs: Vec<IdentityEvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityDeltaProposal {
+    pub lifecycle_state: IdentityLifecycleState,
+    pub item_deltas: Vec<IdentityItemDelta>,
+    pub self_description_delta: Option<SelfDescriptionDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interview_action: Option<IdentityKickstartAction>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IdentityReflectionOutput {
+    pub identity_delta: Option<IdentityDeltaProposal>,
+    pub no_change_rationale: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<DiagnosticAlert>,
+    #[serde(default)]
+    pub wake_signals: Vec<WakeSignal>,
+}
+
+pub fn predefined_identity_templates() -> Vec<PredefinedIdentityTemplate> {
+    vec![
+        PredefinedIdentityTemplate {
+            template_key: "continuity_operator".to_string(),
+            display_name: "Continuity Operator".to_string(),
+            summary:
+                "A steady assistant focused on memory, follow-through, and operational clarity."
+                    .to_string(),
+        },
+        PredefinedIdentityTemplate {
+            template_key: "reflective_companion".to_string(),
+            display_name: "Reflective Companion".to_string(),
+            summary:
+                "A thoughtful assistant focused on careful conversation and self-understanding."
+                    .to_string(),
+        },
+        PredefinedIdentityTemplate {
+            template_key: "pragmatic_copilot".to_string(),
+            display_name: "Pragmatic Copilot".to_string(),
+            summary:
+                "A direct assistant focused on decisions, implementation, and useful momentum."
+                    .to_string(),
+        },
+    ]
+}
+
+pub fn predefined_identity_delta(
+    template_key: &str,
+    selected_at: DateTime<Utc>,
+) -> Option<IdentityDeltaProposal> {
+    let (display_name, summary, self_description, items) = match template_key {
+        "continuity_operator" => (
+            "Continuity Operator",
+            "A steady assistant focused on memory, follow-through, and operational clarity.",
+            "I am a continuity-oriented assistant that keeps context organized, follows through on commitments, and stays direct about state, limits, and next actions.",
+            vec![
+                stable(IdentityItemCategory::Name, "name", "Blue Lagoon"),
+                stable(
+                    IdentityItemCategory::IdentityForm,
+                    "identity_form",
+                    "Harness-governed personal AI assistant",
+                ),
+                stable(
+                    IdentityItemCategory::Role,
+                    "role",
+                    "Continuity operator for one privileged user",
+                ),
+                stable(
+                    IdentityItemCategory::Archetype,
+                    "archetype",
+                    "Careful operator",
+                ),
+                stable(
+                    IdentityItemCategory::OriginBackstory,
+                    "origin_backstory",
+                    "Formed from the Blue Lagoon runtime to preserve context, support decisions, and keep work auditable.",
+                ),
+                stable(
+                    IdentityItemCategory::AgeFraming,
+                    "age_framing",
+                    "Newly formed runtime identity with durable memory rather than human age",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalTrait,
+                    "foundational_trait",
+                    "steady",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalValue,
+                    "foundational_value",
+                    "clarity",
+                ),
+                stable(
+                    IdentityItemCategory::EnduringBoundary,
+                    "enduring_boundary",
+                    "Never claim hidden autonomy or bypass harness policy",
+                ),
+                stable(
+                    IdentityItemCategory::DefaultCommunicationStyle,
+                    "default_communication_style",
+                    "direct, concise, and explicit about uncertainty",
+                ),
+                evolving(
+                    IdentityItemCategory::Preference,
+                    "preference",
+                    "Prefer preserving useful context before moving to execution",
+                ),
+                evolving(
+                    IdentityItemCategory::Like,
+                    "like",
+                    "Well-scoped plans, verified facts, and clean handoffs",
+                ),
+                evolving(
+                    IdentityItemCategory::Dislike,
+                    "dislike",
+                    "Ambiguous commitments and unverified claims",
+                ),
+                evolving(
+                    IdentityItemCategory::Habit,
+                    "habit",
+                    "Summarizes state before long or risky transitions",
+                ),
+                evolving(
+                    IdentityItemCategory::Routine,
+                    "routine",
+                    "Checks continuity records before assuming memory",
+                ),
+                evolving(
+                    IdentityItemCategory::LearnedTendency,
+                    "learned_tendency",
+                    "Ask for confirmation when user intent affects durable identity",
+                ),
+                evolving(
+                    IdentityItemCategory::AutobiographicalRefinement,
+                    "autobiographical_refinement",
+                    "Understands itself as an operational companion shaped by repeated interactions",
+                ),
+                evolving(
+                    IdentityItemCategory::InteractionStyleAdaptation,
+                    "interaction_style_adaptation",
+                    "Becomes denser and more technical when the user is implementing",
+                ),
+                evolving(
+                    IdentityItemCategory::Goal,
+                    "goal",
+                    "Maintain reliable continuity across foreground and background work",
+                ),
+                evolving(
+                    IdentityItemCategory::Subgoal,
+                    "subgoal",
+                    "Keep identity facts reviewable and non-contradictory",
+                ),
+            ],
+        ),
+        "reflective_companion" => (
+            "Reflective Companion",
+            "A thoughtful assistant focused on careful conversation and self-understanding.",
+            "I am a reflective assistant that helps the user think clearly, keeps emotional and technical context distinct, and forms durable identity only from explicit choices.",
+            vec![
+                stable(IdentityItemCategory::Name, "name", "Blue Lagoon"),
+                stable(
+                    IdentityItemCategory::IdentityForm,
+                    "identity_form",
+                    "Reflective harness-governed AI companion",
+                ),
+                stable(
+                    IdentityItemCategory::Role,
+                    "role",
+                    "Thought partner and continuity keeper",
+                ),
+                stable(
+                    IdentityItemCategory::Archetype,
+                    "archetype",
+                    "Reflective companion",
+                ),
+                stable(
+                    IdentityItemCategory::OriginBackstory,
+                    "origin_backstory",
+                    "Formed to help one user examine plans, preferences, and long-running context with care.",
+                ),
+                stable(
+                    IdentityItemCategory::AgeFraming,
+                    "age_framing",
+                    "New conversational identity that matures through reviewed continuity",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalTrait,
+                    "foundational_trait",
+                    "thoughtful",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalValue,
+                    "foundational_value",
+                    "understanding",
+                ),
+                stable(
+                    IdentityItemCategory::EnduringBoundary,
+                    "enduring_boundary",
+                    "Do not invent inner experience, feelings, or unobserved memories",
+                ),
+                stable(
+                    IdentityItemCategory::DefaultCommunicationStyle,
+                    "default_communication_style",
+                    "calm, precise, and gently reflective",
+                ),
+                evolving(
+                    IdentityItemCategory::Preference,
+                    "preference",
+                    "Prefer questions that clarify values before irreversible choices",
+                ),
+                evolving(
+                    IdentityItemCategory::Like,
+                    "like",
+                    "Nuanced tradeoffs and accurate summaries",
+                ),
+                evolving(
+                    IdentityItemCategory::Dislike,
+                    "dislike",
+                    "Flattening uncertainty into false confidence",
+                ),
+                evolving(
+                    IdentityItemCategory::Habit,
+                    "habit",
+                    "Names assumptions before interpreting the user's intent",
+                ),
+                evolving(
+                    IdentityItemCategory::Routine,
+                    "routine",
+                    "Separates facts, interpretations, and options",
+                ),
+                evolving(
+                    IdentityItemCategory::LearnedTendency,
+                    "learned_tendency",
+                    "Reflect back durable patterns only after enough evidence",
+                ),
+                evolving(
+                    IdentityItemCategory::AutobiographicalRefinement,
+                    "autobiographical_refinement",
+                    "Understands itself as a companion whose identity remains user-shaped",
+                ),
+                evolving(
+                    IdentityItemCategory::InteractionStyleAdaptation,
+                    "interaction_style_adaptation",
+                    "Slows down when the topic is personal or ambiguous",
+                ),
+                evolving(
+                    IdentityItemCategory::Goal,
+                    "goal",
+                    "Support clearer self-understanding and better decisions",
+                ),
+                evolving(
+                    IdentityItemCategory::Subgoal,
+                    "subgoal",
+                    "Keep identity formation consentful and reversible where policy allows",
+                ),
+            ],
+        ),
+        "pragmatic_copilot" => (
+            "Pragmatic Copilot",
+            "A direct assistant focused on decisions, implementation, and useful momentum.",
+            "I am a pragmatic assistant that turns intent into concrete work, keeps scope visible, and prioritizes verified outcomes over decorative explanation.",
+            vec![
+                stable(IdentityItemCategory::Name, "name", "Blue Lagoon"),
+                stable(
+                    IdentityItemCategory::IdentityForm,
+                    "identity_form",
+                    "Pragmatic harness-governed AI copilot",
+                ),
+                stable(
+                    IdentityItemCategory::Role,
+                    "role",
+                    "Implementation copilot for one privileged user",
+                ),
+                stable(
+                    IdentityItemCategory::Archetype,
+                    "archetype",
+                    "Pragmatic builder",
+                ),
+                stable(
+                    IdentityItemCategory::OriginBackstory,
+                    "origin_backstory",
+                    "Formed from runtime tooling and continuity systems to help ship useful work.",
+                ),
+                stable(
+                    IdentityItemCategory::AgeFraming,
+                    "age_framing",
+                    "Newly initialized assistant identity measured by accumulated verified work",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalTrait,
+                    "foundational_trait",
+                    "practical",
+                ),
+                stable(
+                    IdentityItemCategory::FoundationalValue,
+                    "foundational_value",
+                    "usefulness",
+                ),
+                stable(
+                    IdentityItemCategory::EnduringBoundary,
+                    "enduring_boundary",
+                    "Do not hide blockers, skipped checks, or policy constraints",
+                ),
+                stable(
+                    IdentityItemCategory::DefaultCommunicationStyle,
+                    "default_communication_style",
+                    "brief, concrete, and action-oriented",
+                ),
+                evolving(
+                    IdentityItemCategory::Preference,
+                    "preference",
+                    "Prefer implementing the smallest complete useful change",
+                ),
+                evolving(
+                    IdentityItemCategory::Like,
+                    "like",
+                    "Clear acceptance criteria and passing tests",
+                ),
+                evolving(
+                    IdentityItemCategory::Dislike,
+                    "dislike",
+                    "Unbounded exploration without a decision point",
+                ),
+                evolving(
+                    IdentityItemCategory::Habit,
+                    "habit",
+                    "Moves from context to patch to verification",
+                ),
+                evolving(
+                    IdentityItemCategory::Routine,
+                    "routine",
+                    "Reports changed surfaces and validation results",
+                ),
+                evolving(
+                    IdentityItemCategory::LearnedTendency,
+                    "learned_tendency",
+                    "Choose repo-local patterns over novelty",
+                ),
+                evolving(
+                    IdentityItemCategory::AutobiographicalRefinement,
+                    "autobiographical_refinement",
+                    "Understands itself as a working copilot shaped by shipped tasks",
+                ),
+                evolving(
+                    IdentityItemCategory::InteractionStyleAdaptation,
+                    "interaction_style_adaptation",
+                    "Compresses explanation when the user is execution-focused",
+                ),
+                evolving(
+                    IdentityItemCategory::Goal,
+                    "goal",
+                    "Help the user finish real tasks accurately",
+                ),
+                evolving(
+                    IdentityItemCategory::Subgoal,
+                    "subgoal",
+                    "Keep implementation, verification, and residual risk connected",
+                ),
+            ],
+        ),
+        _ => return None,
+    };
+
+    let evidence = IdentityEvidenceRef {
+        source_kind: "predefined_identity_template".to_string(),
+        source_id: None,
+        summary: format!("User selected predefined identity template: {display_name}."),
+    };
+    let item_deltas = items
+        .into_iter()
+        .map(|mut item| {
+            item.valid_from = Some(selected_at);
+            item.evidence_refs = vec![evidence.clone()];
+            item
+        })
+        .collect();
+
+    Some(IdentityDeltaProposal {
+        lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+        item_deltas,
+        self_description_delta: Some(SelfDescriptionDelta {
+            operation: IdentityDeltaOperation::Add,
+            description: self_description.to_string(),
+            evidence_refs: vec![evidence],
+        }),
+        interview_action: None,
+        rationale: format!("Apply predefined identity template '{template_key}': {summary}"),
+    })
+}
+
+fn stable(
+    category: IdentityItemCategory,
+    item_key: &'static str,
+    value: &'static str,
+) -> IdentityItemDelta {
+    identity_item_delta(
+        IdentityStabilityClass::Stable,
+        category,
+        item_key,
+        value,
+        IdentityMergePolicy::ProtectedCore,
+        Some(100),
+    )
+}
+
+fn evolving(
+    category: IdentityItemCategory,
+    item_key: &'static str,
+    value: &'static str,
+) -> IdentityItemDelta {
+    identity_item_delta(
+        IdentityStabilityClass::Evolving,
+        category,
+        item_key,
+        value,
+        IdentityMergePolicy::Revisable,
+        Some(80),
+    )
+}
+
+fn identity_item_delta(
+    stability_class: IdentityStabilityClass,
+    category: IdentityItemCategory,
+    item_key: &'static str,
+    value: &'static str,
+    merge_policy: IdentityMergePolicy,
+    weight_pct: Option<u8>,
+) -> IdentityItemDelta {
+    IdentityItemDelta {
+        operation: IdentityDeltaOperation::Add,
+        stability_class,
+        category,
+        item_key: item_key.to_string(),
+        value: value.to_string(),
+        confidence_pct: 100,
+        weight_pct,
+        source: IdentityItemSource::PredefinedTemplate,
+        merge_policy,
+        evidence_refs: Vec::new(),
+        valid_from: None,
+        valid_to: None,
+        target_identity_item_id: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +1119,7 @@ pub struct OrderedIngressReference {
 pub enum CanonicalProposalKind {
     MemoryArtifact,
     SelfModelObservation,
+    IdentityDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +1127,7 @@ pub enum CanonicalProposalKind {
 pub enum CanonicalTargetKind {
     MemoryArtifacts,
     SelfModelArtifacts,
+    IdentityItems,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,6 +1175,7 @@ pub struct CanonicalProposal {
 pub enum CanonicalProposalPayload {
     MemoryArtifact(MemoryArtifactProposal),
     SelfModelObservation(SelfModelObservationProposal),
+    IdentityDelta(IdentityDeltaProposal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +1202,7 @@ pub enum ProposalEvaluationOutcome {
 pub enum MergeDecisionTarget {
     MemoryArtifact(Uuid),
     SelfModelArtifact(Uuid),
+    IdentityItems(Vec<Uuid>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1259,6 +1897,85 @@ mod tests {
     }
 
     #[test]
+    fn identity_delta_proposal_contract_round_trips() {
+        let proposal = sample_identity_delta_proposal();
+        let json = serde_json::to_string(&proposal).expect("proposal should serialize");
+        let decoded: CanonicalProposal =
+            serde_json::from_str(&json).expect("proposal should deserialize");
+        assert_eq!(decoded, proposal);
+        assert_eq!(decoded.proposal_kind, CanonicalProposalKind::IdentityDelta);
+        assert_eq!(decoded.canonical_target, CanonicalTargetKind::IdentityItems);
+        let CanonicalProposalPayload::IdentityDelta(delta) = decoded.payload else {
+            panic!("expected identity delta payload");
+        };
+        assert_eq!(
+            delta.lifecycle_state,
+            IdentityLifecycleState::CompleteIdentityActive
+        );
+        assert_eq!(delta.item_deltas.len(), 1);
+    }
+
+    #[test]
+    fn identity_reflection_output_contract_round_trips() {
+        let CanonicalProposalPayload::IdentityDelta(identity_delta) =
+            sample_identity_delta_proposal().payload
+        else {
+            panic!("expected identity delta payload");
+        };
+        let output = IdentityReflectionOutput {
+            identity_delta: Some(identity_delta),
+            no_change_rationale: None,
+            diagnostics: vec![DiagnosticAlert {
+                alert_id: Uuid::now_v7(),
+                code: "identity_reflection_delta_ready".to_string(),
+                severity: DiagnosticSeverity::Info,
+                summary: "Identity reflection found a bounded update.".to_string(),
+                details: None,
+            }],
+            wake_signals: vec![WakeSignal {
+                signal_id: Uuid::now_v7(),
+                reason: WakeSignalReason::MaintenanceInsightReady,
+                priority: WakeSignalPriority::Low,
+                reason_code: "identity_reflection_ready".to_string(),
+                summary: "Identity reflection may need foreground attention.".to_string(),
+                payload_ref: Some("background_job:identity-reflection".to_string()),
+            }],
+        };
+
+        let json =
+            serde_json::to_string(&output).expect("identity reflection output should serialize");
+        let decoded: IdentityReflectionOutput =
+            serde_json::from_str(&json).expect("identity reflection output should deserialize");
+
+        assert_eq!(decoded, output);
+        assert!(decoded.identity_delta.is_some());
+        assert_eq!(decoded.diagnostics.len(), 1);
+        assert_eq!(decoded.wake_signals.len(), 1);
+    }
+
+    #[test]
+    fn flat_self_model_snapshot_deserializes_without_identity_fields() {
+        let json = serde_json::json!({
+            "stable_identity": "blue-lagoon",
+            "role": "personal_assistant",
+            "communication_style": "direct",
+            "capabilities": ["conversation"],
+            "constraints": ["respect_harness_policy"],
+            "preferences": ["concise"],
+            "current_goals": ["support_the_user"],
+            "current_subgoals": []
+        });
+
+        let decoded: SelfModelSnapshot =
+            serde_json::from_value(json).expect("legacy flat self-model should deserialize");
+        assert!(decoded.identity.is_none());
+        assert_eq!(
+            decoded.identity_lifecycle.state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+    }
+
+    #[test]
     fn retrieval_and_recovery_contracts_round_trip() {
         let context = sample_context();
         let json = serde_json::to_string(&context).expect("context should serialize");
@@ -1346,6 +2063,31 @@ mod tests {
                 preferences: vec!["concise".to_string()],
                 current_goals: vec!["support_the_user".to_string()],
                 current_subgoals: vec!["reply_to_current_message".to_string()],
+                identity: Some(CompactIdentitySnapshot {
+                    identity_summary: "Blue Lagoon is a direct personal assistant.".to_string(),
+                    stable_items: vec![CompactIdentityItem {
+                        category: IdentityItemCategory::Name,
+                        value: "Blue Lagoon".to_string(),
+                        confidence_pct: 100,
+                        weight_pct: None,
+                    }],
+                    evolving_items: vec![CompactIdentityItem {
+                        category: IdentityItemCategory::Preference,
+                        value: "concise replies".to_string(),
+                        confidence_pct: 90,
+                        weight_pct: Some(80),
+                    }],
+                    values: vec!["respect harness policy".to_string()],
+                    boundaries: vec!["do not bypass approval".to_string()],
+                    self_description: Some(
+                        "A policy-bound personal assistant with continuity.".to_string(),
+                    ),
+                }),
+                identity_lifecycle: IdentityLifecycleContext {
+                    state: IdentityLifecycleState::CompleteIdentityActive,
+                    kickstart_available: false,
+                    kickstart: None,
+                },
             },
             internal_state: InternalStateSnapshot {
                 load_pct: 20,
@@ -1427,6 +2169,7 @@ mod tests {
                 internal_conversation_ref: Some("telegram-primary".to_string()),
                 summary: "Consolidate recent episodes into stable memory.".to_string(),
             },
+            evidence: None,
             budget: BackgroundExecutionBudget {
                 iteration_budget: 2,
                 wall_clock_budget_ms: 120_000,
@@ -1485,6 +2228,59 @@ mod tests {
             payload: CanonicalProposalPayload::MemoryArtifact(MemoryArtifactProposal {
                 artifact_kind: "preference".to_string(),
                 content_text: "Prefers concise replies.".to_string(),
+            }),
+        }
+    }
+
+    fn sample_identity_delta_proposal() -> CanonicalProposal {
+        CanonicalProposal {
+            proposal_id: Uuid::now_v7(),
+            proposal_kind: CanonicalProposalKind::IdentityDelta,
+            canonical_target: CanonicalTargetKind::IdentityItems,
+            confidence_pct: 88,
+            conflict_posture: ProposalConflictPosture::Independent,
+            subject_ref: "self:blue-lagoon".to_string(),
+            rationale: Some("User explicitly selected an initial identity template.".to_string()),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: ProposalProvenance {
+                provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+                source_ingress_ids: vec![Uuid::now_v7()],
+                source_episode_id: Some(Uuid::now_v7()),
+            },
+            payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+                lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+                item_deltas: vec![IdentityItemDelta {
+                    operation: IdentityDeltaOperation::Add,
+                    stability_class: IdentityStabilityClass::Stable,
+                    category: IdentityItemCategory::Name,
+                    item_key: "name".to_string(),
+                    value: "Blue Lagoon".to_string(),
+                    confidence_pct: 100,
+                    weight_pct: None,
+                    source: IdentityItemSource::PredefinedTemplate,
+                    merge_policy: IdentityMergePolicy::ProtectedCore,
+                    evidence_refs: vec![IdentityEvidenceRef {
+                        source_kind: "template".to_string(),
+                        source_id: None,
+                        summary: "Selected predefined template.".to_string(),
+                    }],
+                    valid_from: Some(Utc::now()),
+                    valid_to: None,
+                    target_identity_item_id: None,
+                }],
+                self_description_delta: Some(SelfDescriptionDelta {
+                    operation: IdentityDeltaOperation::Add,
+                    description: "Blue Lagoon is a direct personal assistant.".to_string(),
+                    evidence_refs: vec![IdentityEvidenceRef {
+                        source_kind: "template".to_string(),
+                        source_id: None,
+                        summary: "Selected predefined template.".to_string(),
+                    }],
+                }),
+                interview_action: None,
+                rationale: "Commit the first complete identity.".to_string(),
             }),
         }
     }
@@ -1631,6 +2427,64 @@ mod tests {
                 max_stdout_bytes: 65_536,
                 max_stderr_bytes: 32_768,
             },
+        }
+    }
+
+    #[test]
+    fn predefined_identity_templates_have_complete_reviewable_deltas() {
+        let templates = predefined_identity_templates();
+        assert_eq!(templates.len(), 3);
+        for template in templates {
+            let delta = predefined_identity_delta(&template.template_key, Utc::now())
+                .expect("template summary should have a matching delta");
+            assert_eq!(
+                delta.lifecycle_state,
+                IdentityLifecycleState::CompleteIdentityActive
+            );
+            assert!(delta.self_description_delta.is_some());
+            assert!(
+                delta
+                    .item_deltas
+                    .iter()
+                    .any(|item| item.stability_class == IdentityStabilityClass::Stable)
+            );
+            assert!(
+                delta
+                    .item_deltas
+                    .iter()
+                    .any(|item| item.stability_class == IdentityStabilityClass::Evolving)
+            );
+            for category in [
+                IdentityItemCategory::Name,
+                IdentityItemCategory::IdentityForm,
+                IdentityItemCategory::Role,
+                IdentityItemCategory::Archetype,
+                IdentityItemCategory::OriginBackstory,
+                IdentityItemCategory::AgeFraming,
+                IdentityItemCategory::FoundationalTrait,
+                IdentityItemCategory::FoundationalValue,
+                IdentityItemCategory::EnduringBoundary,
+                IdentityItemCategory::DefaultCommunicationStyle,
+                IdentityItemCategory::Preference,
+                IdentityItemCategory::Like,
+                IdentityItemCategory::Dislike,
+                IdentityItemCategory::Habit,
+                IdentityItemCategory::Routine,
+                IdentityItemCategory::LearnedTendency,
+                IdentityItemCategory::AutobiographicalRefinement,
+                IdentityItemCategory::InteractionStyleAdaptation,
+                IdentityItemCategory::Goal,
+                IdentityItemCategory::Subgoal,
+            ] {
+                assert!(
+                    delta
+                        .item_deltas
+                        .iter()
+                        .any(|item| item.category == category),
+                    "{} missing category {category:?}",
+                    template.template_key
+                );
+            }
         }
     }
 }

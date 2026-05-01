@@ -2,11 +2,11 @@
 
 ## Metadata
 
-- Plan Status: READY FOR APPROVAL
+- Plan Status: COMPLETED
 - Created: 2026-04-30
-- Last Updated: 2026-04-30
+- Last Updated: 2026-05-01
 - Owner: Coding agent
-- Approval: PENDING
+- Approval: APPROVED
 
 ## Status Legend
 
@@ -31,8 +31,7 @@ artifacts, merge decisions, governed actions, wake signals, and management CLI
 surfaces. The identity model is still flat, prompt-oriented, and too small to
 support the richer evolving identity described in the original requirements.
 
-This plan is ready for approval but not approved. No implementation tasks have
-started.
+This plan is implemented and final verification is complete.
 
 ## Scope
 
@@ -95,7 +94,7 @@ the architecture.
 
 ### Milestone 1: Canonical Identity Design And Documentation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Make the richer identity requirements explicit enough to implement
   without relying on archived source material or this conversation.
 - Exit Criteria: Canonical docs, gap report references, and implementation plan
@@ -104,7 +103,7 @@ the architecture.
 
 #### Task 1.1: Promote Identity Requirements Into Canonical Docs
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Update canonical requirements and design docs to state the richer
   identity model and first-identity kickstart behavior.
 - Steps:
@@ -121,7 +120,7 @@ the architecture.
 
 #### Task 1.2: Define Identity Domain Model
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Specify the typed identity data model before changing schema or
   contracts.
 - Steps:
@@ -144,7 +143,7 @@ the architecture.
 
 #### Task 1.3: Define Identity Lifecycle And Kickstart Contract
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Specify the state machine and user flow for first identity
   formation.
 - Steps:
@@ -163,7 +162,7 @@ the architecture.
 
 ### Milestone 2: Schema, Contracts, And Seed Baseline
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Add durable storage and cross-process types that can represent rich
   identity without breaking existing self-model behavior.
 - Exit Criteria: New migrations, contracts, seed parsing, repository APIs, and
@@ -172,7 +171,7 @@ the architecture.
 
 #### Task 2.1: Add Identity Persistence Migration
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Create reviewed schema for identity lifecycle, identity items,
   identity templates, interview state, and identity diagnostics.
 - Steps:
@@ -192,7 +191,7 @@ the architecture.
 
 #### Task 2.2: Extend Contracts For Identity Snapshots And Deltas
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add shared types for identity snapshots, lifecycle state, kickstart
   actions, templates, interview answers, and identity deltas.
 - Steps:
@@ -209,7 +208,7 @@ the architecture.
 
 #### Task 2.3: Upgrade Self-Model Seed Format
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Support a richer seed document while preserving current bootstrap
   behavior during migration.
 - Steps:
@@ -226,7 +225,7 @@ the architecture.
 
 #### Task 2.4: Add Identity Repository APIs
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add harness-owned database access functions for identity lifecycle,
   items, templates, interview state, and diagnostics.
 - Steps:
@@ -242,7 +241,7 @@ the architecture.
 
 ### Milestone 3: Identity Lifecycle And Kickstart Flow
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Implement the first complete identity formation path before normal
   identity evolution runs.
 - Exit Criteria: A seed-only system exposes a one-time identity kickstart to the
@@ -251,7 +250,7 @@ the architecture.
 
 #### Task 3.1: Implement Lifecycle Detection In Context Assembly
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Make foreground context know whether identity kickstart is
   available without revealing storage internals.
 - Steps:
@@ -267,7 +266,7 @@ the architecture.
 
 #### Task 3.2: Add Kickstart Tool Schema To Conscious Prompt Conditionally
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Expose identity formation as a governed conscious capability only
   while lifecycle state allows it.
 - Steps:
@@ -284,7 +283,7 @@ the architecture.
 
 #### Task 3.3: Implement Predefined Identity Selection
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let the user choose one of three predefined complete identities and
   commit it through harness validation.
 - Steps:
@@ -301,7 +300,7 @@ the architecture.
 
 #### Task 3.4: Implement Custom Interview State Machine
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let the user build a custom first identity through a durable
   directed conversation.
 - Steps:
@@ -318,7 +317,7 @@ the architecture.
 
 #### Task 3.5: Add Admin Identity Reset
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add a management CLI path to reset identity back to bootstrap-only
   state so kickstart can run again.
 - Steps:
@@ -335,7 +334,7 @@ the architecture.
 
 #### Task 3.6: Add Kickstart Use-Case Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove the full first identity lifecycle works end to end.
 - Steps:
   1. Add or extend tests in `crates/harness/tests/use_case_scenarios.rs`.
@@ -349,7 +348,7 @@ the architecture.
 
 ### Milestone 4: Structured Identity Proposals And Merge Rules
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Replace free-text self-model observations with validated, auditable
   identity deltas.
 - Exit Criteria: Identity deltas support add, reinforce, weaken, revise,
@@ -358,7 +357,7 @@ the architecture.
 
 #### Task 4.1: Implement Identity Delta Proposal Payloads
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add typed proposal payloads for identity item changes and compact
   self-description changes.
 - Steps:
@@ -372,7 +371,7 @@ the architecture.
 
 #### Task 4.2: Implement Identity Proposal Validation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Validate identity deltas before any canonical identity mutation.
 - Steps:
   1. Add validation for required category, operation, value, confidence,
@@ -386,7 +385,7 @@ the architecture.
 
 #### Task 4.3: Implement Identity Merge Engine
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Apply accepted identity deltas to canonical identity items with
   supersession and audit history.
 - Steps:
@@ -399,7 +398,7 @@ the architecture.
 
 #### Task 4.4: Add Duplicate, Contradiction, And Drift Controls
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prevent noisy identity growth and protect stable identity.
 - Steps:
   1. Add exact duplicate checks.
@@ -415,7 +414,7 @@ the architecture.
 
 ### Milestone 5: Reflection, Memory, And Autobiographical Evolution
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Make identity evolve from episodes, memory, and reflection through
   structured proposals instead of appended free text.
 - Exit Criteria: Background reflection produces typed identity deltas,
@@ -424,7 +423,7 @@ the architecture.
 
 #### Task 5.1: Add Structured Reflection Output Schema
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Define and use structured model output for self-model reflection.
 - Steps:
   1. Add schema contract for reflection outputs: deltas, no-change rationale,
@@ -438,7 +437,7 @@ the architecture.
 
 #### Task 5.2: Scope Reflection With Identity Evidence
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Give reflection jobs the evidence needed to propose useful identity
   changes without exposing too much state.
 - Steps:
@@ -452,7 +451,7 @@ the architecture.
 
 #### Task 5.3: Apply Reflection Identity Deltas
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Route reflection deltas through the identity proposal and merge
   path.
 - Steps:
@@ -465,7 +464,7 @@ the architecture.
 
 #### Task 5.4: Add Autobiographical Self-Description Generation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Maintain a compact self-description grounded in accepted identity
   and autobiographical evidence.
 - Steps:
@@ -479,7 +478,7 @@ the architecture.
 
 ### Milestone 6: Action-Relevant Identity And Live Internal State
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Make identity and interoception affect behavior through harness
   decisions, not only prompt wording.
 - Exit Criteria: Tests prove boundaries, preferences, and internal state can
@@ -487,7 +486,7 @@ the architecture.
 
 #### Task 6.1: Derive Live Internal State
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Replace mostly static internal-state values with bounded values
   derived from runtime signals.
 - Steps:
@@ -505,7 +504,7 @@ the architecture.
 
 #### Task 6.2: Integrate Identity Into Governed Action Policy
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let identity boundaries and values affect action policy
   deterministically.
 - Steps:
@@ -519,7 +518,7 @@ the architecture.
 
 #### Task 6.3: Integrate Identity And Internal State Into Proactive Decisions
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let preferences, internal state, and boundaries influence
   scheduled foreground and wake-signal behavior.
 - Steps:
@@ -534,14 +533,14 @@ the architecture.
 
 ### Milestone 7: Management CLI And Operator Workflows
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Provide durable operator inspection and control without raw SQL.
 - Exit Criteria: Operators can inspect identity, history, diagnostics, pending
   identity proposals, and reset identity through management CLI commands.
 
 #### Task 7.1: Add Identity Inspection Commands
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Expose active identity and lifecycle state through the management
   CLI.
 - Steps:
@@ -556,7 +555,7 @@ the architecture.
 
 #### Task 7.2: Add Identity History And Diagnostics Commands
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let operators inspect identity evolution and problems.
 - Steps:
   1. Add commands to list identity item history and merge decisions.
@@ -568,7 +567,7 @@ the architecture.
 
 #### Task 7.3: Add Controlled Identity Edit Proposal Commands
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Let operators or approved user flows propose identity edits without
   direct writes.
 - Steps:
@@ -582,7 +581,7 @@ the architecture.
 
 ### Milestone 8: Documentation, Cleanup, And Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Ensure code, docs, and tests agree and the repository contains only
   intentional final artifacts.
 - Exit Criteria: Internal docs are updated with source references and verified
@@ -591,7 +590,7 @@ the architecture.
 
 #### Task 8.1: Update Internal Documentation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Keep implementation reference docs accurate after behavior changes.
 - Steps:
   1. Update `docs/internal/conscious_loop/CONTEXT_ASSEMBLY.md` with new identity
@@ -609,7 +608,7 @@ the architecture.
 
 #### Task 8.2: Update User-Facing Documentation
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Document supported operator and user workflows after implementation.
 - Steps:
   1. Update `README.md` or `docs/USER_MANUAL.md` with identity kickstart,
@@ -623,7 +622,7 @@ the architecture.
 
 #### Task 8.3: Cleanup Intermediate Artifacts
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Remove artifacts created only to support implementation.
 - Steps:
   1. Inspect the worktree for temporary scripts, scratch fixtures, debug logs,
@@ -638,7 +637,7 @@ the architecture.
 
 #### Task 8.4: Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Validate the integrated identity implementation after cleanup.
 - Steps:
   1. Run formatting and compilation checks.

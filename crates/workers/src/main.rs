@@ -9,19 +9,21 @@ use contracts::{
     CanonicalProposalPayload, CanonicalTargetKind, ConsciousContext, ConsciousWorkerInboundMessage,
     ConsciousWorkerOutboundMessage, ConsciousWorkerRequest, ConsciousWorkerResult,
     ConsciousWorkerStatus, DiagnosticAlert, DiagnosticSeverity, EpisodeSummary,
-    ForegroundExecutionMode, GovernedActionObservation, GovernedActionProposal, LoopKind,
+    ForegroundExecutionMode, GovernedActionObservation, GovernedActionProposal,
+    IdentityDeltaProposal, IdentityInterviewAnswer, IdentityKickstartAction,
+    IdentityKickstartActionKind, IdentityLifecycleState, IdentityReflectionOutput, LoopKind,
     MemoryArtifactProposal, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelCallResponse,
     ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, ProposalConflictPosture,
     ProposalProvenance, ProposalProvenanceKind, RetrievalUpdateOperation, RetrievalUpdateProposal,
     SelfModelObservationProposal, SmokeWorkerResult, ToolPolicy, UnconsciousContext,
     UnconsciousJobKind, UnconsciousMaintenanceOutputs, UnconsciousWorkerRequest,
-    UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal, WakeSignalPriority,
-    WakeSignalReason, WorkerErrorCode, WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse,
-    WorkerResult,
+    UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal, WorkerErrorCode, WorkerFailure,
+    WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult, predefined_identity_delta,
 };
 use serde::Serialize;
 
 const GOVERNED_ACTIONS_BLOCK_TAG: &str = "blue-lagoon-governed-actions";
+const IDENTITY_KICKSTART_BLOCK_TAG: &str = "blue-lagoon-identity-kickstart";
 
 #[derive(Debug, Parser)]
 #[command(name = "workers", about = "Blue Lagoon worker runtime")]
@@ -451,6 +453,9 @@ fn build_unconscious_model_call_request(
     let max_output_tokens = min(token_budget, 1_200);
     let max_input_tokens = max(1, token_budget.saturating_sub(max_output_tokens));
 
+    let identity_reflection_output =
+        payload.context.job_kind == UnconsciousJobKind::SelfModelReflection;
+
     ModelCallRequest {
         request_id: uuid::Uuid::now_v7(),
         trace_id: request.trace_id,
@@ -464,12 +469,44 @@ fn build_unconscious_model_call_request(
             timeout_ms: payload.context.budget.wall_clock_budget_ms,
         },
         input: build_unconscious_model_input(&payload.context),
-        output_mode: ModelOutputMode::PlainText,
-        schema_name: None,
-        schema_json: None,
+        output_mode: if identity_reflection_output {
+            ModelOutputMode::JsonObject
+        } else {
+            ModelOutputMode::PlainText
+        },
+        schema_name: identity_reflection_output.then(|| "identity_reflection_output".to_string()),
+        schema_json: identity_reflection_output.then(identity_reflection_output_schema),
         tool_policy: ToolPolicy::ProposalOnly,
         provider_hint: None,
     }
+}
+
+fn identity_reflection_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["identity_delta", "no_change_rationale", "diagnostics", "wake_signals"],
+        "properties": {
+            "identity_delta": {
+                "type": ["object", "null"],
+                "description": "Optional IdentityDeltaProposal. Use null when no identity change is warranted."
+            },
+            "no_change_rationale": {
+                "type": ["string", "null"],
+                "description": "Required when identity_delta is null; concise reason no canonical identity change should be proposed."
+            },
+            "diagnostics": {
+                "type": "array",
+                "description": "Optional diagnostic alerts for drift, contradiction, uncertainty, or maintenance notes.",
+                "items": { "type": "object" }
+            },
+            "wake_signals": {
+                "type": "array",
+                "description": "Optional wake-signal requests when user guidance or later foreground attention is warranted.",
+                "items": { "type": "object" }
+            }
+        }
+    })
 }
 
 fn build_model_input(context: &ConsciousContext) -> ModelInput {
@@ -543,6 +580,12 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
             role: ModelMessageRole::Developer,
             content: governed_action_schema_message(),
         });
+        if let Some(message) = identity_kickstart_schema_message(context) {
+            messages.push(ModelInputMessage {
+                role: ModelMessageRole::Developer,
+                content: message,
+            });
+        }
     }
 
     let subgoals_fragment = if context.self_model.current_subgoals.is_empty() {
@@ -567,13 +610,16 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         .format("%Y-%m-%d %H:%M UTC")
         .to_string();
 
+    let identity_fragment = identity_system_prompt_fragment(context);
+
     ModelInput {
         system_prompt: format!(
-            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
+            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
             name = context.self_model.stable_identity,
             role = context.self_model.role,
             style = context.self_model.communication_style,
             preferences = join_or_none(&context.self_model.preferences),
+            identity = identity_fragment,
             capabilities = join_or_none(&context.self_model.capabilities),
             constraints = join_or_none(&context.self_model.constraints),
             goals = join_or_none(&context.self_model.current_goals),
@@ -587,6 +633,107 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         ),
         messages,
     }
+}
+
+fn identity_system_prompt_fragment(context: &ConsciousContext) -> String {
+    if context.self_model.identity_lifecycle.kickstart_available {
+        return " Identity formation is available: the assistant does not yet have a complete chosen identity with the user.".to_string();
+    }
+
+    let Some(identity) = &context.self_model.identity else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    if !identity.identity_summary.is_empty() {
+        parts.push(format!("Identity: {}", identity.identity_summary));
+    }
+    if let Some(description) = &identity.self_description {
+        parts.push(format!("Self-description: {description}"));
+    }
+    if !identity.values.is_empty() {
+        parts.push(format!("Values: {}", join_or_none(&identity.values)));
+    }
+    if !identity.boundaries.is_empty() {
+        parts.push(format!(
+            "Boundaries: {}",
+            join_or_none(&identity.boundaries)
+        ));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(". "))
+    }
+}
+
+fn identity_kickstart_schema_message(context: &ConsciousContext) -> Option<String> {
+    let kickstart = context.self_model.identity_lifecycle.kickstart.as_ref()?;
+    if !context.self_model.identity_lifecycle.kickstart_available {
+        return None;
+    }
+
+    let mut available_actions = kickstart
+        .available_actions
+        .iter()
+        .map(|action| match action {
+            IdentityKickstartActionKind::SelectPredefinedTemplate => "select_predefined_identity",
+            IdentityKickstartActionKind::StartCustomInterview => "start_custom_identity_interview",
+            IdentityKickstartActionKind::AnswerCustomInterview => "answer_custom_identity_question",
+            IdentityKickstartActionKind::Cancel => "cancel_identity_formation",
+        })
+        .collect::<Vec<_>>();
+    available_actions.sort_unstable();
+
+    let templates = kickstart
+        .predefined_templates
+        .iter()
+        .map(|template| {
+            format!(
+                "- {}: {} ({})",
+                template.template_key, template.display_name, template.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let templates = if templates.is_empty() {
+        "No predefined identities are available in this step.".to_string()
+    } else {
+        templates
+    };
+    let next_step = kickstart.next_step.as_deref().unwrap_or("choose_next_step");
+    let resume_summary = kickstart.resume_summary.as_deref().unwrap_or("none");
+
+    Some(format!(
+        r#"IDENTITY FORMATION CAPABILITY
+
+The assistant does not yet have a complete chosen identity with the user. You may help the user form it when the conversation calls for that. Do not mention implementation details or hidden maintenance.
+
+Available identity actions: {available_actions}
+Next identity step: {next_step}
+Resume summary: {resume_summary}
+Predefined identities:
+{templates}
+
+To request identity formation, append exactly one fenced code block tagged "{tag}" after your user-visible reply. Omit this block unless the user is choosing, starting, answering, or canceling identity formation.
+
+```{tag}
+{{
+  "action": "select_predefined_identity",
+  "template_key": "<one predefined identity key, or null>",
+  "answer": null,
+  "cancel_reason": null
+}}
+```
+
+For a custom path, use action "start_custom_identity_interview" or "answer_custom_identity_question". For cancellation, use action "cancel_identity_formation"."#,
+        available_actions = available_actions.join(", "),
+        next_step = next_step,
+        resume_summary = resume_summary,
+        templates = templates,
+        tag = IDENTITY_KICKSTART_BLOCK_TAG,
+    ))
 }
 
 fn governed_action_schema_message() -> String {
@@ -690,20 +837,158 @@ fn build_governed_action_proposals(
     Ok(envelope.actions)
 }
 
-fn strip_governed_action_block(model_text: &str) -> String {
-    match governed_action_block_bounds(model_text) {
+fn build_identity_kickstart_proposals(
+    context: &ConsciousContext,
+    model_text: &str,
+) -> std::result::Result<Vec<CanonicalProposal>, String> {
+    let Some(block_json) = extract_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG) else {
+        return Ok(Vec::new());
+    };
+    if !context.self_model.identity_lifecycle.kickstart_available {
+        return Err(
+            "identity kickstart block emitted when identity formation is unavailable".to_string(),
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct IdentityKickstartBlock {
+        action: String,
+        template_key: Option<String>,
+        answer: Option<serde_json::Value>,
+        cancel_reason: Option<String>,
+    }
+
+    let block: IdentityKickstartBlock = serde_json::from_str(block_json)
+        .map_err(|error| format!("invalid identity kickstart block: {error}"))?;
+    match block.action.as_str() {
+        "select_predefined_identity" => {
+            if context.self_model.identity_lifecycle.state
+                != IdentityLifecycleState::BootstrapSeedOnly
+            {
+                return Err(
+                    "predefined identity selection is only available before identity completion"
+                        .to_string(),
+                );
+            }
+            let template_key = block
+                .template_key
+                .as_deref()
+                .ok_or_else(|| "identity template_key is required".to_string())?;
+            let delta =
+                predefined_identity_delta(template_key, context.trigger.ingress.occurred_at)
+                    .ok_or_else(|| {
+                        format!("unknown predefined identity template: {template_key}")
+                    })?;
+            Ok(vec![CanonicalProposal {
+                proposal_id: uuid::Uuid::now_v7(),
+                proposal_kind: CanonicalProposalKind::IdentityDelta,
+                canonical_target: CanonicalTargetKind::IdentityItems,
+                confidence_pct: 100,
+                conflict_posture: ProposalConflictPosture::Independent,
+                subject_ref: "self:blue-lagoon".to_string(),
+                rationale: Some(format!(
+                    "User selected predefined identity template '{template_key}'."
+                )),
+                valid_from: Some(context.trigger.ingress.occurred_at),
+                valid_to: None,
+                supersedes_artifact_id: None,
+                provenance: ProposalProvenance {
+                    provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+                    source_ingress_ids: current_source_ingress_ids(context),
+                    source_episode_id: None,
+                },
+                payload: CanonicalProposalPayload::IdentityDelta(delta),
+            }])
+        }
+        "start_custom_identity_interview" => Ok(vec![identity_interview_action_proposal(
+            context,
+            IdentityKickstartAction::StartCustomInterview,
+            IdentityLifecycleState::IdentityKickstartInProgress,
+            "User started a custom identity interview.",
+        )]),
+        "answer_custom_identity_question" => {
+            let answer = parse_identity_interview_answer(block.answer.as_ref())?;
+            Ok(vec![identity_interview_action_proposal(
+                context,
+                IdentityKickstartAction::AnswerCustomInterview(answer),
+                IdentityLifecycleState::IdentityKickstartInProgress,
+                "User answered a custom identity interview step.",
+            )])
+        }
+        "cancel_identity_formation" => Ok(vec![identity_interview_action_proposal(
+            context,
+            IdentityKickstartAction::Cancel {
+                reason: block.cancel_reason,
+            },
+            IdentityLifecycleState::BootstrapSeedOnly,
+            "User cancelled identity formation.",
+        )]),
+        other => Err(format!("unsupported identity kickstart action: {other}")),
+    }
+}
+
+fn parse_identity_interview_answer(
+    value: Option<&serde_json::Value>,
+) -> std::result::Result<IdentityInterviewAnswer, String> {
+    let value = value.ok_or_else(|| "identity answer is required".to_string())?;
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid identity interview answer: {error}"))
+}
+
+fn identity_interview_action_proposal(
+    context: &ConsciousContext,
+    action: IdentityKickstartAction,
+    lifecycle_state: IdentityLifecycleState,
+    rationale: &str,
+) -> CanonicalProposal {
+    CanonicalProposal {
+        proposal_id: uuid::Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: 100,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(rationale.to_string()),
+        valid_from: Some(context.trigger.ingress.occurred_at),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: current_source_ingress_ids(context),
+            source_episode_id: None,
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+            lifecycle_state,
+            item_deltas: Vec::new(),
+            self_description_delta: None,
+            interview_action: Some(action),
+            rationale: rationale.to_string(),
+        }),
+    }
+}
+
+fn strip_worker_control_blocks(model_text: &str) -> String {
+    let without_identity = strip_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG);
+    strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG)
+}
+
+fn strip_tagged_block(model_text: &str, tag: &str) -> String {
+    match tagged_block_bounds(model_text, tag) {
         Some((start, _json_start, _json_end, _end)) => model_text[..start].trim_end().to_string(),
         None => model_text.to_string(),
     }
 }
 
 fn extract_governed_action_block(model_text: &str) -> Option<&str> {
-    governed_action_block_bounds(model_text)
+    extract_tagged_block(model_text, GOVERNED_ACTIONS_BLOCK_TAG)
+}
+
+fn extract_tagged_block<'a>(model_text: &'a str, tag: &str) -> Option<&'a str> {
+    tagged_block_bounds(model_text, tag)
         .map(|(_start, json_start, json_end, _end)| model_text[json_start..json_end].trim())
 }
 
-fn governed_action_block_bounds(model_text: &str) -> Option<(usize, usize, usize, usize)> {
-    let marker = format!("```{GOVERNED_ACTIONS_BLOCK_TAG}");
+fn tagged_block_bounds(model_text: &str, tag: &str) -> Option<(usize, usize, usize, usize)> {
+    let marker = format!("```{tag}");
     let start = model_text.rfind(&marker)?;
     let after_marker = &model_text[start + marker.len()..];
     let newline_offset = after_marker.find('\n')?;
@@ -765,6 +1050,24 @@ fn build_unconscious_model_input(context: &UnconsciousContext) -> ModelInput {
         ),
     }];
 
+    if let Some(evidence) = &context.evidence {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: format!(
+                "Bounded reflection evidence: {}",
+                serde_json::to_string(evidence)
+                    .unwrap_or_else(|_| "evidence serialization unavailable".to_string())
+            ),
+        });
+    }
+
+    if context.job_kind == UnconsciousJobKind::SelfModelReflection {
+        messages.push(ModelInputMessage {
+            role: ModelMessageRole::Developer,
+            content: "Self-model reflection must return one JSON object matching identity_reflection_output. Use identity_delta only for evidence-backed identity item or self-description changes. Use no_change_rationale when no canonical identity change is warranted. Diagnostics and wake_signals are optional arrays. Do not request direct writes, direct side effects, or user-facing replies.".to_string(),
+        });
+    }
+
     messages.push(ModelInputMessage {
         role: ModelMessageRole::User,
         content: format!(
@@ -792,9 +1095,13 @@ fn build_conscious_worker_response(
     payload: &ConsciousWorkerRequest,
     model_response: ModelCallResponse,
 ) -> std::result::Result<WorkerResponse, String> {
-    let candidate_proposals = build_candidate_proposals(&payload.context)?;
+    let mut candidate_proposals = build_candidate_proposals(&payload.context)?;
+    candidate_proposals.extend(build_identity_kickstart_proposals(
+        &payload.context,
+        &model_response.output.text,
+    )?);
     let governed_action_proposals = build_governed_action_proposals(&model_response.output.text)?;
-    let assistant_text = strip_governed_action_block(&model_response.output.text);
+    let assistant_text = strip_worker_control_blocks(&model_response.output.text);
     Ok(WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
@@ -833,11 +1140,25 @@ fn build_unconscious_worker_response(
     payload: &UnconsciousWorkerRequest,
     model_response: ModelCallResponse,
 ) -> WorkerResponse {
-    let model_text = model_response.output.text;
-    let canonical_proposals = build_unconscious_canonical_proposals(&payload.context, &model_text);
+    let model_output = model_response.output;
+    let model_text = model_output.text;
+    let reflection_output = if payload.context.job_kind == UnconsciousJobKind::SelfModelReflection {
+        Some(parse_identity_reflection_output(model_output.json.as_ref()))
+    } else {
+        None
+    };
+    let canonical_proposals = build_unconscious_canonical_proposals(
+        &payload.context,
+        &model_text,
+        reflection_output
+            .as_ref()
+            .and_then(|parsed| parsed.output.as_ref()),
+    );
     let retrieval_updates =
         build_unconscious_retrieval_updates(&payload.context, &model_text, &canonical_proposals);
-    let diagnostics = build_unconscious_diagnostics(&payload.context, &model_text);
+    let diagnostics =
+        build_unconscious_diagnostics(&payload.context, &model_text, reflection_output.as_ref());
+    let wake_signals = build_unconscious_wake_signals(&payload.context, reflection_output.as_ref());
 
     WorkerResponse {
         request_id: request.request_id,
@@ -855,23 +1176,68 @@ fn build_unconscious_worker_response(
                 canonical_proposals,
                 retrieval_updates,
                 diagnostics,
-                wake_signals: build_default_wake_signals(&payload.context),
+                wake_signals,
             },
         }),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedIdentityReflectionOutput {
+    output: Option<IdentityReflectionOutput>,
+    diagnostic: Option<DiagnosticAlert>,
+}
+
+fn parse_identity_reflection_output(
+    model_json: Option<&serde_json::Value>,
+) -> ParsedIdentityReflectionOutput {
+    let Some(model_json) = model_json else {
+        return ParsedIdentityReflectionOutput {
+            output: None,
+            diagnostic: Some(identity_reflection_invalid_output_diagnostic(
+                "self-model reflection did not return the required JSON object".to_string(),
+            )),
+        };
+    };
+
+    match serde_json::from_value::<IdentityReflectionOutput>(model_json.clone()) {
+        Ok(output) => ParsedIdentityReflectionOutput {
+            output: Some(output),
+            diagnostic: None,
+        },
+        Err(error) => ParsedIdentityReflectionOutput {
+            output: None,
+            diagnostic: Some(identity_reflection_invalid_output_diagnostic(format!(
+                "self-model reflection returned invalid identity_reflection_output JSON: {error}"
+            ))),
+        },
+    }
+}
+
+fn identity_reflection_invalid_output_diagnostic(details: String) -> DiagnosticAlert {
+    DiagnosticAlert {
+        alert_id: uuid::Uuid::now_v7(),
+        code: "identity_reflection_invalid_output".to_string(),
+        severity: DiagnosticSeverity::Warning,
+        summary: "Self-model reflection output was ignored because it did not satisfy the structured identity contract.".to_string(),
+        details: Some(details),
     }
 }
 
 fn build_unconscious_canonical_proposals(
     context: &UnconsciousContext,
     model_text: &str,
+    reflection_output: Option<&IdentityReflectionOutput>,
 ) -> Vec<CanonicalProposal> {
     match context.job_kind {
         UnconsciousJobKind::MemoryConsolidation => {
             build_memory_consolidation_proposals(context, model_text)
         }
-        UnconsciousJobKind::SelfModelReflection => {
-            build_self_model_reflection_proposals(context, model_text)
-        }
+        UnconsciousJobKind::SelfModelReflection => reflection_output
+            .and_then(|output| output.identity_delta.clone())
+            .map(|delta| build_identity_reflection_proposal(context, delta))
+            .into_iter()
+            .collect(),
         UnconsciousJobKind::RetrievalMaintenance
         | UnconsciousJobKind::ContradictionAndDriftScan => Vec::new(),
     }
@@ -920,26 +1286,23 @@ fn build_memory_consolidation_proposals(
     }]
 }
 
-fn build_self_model_reflection_proposals(
+fn build_identity_reflection_proposal(
     context: &UnconsciousContext,
-    model_text: &str,
-) -> Vec<CanonicalProposal> {
-    let content_text = model_text.trim();
-    if content_text.is_empty() {
-        return Vec::new();
-    }
-
-    vec![CanonicalProposal {
+    identity_delta: IdentityDeltaProposal,
+) -> CanonicalProposal {
+    CanonicalProposal {
         proposal_id: uuid::Uuid::now_v7(),
-        proposal_kind: CanonicalProposalKind::SelfModelObservation,
-        canonical_target: CanonicalTargetKind::SelfModelArtifacts,
-        confidence_pct: 68,
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: identity_delta
+            .item_deltas
+            .iter()
+            .map(|delta| delta.confidence_pct)
+            .max()
+            .unwrap_or(70),
         conflict_posture: ProposalConflictPosture::Independent,
-        subject_ref: "self".to_string(),
-        rationale: Some(
-            "Bounded background self-model reflection over the canonical self-model state."
-                .to_string(),
-        ),
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(identity_delta.rationale.clone()),
         valid_from: None,
         valid_to: None,
         supersedes_artifact_id: None,
@@ -948,11 +1311,8 @@ fn build_self_model_reflection_proposals(
             source_ingress_ids: Vec::new(),
             source_episode_id: context.scope.episode_ids.first().copied(),
         },
-        payload: CanonicalProposalPayload::SelfModelObservation(SelfModelObservationProposal {
-            observation_kind: classify_self_model_observation_kind(content_text).to_string(),
-            content_text: content_text.to_string(),
-        }),
-    }]
+        payload: CanonicalProposalPayload::IdentityDelta(identity_delta),
+    }
 }
 
 fn build_unconscious_retrieval_updates(
@@ -998,23 +1358,52 @@ fn build_unconscious_retrieval_updates(
 fn build_unconscious_diagnostics(
     context: &UnconsciousContext,
     model_text: &str,
+    reflection_output: Option<&ParsedIdentityReflectionOutput>,
 ) -> Vec<DiagnosticAlert> {
     match context.job_kind {
         UnconsciousJobKind::ContradictionAndDriftScan => {
             vec![classify_contradiction_and_drift(context, model_text)]
         }
-        UnconsciousJobKind::MemoryConsolidation
-        | UnconsciousJobKind::RetrievalMaintenance
-        | UnconsciousJobKind::SelfModelReflection => vec![DiagnosticAlert {
-            alert_id: uuid::Uuid::now_v7(),
-            code: format!("{}_completed", unconscious_task_class(context.job_kind)),
-            severity: DiagnosticSeverity::Info,
-            summary: format!(
-                "{} completed under bounded background execution",
-                unconscious_task_class(context.job_kind)
-            ),
-            details: None,
-        }],
+        UnconsciousJobKind::SelfModelReflection => {
+            let Some(reflection_output) = reflection_output else {
+                return vec![identity_reflection_invalid_output_diagnostic(
+                    "identity reflection output was not parsed".to_string(),
+                )];
+            };
+
+            if let Some(diagnostic) = &reflection_output.diagnostic {
+                return vec![diagnostic.clone()];
+            }
+
+            let Some(output) = &reflection_output.output else {
+                return Vec::new();
+            };
+
+            let mut diagnostics = output.diagnostics.clone();
+            if output.identity_delta.is_none() {
+                diagnostics.push(DiagnosticAlert {
+                    alert_id: uuid::Uuid::now_v7(),
+                    code: "identity_reflection_no_change".to_string(),
+                    severity: DiagnosticSeverity::Info,
+                    summary: "Self-model reflection completed without identity changes."
+                        .to_string(),
+                    details: output.no_change_rationale.clone(),
+                });
+            }
+            diagnostics
+        }
+        UnconsciousJobKind::MemoryConsolidation | UnconsciousJobKind::RetrievalMaintenance => {
+            vec![DiagnosticAlert {
+                alert_id: uuid::Uuid::now_v7(),
+                code: format!("{}_completed", unconscious_task_class(context.job_kind)),
+                severity: DiagnosticSeverity::Info,
+                summary: format!(
+                    "{} completed under bounded background execution",
+                    unconscious_task_class(context.job_kind)
+                ),
+                details: None,
+            }]
+        }
     }
 }
 
@@ -1074,22 +1463,6 @@ fn contradiction_scope_label(context: &UnconsciousContext) -> String {
         .clone()
         .or_else(|| context.scope.internal_principal_ref.clone())
         .unwrap_or_else(|| "the scoped continuity window".to_string())
-}
-
-fn classify_self_model_observation_kind(model_text: &str) -> &'static str {
-    let lowered = model_text.to_ascii_lowercase();
-    if lowered.contains("goal") || lowered.contains("subgoal") {
-        return "subgoal";
-    }
-    if lowered.contains("style")
-        || lowered.contains("tone")
-        || lowered.contains("concise")
-        || lowered.contains("direct")
-        || lowered.contains("communication")
-    {
-        return "interaction_style";
-    }
-    "preference"
 }
 
 fn history_message_count(context: &ConsciousContext) -> u32 {
@@ -1156,19 +1529,18 @@ fn unconscious_task_class(kind: UnconsciousJobKind) -> &'static str {
     }
 }
 
-fn build_default_wake_signals(context: &UnconsciousContext) -> Vec<WakeSignal> {
+fn build_unconscious_wake_signals(
+    context: &UnconsciousContext,
+    reflection_output: Option<&ParsedIdentityReflectionOutput>,
+) -> Vec<WakeSignal> {
     if context.job_kind != UnconsciousJobKind::SelfModelReflection {
         return Vec::new();
     }
 
-    vec![WakeSignal {
-        signal_id: uuid::Uuid::now_v7(),
-        reason: WakeSignalReason::MaintenanceInsightReady,
-        priority: WakeSignalPriority::Low,
-        reason_code: "maintenance_insight_ready".to_string(),
-        summary: "Background self-model reflection produced a maintenance insight.".to_string(),
-        payload_ref: Some(format!("background_job:{}", context.job_id)),
-    }]
+    reflection_output
+        .and_then(|parsed| parsed.output.as_ref())
+        .map(|output| output.wake_signals.clone())
+        .unwrap_or_default()
 }
 
 fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> String {
@@ -1403,9 +1775,14 @@ mod tests {
     use super::*;
     use contracts::{
         BackgroundExecutionBudget, BackgroundTrigger, BackgroundTriggerKind, ChannelKind,
-        ConsciousContext, ForegroundBudget, ForegroundTrigger, ForegroundTriggerKind,
-        IngressEventKind, InternalStateSnapshot, ModelOutput, ModelUsage, NormalizedIngress,
-        SelfModelSnapshot, UnconsciousContext, UnconsciousJobKind, UnconsciousScope,
+        CompactIdentityItem, CompactIdentitySnapshot, ConsciousContext, ForegroundBudget,
+        ForegroundTrigger, ForegroundTriggerKind, IdentityDeltaOperation, IdentityEvidenceRef,
+        IdentityItemCategory, IdentityItemDelta, IdentityItemSource, IdentityKickstartContext,
+        IdentityLifecycleContext, IdentityLifecycleState, IdentityMergePolicy,
+        IdentityStabilityClass, IngressEventKind, InternalStateSnapshot, ModelOutput, ModelUsage,
+        NormalizedIngress, PredefinedIdentityTemplate, SelfDescriptionDelta, SelfModelSnapshot,
+        UnconsciousContext, UnconsciousJobKind, UnconsciousScope, WakeSignalPriority,
+        WakeSignalReason,
     };
 
     #[test]
@@ -1471,6 +1848,114 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| { message.content.contains(GOVERNED_ACTIONS_BLOCK_TAG) })
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_includes_identity_kickstart_only_when_available() {
+        let mut context = sample_context();
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::BootstrapSeedOnly,
+            kickstart_available: true,
+            kickstart: Some(IdentityKickstartContext {
+                available_actions: vec![
+                    IdentityKickstartActionKind::SelectPredefinedTemplate,
+                    IdentityKickstartActionKind::StartCustomInterview,
+                ],
+                next_step: Some("choose_predefined_identity_or_start_custom_interview".to_string()),
+                resume_summary: None,
+                predefined_templates: vec![PredefinedIdentityTemplate {
+                    template_key: "continuity_operator".to_string(),
+                    display_name: "Continuity Operator".to_string(),
+                    summary: "Steady continuity-focused assistant.".to_string(),
+                }],
+            }),
+        };
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let identity_message = model_request
+            .input
+            .messages
+            .iter()
+            .find(|message| message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG))
+            .expect("identity formation capability should be present");
+
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("Identity formation is available")
+        );
+        assert!(
+            identity_message
+                .content
+                .contains("select_predefined_identity")
+        );
+        assert!(
+            identity_message
+                .content
+                .contains("start_custom_identity_interview")
+        );
+        assert!(identity_message.content.contains("continuity_operator"));
+        for hidden_term in ["table", "storage", "validation internals", "lifecycle"] {
+            assert!(
+                !identity_message.content.contains(hidden_term),
+                "identity formation message leaked hidden term: {hidden_term}"
+            );
+        }
+    }
+
+    #[test]
+    fn conscious_model_request_hides_identity_kickstart_after_completion() {
+        let mut context = sample_context();
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::CompleteIdentityActive,
+            kickstart_available: false,
+            kickstart: None,
+        };
+        context.self_model.identity = Some(CompactIdentitySnapshot {
+            identity_summary: "Lagoon Complete".to_string(),
+            stable_items: vec![CompactIdentityItem {
+                category: IdentityItemCategory::Name,
+                value: "Lagoon Complete".to_string(),
+                confidence_pct: 100,
+                weight_pct: None,
+            }],
+            evolving_items: Vec::new(),
+            values: vec!["clarity".to_string()],
+            boundaries: vec!["ask before risky actions".to_string()],
+            self_description: Some("A clear, bounded assistant.".to_string()),
+        });
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG))
+        );
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("Lagoon Complete")
+        );
+        assert!(model_request.input.system_prompt.contains("clarity"));
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("ask before risky actions")
         );
     }
 
@@ -1652,6 +2137,82 @@ mod tests {
     }
 
     #[test]
+    fn conscious_worker_response_extracts_identity_kickstart_selection() {
+        let mut context = sample_context();
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::BootstrapSeedOnly,
+            kickstart_available: true,
+            kickstart: Some(IdentityKickstartContext {
+                available_actions: vec![IdentityKickstartActionKind::SelectPredefinedTemplate],
+                next_step: Some("choose_predefined_identity_or_start_custom_interview".to_string()),
+                resume_summary: None,
+                predefined_templates: contracts::predefined_identity_templates(),
+            }),
+        };
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let identity_block = serde_json::json!({
+            "action": "select_predefined_identity",
+            "template_key": "continuity_operator",
+            "answer": serde_json::Value::Null,
+            "cancel_reason": serde_json::Value::Null,
+        });
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: format!(
+                    "Continuity Operator selected.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\n{}\n```",
+                    identity_block
+                ),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 12,
+            },
+        };
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("worker response should be valid");
+        match response.result {
+            WorkerResult::Conscious(result) => {
+                assert_eq!(
+                    result.assistant_output.text,
+                    "Continuity Operator selected."
+                );
+                let identity_proposals = result
+                    .candidate_proposals
+                    .iter()
+                    .filter(|proposal| {
+                        proposal.proposal_kind == CanonicalProposalKind::IdentityDelta
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(identity_proposals.len(), 1);
+                let CanonicalProposalPayload::IdentityDelta(delta) = &identity_proposals[0].payload
+                else {
+                    panic!("expected identity delta");
+                };
+                assert_eq!(
+                    delta.lifecycle_state,
+                    IdentityLifecycleState::CompleteIdentityActive
+                );
+                assert!(delta.item_deltas.len() >= 20);
+                assert!(delta.self_description_delta.is_some());
+            }
+            other => panic!("expected conscious worker result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unconscious_model_request_uses_scope_and_budget() {
         let request = WorkerRequest::unconscious(
             uuid::Uuid::now_v7(),
@@ -1682,6 +2243,34 @@ mod tests {
                 .messages
                 .first()
                 .is_some_and(|message| message.content.contains("Scoped background maintenance"))
+        );
+    }
+
+    #[test]
+    fn self_model_reflection_model_request_requires_structured_identity_output() {
+        let mut context = sample_unconscious_context();
+        context.job_kind = UnconsciousJobKind::SelfModelReflection;
+        let request =
+            WorkerRequest::unconscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Unconscious(payload) = &request.payload else {
+            panic!("expected unconscious payload");
+        };
+
+        let model_request = build_unconscious_model_call_request(&request, payload.as_ref());
+
+        assert_eq!(model_request.output_mode, ModelOutputMode::JsonObject);
+        assert_eq!(
+            model_request.schema_name.as_deref(),
+            Some("identity_reflection_output")
+        );
+        assert!(model_request.schema_json.is_some());
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("identity_delta")
+                    && message.content.contains("no_change_rationale"))
         );
     }
 
@@ -1798,6 +2387,7 @@ mod tests {
         let diagnostics = build_unconscious_diagnostics(
             &context,
             "Continuity remains aligned and no notable drift was found.",
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -1807,6 +2397,7 @@ mod tests {
         let diagnostics = build_unconscious_diagnostics(
             &context,
             "Continuity remains aligned and stable across the scoped review.",
+            None,
         );
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "drift_scan_clear");
@@ -1814,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn self_model_reflection_emits_a_self_model_observation_proposal() {
+    fn self_model_reflection_emits_identity_delta_from_structured_output() {
         let mut context = sample_unconscious_context();
         context.job_kind = UnconsciousJobKind::SelfModelReflection;
 
@@ -1832,8 +2423,30 @@ mod tests {
             model: "z-ai-background".to_string(),
             received_at: chrono::Utc::now(),
             output: ModelOutput {
-                text: "Prefer concise progress updates during long maintenance runs.".to_string(),
-                json: None,
+                text: String::new(),
+                json: Some(
+                    serde_json::to_value(IdentityReflectionOutput {
+                        identity_delta: Some(identity_reflection_delta()),
+                        no_change_rationale: None,
+                        diagnostics: vec![DiagnosticAlert {
+                            alert_id: uuid::Uuid::now_v7(),
+                            code: "identity_reflection_delta_ready".to_string(),
+                            severity: DiagnosticSeverity::Info,
+                            summary: "Reflection found an evidence-backed identity update."
+                                .to_string(),
+                            details: None,
+                        }],
+                        wake_signals: vec![WakeSignal {
+                            signal_id: uuid::Uuid::now_v7(),
+                            reason: WakeSignalReason::MaintenanceInsightReady,
+                            priority: WakeSignalPriority::Low,
+                            reason_code: "identity_reflection_ready".to_string(),
+                            summary: "Identity reflection produced a bounded update.".to_string(),
+                            payload_ref: Some("background_job:identity-reflection".to_string()),
+                        }],
+                    })
+                    .expect("identity reflection output should serialize"),
+                ),
                 finish_reason: "stop".to_string(),
             },
             usage: ModelUsage {
@@ -1851,27 +2464,114 @@ mod tests {
                 assert_eq!(result.maintenance_outputs.diagnostics.len(), 1);
                 assert_eq!(result.maintenance_outputs.wake_signals.len(), 1);
                 let proposal = &result.maintenance_outputs.canonical_proposals[0];
-                assert_eq!(
-                    proposal.proposal_kind,
-                    CanonicalProposalKind::SelfModelObservation
-                );
+                assert_eq!(proposal.proposal_kind, CanonicalProposalKind::IdentityDelta);
                 assert_eq!(
                     proposal.canonical_target,
-                    CanonicalTargetKind::SelfModelArtifacts
+                    CanonicalTargetKind::IdentityItems
                 );
                 assert_eq!(
                     proposal.provenance.provenance_kind,
                     ProposalProvenanceKind::SelfModelReflection
                 );
-                let CanonicalProposalPayload::SelfModelObservation(payload) = &proposal.payload
-                else {
-                    panic!("expected a self-model observation payload");
+                let CanonicalProposalPayload::IdentityDelta(delta) = &proposal.payload else {
+                    panic!("expected an identity delta payload");
                 };
-                assert_eq!(payload.observation_kind, "interaction_style");
+                assert_eq!(delta.item_deltas.len(), 1);
+                assert_eq!(
+                    delta.item_deltas[0].category,
+                    IdentityItemCategory::InteractionStyleAdaptation
+                );
             }
             WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
             WorkerResult::Conscious(_) => panic!("unexpected conscious response"),
             WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
+        }
+    }
+
+    #[test]
+    fn self_model_reflection_invalid_output_records_diagnostic_without_delta() {
+        let mut context = sample_unconscious_context();
+        context.job_kind = UnconsciousJobKind::SelfModelReflection;
+
+        let request =
+            WorkerRequest::unconscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Unconscious(payload) = &request.payload else {
+            panic!("expected unconscious payload");
+        };
+        let model_request = build_unconscious_model_call_request(&request, payload.as_ref());
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-background".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: "free text should not become a self-model write".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 18,
+                output_tokens: 7,
+            },
+        };
+
+        let response =
+            build_unconscious_worker_response(&request, payload.as_ref(), model_response);
+        match response.result {
+            WorkerResult::Unconscious(result) => {
+                assert!(result.maintenance_outputs.canonical_proposals.is_empty());
+                assert!(result.maintenance_outputs.retrieval_updates.is_empty());
+                assert!(result.maintenance_outputs.wake_signals.is_empty());
+                assert_eq!(result.maintenance_outputs.diagnostics.len(), 1);
+                assert_eq!(
+                    result.maintenance_outputs.diagnostics[0].code,
+                    "identity_reflection_invalid_output"
+                );
+            }
+            WorkerResult::Smoke(_) => panic!("unexpected smoke response"),
+            WorkerResult::Conscious(_) => panic!("unexpected conscious response"),
+            WorkerResult::Error(error) => panic!("unexpected worker error: {}", error.message),
+        }
+    }
+
+    fn identity_reflection_delta() -> IdentityDeltaProposal {
+        IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+            item_deltas: vec![IdentityItemDelta {
+                operation: IdentityDeltaOperation::Add,
+                stability_class: IdentityStabilityClass::Evolving,
+                category: IdentityItemCategory::InteractionStyleAdaptation,
+                item_key: "progress_updates".to_string(),
+                value: "Use concise progress updates during long maintenance runs.".to_string(),
+                confidence_pct: 82,
+                weight_pct: Some(70),
+                source: IdentityItemSource::ModelInferred,
+                merge_policy: IdentityMergePolicy::Revisable,
+                evidence_refs: vec![IdentityEvidenceRef {
+                    source_kind: "episode".to_string(),
+                    source_id: None,
+                    summary: "Recent scoped episodes favored concise maintenance updates."
+                        .to_string(),
+                }],
+                valid_from: None,
+                valid_to: None,
+                target_identity_item_id: None,
+            }],
+            self_description_delta: Some(SelfDescriptionDelta {
+                operation: IdentityDeltaOperation::Revise,
+                description: "Blue Lagoon gives concise progress updates during long work."
+                    .to_string(),
+                evidence_refs: vec![IdentityEvidenceRef {
+                    source_kind: "episode".to_string(),
+                    source_id: None,
+                    summary: "Reflection over recent scoped episodes.".to_string(),
+                }],
+            }),
+            interview_action: None,
+            rationale: "Background reflection found an evidence-backed interaction style update."
+                .to_string(),
         }
     }
 
@@ -1921,6 +2621,8 @@ mod tests {
                 preferences: vec!["concise".to_string()],
                 current_goals: vec!["support_the_user".to_string()],
                 current_subgoals: vec!["reply_to_current_message".to_string()],
+                identity: None,
+                identity_lifecycle: Default::default(),
             },
             internal_state: InternalStateSnapshot {
                 load_pct: 15,
@@ -1967,6 +2669,7 @@ mod tests {
                 internal_conversation_ref: Some("telegram-primary".to_string()),
                 summary: "Consolidate recent episodes into long-term memory.".to_string(),
             },
+            evidence: None,
             budget: BackgroundExecutionBudget {
                 iteration_budget: 2,
                 wall_clock_budget_ms: 120_000,

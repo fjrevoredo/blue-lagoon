@@ -29,7 +29,7 @@ use crate::{
     fetched_content::{
         DefaultFetchedContentFormatter, FetchedContentFormatter, FetchedContentInput,
     },
-    policy, recovery, scheduled_foreground, tool_execution,
+    identity, policy, recovery, scheduled_foreground, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -107,7 +107,9 @@ pub async fn plan_governed_action(
     let risk_tier = policy::classify_governed_action_risk(&request.proposal);
     let requires_approval = policy::governed_action_requires_approval(config, risk_tier);
 
-    let validation_error = validate_capability_scope(config, &request.proposal).err();
+    let validation_error = validate_governed_action_policy(config, pool, &request.proposal)
+        .await
+        .err();
     let status = if validation_error.is_some() {
         GovernedActionStatus::Blocked
     } else if requires_approval {
@@ -483,7 +485,7 @@ pub async fn execute_governed_action(
     record: &GovernedActionExecutionRecord,
 ) -> Result<GovernedActionExecutionResult> {
     let proposal = proposal_from_record(record);
-    if let Err(error) = validate_capability_scope(config, &proposal) {
+    if let Err(error) = validate_governed_action_policy(config, pool, &proposal).await {
         let summary = error.to_string();
         let completed_at = Utc::now();
         let record = update_governed_action_execution(
@@ -674,6 +676,19 @@ pub async fn execute_governed_action(
         (Err(action_error), Err(lease_error)) => Err(lease_error.context(format!(
             "failed to complete governed-action worker lease after action failure: {action_error}"
         ))),
+    }
+}
+
+async fn validate_governed_action_policy(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    proposal: &GovernedActionProposal,
+) -> Result<()> {
+    validate_capability_scope(config, proposal)?;
+    let identity = identity::reconstruct_compact_identity_snapshot(pool, 32).await?;
+    match policy::evaluate_governed_action_identity_boundaries(proposal, &identity.boundaries) {
+        policy::PolicyDecision::Allowed => Ok(()),
+        policy::PolicyDecision::Denied { reason } => bail!("{reason}"),
     }
 }
 

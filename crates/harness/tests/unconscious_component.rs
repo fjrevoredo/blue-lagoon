@@ -19,7 +19,7 @@ use harness::{
     continuity,
     execution::{self, NewExecutionRecord},
     foreground::{self, NewEpisode, NewEpisodeMessage},
-    migration,
+    identity, migration,
     model_gateway::{FakeModelProviderTransport, ProviderHttpResponse},
     recovery,
 };
@@ -525,6 +525,108 @@ async fn background_execution_leases_due_job_and_creates_execution_state() -> Re
 
 #[tokio::test]
 #[serial]
+async fn self_model_reflection_lease_includes_bounded_identity_evidence() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let trace_id = Uuid::now_v7();
+        let conversation = "telegram-primary";
+        let episode_id = seed_episode_for_conversation(&ctx.pool, trace_id, conversation).await?;
+        let memory_artifact_id = seed_memory_artifact(&ctx.pool, trace_id, episode_id).await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(trace_id),
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Blue Lagoon".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "operator_seed".to_string(),
+                source_kind: "operator_authored".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([{
+                    "source_kind": "test_seed",
+                    "summary": "seed identity evidence"
+                }]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({ "test": true }),
+            },
+        )
+        .await?;
+        seed_complete_identity_lifecycle(&ctx.pool, "reflection evidence test").await?;
+
+        let background_job_id = Uuid::now_v7();
+        let now = Utc::now();
+        background::insert_job(
+            &ctx.pool,
+            &background::NewBackgroundJob {
+                background_job_id,
+                trace_id,
+                job_kind: UnconsciousJobKind::SelfModelReflection,
+                trigger: sample_trigger(
+                    BackgroundTriggerKind::TimeSchedule,
+                    "scheduled self-model reflection",
+                ),
+                deduplication_key: format!("job:self-model-reflection:{background_job_id}"),
+                scope: UnconsciousScope {
+                    episode_ids: vec![episode_id],
+                    memory_artifact_ids: vec![memory_artifact_id],
+                    retrieval_artifact_ids: Vec::new(),
+                    self_model_artifact_id: None,
+                    internal_principal_ref: Some("primary-user".to_string()),
+                    internal_conversation_ref: Some(conversation.to_string()),
+                    summary: "self-model reflection evidence scope".to_string(),
+                },
+                budget: sample_budget(),
+                status: BackgroundJobStatus::Planned,
+                available_at: now,
+                lease_expires_at: None,
+                last_started_at: None,
+                last_completed_at: None,
+            },
+        )
+        .await?;
+
+        let leased = background_execution::lease_next_due_job(&ctx.pool, &ctx.config, now)
+            .await?
+            .expect("expected self-model reflection job to be leased");
+
+        let contracts::WorkerPayload::Unconscious(payload) = &leased.request.payload else {
+            panic!("expected unconscious payload");
+        };
+        let evidence = payload
+            .context
+            .evidence
+            .as_ref()
+            .expect("self-model reflection request should include evidence");
+        assert!(evidence.current_identity.as_ref().is_some_and(|identity| {
+            identity
+                .stable_items
+                .iter()
+                .any(|item| item.value == "Blue Lagoon")
+        }));
+        assert_eq!(evidence.recent_episodes.len(), 1);
+        assert_eq!(evidence.memory_artifacts.len(), 1);
+        assert!(evidence.internal_state.is_some());
+        assert!(
+            evidence
+                .scope_metadata
+                .iter()
+                .any(|entry| entry == "episode_count:1")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn background_execution_completes_due_job_and_records_audit_history() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -812,7 +914,9 @@ async fn background_execution_applies_self_model_reflection_through_canonical_me
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
         config.worker.args = vec!["unconscious-worker".to_string()];
-        let prior_self_model_artifact_id = seed_self_model_artifact(&ctx.pool, Uuid::now_v7()).await?;
+        let prior_self_model_artifact_id =
+            seed_self_model_artifact(&ctx.pool, Uuid::now_v7()).await?;
+        seed_complete_identity_lifecycle(&ctx.pool, "reflection merge test").await?;
 
         let background_job_id = seed_planned_background_job_with_kind(
             &ctx.pool,
@@ -825,7 +929,7 @@ async fn background_execution_applies_self_model_reflection_through_canonical_me
             status: 200,
             body: json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "message": { "content": identity_delta_reflection_output_content() },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -849,32 +953,16 @@ async fn background_execution_applies_self_model_reflection_through_canonical_me
         let proposals =
             continuity::list_proposals_for_execution(&ctx.pool, outcome.execution_id).await?;
         assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].proposal_kind, "self_model_observation");
+        assert_eq!(proposals[0].proposal_kind, "identity_delta");
         assert_eq!(proposals[0].status, "accepted");
+        assert_ne!(prior_self_model_artifact_id, Uuid::nil());
 
-        let merge_decision =
-            continuity::get_merge_decision_by_proposal(&ctx.pool, proposals[0].proposal_id)
-                .await?
-                .expect("accepted self-model reflection should have a merge decision");
-        let accepted_artifact_id = merge_decision
-            .accepted_self_model_artifact_id
-            .expect("accepted self-model reflection should create a canonical artifact");
-        let active_artifacts = continuity::list_active_self_model_artifacts(&ctx.pool, 10).await?;
-        assert_eq!(active_artifacts.len(), 1);
-        assert_eq!(active_artifacts[0].self_model_artifact_id, accepted_artifact_id);
-        assert!(
-            active_artifacts[0].preferences.iter().any(|value| {
-                value == "Prefer concise progress updates during long maintenance runs."
-            })
-        );
-
-        let superseded_artifacts =
-            continuity::list_superseded_self_model_artifacts(&ctx.pool, 10).await?;
-        assert_eq!(superseded_artifacts.len(), 1);
-        assert_eq!(
-            superseded_artifacts[0].self_model_artifact_id,
-            prior_self_model_artifact_id
-        );
+        let active_identity = identity::list_active_identity_items(&ctx.pool, 10).await?;
+        assert!(active_identity.iter().any(|item| {
+            item.category == "interaction_style_adaptation"
+                && item.value_text
+                    == "Prefer concise progress updates during long maintenance runs."
+        }));
 
         let retrieval_artifacts = continuity::list_active_retrieval_artifacts_for_conversation(
             &ctx.pool,
@@ -924,7 +1012,7 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
             status: 200,
             body: json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "message": { "content": wake_signal_reflection_output_content() },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -945,7 +1033,11 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
         .expect("expected a due self-model-reflection job to execute");
 
         assert_eq!(outcome.background_job_id, background_job_id);
-        assert!(background::list_pending_wake_signals(&ctx.pool, 10).await?.is_empty());
+        assert!(
+            background::list_pending_wake_signals(&ctx.pool, 10)
+                .await?
+                .is_empty()
+        );
 
         let signal_row = sqlx::query(
             r#"
@@ -991,7 +1083,7 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
         assert!(
             ingress_row
                 .get::<String, _>("text_body")
-            .contains("policy-approved maintenance wake signal")
+                .contains("policy-approved maintenance wake signal")
         );
 
         let background_to_wake_link_count: i64 = sqlx::query_scalar(
@@ -1046,8 +1138,16 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
         );
 
         let audit_events = audit::list_for_execution(&ctx.pool, outcome.execution_id).await?;
-        assert!(audit_events.iter().any(|event| event.event_kind == "wake_signal_recorded"));
-        assert!(audit_events.iter().any(|event| event.event_kind == "wake_signal_reviewed"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "wake_signal_recorded")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "wake_signal_reviewed")
+        );
         assert!(
             audit_events
                 .iter()
@@ -1081,7 +1181,7 @@ async fn background_execution_rejects_wake_signal_when_no_foreground_binding_is_
             status: 200,
             body: json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "message": { "content": wake_signal_reflection_output_content() },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1437,6 +1537,86 @@ async fn seed_retrieval_artifact(
     Ok(retrieval_artifact_id)
 }
 
+async fn seed_memory_artifact(
+    pool: &sqlx::PgPool,
+    trace_id: Uuid,
+    episode_id: Uuid,
+) -> Result<Uuid> {
+    let execution_id = seed_execution(pool, trace_id).await?;
+    let proposal_id = Uuid::now_v7();
+    continuity::insert_proposal(
+        pool,
+        &continuity::NewProposalRecord {
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: Some(episode_id),
+            source_ingress_id: None,
+            source_loop_kind: "unconscious".to_string(),
+            proposal_kind: "memory_artifact".to_string(),
+            canonical_target: "memory_artifacts".to_string(),
+            status: "accepted".to_string(),
+            confidence: 0.9,
+            conflict_posture: "independent".to_string(),
+            subject_ref: "primary-user".to_string(),
+            content_text: "Prefers concise summaries during maintenance.".to_string(),
+            rationale: Some("Seeded memory evidence for reflection scope.".to_string()),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            supersedes_artifact_kind: None,
+            payload: json!({ "artifact_kind": "preference" }),
+        },
+    )
+    .await?;
+    let memory_artifact_id = Uuid::now_v7();
+    continuity::insert_memory_artifact(
+        pool,
+        &continuity::NewMemoryArtifact {
+            memory_artifact_id,
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: Some(episode_id),
+            source_ingress_id: None,
+            artifact_kind: "preference".to_string(),
+            subject_ref: "primary-user".to_string(),
+            content_text: "Prefers concise summaries during maintenance.".to_string(),
+            confidence: 0.9,
+            provenance_kind: "episode_observation".to_string(),
+            status: "active".to_string(),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            superseded_at: None,
+            superseded_by_artifact_id: None,
+            supersedes_artifact_id: None,
+            payload: json!({ "test": true }),
+        },
+    )
+    .await?;
+    Ok(memory_artifact_id)
+}
+
+async fn seed_complete_identity_lifecycle(pool: &sqlx::PgPool, reason: &str) -> Result<()> {
+    identity::record_lifecycle_transition(
+        pool,
+        &identity::NewIdentityLifecycle {
+            identity_lifecycle_id: Uuid::now_v7(),
+            status: "current".to_string(),
+            lifecycle_state: "complete_identity_active".to_string(),
+            active_self_model_artifact_id: None,
+            active_interview_id: None,
+            transition_reason: reason.to_string(),
+            transitioned_by: "test_seed".to_string(),
+            kickstart_started_at: Some(Utc::now()),
+            kickstart_completed_at: Some(Utc::now()),
+            reset_at: None,
+            payload: json!({ "test": true }),
+        },
+    )
+    .await
+}
+
 async fn seed_self_model_artifact(pool: &sqlx::PgPool, trace_id: Uuid) -> Result<Uuid> {
     let execution_id = seed_execution(pool, trace_id).await?;
     let self_model_artifact_id = Uuid::now_v7();
@@ -1527,6 +1707,57 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             timeout_ms: 20_000,
         },
     }
+}
+
+fn identity_delta_reflection_output_content() -> String {
+    json!({
+        "identity_delta": {
+            "lifecycle_state": "complete_identity_active",
+            "item_deltas": [{
+                "operation": "add",
+                "stability_class": "evolving",
+                "category": "interaction_style_adaptation",
+                "item_key": "progress_updates",
+                "value": "Prefer concise progress updates during long maintenance runs.",
+                "confidence_pct": 82,
+                "weight_pct": 70,
+                "source": "model_inferred",
+                "merge_policy": "revisable",
+                "evidence_refs": [{
+                    "source_kind": "episode",
+                    "source_id": null,
+                    "summary": "Scoped reflection evidence favored concise progress updates."
+                }],
+                "valid_from": null,
+                "valid_to": null,
+                "target_identity_item_id": null
+            }],
+            "self_description_delta": null,
+            "interview_action": null,
+            "rationale": "Background reflection found an evidence-backed interaction style update."
+        },
+        "no_change_rationale": null,
+        "diagnostics": [],
+        "wake_signals": []
+    })
+    .to_string()
+}
+
+fn wake_signal_reflection_output_content() -> String {
+    json!({
+        "identity_delta": null,
+        "no_change_rationale": "No identity delta was warranted; foreground attention is useful for maintenance insight review.",
+        "diagnostics": [],
+        "wake_signals": [{
+            "signal_id": Uuid::now_v7(),
+            "reason": "maintenance_insight_ready",
+            "priority": "low",
+            "reason_code": "maintenance_insight_ready",
+            "summary": "Background self-model reflection produced a maintenance insight.",
+            "payload_ref": "background_job:latest"
+        }]
+    })
+    .to_string()
 }
 
 async fn read_pid_file(path: &std::path::Path) -> Result<u32> {

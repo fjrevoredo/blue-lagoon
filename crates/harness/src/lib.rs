@@ -13,6 +13,7 @@ pub mod fetched_content;
 pub mod foreground;
 pub mod foreground_orchestration;
 pub mod governed_actions;
+pub mod identity;
 pub mod ingress;
 pub mod management;
 pub mod memory;
