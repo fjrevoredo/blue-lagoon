@@ -2031,6 +2031,102 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
 
 #[tokio::test]
 #[serial]
+async fn foreground_orchestration_infers_custom_identity_start_without_worker_block() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let mut ingress = ingress;
+        ingress.text_body = Some("let's create a custom one".to_string());
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 13,
+                    "completion_tokens": 0
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed orchestration, got {other:?}"),
+        };
+
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Starting the custom identity interview. What name should this assistant identity use?"
+        );
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should be current");
+        assert_eq!(lifecycle.lifecycle_state, "identity_kickstart_in_progress");
+        let interview_id = lifecycle
+            .active_interview_id
+            .expect("custom interview should be active");
+        let interview = identity::get_identity_interview(&ctx.pool, interview_id)
+            .await?
+            .expect("identity interview should be stored");
+        assert_eq!(interview.current_step, "name");
+
+        let episode = foreground::get_episode(&ctx.pool, completed.episode_id).await?;
+        assert!(
+            episode
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("proposals evaluated=1"))
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn planned_foreground_orchestration_processes_backlog_batch_with_single_reply() -> Result<()>
 {
     support::with_migrated_database(|ctx| async move {
@@ -2311,7 +2407,22 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
                 .any(|event| event.event_kind == "foreground_execution_failed")
         );
         assert!(transport.seen_requests().is_empty());
-        assert!(delivery.sent_messages().is_empty());
+        assert_eq!(delivery.sent_messages().len(), 1);
+        let failure_notice = &delivery.sent_messages()[0];
+        assert_eq!(failure_notice.chat_id, 42);
+        assert_eq!(failure_notice.reply_to_message_id, Some(42));
+        assert!(failure_notice.text.contains("internal runtime error"));
+        assert!(failure_notice.text.contains("context_assembly_failure"));
+        assert!(
+            failure_notice
+                .text
+                .contains(&execution.trace_id.to_string())
+        );
+        assert!(
+            !failure_notice
+                .text
+                .contains("missing foreground self-model seed configuration")
+        );
         Ok(())
     })
     .await

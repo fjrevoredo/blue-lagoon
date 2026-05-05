@@ -1361,6 +1361,7 @@ pub enum GovernedActionKind {
     ListWorkspaceScriptRuns,
     UpsertScheduledForegroundTask,
     RequestBackgroundJob,
+    RunDiagnostic,
     RunSubprocess,
     RunWorkspaceScript,
     WebFetch,
@@ -1479,6 +1480,59 @@ pub struct RequestBackgroundJobAction {
     pub internal_conversation_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticDocument {
+    Philosophy,
+    Requirements,
+    ImplementationDesign,
+    InternalDocumentation,
+    ContextAssembly,
+    GovernedActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "query", content = "params")]
+pub enum DiagnosticQuery {
+    RuntimeStatus,
+    HealthSummary,
+    OperationalDiagnostics { limit: u32 },
+    TraceRecent { limit: u32 },
+    TraceShow {
+        trace_id: Option<Uuid>,
+        execution_id: Option<Uuid>,
+    },
+    ForegroundPending { limit: u32 },
+    ForegroundSchedules { limit: u32 },
+    BackgroundList { limit: u32 },
+    RecoveryCheckpoints { open_only: bool, limit: u32 },
+    RecoveryLeases {
+        limit: u32,
+        soft_warning_threshold_percent: u8,
+    },
+    SchemaStatus,
+    SchemaUpgradePath,
+    ApprovalsList { limit: u32 },
+    ActionsList { limit: u32 },
+    WakeSignalsList { limit: u32 },
+    IdentityStatus,
+    IdentityShow,
+    IdentityHistory { limit: u32 },
+    IdentityDiagnostics { limit: u32 },
+    WorkspaceArtifacts { limit: u32 },
+    WorkspaceScripts { limit: u32 },
+    WorkspaceRuns {
+        script_id: Option<Uuid>,
+        limit: u32,
+    },
+    InternalDoc { document: DiagnosticDocument },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDiagnosticAction {
+    pub query: DiagnosticQuery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubprocessAction {
     pub command: String,
@@ -1514,6 +1568,7 @@ pub enum GovernedActionPayload {
     ListWorkspaceScriptRuns(ListWorkspaceScriptRunsAction),
     UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
     RequestBackgroundJob(RequestBackgroundJobAction),
+    RunDiagnostic(RunDiagnosticAction),
     RunSubprocess(SubprocessAction),
     RunWorkspaceScript(WorkspaceScriptAction),
     WebFetch(WebFetchAction),

@@ -121,11 +121,14 @@ Messages are appended in this order by `build_model_input()`:
 | N+3 | Developer | `"Retrieved canonical context: ..."` summary | Only if `retrieved_context.items` is non-empty |
 | N+4 | Developer | Governed action observations | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Full governed action schema | If `governed_action_observations` is empty |
-| N+5 (alt) | Developer | Identity kickstart action block schema and predefined template summaries | If governed action observations are empty and identity kickstart is available |
+| N+5 (alt) | Developer | Troubleshooting capability guidance | If governed action observations are empty and the current trigger asks about errors, traces, logs, diagnostics, debugging, or failures |
+| N+6 (alt) | Developer | Identity kickstart action block schema and predefined template summaries | If governed action observations are empty and identity kickstart is available |
 
 `ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:474`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:1928` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:1945`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:677`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:706` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and lists read-only admin CLI commands that can be proposed through governed `run_subprocess` actions. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2115` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2132`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 
@@ -166,6 +169,45 @@ custom interview, context assembly loads the active interview and sets
 conversation can resume deterministically. Each answer is persisted in
 `identity_kickstart_interviews`; the final required answer is converted by the
 harness into canonical identity items and a complete lifecycle transition.
+
+Worker-side identity block parsing is intentionally tolerant:
+`build_identity_kickstart_proposals()` in `crates/workers/src/main.rs:920`
+ignores malformed optional identity blocks rather than failing the whole worker
+turn. `parse_identity_interview_answer()` in
+`crates/workers/src/main.rs:1008` accepts the canonical structured answer shape,
+a plain string answer, or a missing/null answer that can be inferred from the
+current trigger and `kickstart.next_step`.
+
+Foreground orchestration augments worker-emitted proposals through
+`foreground_candidate_proposals()`
+(`crates/harness/src/foreground_orchestration.rs:2141`). If the worker omits an
+identity block, `inferred_identity_kickstart_proposals()`
+(`crates/harness/src/foreground_orchestration.rs:2247`) can still infer a
+bounded harness-native proposal from obvious bootstrap custom-start or
+predefined-template intent, and from non-ambiguous answers while a custom
+interview is in progress. Ambiguous acknowledgements such as `ok` do not become
+identity answers; the next prompt is repeated instead.
+
+Foreground delivery treats the stripped control-block text as the primary
+assistant reply. If the model emits only a control block, or if the harness
+inferred an identity kickstart proposal, the harness falls back inside
+`foreground_assistant_delivery_text()`
+(`crates/harness/src/foreground_orchestration.rs:2155`): pending approvals use
+an approval-specific continuation prompt, and identity kickstart proposals use a
+bounded identity-specific prompt such as the first custom interview question.
+Custom interview prompt text is owned by
+`custom_identity_step_user_prompt()`
+(`crates/harness/src/identity.rs:1893`). This prevents a valid control action
+or obvious identity step from surfacing to Telegram as the generic
+empty-response fallback.
+
+After Telegram chat metadata has been parsed, foreground failures are also
+reported back to the user through `record_and_deliver_foreground_failure()`
+(`crates/harness/src/foreground_orchestration.rs:1658`). The message generated
+by `foreground_failure_notice_text()`
+(`crates/harness/src/foreground_orchestration.rs:1940`) includes the trace id
+and failure kind, while the full error chain remains only in execution records,
+episode failure summaries, and audit events.
 
 ---
 
@@ -215,4 +257,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-01.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-02.*

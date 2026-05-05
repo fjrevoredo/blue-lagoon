@@ -580,6 +580,12 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
             role: ModelMessageRole::Developer,
             content: governed_action_schema_message(),
         });
+        if should_include_troubleshooting_guidance(context) {
+            messages.push(ModelInputMessage {
+                role: ModelMessageRole::Developer,
+                content: troubleshooting_guidance_message(),
+            });
+        }
         if let Some(message) = identity_kickstart_schema_message(context) {
             messages.push(ModelInputMessage {
                 role: ModelMessageRole::Developer,
@@ -668,6 +674,59 @@ fn identity_system_prompt_fragment(context: &ConsciousContext) -> String {
     }
 }
 
+fn should_include_troubleshooting_guidance(context: &ConsciousContext) -> bool {
+    let trigger_text = context
+        .trigger
+        .ingress
+        .text_body
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let troubleshooting_terms = [
+        "error",
+        "trace",
+        "log",
+        "logs",
+        "diagnostic",
+        "diagnostics",
+        "troubleshoot",
+        "debug",
+        "failure",
+        "failed",
+        "crash",
+        "stuck",
+        "what happened",
+        "why did",
+    ];
+    troubleshooting_terms
+        .iter()
+        .any(|term| trigger_text.contains(term))
+}
+
+fn troubleshooting_guidance_message() -> String {
+    r#"TROUBLESHOOTING CAPABILITY
+
+Use this only when the user asks about runtime errors, traces, logs, failures, diagnostics, or why the assistant got stuck. This is progressive disclosure: do not discuss these internals unless they are relevant to troubleshooting.
+
+Self-understanding boundary:
+- You are the conscious assistant identity, not the harness. The harness is the runtime/body that assembles context, mediates actions, validates proposals, owns canonical writes, and records traces.
+- You may know the high-level conscious/unconscious loop model and read restricted internal documentation for troubleshooting.
+- You must not claim direct control over memory, identity storage, the database, workers, or the harness. You can influence memory and identity only through normal conscious behavior and harness-mediated proposals.
+
+Restricted internal documentation reads:
+- You may inspect `PHILOSOPHY.md`, `docs/REQUIREMENTS.md`, `docs/IMPLEMENTATION_DESIGN.md`, and selected files under `docs/internal/` only through the `run_diagnostic` action's `internal_doc` query.
+
+Diagnostic tool:
+- Use `run_diagnostic` for runtime troubleshooting. It is a harness-native read-only action: no shell, no filesystem scope, no environment variables, no network, and no state-changing admin commands.
+- Available query names: `runtime_status`, `health_summary`, `operational_diagnostics`, `trace_recent`, `trace_show`, `foreground_pending`, `foreground_schedules`, `background_list`, `recovery_checkpoints`, `recovery_leases`, `schema_status`, `schema_upgrade_path`, `approvals_list`, `actions_list`, `wake_signals_list`, `identity_status`, `identity_show`, `identity_history`, `identity_diagnostics`, `workspace_artifacts`, `workspace_scripts`, `workspace_runs`, `internal_doc`.
+- Available internal documents: `philosophy`, `requirements`, `implementation_design`, `internal_documentation`, `context_assembly`, `governed_actions`.
+
+Do not propose `run_subprocess` for diagnostics. If a diagnostic query fails, report the exact failure and the next useful diagnostic query instead of guessing.
+
+When a trace id is present in chat, start with `trace_show`, then use `operational_diagnostics`, `health_summary`, and `trace_recent` only if needed."#
+        .to_string()
+}
+
 fn identity_kickstart_schema_message(context: &ConsciousContext) -> Option<String> {
     let kickstart = context.self_model.identity_lifecycle.kickstart.as_ref()?;
     if !context.self_model.identity_lifecycle.kickstart_available {
@@ -753,6 +812,7 @@ Available action kinds:
 - list_workspace_script_runs: inspect bounded script run history
 - upsert_scheduled_foreground_task: create or update future foreground work
 - request_background_job: request bounded background maintenance work
+- run_diagnostic: run a harness-native read-only diagnostic query
 - run_subprocess: execute a bounded shell command
 - run_workspace_script: run a registered workspace script by its script_id UUID
 - web_fetch: perform an HTTP GET request to a URL (requires network: "enabled"; automatically routed for approval)
@@ -792,6 +852,8 @@ Harness-native payload examples:
 - "payload": { "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
 - "payload": { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
 - "payload": { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
+- "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "trace_show", "params": { "trace_id": "<uuid>", "execution_id": null } } } }
+- "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "internal_doc", "params": { "document": "context_assembly" } } } }
 - For harness-native payloads, capability_scope.filesystem read_roots/write_roots must be [], network must be "disabled", environment allow_variables must be [], and execution values may be 0.
 
 Alternate payload shape for web_fetch:
@@ -845,9 +907,7 @@ fn build_identity_kickstart_proposals(
         return Ok(Vec::new());
     };
     if !context.self_model.identity_lifecycle.kickstart_available {
-        return Err(
-            "identity kickstart block emitted when identity formation is unavailable".to_string(),
-        );
+        return Ok(Vec::new());
     }
     #[derive(serde::Deserialize)]
     struct IdentityKickstartBlock {
@@ -857,27 +917,25 @@ fn build_identity_kickstart_proposals(
         cancel_reason: Option<String>,
     }
 
-    let block: IdentityKickstartBlock = serde_json::from_str(block_json)
-        .map_err(|error| format!("invalid identity kickstart block: {error}"))?;
+    let block: IdentityKickstartBlock = match serde_json::from_str(block_json) {
+        Ok(block) => block,
+        Err(_) => return Ok(Vec::new()),
+    };
     match block.action.as_str() {
         "select_predefined_identity" => {
             if context.self_model.identity_lifecycle.state
                 != IdentityLifecycleState::BootstrapSeedOnly
             {
-                return Err(
-                    "predefined identity selection is only available before identity completion"
-                        .to_string(),
-                );
+                return Ok(Vec::new());
             }
-            let template_key = block
-                .template_key
-                .as_deref()
-                .ok_or_else(|| "identity template_key is required".to_string())?;
-            let delta =
+            let Some(template_key) = block.template_key.as_deref() else {
+                return Ok(Vec::new());
+            };
+            let Some(delta) =
                 predefined_identity_delta(template_key, context.trigger.ingress.occurred_at)
-                    .ok_or_else(|| {
-                        format!("unknown predefined identity template: {template_key}")
-                    })?;
+            else {
+                return Ok(Vec::new());
+            };
             Ok(vec![CanonicalProposal {
                 proposal_id: uuid::Uuid::now_v7(),
                 proposal_kind: CanonicalProposalKind::IdentityDelta,
@@ -906,7 +964,10 @@ fn build_identity_kickstart_proposals(
             "User started a custom identity interview.",
         )]),
         "answer_custom_identity_question" => {
-            let answer = parse_identity_interview_answer(block.answer.as_ref())?;
+            let Some(answer) = parse_identity_interview_answer(context, block.answer.as_ref())?
+            else {
+                return Ok(Vec::new());
+            };
             Ok(vec![identity_interview_action_proposal(
                 context,
                 IdentityKickstartAction::AnswerCustomInterview(answer),
@@ -922,16 +983,62 @@ fn build_identity_kickstart_proposals(
             IdentityLifecycleState::BootstrapSeedOnly,
             "User cancelled identity formation.",
         )]),
-        other => Err(format!("unsupported identity kickstart action: {other}")),
+        _ => Ok(Vec::new()),
     }
 }
 
 fn parse_identity_interview_answer(
+    context: &ConsciousContext,
     value: Option<&serde_json::Value>,
-) -> std::result::Result<IdentityInterviewAnswer, String> {
-    let value = value.ok_or_else(|| "identity answer is required".to_string())?;
-    serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid identity interview answer: {error}"))
+) -> std::result::Result<Option<IdentityInterviewAnswer>, String> {
+    let Some(value) = value else {
+        return Ok(infer_identity_interview_answer_from_trigger(context));
+    };
+    if value.is_null() {
+        return Ok(infer_identity_interview_answer_from_trigger(context));
+    }
+    if let Some(answer_text) = value.as_str() {
+        let Some(step_key) = current_identity_interview_step(context) else {
+            return Ok(None);
+        };
+        return Ok(Some(IdentityInterviewAnswer {
+            step_key,
+            answer_text: answer_text.trim().to_string(),
+        }));
+    }
+
+    match serde_json::from_value::<IdentityInterviewAnswer>(value.clone()) {
+        Ok(answer) => Ok(Some(answer)),
+        Err(_) => Ok(infer_identity_interview_answer_from_trigger(context)),
+    }
+}
+
+fn infer_identity_interview_answer_from_trigger(
+    context: &ConsciousContext,
+) -> Option<IdentityInterviewAnswer> {
+    let step_key = current_identity_interview_step(context)?;
+    let answer_text = context.trigger.ingress.text_body.as_deref()?.trim();
+    if answer_text.is_empty() {
+        return None;
+    }
+    Some(IdentityInterviewAnswer {
+        step_key,
+        answer_text: answer_text.to_string(),
+    })
+}
+
+fn current_identity_interview_step(context: &ConsciousContext) -> Option<String> {
+    if context.self_model.identity_lifecycle.state
+        != IdentityLifecycleState::IdentityKickstartInProgress
+    {
+        return None;
+    }
+    context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .and_then(|kickstart| kickstart.next_step.clone())
 }
 
 fn identity_interview_action_proposal(
@@ -1017,6 +1124,7 @@ fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static 
             "upsert_scheduled_foreground_task"
         }
         contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        contracts::GovernedActionKind::RunDiagnostic => "run_diagnostic",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
@@ -1960,6 +2068,46 @@ mod tests {
     }
 
     #[test]
+    fn conscious_model_request_includes_troubleshooting_guidance_only_for_error_intent() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("tell me more about the error trace".to_string());
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let troubleshooting_message = model_request
+            .input
+            .messages
+            .iter()
+            .find(|message| message.content.contains("TROUBLESHOOTING CAPABILITY"))
+            .expect("troubleshooting guidance should be disclosed for error intent");
+
+        assert!(troubleshooting_message.content.contains("admin trace show"));
+        assert!(
+            troubleshooting_message
+                .content
+                .contains("You are the conscious assistant identity, not the harness")
+        );
+
+        let normal_request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(normal_payload) = &normal_request.payload else {
+            panic!("expected conscious payload");
+        };
+        let normal_model_request =
+            build_model_call_request(&normal_request, normal_payload.as_ref());
+        assert!(
+            !normal_model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("TROUBLESHOOTING CAPABILITY"))
+        );
+    }
+
+    #[test]
     fn conscious_model_request_observation_follow_up_forbids_new_action_promises() {
         let mut context = sample_context();
         context.governed_action_observations = vec![contracts::GovernedActionObservation {
@@ -2210,6 +2358,99 @@ mod tests {
             }
             other => panic!("expected conscious worker result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn conscious_worker_response_accepts_identity_answer_string_block() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("Richard".to_string());
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::IdentityKickstartInProgress,
+            kickstart_available: true,
+            kickstart: Some(IdentityKickstartContext {
+                available_actions: vec![IdentityKickstartActionKind::AnswerCustomInterview],
+                next_step: Some("name".to_string()),
+                resume_summary: Some("custom identity interview is in progress".to_string()),
+                predefined_templates: Vec::new(),
+            }),
+        };
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let identity_block = serde_json::json!({
+            "action": "answer_custom_identity_question",
+            "template_key": serde_json::Value::Null,
+            "answer": "Richard",
+            "cancel_reason": serde_json::Value::Null,
+        });
+        let model_response = conscious_model_response(
+            &request,
+            &model_request,
+            format!(
+                "Got it.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\n{}\n```",
+                identity_block
+            ),
+        );
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("worker response should be valid");
+        let WorkerResult::Conscious(result) = response.result else {
+            panic!("expected conscious worker result");
+        };
+        let identity_proposal = result
+            .candidate_proposals
+            .iter()
+            .find_map(|proposal| match &proposal.payload {
+                CanonicalProposalPayload::IdentityDelta(delta) => Some(delta),
+                _ => None,
+            })
+            .expect("identity answer proposal should be present");
+        assert_eq!(
+            identity_proposal.interview_action,
+            Some(IdentityKickstartAction::AnswerCustomInterview(
+                IdentityInterviewAnswer {
+                    step_key: "name".to_string(),
+                    answer_text: "Richard".to_string(),
+                },
+            ))
+        );
+        assert_eq!(result.assistant_output.text, "Got it.");
+    }
+
+    #[test]
+    fn conscious_worker_response_ignores_malformed_identity_block() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("Richard".to_string());
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::IdentityKickstartInProgress,
+            kickstart_available: true,
+            kickstart: Some(IdentityKickstartContext {
+                available_actions: vec![IdentityKickstartActionKind::AnswerCustomInterview],
+                next_step: Some("name".to_string()),
+                resume_summary: Some("custom identity interview is in progress".to_string()),
+                predefined_templates: Vec::new(),
+            }),
+        };
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_response = conscious_model_response(
+            &request,
+            &model_request,
+            format!("Got it.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\nnot json\n```"),
+        );
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("malformed optional identity block should not fail worker response");
+        let WorkerResult::Conscious(result) = response.result else {
+            panic!("expected conscious worker result");
+        };
+        assert!(result.candidate_proposals.is_empty());
+        assert_eq!(result.assistant_output.text, "Got it.");
     }
 
     #[test]
@@ -2644,6 +2885,30 @@ mod tests {
             retrieved_context: contracts::RetrievedContext::default(),
             governed_action_observations: Vec::new(),
             recovery_context: contracts::ForegroundRecoveryContext::default(),
+        }
+    }
+
+    fn conscious_model_response(
+        request: &WorkerRequest,
+        model_request: &contracts::ModelCallRequest,
+        text: String,
+    ) -> ModelCallResponse {
+        ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text,
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 12,
+            },
         }
     }
 

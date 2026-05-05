@@ -4404,6 +4404,7 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
             "upsert_scheduled_foreground_task"
         }
         contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        contracts::GovernedActionKind::RunDiagnostic => "run_diagnostic",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
     .to_string()

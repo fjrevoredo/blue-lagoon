@@ -39,6 +39,7 @@ fn kind_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        GovernedActionKind::RunDiagnostic => "run_diagnostic",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         GovernedActionKind::WebFetch => "web_fetch",

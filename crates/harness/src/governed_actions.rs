@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs};
 
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
@@ -8,9 +8,10 @@ use contracts::{
     GovernedActionKind, GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
     GovernedActionRiskTier, GovernedActionStatus, InspectWorkspaceArtifactAction,
     InspectWorkspaceScriptAction, ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction,
-    ListWorkspaceScriptsAction, NetworkAccessPosture, RequestBackgroundJobAction, SubprocessAction,
-    UpdateWorkspaceArtifactAction, UpsertScheduledForegroundTaskAction, WebFetchAction,
-    WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
+    ListWorkspaceScriptsAction, NetworkAccessPosture, RequestBackgroundJobAction,
+    RunDiagnosticAction, SubprocessAction, UpdateWorkspaceArtifactAction,
+    UpsertScheduledForegroundTaskAction, WebFetchAction, WorkspaceArtifactKind,
+    WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
     WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
@@ -29,7 +30,7 @@ use crate::{
     fetched_content::{
         DefaultFetchedContentFormatter, FetchedContentFormatter, FetchedContentInput,
     },
-    identity, policy, recovery, scheduled_foreground, tool_execution,
+    identity, management, policy, recovery, scheduled_foreground, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -37,6 +38,7 @@ use crate::{
 
 const WEB_FETCH_OBSERVATION_PREVIEW_CHARS: usize = 1_500;
 const WORKSPACE_OBSERVATION_PREVIEW_CHARS: usize = 2_000;
+const DIAGNOSTIC_OBSERVATION_PREVIEW_CHARS: usize = 4_000;
 const GOVERNED_ACTION_LIST_LIMIT_MAX: u32 = 25;
 
 #[derive(Debug, Clone)]
@@ -586,7 +588,8 @@ pub async fn execute_governed_action(
         | GovernedActionPayload::AppendWorkspaceScriptVersion(_)
         | GovernedActionPayload::ListWorkspaceScriptRuns(_)
         | GovernedActionPayload::UpsertScheduledForegroundTask(_)
-        | GovernedActionPayload::RequestBackgroundJob(_) => {
+        | GovernedActionPayload::RequestBackgroundJob(_)
+        | GovernedActionPayload::RunDiagnostic(_) => {
             config.governed_actions.default_subprocess_timeout_ms
         }
         _ => started_record.capability_scope.execution.timeout_ms,
@@ -640,6 +643,9 @@ pub async fn execute_governed_action(
         }
         GovernedActionPayload::RequestBackgroundJob(action) => {
             execute_request_background_job(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::RunDiagnostic(action) => {
+            execute_run_diagnostic_action(config, pool, &started_record, action).await
         }
     };
     let lease_completion_result = if result.as_ref().is_ok_and(governed_action_result_is_timeout) {
@@ -1419,6 +1425,183 @@ async fn execute_request_background_job(
     complete_harness_native_action(pool, record, summary, payload).await
 }
 
+async fn execute_run_diagnostic_action(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &RunDiagnosticAction,
+) -> Result<GovernedActionExecutionResult> {
+    let (summary, payload) = match &action.query {
+        contracts::DiagnosticQuery::RuntimeStatus => (
+            "loaded runtime status".to_string(),
+            serde_json::to_value(management::load_runtime_status(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::HealthSummary => (
+            "loaded operational health summary".to_string(),
+            serde_json::to_value(management::load_operational_health_summary(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::OperationalDiagnostics { limit } => (
+            format!("listed {limit} recent operational diagnostics"),
+            serde_json::to_value(
+                management::list_recent_operational_diagnostics(config, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::TraceRecent { limit } => (
+            format!("listed {limit} recent traces"),
+            serde_json::to_value(management::list_recent_traces(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::TraceShow {
+            trace_id,
+            execution_id,
+        } => (
+            "loaded trace report".to_string(),
+            serde_json::to_value(
+                management::load_trace_report(
+                    config,
+                    management::TraceLookupRequest {
+                        trace_id: *trace_id,
+                        execution_id: *execution_id,
+                    },
+                )
+                .await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::ForegroundPending { limit } => (
+            format!("listed {limit} pending foreground conversations"),
+            serde_json::to_value(
+                management::list_pending_foreground_conversations(config, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::ForegroundSchedules { limit } => (
+            format!("listed {limit} scheduled foreground tasks"),
+            serde_json::to_value(
+                management::list_scheduled_foreground_tasks(config, None, false, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::BackgroundList { limit } => (
+            format!("listed {limit} background jobs"),
+            serde_json::to_value(management::list_background_jobs(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::RecoveryCheckpoints { open_only, limit } => (
+            format!("listed {limit} recovery checkpoints"),
+            serde_json::to_value(
+                management::list_recovery_checkpoints(config, *open_only, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::RecoveryLeases {
+            limit,
+            soft_warning_threshold_percent,
+        } => (
+            format!("listed {limit} worker leases"),
+            serde_json::to_value(
+                management::list_active_worker_leases(
+                    config,
+                    *limit,
+                    *soft_warning_threshold_percent,
+                )
+                .await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::SchemaStatus => (
+            "loaded schema status".to_string(),
+            serde_json::to_value(management::load_schema_status(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::SchemaUpgradePath => (
+            "loaded schema upgrade assessment".to_string(),
+            serde_json::to_value(management::load_schema_upgrade_assessment(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::ApprovalsList { limit } => (
+            format!("listed {limit} approval requests"),
+            serde_json::to_value(management::list_approval_requests(config, None, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::ActionsList { limit } => (
+            format!("listed {limit} governed actions"),
+            serde_json::to_value(management::list_governed_actions(config, None, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::WakeSignalsList { limit } => (
+            format!("listed {limit} wake signals"),
+            serde_json::to_value(management::list_wake_signals(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::IdentityStatus => (
+            "loaded identity status".to_string(),
+            serde_json::to_value(management::load_identity_status(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::IdentityShow => (
+            "loaded compact identity view".to_string(),
+            serde_json::to_value(management::load_identity_show(config).await?)?,
+        ),
+        contracts::DiagnosticQuery::IdentityHistory { limit } => (
+            format!("listed {limit} identity history rows"),
+            serde_json::to_value(management::list_identity_history(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::IdentityDiagnostics { limit } => (
+            format!("listed {limit} identity diagnostics"),
+            serde_json::to_value(management::list_identity_diagnostics(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::WorkspaceArtifacts { limit } => (
+            format!("listed {limit} workspace artifacts"),
+            serde_json::to_value(
+                management::list_workspace_artifact_summaries(config, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::WorkspaceScripts { limit } => (
+            format!("listed {limit} workspace scripts"),
+            serde_json::to_value(management::list_workspace_scripts(config, *limit).await?)?,
+        ),
+        contracts::DiagnosticQuery::WorkspaceRuns { script_id, limit } => (
+            format!("listed {limit} workspace script runs"),
+            serde_json::to_value(
+                management::list_workspace_script_runs(config, *script_id, *limit).await?,
+            )?,
+        ),
+        contracts::DiagnosticQuery::InternalDoc { document } => {
+            let (path, content) = read_allowed_internal_diagnostic_doc(*document)?;
+            (
+                format!("read internal diagnostic document {path}"),
+                json!({
+                    "document": document,
+                    "path": path,
+                    "content": content,
+                }),
+            )
+        }
+    };
+
+    complete_harness_native_action(
+        pool,
+        record,
+        summary.clone(),
+        json!({
+            "query": &action.query,
+            "summary": summary,
+            "result": payload,
+        }),
+    )
+    .await
+}
+
+fn read_allowed_internal_diagnostic_doc(
+    document: contracts::DiagnosticDocument,
+) -> Result<(String, String)> {
+    let relative_path = match document {
+        contracts::DiagnosticDocument::Philosophy => "PHILOSOPHY.md",
+        contracts::DiagnosticDocument::Requirements => "docs/REQUIREMENTS.md",
+        contracts::DiagnosticDocument::ImplementationDesign => "docs/IMPLEMENTATION_DESIGN.md",
+        contracts::DiagnosticDocument::InternalDocumentation => {
+            "docs/internal/INTERNAL_DOCUMENTATION.md"
+        }
+        contracts::DiagnosticDocument::ContextAssembly => {
+            "docs/internal/conscious_loop/CONTEXT_ASSEMBLY.md"
+        }
+        contracts::DiagnosticDocument::GovernedActions => {
+            "docs/internal/conscious_loop/GOVERNED_ACTIONS.md"
+        }
+    };
+    let content = fs::read_to_string(relative_path)
+        .with_context(|| format!("failed to read diagnostic document {relative_path}"))?;
+    Ok((relative_path.to_string(), content))
+}
+
 pub fn fingerprint_governed_action(
     proposal: &GovernedActionProposal,
 ) -> Result<GovernedActionFingerprint> {
@@ -1458,6 +1641,7 @@ pub fn validate_capability_scope(
             | GovernedActionKind::ListWorkspaceScriptRuns
             | GovernedActionKind::UpsertScheduledForegroundTask
             | GovernedActionKind::RequestBackgroundJob
+            | GovernedActionKind::RunDiagnostic
     );
     if filesystem_roots.is_empty() && !is_harness_native && !is_web_fetch {
         bail!("governed actions must request at least one filesystem root");
@@ -1595,6 +1779,10 @@ pub fn validate_capability_scope(
         ) => {
             validate_harness_native_scope(scope, "background job request")?;
         }
+        (GovernedActionKind::RunDiagnostic, GovernedActionPayload::RunDiagnostic(action)) => {
+            validate_harness_native_scope(scope, "diagnostic query")?;
+            validate_run_diagnostic_action(action)?;
+        }
         (GovernedActionKind::RunSubprocess, GovernedActionPayload::RunSubprocess(action)) => {
             if action.command.trim().is_empty() {
                 bail!("subprocess proposals must declare a command");
@@ -1664,6 +1852,9 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::RequestBackgroundJob,
             GovernedActionPayload::RequestBackgroundJob(action),
         ) => validate_request_background_job_action(action),
+        (GovernedActionKind::RunDiagnostic, GovernedActionPayload::RunDiagnostic(action)) => {
+            validate_run_diagnostic_action(action)
+        }
         (GovernedActionKind::RunSubprocess, GovernedActionPayload::RunSubprocess(action)) => {
             validate_subprocess_action(action)
         }
@@ -1826,6 +2017,61 @@ fn validate_upsert_scheduled_foreground_task_action(
 fn validate_request_background_job_action(action: &RequestBackgroundJobAction) -> Result<()> {
     if action.rationale.trim().is_empty() {
         bail!("background job request rationale must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_run_diagnostic_action(action: &RunDiagnosticAction) -> Result<()> {
+    match &action.query {
+        contracts::DiagnosticQuery::TraceShow {
+            trace_id,
+            execution_id,
+        } => {
+            if trace_id.is_none() && execution_id.is_none() {
+                bail!("diagnostic trace_show requires trace_id or execution_id");
+            }
+        }
+        contracts::DiagnosticQuery::RecoveryLeases {
+            soft_warning_threshold_percent,
+            ..
+        } => {
+            if !(1..=100).contains(soft_warning_threshold_percent) {
+                bail!("diagnostic recovery_leases soft warning threshold must be 1-100");
+            }
+        }
+        _ => {}
+    }
+    validate_diagnostic_limit(action)
+}
+
+fn validate_diagnostic_limit(action: &RunDiagnosticAction) -> Result<()> {
+    let limit = match &action.query {
+        contracts::DiagnosticQuery::OperationalDiagnostics { limit }
+        | contracts::DiagnosticQuery::TraceRecent { limit }
+        | contracts::DiagnosticQuery::ForegroundPending { limit }
+        | contracts::DiagnosticQuery::ForegroundSchedules { limit }
+        | contracts::DiagnosticQuery::BackgroundList { limit }
+        | contracts::DiagnosticQuery::RecoveryCheckpoints { limit, .. }
+        | contracts::DiagnosticQuery::RecoveryLeases { limit, .. }
+        | contracts::DiagnosticQuery::ApprovalsList { limit }
+        | contracts::DiagnosticQuery::ActionsList { limit }
+        | contracts::DiagnosticQuery::WakeSignalsList { limit }
+        | contracts::DiagnosticQuery::IdentityHistory { limit }
+        | contracts::DiagnosticQuery::IdentityDiagnostics { limit }
+        | contracts::DiagnosticQuery::WorkspaceArtifacts { limit }
+        | contracts::DiagnosticQuery::WorkspaceScripts { limit }
+        | contracts::DiagnosticQuery::WorkspaceRuns { limit, .. } => Some(*limit),
+        contracts::DiagnosticQuery::RuntimeStatus
+        | contracts::DiagnosticQuery::HealthSummary
+        | contracts::DiagnosticQuery::TraceShow { .. }
+        | contracts::DiagnosticQuery::SchemaStatus
+        | contracts::DiagnosticQuery::SchemaUpgradePath
+        | contracts::DiagnosticQuery::IdentityStatus
+        | contracts::DiagnosticQuery::IdentityShow
+        | contracts::DiagnosticQuery::InternalDoc { .. } => None,
+    };
+    if let Some(limit) = limit {
+        validate_limit(limit, "diagnostic query")?;
     }
     Ok(())
 }
@@ -2888,6 +3134,7 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        GovernedActionKind::RunDiagnostic => "run_diagnostic",
         GovernedActionKind::RunSubprocess => "run_subprocess",
         GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         GovernedActionKind::WebFetch => "web_fetch",
@@ -2907,6 +3154,7 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
         "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
         "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
+        "run_diagnostic" => Ok(GovernedActionKind::RunDiagnostic),
         "run_subprocess" => Ok(GovernedActionKind::RunSubprocess),
         "run_workspace_script" => Ok(GovernedActionKind::RunWorkspaceScript),
         "web_fetch" => Ok(GovernedActionKind::WebFetch),
@@ -3070,6 +3318,9 @@ enum CanonicalGovernedActionPayload {
         wake_preference: Option<String>,
         internal_conversation_ref: Option<String>,
     },
+    RunDiagnostic {
+        query: contracts::DiagnosticQuery,
+    },
     RunSubprocess {
         command: String,
         args: Vec<String>,
@@ -3197,6 +3448,9 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                     .internal_conversation_ref
                     .as_ref()
                     .map(|value| value.trim().to_string()),
+            },
+            GovernedActionPayload::RunDiagnostic(action) => Self::RunDiagnostic {
+                query: action.query.clone(),
             },
             GovernedActionPayload::RunSubprocess(action) => Self::RunSubprocess {
                 command: action.command.trim().to_string(),

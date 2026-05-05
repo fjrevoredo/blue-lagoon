@@ -182,7 +182,8 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         | GovernedActionKind::ListWorkspaceArtifacts
         | GovernedActionKind::ListWorkspaceScripts
         | GovernedActionKind::InspectWorkspaceScript
-        | GovernedActionKind::ListWorkspaceScriptRuns => GovernedActionRiskTier::Tier0,
+        | GovernedActionKind::ListWorkspaceScriptRuns
+        | GovernedActionKind::RunDiagnostic => GovernedActionRiskTier::Tier0,
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
         | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,

@@ -1890,25 +1890,28 @@ fn next_missing_step(answered_fields: &serde_json::Map<String, Value>) -> Option
         .find(|step| !answered_fields.contains_key(*step))
 }
 
-fn custom_identity_step_prompt(step: &str) -> String {
+pub fn custom_identity_step_user_prompt(step: &str) -> &'static str {
     match step {
-        "name" => "Ask the user what name the assistant identity should use.",
-        "identity_form" => "Ask what kind of identity form the assistant should have.",
-        "archetype_role" => "Ask for the desired archetype or role.",
-        "temperament" => "Ask for core temperament traits.",
-        "communication_style" => "Ask how the assistant should usually communicate.",
-        "backstory" => "Ask for a short origin or backstory.",
-        "age_framing" => "Ask how age or maturity should be framed.",
-        "likes" => "Ask what this identity tends to like.",
-        "dislikes" => "Ask what this identity tends to dislike.",
-        "values" => "Ask for foundational values.",
-        "boundaries" => "Ask for enduring boundaries.",
-        "tendencies" => "Ask for learned tendencies or habits.",
-        "goals" => "Ask for goals or subgoals.",
-        "relationship_to_user" => "Ask how the identity should relate to the user.",
-        _ => "Ask the next identity interview question.",
+        "name" => "What name should this assistant identity use?",
+        "identity_form" => "What kind of identity form should this assistant have?",
+        "archetype_role" => "What archetype or role should define this identity?",
+        "temperament" => "What core temperament traits should this identity have?",
+        "communication_style" => "How should this identity usually communicate?",
+        "backstory" => "What short origin or backstory should this identity have?",
+        "age_framing" => "How should this identity frame its age or maturity?",
+        "likes" => "What should this identity tend to like?",
+        "dislikes" => "What should this identity tend to dislike?",
+        "values" => "What foundational values should this identity hold?",
+        "boundaries" => "What enduring boundaries should this identity keep?",
+        "tendencies" => "What learned tendencies or habits should this identity have?",
+        "goals" => "What goals or subgoals should this identity carry?",
+        "relationship_to_user" => "How should this identity relate to the user?",
+        _ => "What should the next identity interview answer be?",
     }
-    .to_string()
+}
+
+fn custom_identity_step_prompt(step: &str) -> String {
+    custom_identity_step_user_prompt(step).to_string()
 }
 
 fn custom_identity_deltas_from_answers(

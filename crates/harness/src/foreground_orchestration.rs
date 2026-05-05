@@ -11,7 +11,7 @@ use crate::{
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
-    governed_actions,
+    governed_actions, identity,
     model_gateway::ModelProviderTransport,
     policy, proposal, recovery,
     telegram::{self, TelegramChatAction, TelegramDelivery, TelegramOutboundMessage},
@@ -93,6 +93,20 @@ struct GovernedActionProcessingSummary {
     executed_count: usize,
     blocked_count: usize,
     pending_approval_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundFailureContext {
+    trace_id: Uuid,
+    execution_id: Uuid,
+    episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundFailureDeliveryTarget {
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
 }
 
 pub async fn orchestrate_telegram_foreground_ingress<T, D>(
@@ -925,6 +939,10 @@ where
             .await;
         }
     };
+    let failure_delivery_target = ForegroundFailureDeliveryTarget {
+        chat_id,
+        reply_to_message_id,
+    };
     emit_typing_chat_action(
         delivery,
         chat_id,
@@ -948,13 +966,16 @@ where
     {
         Ok(assembly) => assembly,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::ContextAssemblyFailure,
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    ForegroundFailureKind::ContextAssemblyFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -964,13 +985,16 @@ where
     {
         Ok(payload) => payload,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -990,13 +1014,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1020,13 +1047,16 @@ where
     {
         Ok(response) => response,
         Err(error) => {
-            record_foreground_failure(
+            record_and_deliver_foreground_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                classify_conscious_worker_failure(&error),
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    classify_conscious_worker_failure(&error),
+                ),
                 &format_error_chain(&error),
+                delivery,
+                failure_delivery_target,
             )
             .await?;
             return Err(error);
@@ -1035,13 +1065,16 @@ where
 
     let contracts::WorkerResult::Conscious(initial_result) = &initial_response.result else {
         let message = "conscious worker returned a non-conscious result".to_string();
-        record_foreground_failure(
+        record_and_deliver_foreground_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::WorkerProtocolFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::WorkerProtocolFailure,
+            ),
             &message,
+            delivery,
+            failure_delivery_target,
         )
         .await?;
         bail!(message);
@@ -1058,13 +1091,16 @@ where
     {
         Ok(summary) => summary,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -1102,13 +1138,16 @@ where
         {
             Ok(response) => response,
             Err(error) => {
-                record_foreground_failure(
+                record_and_deliver_foreground_failure(
                     pool,
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    recorded_episode_id,
-                    classify_conscious_worker_failure(&error),
+                    foreground_failure_context(
+                        &trigger,
+                        recorded_episode_id,
+                        classify_conscious_worker_failure(&error),
+                    ),
                     &format_error_chain(&error),
+                    delivery,
+                    failure_delivery_target,
                 )
                 .await?;
                 return Err(error);
@@ -1119,13 +1158,16 @@ where
             _ => {
                 let message =
                     "conscious follow-up worker returned a non-conscious result".to_string();
-                record_foreground_failure(
+                record_and_deliver_foreground_failure(
                     pool,
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    recorded_episode_id,
-                    ForegroundFailureKind::WorkerProtocolFailure,
+                    foreground_failure_context(
+                        &trigger,
+                        recorded_episode_id,
+                        ForegroundFailureKind::WorkerProtocolFailure,
+                    ),
                     &message,
+                    delivery,
+                    failure_delivery_target,
                 )
                 .await?;
                 bail!(message);
@@ -1136,8 +1178,15 @@ where
         (initial_response.clone(), initial_result.clone())
     };
 
-    let assistant_text =
-        foreground_assistant_delivery_text(&result.assistant_output.text, &governed_action_summary);
+    let candidate_proposals =
+        foreground_candidate_proposals(&assembly.context, &trigger, &result.candidate_proposals);
+
+    let assistant_text = foreground_assistant_delivery_text(
+        &result.assistant_output.text,
+        &governed_action_summary,
+        &candidate_proposals,
+        &assembly.context,
+    );
     let assistant_episode_message_id = Uuid::now_v7();
     if let Err(error) = foreground::insert_episode_message(
         pool,
@@ -1155,13 +1204,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1196,13 +1248,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1219,19 +1274,22 @@ where
         },
         "foreground_orchestration",
         None,
-        &result.candidate_proposals,
+        &candidate_proposals,
     )
     .await
     {
         Ok(summary) => summary,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -1242,13 +1300,16 @@ where
     let response_payload = match response_payload {
         Ok(response_payload) => response_payload,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -1262,13 +1323,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1291,13 +1355,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1317,13 +1384,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1343,7 +1413,7 @@ where
                 "processed_ingress_ids": processed_ingress_ids,
                 "outbound_message_id": delivery_receipt.message_id,
                 "assistant_summary": result.episode_summary.summary,
-                "candidate_proposal_count": result.candidate_proposals.len(),
+                "candidate_proposal_count": candidate_proposals.len(),
                 "governed_action_summary": {
                     "proposed": governed_action_summary.proposed_count,
                     "executed": governed_action_summary.executed_count,
@@ -1361,13 +1431,16 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1569,6 +1642,50 @@ async fn record_foreground_failure(
     Ok(())
 }
 
+fn foreground_failure_context(
+    trigger: &contracts::ForegroundTrigger,
+    episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
+) -> ForegroundFailureContext {
+    ForegroundFailureContext {
+        trace_id: trigger.trace_id,
+        execution_id: trigger.execution_id,
+        episode_id,
+        failure_kind,
+    }
+}
+
+async fn record_and_deliver_foreground_failure<D>(
+    pool: &sqlx::PgPool,
+    context: ForegroundFailureContext,
+    error_message: &str,
+    delivery: &mut D,
+    target: ForegroundFailureDeliveryTarget,
+) -> Result<()>
+where
+    D: TelegramDelivery,
+{
+    let record_result = record_foreground_failure(
+        pool,
+        context.trace_id,
+        context.execution_id,
+        context.episode_id,
+        context.failure_kind,
+        error_message,
+    )
+    .await;
+    deliver_foreground_failure_notice(
+        delivery,
+        target.chat_id,
+        target.reply_to_message_id,
+        context.trace_id,
+        context.execution_id,
+        context.failure_kind,
+    )
+    .await;
+    record_result
+}
+
 async fn launch_leased_conscious_worker<T>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
@@ -1680,6 +1797,28 @@ async fn record_and_return_failure<T>(
     Err(error)
 }
 
+async fn record_deliver_and_return_failure<T, D>(
+    pool: &sqlx::PgPool,
+    context: ForegroundFailureContext,
+    error: Error,
+    delivery: &mut D,
+    target: ForegroundFailureDeliveryTarget,
+) -> Result<T>
+where
+    D: TelegramDelivery,
+{
+    let error_message = format_error_chain(&error);
+    if let Err(record_error) =
+        record_and_deliver_foreground_failure(pool, context, &error_message, delivery, target).await
+    {
+        return Err(error.context(format!(
+            "failed to record foreground execution failure: {record_error}"
+        )));
+    }
+
+    Err(error)
+}
+
 async fn record_and_return_approval_resolution_failure<T>(
     pool: &sqlx::PgPool,
     trigger: &contracts::ForegroundTrigger,
@@ -1755,6 +1894,54 @@ fn format_error_chain(error: &Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+async fn deliver_foreground_failure_notice<D>(
+    delivery: &mut D,
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    failure_kind: ForegroundFailureKind,
+) where
+    D: TelegramDelivery,
+{
+    let text = foreground_failure_notice_text(trace_id, failure_kind);
+    match delivery
+        .send_message(&TelegramOutboundMessage {
+            chat_id,
+            text,
+            reply_to_message_id,
+            reply_markup: None,
+        })
+        .await
+    {
+        Ok(receipt) => {
+            info!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                outbound_message_id = receipt.message_id,
+                failure_kind = failure_kind.as_str(),
+                "foreground failure notice delivered"
+            );
+        }
+        Err(error) => {
+            warn!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                failure_kind = failure_kind.as_str(),
+                error = %format_error_chain(&error),
+                "foreground failure notice delivery failed"
+            );
+        }
+    }
+}
+
+fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
+    format!(
+        "I hit an internal runtime error while processing that message. Trace: {trace_id}. Failure kind: {}. Send another message to continue.",
+        failure_kind.as_str()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1951,9 +2138,25 @@ fn approval_follow_up_delivery_text(model_text: &str) -> String {
     }
 }
 
+fn foreground_candidate_proposals(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    worker_proposals: &[contracts::CanonicalProposal],
+) -> Vec<contracts::CanonicalProposal> {
+    let mut proposals = worker_proposals.to_vec();
+    proposals.extend(inferred_identity_kickstart_proposals(
+        context,
+        trigger,
+        worker_proposals,
+    ));
+    proposals
+}
+
 fn foreground_assistant_delivery_text(
     model_text: &str,
     governed_action_summary: &GovernedActionProcessingSummary,
+    candidate_proposals: &[contracts::CanonicalProposal],
+    context: &contracts::ConsciousContext,
 ) -> String {
     let trimmed = model_text.trim();
     if !trimmed.is_empty() {
@@ -1971,7 +2174,323 @@ fn foreground_assistant_delivery_text(
         };
     }
 
+    if let Some(identity_fallback) =
+        identity_kickstart_delivery_fallback(candidate_proposals, context)
+    {
+        return identity_fallback;
+    }
+
     "No assistant response was generated.".to_string()
+}
+
+fn identity_kickstart_delivery_fallback(
+    candidate_proposals: &[contracts::CanonicalProposal],
+    context: &contracts::ConsciousContext,
+) -> Option<String> {
+    candidate_proposals.iter().find_map(|proposal| {
+        let contracts::CanonicalProposalPayload::IdentityDelta(payload) = &proposal.payload else {
+            return None;
+        };
+
+        match payload.interview_action.as_ref() {
+            Some(contracts::IdentityKickstartAction::StartCustomInterview) => Some(format!(
+                "Starting the custom identity interview. {}",
+                identity::custom_identity_step_user_prompt("name")
+            )),
+            Some(contracts::IdentityKickstartAction::AnswerCustomInterview(_)) => {
+                Some(identity_answer_delivery_fallback(context, payload))
+            }
+            Some(contracts::IdentityKickstartAction::SelectPredefinedTemplate { .. }) => {
+                Some("Identity template selected.".to_string())
+            }
+            Some(contracts::IdentityKickstartAction::Cancel { .. }) => {
+                Some("Identity kickstart cancelled.".to_string())
+            }
+            None if payload.lifecycle_state
+                == contracts::IdentityLifecycleState::CompleteIdentityActive =>
+            {
+                Some("Identity update prepared.".to_string())
+            }
+            None => None,
+        }
+    })
+}
+
+fn identity_answer_delivery_fallback(
+    context: &contracts::ConsciousContext,
+    payload: &contracts::IdentityDeltaProposal,
+) -> String {
+    if payload.lifecycle_state == contracts::IdentityLifecycleState::CompleteIdentityActive {
+        return "Identity interview completed.".to_string();
+    }
+
+    let Some(current_step) = context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .and_then(|kickstart| kickstart.next_step.as_deref())
+    else {
+        return "Saved that identity interview answer. Continue with the next identity detail when ready.".to_string();
+    };
+
+    let Some(next_step) = next_custom_identity_step(current_step) else {
+        return "Identity interview completed.".to_string();
+    };
+
+    format!(
+        "Saved that identity interview answer. {}",
+        identity::custom_identity_step_user_prompt(next_step)
+    )
+}
+
+fn inferred_identity_kickstart_proposals(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    existing_proposals: &[contracts::CanonicalProposal],
+) -> Vec<contracts::CanonicalProposal> {
+    if !context.self_model.identity_lifecycle.kickstart_available
+        || existing_proposals.iter().any(|proposal| {
+            matches!(
+                proposal.payload,
+                contracts::CanonicalProposalPayload::IdentityDelta(_)
+            )
+        })
+    {
+        return Vec::new();
+    }
+
+    let Some(user_text) = trigger.ingress.text_body.as_deref().map(str::trim) else {
+        return Vec::new();
+    };
+    if user_text.is_empty() {
+        return Vec::new();
+    }
+
+    match context.self_model.identity_lifecycle.state {
+        contracts::IdentityLifecycleState::BootstrapSeedOnly => {
+            infer_bootstrap_identity_proposal(context, trigger, user_text)
+                .into_iter()
+                .collect()
+        }
+        contracts::IdentityLifecycleState::IdentityKickstartInProgress => {
+            infer_in_progress_identity_proposal(context, trigger, user_text)
+                .into_iter()
+                .collect()
+        }
+        contracts::IdentityLifecycleState::CompleteIdentityActive
+        | contracts::IdentityLifecycleState::IdentityResetPending => Vec::new(),
+    }
+}
+
+fn infer_bootstrap_identity_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    user_text: &str,
+) -> Option<contracts::CanonicalProposal> {
+    let normalized = normalize_identity_intent_text(user_text);
+    if is_custom_identity_start_intent(&normalized) {
+        return Some(identity_interview_action_proposal(
+            context,
+            trigger,
+            contracts::IdentityKickstartAction::StartCustomInterview,
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            "User started a custom identity interview.",
+        ));
+    }
+
+    let template_key = predefined_identity_template_intent(&normalized)?;
+    let payload = contracts::predefined_identity_delta(&template_key, trigger.ingress.occurred_at)?;
+    Some(identity_delta_proposal(
+        context,
+        trigger,
+        payload,
+        format!("User selected predefined identity template '{template_key}'."),
+    ))
+}
+
+fn infer_in_progress_identity_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    user_text: &str,
+) -> Option<contracts::CanonicalProposal> {
+    let normalized = normalize_identity_intent_text(user_text);
+    if is_identity_cancel_intent(&normalized) {
+        return Some(identity_interview_action_proposal(
+            context,
+            trigger,
+            contracts::IdentityKickstartAction::Cancel {
+                reason: Some(user_text.to_string()),
+            },
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            "User cancelled identity formation.",
+        ));
+    }
+    if is_ambiguous_identity_answer(&normalized) {
+        return None;
+    }
+    let step_key = context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .and_then(|kickstart| kickstart.next_step.as_deref())?;
+    if !CUSTOM_IDENTITY_STEPS.contains(&step_key) {
+        return None;
+    }
+    Some(identity_interview_action_proposal(
+        context,
+        trigger,
+        contracts::IdentityKickstartAction::AnswerCustomInterview(
+            contracts::IdentityInterviewAnswer {
+                step_key: step_key.to_string(),
+                answer_text: user_text.to_string(),
+            },
+        ),
+        contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+        "User answered a custom identity interview step.",
+    ))
+}
+
+fn identity_interview_action_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    action: contracts::IdentityKickstartAction,
+    lifecycle_state: contracts::IdentityLifecycleState,
+    rationale: &str,
+) -> contracts::CanonicalProposal {
+    identity_delta_proposal(
+        context,
+        trigger,
+        contracts::IdentityDeltaProposal {
+            lifecycle_state,
+            item_deltas: Vec::new(),
+            self_description_delta: None,
+            interview_action: Some(action),
+            rationale: rationale.to_string(),
+        },
+        rationale.to_string(),
+    )
+}
+
+fn identity_delta_proposal(
+    _context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    payload: contracts::IdentityDeltaProposal,
+    rationale: String,
+) -> contracts::CanonicalProposal {
+    contracts::CanonicalProposal {
+        proposal_id: Uuid::now_v7(),
+        proposal_kind: contracts::CanonicalProposalKind::IdentityDelta,
+        canonical_target: contracts::CanonicalTargetKind::IdentityItems,
+        confidence_pct: 100,
+        conflict_posture: contracts::ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(rationale),
+        valid_from: Some(trigger.ingress.occurred_at),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: contracts::ProposalProvenance {
+            provenance_kind: contracts::ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![trigger.ingress.ingress_id],
+            source_episode_id: None,
+        },
+        payload: contracts::CanonicalProposalPayload::IdentityDelta(payload),
+    }
+}
+
+const CUSTOM_IDENTITY_STEPS: &[&str] = &[
+    "name",
+    "identity_form",
+    "archetype_role",
+    "temperament",
+    "communication_style",
+    "backstory",
+    "age_framing",
+    "likes",
+    "dislikes",
+    "values",
+    "boundaries",
+    "tendencies",
+    "goals",
+    "relationship_to_user",
+];
+
+fn next_custom_identity_step(current_step: &str) -> Option<&'static str> {
+    let current_index = CUSTOM_IDENTITY_STEPS
+        .iter()
+        .position(|step| *step == current_step)?;
+    CUSTOM_IDENTITY_STEPS.get(current_index + 1).copied()
+}
+
+fn normalize_identity_intent_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn is_custom_identity_start_intent(normalized: &str) -> bool {
+    let has_custom = normalized.contains("custom")
+        || normalized.contains("scratch")
+        || normalized.contains("from zero")
+        || normalized.contains("from the ground");
+    let has_identity = normalized.contains("identity")
+        || normalized.contains("one")
+        || normalized.contains("path")
+        || normalized.contains("create")
+        || normalized.contains("build");
+    has_custom && has_identity
+}
+
+fn predefined_identity_template_intent(normalized: &str) -> Option<String> {
+    let trimmed = normalized.trim();
+    if matches!(trimmed, "1" | "one" | "option 1" | "first") {
+        return Some("continuity_operator".to_string());
+    }
+    if matches!(trimmed, "2" | "two" | "option 2" | "second") {
+        return Some("reflective_companion".to_string());
+    }
+    if matches!(trimmed, "3" | "three" | "option 3" | "third") {
+        return Some("pragmatic_copilot".to_string());
+    }
+
+    let options: [(&str, &[&str]); 3] = [
+        ("continuity_operator", &["continuity operator"]),
+        ("reflective_companion", &["reflective companion"]),
+        (
+            "pragmatic_copilot",
+            &["pragmatic copilot", "pragmatic co pilot"],
+        ),
+    ];
+    options
+        .iter()
+        .find(|(_, needles)| needles.iter().any(|needle| normalized.contains(needle)))
+        .map(|(template_key, _)| (*template_key).to_string())
+}
+
+fn is_identity_cancel_intent(normalized: &str) -> bool {
+    if normalized.contains("never mind") {
+        return true;
+    }
+    normalized
+        .split_whitespace()
+        .any(|word| matches!(word, "cancel" | "stop" | "abort" | "nevermind" | "quit"))
+}
+
+fn is_ambiguous_identity_answer(normalized: &str) -> bool {
+    let trimmed = normalized.trim();
+    trimmed.is_empty()
+        || matches!(
+            trimmed,
+            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no"
+        )
 }
 
 async fn emit_typing_chat_action<D>(
@@ -2026,6 +2545,7 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
             "upsert_scheduled_foreground_task"
         }
         contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        contracts::GovernedActionKind::RunDiagnostic => "run_diagnostic",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
@@ -2083,9 +2603,14 @@ mod tests {
             pending_approval_count: 1,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary),
+            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary, &[], &context),
             "Waiting on approval."
         );
     }
@@ -2096,9 +2621,14 @@ mod tests {
             pending_approval_count: 1,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text("", &summary),
+            foreground_assistant_delivery_text("", &summary, &[], &context),
             "Approval requested. Use the approval prompt above to continue."
         );
     }
@@ -2109,10 +2639,233 @@ mod tests {
             pending_approval_count: 2,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text(" \n", &summary),
+            foreground_assistant_delivery_text(" \n", &summary, &[], &context),
             "2 approvals requested. Use the approval prompts above to continue."
         );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_identity_kickstart_control_only() {
+        let summary = GovernedActionProcessingSummary::default();
+        let proposal = identity_action_proposal(
+            contracts::IdentityKickstartAction::StartCustomInterview,
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+        );
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "let's create a custom one",
+        );
+
+        assert_eq!(
+            foreground_assistant_delivery_text(" \n", &summary, &[proposal], &context),
+            "Starting the custom identity interview. What name should this assistant identity use?"
+        );
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_infers_custom_identity_start_when_worker_omits_block() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "let's create a custom one",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert_eq!(proposals.len(), 1);
+        let contracts::CanonicalProposalPayload::IdentityDelta(delta) = &proposals[0].payload
+        else {
+            panic!("expected identity delta");
+        };
+        assert_eq!(
+            delta.interview_action,
+            Some(contracts::IdentityKickstartAction::StartCustomInterview)
+        );
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_ignores_ambiguous_identity_answer() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            Some("name"),
+            "ok",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_infers_identity_interview_answer() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            Some("name"),
+            "Lagoon Forge",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert_eq!(proposals.len(), 1);
+        let contracts::CanonicalProposalPayload::IdentityDelta(delta) = &proposals[0].payload
+        else {
+            panic!("expected identity delta");
+        };
+        assert_eq!(
+            delta.interview_action,
+            Some(contracts::IdentityKickstartAction::AnswerCustomInterview(
+                contracts::IdentityInterviewAnswer {
+                    step_key: "name".to_string(),
+                    answer_text: "Lagoon Forge".to_string(),
+                },
+            ))
+        );
+        assert_eq!(
+            foreground_assistant_delivery_text(
+                " \n",
+                &GovernedActionProcessingSummary::default(),
+                &proposals,
+                &context
+            ),
+            "Saved that identity interview answer. What kind of identity form should this assistant have?"
+        );
+    }
+
+    #[test]
+    fn foreground_failure_notice_includes_trace_and_kind_without_internal_error() {
+        let trace_id = Uuid::now_v7();
+        let notice =
+            foreground_failure_notice_text(trace_id, ForegroundFailureKind::ContextAssemblyFailure);
+
+        assert!(notice.contains(&trace_id.to_string()));
+        assert!(notice.contains("context_assembly_failure"));
+        assert!(!notice.contains("missing foreground self-model seed configuration"));
+    }
+
+    fn identity_action_proposal(
+        action: contracts::IdentityKickstartAction,
+        lifecycle_state: contracts::IdentityLifecycleState,
+    ) -> contracts::CanonicalProposal {
+        contracts::CanonicalProposal {
+            proposal_id: Uuid::now_v7(),
+            proposal_kind: contracts::CanonicalProposalKind::IdentityDelta,
+            canonical_target: contracts::CanonicalTargetKind::IdentityItems,
+            confidence_pct: 100,
+            conflict_posture: contracts::ProposalConflictPosture::Independent,
+            subject_ref: "self:blue-lagoon".to_string(),
+            rationale: Some("Identity kickstart action.".to_string()),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: contracts::ProposalProvenance {
+                provenance_kind: contracts::ProposalProvenanceKind::EpisodeObservation,
+                source_ingress_ids: vec![Uuid::now_v7()],
+                source_episode_id: Some(Uuid::now_v7()),
+            },
+            payload: contracts::CanonicalProposalPayload::IdentityDelta(
+                contracts::IdentityDeltaProposal {
+                    lifecycle_state,
+                    item_deltas: Vec::new(),
+                    self_description_delta: None,
+                    interview_action: Some(action),
+                    rationale: "Identity kickstart action.".to_string(),
+                },
+            ),
+        }
+    }
+
+    fn test_conscious_context(
+        state: contracts::IdentityLifecycleState,
+        next_step: Option<&str>,
+        user_text: &str,
+    ) -> contracts::ConsciousContext {
+        let trigger = test_foreground_trigger(user_text);
+        contracts::ConsciousContext {
+            context_id: Uuid::now_v7(),
+            assembled_at: Utc::now(),
+            trigger,
+            self_model: contracts::SelfModelSnapshot {
+                stable_identity: "blue-lagoon".to_string(),
+                role: "Personal AI assistant".to_string(),
+                communication_style: "Direct".to_string(),
+                capabilities: Vec::new(),
+                constraints: Vec::new(),
+                preferences: Vec::new(),
+                current_goals: Vec::new(),
+                current_subgoals: Vec::new(),
+                identity: None,
+                identity_lifecycle: contracts::IdentityLifecycleContext {
+                    state,
+                    kickstart_available: true,
+                    kickstart: Some(contracts::IdentityKickstartContext {
+                        available_actions: vec![
+                            contracts::IdentityKickstartActionKind::SelectPredefinedTemplate,
+                            contracts::IdentityKickstartActionKind::StartCustomInterview,
+                            contracts::IdentityKickstartActionKind::AnswerCustomInterview,
+                            contracts::IdentityKickstartActionKind::Cancel,
+                        ],
+                        next_step: next_step.map(str::to_string),
+                        resume_summary: None,
+                        predefined_templates: contracts::predefined_identity_templates(),
+                    }),
+                },
+            },
+            internal_state: contracts::InternalStateSnapshot {
+                load_pct: 0,
+                health_pct: 100,
+                reliability_pct: 100,
+                resource_pressure_pct: 0,
+                confidence_pct: 100,
+                connection_quality_pct: 100,
+                active_conditions: Vec::new(),
+            },
+            recent_history: Vec::new(),
+            retrieved_context: contracts::RetrievedContext::default(),
+            governed_action_observations: Vec::new(),
+            recovery_context: contracts::ForegroundRecoveryContext::default(),
+        }
+    }
+
+    fn test_foreground_trigger(user_text: &str) -> contracts::ForegroundTrigger {
+        let ingress_id = Uuid::now_v7();
+        contracts::ForegroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            trigger_kind: contracts::ForegroundTriggerKind::UserIngress,
+            ingress: contracts::NormalizedIngress {
+                ingress_id,
+                channel_kind: contracts::ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                external_event_id: format!("event-{ingress_id}"),
+                external_message_id: Some(format!("message-{ingress_id}")),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                event_kind: contracts::IngressEventKind::MessageCreated,
+                occurred_at: Utc::now(),
+                text_body: Some(user_text.to_string()),
+                reply_to: None,
+                attachments: Vec::new(),
+                command_hint: None,
+                approval_payload: None,
+                raw_payload_ref: None,
+            },
+            received_at: Utc::now(),
+            deduplication_key: format!("test:{ingress_id}"),
+            budget: contracts::ForegroundBudget {
+                iteration_budget: 1,
+                wall_clock_budget_ms: 30_000,
+                token_budget: 4_000,
+            },
+        }
     }
 }

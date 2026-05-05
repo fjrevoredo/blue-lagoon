@@ -1319,7 +1319,8 @@ fn governed_action_recovery_action_classification(
         | GovernedActionKind::ListWorkspaceArtifacts
         | GovernedActionKind::ListWorkspaceScripts
         | GovernedActionKind::InspectWorkspaceScript
-        | GovernedActionKind::ListWorkspaceScriptRuns => RecoveryActionClassification::SafeReplay,
+        | GovernedActionKind::ListWorkspaceScriptRuns
+        | GovernedActionKind::RunDiagnostic => RecoveryActionClassification::SafeReplay,
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
         | GovernedActionKind::CreateWorkspaceScript
@@ -2896,6 +2897,7 @@ mod tests {
             GovernedActionKind::ListWorkspaceScripts,
             GovernedActionKind::InspectWorkspaceScript,
             GovernedActionKind::ListWorkspaceScriptRuns,
+            GovernedActionKind::RunDiagnostic,
         ] {
             let record = governed_action_record_for_classification(action_kind);
             assert_eq!(
