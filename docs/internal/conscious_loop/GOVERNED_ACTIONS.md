@@ -6,6 +6,12 @@
 
 The governed action system is the conscious loop's proposal-only tool surface.
 The model emits plain text plus, when needed, one fenced JSON proposal block.
+Returning only an action or payload name such as `list_workspace_artifacts` is
+invalid. Invented aliases such as `read_workspace_artifacts` are also invalid.
+These shapes are treated as malformed governed-action proposals.
+Each model response may propose at most one governed action. If another action
+is needed after the harness returns an observation, the harness performs another
+bounded same-turn model call and revalidates the next proposal.
 The harness parses the proposal, validates the requested scope, classifies risk,
 persists an auditable execution record, optionally requests approval, and only
 then executes the action through harness-owned services.
@@ -26,8 +32,8 @@ created.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1370), payload structs (line 1400), `GovernedActionPayload` (line 1606) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 809), `build_governed_action_proposals()` (line 912), `governed_action_kind_as_str()` (line 1137) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_inspect_workspace_artifact()` (line 871), `execute_create_workspace_script()` (line 1188), `execute_request_background_job()` (line 1406), `validate_capability_scope()` (line 1663), `governed_action_kind_as_str()` (line 3163), `CanonicalGovernedActionPayload` (line 3287) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 841), `build_governed_action_proposals()` (line 944), `governed_action_kind_as_str()` (line 1285) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_inspect_workspace_artifact()` (line 871), `execute_create_workspace_script()` (line 1188), `execute_request_background_job()` (line 1406), `validate_capability_scope()` (line 1663), `governed_action_kind_as_str()` (line 3159), `CanonicalGovernedActionPayload` (line 3283) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |

@@ -21,8 +21,9 @@ pending actions - enters through this pipeline. Nothing else reaches the model.
 | File | Relevant symbol |
 |---|---|
 | `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 206), assembly limit constants (lines 18-20) |
-| `crates/workers/src/main.rs` | `build_model_input()` (line 512), `build_model_call_request()` (line 419), `identity_kickstart_schema_message()` (line 741), `build_identity_kickstart_proposals()` (line 929) |
-| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 428), `predefined_identity_templates()` (line 634), `predefined_identity_delta()` (line 660) |
+| `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 168), `load_episode_context()` (line 568) |
+| `crates/workers/src/main.rs` | `build_model_input()` (line 514), `format_conversation_excerpt()` (line 665), `troubleshooting_guidance_message()` (line 749), `identity_kickstart_schema_message()` (line 773), `is_foreground_visible_context_text()` (line 1810), `retrieved_context_summary()` (line 1885), `retrieved_episode_message_summary()` (line 1918) |
+| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105) |
 | `config/self_model_seed.toml` | Bootstrap self-model and seed identity values |
 | `config/default.toml` | `harness.default_foreground_token_budget` |
 
@@ -37,7 +38,7 @@ Steps execute in order inside `assemble_foreground_context()`:
    snapshot from active `identity_items`.
 3. Internal state snapshot built from `InternalStateSeed` + active conditions.
 4. Trigger text truncated to `trigger_text_char_limit` characters.
-5. Recent episode history fetched - up to `recent_history_limit` episodes before the trigger timestamp; each message truncated to `history_message_char_limit` characters.
+5. Recent episode history fetched - up to `recent_history_limit` episodes before the trigger timestamp; each message truncated to `history_message_char_limit` characters, then labeled with author and UTC timestamp before model submission.
 6. Retrieved context assembled via `retrieval::assemble_retrieved_context()`.
 
 ### `ModelInput` Structure
@@ -81,9 +82,9 @@ Goals: {current_goals}.[ Active subgoals: {current_subgoals}.][ Active condition
 
 Current time: {current_time}.
 
-Runtime state: load={load_pct}%, health={health_pct}%, confidence={confidence_pct}%, mode={mode}.
+Operational estimates from harness counters: load_estimate={load_pct}%, health_estimate={health_pct}%, confidence_estimate={confidence_pct}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.
 
-You have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.
+You have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. When an action is required, never output only an action or payload name; emit the full tagged governed-action JSON block.
 ```
 
 Field sources:
@@ -93,21 +94,23 @@ Field sources:
 | `{stable_identity}` | `self_model.stable_identity` |
 | `{role}` | `self_model.role` |
 | `{communication_style}` | `self_model.communication_style` |
-| `{preferences}` | `self_model.preferences` joined |
+| `{preferences}` | foreground-visible `self_model.preferences` joined |
 | identity formation fragment | Present when `self_model.identity_lifecycle.kickstart_available` is true |
 | active identity fragment | Present when `self_model.identity` is populated from active identity items |
-| `{capabilities}` | `self_model.capabilities` joined |
-| `{constraints}` | `self_model.constraints` joined |
-| `{current_goals}` | `self_model.current_goals` joined |
-| `{current_subgoals}` | `self_model.current_subgoals` joined — **fragment omitted when empty** |
+| `{capabilities}` | foreground-visible `self_model.capabilities` joined |
+| `{constraints}` | foreground-visible `self_model.constraints` joined |
+| `{current_goals}` | foreground-visible `self_model.current_goals` joined |
+| `{current_subgoals}` | foreground-visible `self_model.current_subgoals` joined — **fragment omitted when empty** |
 | `{active_conditions}` | `internal_state.active_conditions` joined — **fragment omitted when empty** |
 | `{current_time}` | `context.assembled_at` formatted as `"%Y-%m-%d %H:%M UTC"` |
-| `{load_pct}` | `internal_state.load_pct` (u8, 0–100) |
-| `{health_pct}` | `internal_state.health_pct` (u8, 0–100) |
-| `{confidence_pct}` | `internal_state.confidence_pct` (u8, 0–100) |
+| `{load_pct}` | `internal_state.load_pct` (u8, 0–100), surfaced as a derived estimate |
+| `{health_pct}` | `internal_state.health_pct` (u8, 0–100), surfaced as a derived estimate |
+| `{confidence_pct}` | `internal_state.confidence_pct` (u8, 0–100), surfaced as a derived estimate |
 | `{mode}` | `"single_ingress"` or `"backlog_recovery"` |
 
-`InternalStateSnapshot` also tracks `reliability_pct`, `resource_pressure_pct`, and `connection_quality_pct` — these are intentionally omitted from the prompt for brevity.
+`InternalStateSnapshot` also tracks `reliability_pct`, `resource_pressure_pct`, and `connection_quality_pct` — these are intentionally omitted from the prompt for brevity. The visible operational metrics are derived from harness counters and must not be treated as literal self-knowledge or proof that an action happened.
+
+Foreground self-model text is passed through `is_foreground_visible_context_text()` before it is surfaced in the system prompt. Empty strings, JSON-like blobs, and internal maintenance/reflection markers such as `reflection_id`, `blue_lagoon_self_check`, `trigger_summary`, or `token_budget_remaining` are filtered out at the prompt boundary. This does not mutate canonical records; it prevents maintenance artifacts from being mistaken for the assistant's conscious identity.
 
 ### Message Array Ordering
 
@@ -115,10 +118,10 @@ Messages are appended in this order by `build_model_input()`:
 
 | # | Role | Content | Condition |
 |---|---|---|---|
-| 1..N | User / Assistant | Recent episode excerpts, oldest first (reversed from DB fetch) | Always |
-| N+1 | User | Current trigger `text_body` | Only if `text_body` is `Some` |
+| 1..N | User / Assistant | Recent episode excerpts, oldest first (reversed from DB fetch), formatted as `[YYYY-MM-DD HH:MM UTC] Author: text` | Always |
+| N+1 | User | Current trigger `text_body`, formatted as `[YYYY-MM-DD HH:MM UTC] User: text` | Only if `text_body` is `Some` |
 | N+2 | Developer | Backlog recovery notice with ordered ingress batch | Only in `BacklogRecovery` mode with non-empty `ordered_ingress` |
-| N+3 | Developer | `"Retrieved canonical context: ..."` summary | Only if `retrieved_context.items` is non-empty |
+| N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with memory artifact content, episode summaries, latest prior user/assistant excerpts when present, timestamps, status, and relevance reason; durable IDs are not included in the model-facing summary | Only if `retrieved_context.items` is non-empty |
 | N+4 | Developer | Governed action observations plus, when available, foreground action-loop state | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Full governed action schema | If `governed_action_observations` is empty |
 | N+5 (alt) | Developer | Troubleshooting capability guidance | If governed action observations are empty and the current trigger asks about errors, traces, logs, diagnostics, debugging, or failures |
@@ -128,9 +131,9 @@ Messages are appended in this order by `build_model_input()`:
 
 When governed action observations are present, `build_model_input()` appends a Developer message that summarizes the observations, includes the current `ForegroundGovernedActionLoopState` when the harness supplied it, and explicitly tells the worker to continue the same foreground turn. The worker may propose another governed action in that same turn if it is still needed, but the harness remains the authority for whether the proposal is allowed, approval-gated, or denied under policy, the configured per-turn action cap, and the remaining loop budget.
 
-Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:688`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:717` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:720`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:749` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2318` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2346`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2347` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2375`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 

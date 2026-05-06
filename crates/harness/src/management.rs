@@ -467,6 +467,125 @@ pub struct TraceNote {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceDiagnosisVerdict {
+    Succeeded,
+    Failed,
+    AwaitingApproval,
+    Blocked,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFailureClass {
+    ModelGatewayTransportFailure,
+    ProviderRejected,
+    TelegramDeliveryFailure,
+    PersistenceFailure,
+    ContextAssemblyFailure,
+    MalformedActionProposal,
+    ApprovalPending,
+    ApprovalRejected,
+    ApprovalExpired,
+    GovernedActionBlocked,
+    RecoveryInterrupted,
+    UnknownFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceLikelyCauseKind {
+    DirectFact,
+    Inference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSideEffectStatus {
+    NoneExecuted,
+    Executed,
+    Possible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceUserReplyStatus {
+    Produced,
+    NotProduced,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceRetrySafety {
+    Safe,
+    Unsafe,
+    RequiresOperator,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceNodeReference {
+    pub node_id: String,
+    pub node_kind: String,
+    pub source_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub status: Option<String>,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceDiagnosisSummary {
+    pub trace_id: Uuid,
+    pub root_execution_id: Option<Uuid>,
+    pub verdict: TraceDiagnosisVerdict,
+    pub failure_class: Option<TraceFailureClass>,
+    pub first_failing_node: Option<TraceNodeReference>,
+    pub last_successful_node: Option<TraceNodeReference>,
+    pub side_effect_status: TraceSideEffectStatus,
+    pub user_reply_status: TraceUserReplyStatus,
+    pub retry_safety: TraceRetrySafety,
+    pub likely_cause: Option<String>,
+    pub likely_cause_kind: Option<TraceLikelyCauseKind>,
+    pub suggested_next_steps: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFocusSelector {
+    FailingNode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFocusPayloadAvailability {
+    Available,
+    Partial,
+    RetentionExpired,
+    NotRecorded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceFocusReport {
+    pub selector: TraceFocusSelector,
+    pub resolved_node: Option<TraceNode>,
+    pub payload_availability: TraceFocusPayloadAvailability,
+    pub payload_availability_reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceExplanationReport {
+    pub diagnosis: TraceDiagnosisSummary,
+    pub focus: Option<TraceFocusReport>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolveApprovalRequest {
     pub approval_request_id: Uuid,
@@ -2068,6 +2187,123 @@ pub async fn load_trace_report(
     Ok(builder.finish())
 }
 
+pub fn explain_trace_report(
+    report: &TraceReport,
+    focus: Option<TraceFocusSelector>,
+) -> TraceExplanationReport {
+    let diagnosis = diagnose_trace_report(report);
+    let focus = focus.map(|selector| inspect_trace_report_focus(report, &diagnosis, selector));
+    TraceExplanationReport { diagnosis, focus }
+}
+
+pub fn diagnose_trace_report(report: &TraceReport) -> TraceDiagnosisSummary {
+    let pending_approval = find_pending_approval_node(report);
+    let blocked_node = find_blocked_node(report);
+    let first_failing_node = find_first_failing_node(report);
+    let primary_failure = pending_approval
+        .or(blocked_node)
+        .or(first_failing_node)
+        .map(trace_node_reference);
+    let last_successful_node = primary_failure
+        .as_ref()
+        .and_then(|failure| find_last_nonfailing_before(report, &failure.node_id))
+        .or_else(|| {
+            report
+                .nodes
+                .iter()
+                .rev()
+                .find(|node| node_is_nonfailing(node))
+                .map(trace_node_reference)
+        });
+    let failure_class =
+        classify_trace_failure(report, pending_approval, blocked_node, first_failing_node);
+    let verdict = derive_trace_verdict(report, pending_approval, blocked_node, failure_class);
+    let side_effect_status = derive_side_effect_status(report);
+    let user_reply_status = derive_user_reply_status(report);
+    let retry_safety = derive_retry_safety(verdict, side_effect_status, failure_class);
+    let (likely_cause, likely_cause_kind) = derive_likely_cause(
+        report,
+        failure_class,
+        pending_approval,
+        blocked_node,
+        first_failing_node,
+    );
+    let mut notes = report
+        .notes
+        .iter()
+        .map(|note| format!("{}: {}", note.note_kind, note.message))
+        .collect::<Vec<_>>();
+    if first_failing_node.is_none() && pending_approval.is_none() && blocked_node.is_none() {
+        notes.push("No explicit failing node was found in the durable trace.".to_string());
+    }
+    let suggested_next_steps = derive_next_steps(
+        failure_class,
+        retry_safety,
+        side_effect_status,
+        pending_approval.is_some(),
+    );
+
+    TraceDiagnosisSummary {
+        trace_id: report.trace_id,
+        root_execution_id: report.root_execution_id,
+        verdict,
+        failure_class,
+        first_failing_node: primary_failure,
+        last_successful_node,
+        side_effect_status,
+        user_reply_status,
+        retry_safety,
+        likely_cause,
+        likely_cause_kind,
+        suggested_next_steps,
+        notes,
+    }
+}
+
+fn find_last_nonfailing_before(
+    report: &TraceReport,
+    failing_node_id: &str,
+) -> Option<TraceNodeReference> {
+    let failure_index = report
+        .nodes
+        .iter()
+        .position(|node| node.node_id == failing_node_id)?;
+    report.nodes[..failure_index]
+        .iter()
+        .rev()
+        .find(|node| node_is_nonfailing(node))
+        .map(trace_node_reference)
+}
+
+pub fn inspect_trace_report_focus(
+    report: &TraceReport,
+    diagnosis: &TraceDiagnosisSummary,
+    selector: TraceFocusSelector,
+) -> TraceFocusReport {
+    let resolved_node = match selector {
+        TraceFocusSelector::FailingNode => diagnosis.first_failing_node.as_ref().and_then(|node| {
+            report
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == node.node_id)
+                .cloned()
+        }),
+    };
+    let (payload_availability, payload_availability_reason, mut notes) =
+        classify_focus_payload_availability(resolved_node.as_ref());
+    if resolved_node.is_none() {
+        notes.push("The requested focus target is not present in this trace.".to_string());
+    }
+
+    TraceFocusReport {
+        selector,
+        resolved_node,
+        payload_availability,
+        payload_availability_reason,
+        notes,
+    }
+}
+
 pub async fn list_recent_traces(config: &RuntimeConfig, limit: u32) -> Result<Vec<TraceSummary>> {
     let pool = db::connect(config).await?;
     verify_schema(&pool, config).await?;
@@ -3282,6 +3518,593 @@ fn trace_node_kind_for_causal_kind(kind: &str) -> Option<&'static str> {
 
 fn trace_node_id(kind: &str, id: Uuid) -> String {
     format!("{kind}:{id}")
+}
+
+fn trace_node_reference(node: &TraceNode) -> TraceNodeReference {
+    TraceNodeReference {
+        node_id: node.node_id.clone(),
+        node_kind: node.node_kind.clone(),
+        source_id: node.source_id,
+        occurred_at: node.occurred_at,
+        status: node.status.clone(),
+        title: node.title.clone(),
+        summary: node.summary.clone(),
+    }
+}
+
+fn find_pending_approval_node(report: &TraceReport) -> Option<&TraceNode> {
+    report.nodes.iter().find(|node| {
+        node.node_kind == "approval_request" && matches!(node.status.as_deref(), Some("pending"))
+    })
+}
+
+fn find_blocked_node(report: &TraceReport) -> Option<&TraceNode> {
+    report.nodes.iter().find(|node| {
+        (node.node_kind == "governed_action_execution"
+            && matches!(node.status.as_deref(), Some("blocked")))
+            || (node.node_kind == "approval_request"
+                && matches!(node.status.as_deref(), Some("rejected" | "expired")))
+    })
+}
+
+fn find_first_failing_node(report: &TraceReport) -> Option<&TraceNode> {
+    report
+        .nodes
+        .iter()
+        .filter(|node| node_is_failure(node))
+        .min_by(|left, right| {
+            trace_failure_priority(left)
+                .cmp(&trace_failure_priority(right))
+                .then_with(|| left.occurred_at.cmp(&right.occurred_at))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        })
+}
+
+fn node_is_failure(node: &TraceNode) -> bool {
+    match node.node_kind.as_str() {
+        "audit_event" => matches!(node.status.as_deref(), Some("error" | "critical")),
+        _ => matches!(
+            node.status.as_deref(),
+            Some("failed" | "blocked" | "rejected" | "expired" | "invalidated")
+        ),
+    }
+}
+
+fn node_is_nonfailing(node: &TraceNode) -> bool {
+    !node_is_failure(node) && !matches!(node.status.as_deref(), Some("pending"))
+}
+
+fn trace_failure_priority(node: &TraceNode) -> u8 {
+    match node.node_kind.as_str() {
+        "model_call" | "governed_action_execution" | "approval_request" => 0,
+        "audit_event" => 1,
+        "execution" | "episode" => 2,
+        _ => 3,
+    }
+}
+
+fn derive_trace_verdict(
+    report: &TraceReport,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    failure_class: Option<TraceFailureClass>,
+) -> TraceDiagnosisVerdict {
+    if pending_approval.is_some() {
+        return TraceDiagnosisVerdict::AwaitingApproval;
+    }
+    if blocked_node.is_some() {
+        return TraceDiagnosisVerdict::Blocked;
+    }
+    if failure_class.is_some() {
+        return TraceDiagnosisVerdict::Failed;
+    }
+    if report.nodes.iter().any(|node| {
+        matches!(
+            node.status.as_deref(),
+            Some("succeeded" | "executed" | "resolved" | "completed")
+        )
+    }) || report.nodes.iter().any(|node| {
+        node.node_kind == "episode_message"
+            && node.payload.get("message_role").and_then(JsonValue::as_str) == Some("assistant")
+    }) {
+        return TraceDiagnosisVerdict::Succeeded;
+    }
+    TraceDiagnosisVerdict::Inconclusive
+}
+
+fn classify_trace_failure(
+    report: &TraceReport,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    first_failing_node: Option<&TraceNode>,
+) -> Option<TraceFailureClass> {
+    if pending_approval.is_some() {
+        return Some(TraceFailureClass::ApprovalPending);
+    }
+    if let Some(node) = blocked_node {
+        return match node.status.as_deref() {
+            Some("rejected") => Some(TraceFailureClass::ApprovalRejected),
+            Some("expired") => Some(TraceFailureClass::ApprovalExpired),
+            _ => Some(TraceFailureClass::GovernedActionBlocked),
+        };
+    }
+    let node = first_failing_node?;
+    match node.node_kind.as_str() {
+        "model_call" => {
+            classify_model_call_failure(report, node).or(Some(TraceFailureClass::UnknownFailure))
+        }
+        "audit_event" => classify_audit_failure(node),
+        "execution" | "episode" => classify_failure_from_related_audit(report, node)
+            .or(Some(TraceFailureClass::UnknownFailure)),
+        "governed_action_execution" => Some(TraceFailureClass::GovernedActionBlocked),
+        _ => Some(TraceFailureClass::UnknownFailure),
+    }
+}
+
+fn classify_model_call_failure(
+    report: &TraceReport,
+    node: &TraceNode,
+) -> Option<TraceFailureClass> {
+    if let Some(failure_class) = classify_failure_from_related_audit(report, node) {
+        return Some(failure_class);
+    }
+    let error_summary = node
+        .payload
+        .get("error_summary")
+        .and_then(JsonValue::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    match error_summary.as_deref() {
+        Some(summary) if summary.contains("timeout") || summary.contains("transport") => {
+            Some(TraceFailureClass::ModelGatewayTransportFailure)
+        }
+        Some(summary) if summary.contains("status 4") || summary.contains("status 5") => {
+            Some(TraceFailureClass::ProviderRejected)
+        }
+        Some(summary) if summary.contains("persist") || summary.contains("database") => {
+            Some(TraceFailureClass::PersistenceFailure)
+        }
+        _ => None,
+    }
+}
+
+fn classify_failure_from_related_audit(
+    report: &TraceReport,
+    node: &TraceNode,
+) -> Option<TraceFailureClass> {
+    let execution_id = node.related_ids.get("execution_id").copied().or_else(|| {
+        node.payload
+            .get("execution_id")
+            .and_then(JsonValue::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+    });
+    report
+        .nodes
+        .iter()
+        .filter(|candidate| {
+            candidate.node_kind == "audit_event"
+                && candidate.occurred_at >= node.occurred_at
+                && execution_id.map(|id| candidate.related_ids.get("execution_id") == Some(&id))
+                    != Some(false)
+        })
+        .find_map(classify_audit_failure)
+}
+
+fn classify_audit_failure(node: &TraceNode) -> Option<TraceFailureClass> {
+    let payload = node.payload.get("payload")?;
+    let failure_kind = payload
+        .get("failure_kind")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("reason_code").and_then(JsonValue::as_str))?;
+    match failure_kind {
+        "model_gateway_transport_failure" => Some(TraceFailureClass::ModelGatewayTransportFailure),
+        "provider_rejected" => Some(TraceFailureClass::ProviderRejected),
+        "telegram_delivery_failure" => Some(TraceFailureClass::TelegramDeliveryFailure),
+        "persistence_failure" => Some(TraceFailureClass::PersistenceFailure),
+        "context_assembly_failure" => Some(TraceFailureClass::ContextAssemblyFailure),
+        "malformed_action_proposal" => Some(TraceFailureClass::MalformedActionProposal),
+        "recovery_interrupted" => Some(TraceFailureClass::RecoveryInterrupted),
+        _ => Some(TraceFailureClass::UnknownFailure),
+    }
+}
+
+fn derive_side_effect_status(report: &TraceReport) -> TraceSideEffectStatus {
+    let actions = report
+        .nodes
+        .iter()
+        .filter(|node| node.node_kind == "governed_action_execution")
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        return TraceSideEffectStatus::NoneExecuted;
+    }
+    if actions
+        .iter()
+        .any(|node| matches!(node.status.as_deref(), Some("executed")))
+    {
+        return TraceSideEffectStatus::Executed;
+    }
+    if actions.iter().any(|node| {
+        matches!(node.status.as_deref(), Some("failed"))
+            || node
+                .payload
+                .get("started_at")
+                .is_some_and(|value| !value.is_null())
+    }) {
+        return TraceSideEffectStatus::Possible;
+    }
+    if actions.iter().all(|node| {
+        matches!(
+            node.status.as_deref(),
+            Some(
+                "proposed"
+                    | "awaiting_approval"
+                    | "approved"
+                    | "blocked"
+                    | "rejected"
+                    | "expired"
+                    | "invalidated"
+            )
+        )
+    }) {
+        return TraceSideEffectStatus::NoneExecuted;
+    }
+    TraceSideEffectStatus::Unknown
+}
+
+fn derive_user_reply_status(report: &TraceReport) -> TraceUserReplyStatus {
+    if report.nodes.iter().any(|node| {
+        node.node_kind == "episode_message"
+            && node.payload.get("message_role").and_then(JsonValue::as_str) == Some("assistant")
+    }) {
+        return TraceUserReplyStatus::Produced;
+    }
+    if report
+        .nodes
+        .iter()
+        .any(|node| matches!(node.node_kind.as_str(), "execution" | "episode" | "ingress"))
+    {
+        return TraceUserReplyStatus::NotProduced;
+    }
+    TraceUserReplyStatus::Unknown
+}
+
+fn derive_retry_safety(
+    verdict: TraceDiagnosisVerdict,
+    side_effect_status: TraceSideEffectStatus,
+    failure_class: Option<TraceFailureClass>,
+) -> TraceRetrySafety {
+    if verdict == TraceDiagnosisVerdict::AwaitingApproval
+        || matches!(
+            failure_class,
+            Some(TraceFailureClass::ApprovalPending)
+                | Some(TraceFailureClass::ApprovalRejected)
+                | Some(TraceFailureClass::ApprovalExpired)
+        )
+    {
+        return TraceRetrySafety::RequiresOperator;
+    }
+    match side_effect_status {
+        TraceSideEffectStatus::NoneExecuted => match verdict {
+            TraceDiagnosisVerdict::Succeeded => TraceRetrySafety::Unsafe,
+            TraceDiagnosisVerdict::Failed
+            | TraceDiagnosisVerdict::Blocked
+            | TraceDiagnosisVerdict::Inconclusive => TraceRetrySafety::Safe,
+            TraceDiagnosisVerdict::AwaitingApproval => TraceRetrySafety::RequiresOperator,
+        },
+        TraceSideEffectStatus::Executed | TraceSideEffectStatus::Possible => {
+            TraceRetrySafety::Unsafe
+        }
+        TraceSideEffectStatus::Unknown => TraceRetrySafety::Unknown,
+    }
+}
+
+fn derive_likely_cause(
+    report: &TraceReport,
+    failure_class: Option<TraceFailureClass>,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    first_failing_node: Option<&TraceNode>,
+) -> (Option<String>, Option<TraceLikelyCauseKind>) {
+    if let Some(node) = pending_approval {
+        return (
+            Some(format!(
+                "Approval request is pending: {}",
+                short_trace_text(&node.summary)
+            )),
+            Some(TraceLikelyCauseKind::DirectFact),
+        );
+    }
+    if let Some(node) = blocked_node {
+        let detail = node
+            .payload
+            .get("blocked_reason")
+            .and_then(JsonValue::as_str)
+            .or_else(|| {
+                node.payload
+                    .get("consequence_summary")
+                    .and_then(JsonValue::as_str)
+            })
+            .unwrap_or(node.summary.as_str());
+        return (
+            Some(short_trace_text(detail)),
+            Some(TraceLikelyCauseKind::DirectFact),
+        );
+    }
+    if let Some(node) = first_failing_node {
+        if node.node_kind == "model_call" {
+            if let Some(error_summary) = node
+                .payload
+                .get("error_summary")
+                .and_then(JsonValue::as_str)
+            {
+                return (
+                    Some(short_trace_text(error_summary)),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                );
+            }
+        }
+        if node.node_kind == "audit_event" {
+            if let Some(error) = node
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(JsonValue::as_str)
+            {
+                return (
+                    Some(short_trace_text(error)),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                );
+            }
+        }
+    }
+    match failure_class {
+        Some(class) => (
+            Some(short_trace_text(&trace_failure_class_label(class))),
+            Some(TraceLikelyCauseKind::Inference),
+        ),
+        None => {
+            if report.nodes.is_empty() {
+                (
+                    Some(
+                        "No durable trace records were found for this trace identifier."
+                            .to_string(),
+                    ),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                )
+            } else {
+                (None, None)
+            }
+        }
+    }
+}
+
+fn derive_next_steps(
+    failure_class: Option<TraceFailureClass>,
+    retry_safety: TraceRetrySafety,
+    side_effect_status: TraceSideEffectStatus,
+    awaiting_approval: bool,
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    match failure_class {
+        Some(TraceFailureClass::ModelGatewayTransportFailure) => {
+            steps.push("Check model gateway and provider availability.".to_string());
+            steps.push(
+                "Inspect recent operational diagnostics for repeated transport failures."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ProviderRejected) => {
+            steps.push(
+                "Inspect the failing model-call payload and provider error summary.".to_string(),
+            );
+            steps.push("Check recent diagnostics for repeated provider rejections.".to_string());
+        }
+        Some(TraceFailureClass::ContextAssemblyFailure) => {
+            steps.push("Inspect the latest foreground context assembly audit events.".to_string());
+            steps.push(
+                "Review recent diagnostics for self-model or context assembly issues.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::MalformedActionProposal) => {
+            steps.push(
+                "Inspect the failing worker output and governed-action proposal formatting."
+                    .to_string(),
+            );
+            steps.push(
+                "Retry the request only after confirming the assistant produced a valid tagged action block."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::GovernedActionBlocked) => {
+            steps.push(
+                "Inspect the blocked reason and capability scope on the governed action."
+                    .to_string(),
+            );
+            steps.push(
+                "Use the governed-action and approval management surfaces before retrying."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ApprovalPending) => {
+            steps.push(
+                "Resolve the pending approval request through the management CLI.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::ApprovalRejected | TraceFailureClass::ApprovalExpired) => {
+            steps.push(
+                "Inspect the approval outcome and decide whether a new request is needed."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::PersistenceFailure) => {
+            steps.push(
+                "Inspect recent diagnostics and recovery health for persistence errors."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::RecoveryInterrupted) => {
+            steps.push(
+                "Inspect recovery checkpoints and worker leases before retrying.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::TelegramDeliveryFailure) => {
+            steps.push(
+                "Inspect channel delivery diagnostics before retrying the foreground turn."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::UnknownFailure) | None => {}
+    }
+    if awaiting_approval && !steps.iter().any(|step| step.contains("approval")) {
+        steps.push(
+            "Resolve the pending approval request before attempting further work.".to_string(),
+        );
+    }
+    match retry_safety {
+        TraceRetrySafety::Safe => {
+            steps.push("Retry is safe once the underlying issue is addressed.".to_string());
+        }
+        TraceRetrySafety::Unsafe => {
+            steps.push(
+                "Do not retry blindly; the trace may already include side effects.".to_string(),
+            );
+        }
+        TraceRetrySafety::RequiresOperator => {
+            steps.push("Operator action is required before continuation.".to_string());
+        }
+        TraceRetrySafety::Unknown => {
+            steps.push(
+                "Treat retry safety as unknown until the ambiguous state is resolved.".to_string(),
+            );
+        }
+    }
+    if side_effect_status == TraceSideEffectStatus::NoneExecuted
+        && !steps
+            .iter()
+            .any(|step| step.contains("Inspect the failing model-call payload"))
+        && failure_class == Some(TraceFailureClass::ModelGatewayTransportFailure)
+    {
+        steps.push("No governed action side effects executed before the failure.".to_string());
+    }
+    if steps.is_empty() {
+        steps.push(
+            "Use trace show for the full timeline and inspect the most relevant node payload."
+                .to_string(),
+        );
+    }
+    steps
+}
+
+fn trace_failure_class_label(class: TraceFailureClass) -> String {
+    match class {
+        TraceFailureClass::ModelGatewayTransportFailure => {
+            "The trace failed at the model gateway transport boundary.".to_string()
+        }
+        TraceFailureClass::ProviderRejected => {
+            "The model provider rejected or failed the request.".to_string()
+        }
+        TraceFailureClass::TelegramDeliveryFailure => {
+            "Delivery back to the conversation channel failed.".to_string()
+        }
+        TraceFailureClass::PersistenceFailure => {
+            "Persistence failed during foreground processing.".to_string()
+        }
+        TraceFailureClass::ContextAssemblyFailure => {
+            "Foreground context assembly failed before model completion.".to_string()
+        }
+        TraceFailureClass::MalformedActionProposal => {
+            "The assistant attempted a governed action but returned an invalid action proposal shape."
+                .to_string()
+        }
+        TraceFailureClass::ApprovalPending => {
+            "The foreground turn is waiting on a pending approval request.".to_string()
+        }
+        TraceFailureClass::ApprovalRejected => "The required approval was rejected.".to_string(),
+        TraceFailureClass::ApprovalExpired => {
+            "The required approval expired before execution.".to_string()
+        }
+        TraceFailureClass::GovernedActionBlocked => {
+            "A governed action was blocked by policy or validation.".to_string()
+        }
+        TraceFailureClass::RecoveryInterrupted => {
+            "Recovery interrupted the normal foreground continuation path.".to_string()
+        }
+        TraceFailureClass::UnknownFailure => {
+            "The trace contains a failure, but the exact class could not be derived safely."
+                .to_string()
+        }
+    }
+}
+
+fn classify_focus_payload_availability(
+    node: Option<&TraceNode>,
+) -> (TraceFocusPayloadAvailability, Option<String>, Vec<String>) {
+    let Some(node) = node else {
+        return (
+            TraceFocusPayloadAvailability::Unavailable,
+            Some("No node was resolved for the requested focus target.".to_string()),
+            Vec::new(),
+        );
+    };
+
+    if node.node_kind == "model_call" {
+        let retained_fields = [
+            "request_payload_json",
+            "response_payload_json",
+            "system_prompt_text",
+            "messages_json",
+        ];
+        let available_fields = retained_fields
+            .iter()
+            .filter(|field| {
+                node.payload
+                    .get(**field)
+                    .is_some_and(|value| !value.is_null())
+            })
+            .count();
+        if let Some(reason) = node
+            .payload
+            .get("payload_retention_reason")
+            .and_then(JsonValue::as_str)
+        {
+            return (
+                TraceFocusPayloadAvailability::RetentionExpired,
+                Some(format!(
+                    "Model-call payload fields were cleared by retention: {reason}."
+                )),
+                vec!["Only retained metadata remains available for this model call.".to_string()],
+            );
+        }
+        if available_fields == retained_fields.len() {
+            return (TraceFocusPayloadAvailability::Available, None, Vec::new());
+        }
+        if available_fields == 0 {
+            return (
+                TraceFocusPayloadAvailability::NotRecorded,
+                Some(
+                    "The retained model-call payload fields are not available on this trace."
+                        .to_string(),
+                ),
+                Vec::new(),
+            );
+        }
+        return (
+            TraceFocusPayloadAvailability::Partial,
+            Some(
+                "Some model-call payload fields are available, but others are absent.".to_string(),
+            ),
+            Vec::new(),
+        );
+    }
+
+    if node.payload.is_null() {
+        return (
+            TraceFocusPayloadAvailability::Unavailable,
+            Some("No payload is stored for this node.".to_string()),
+            Vec::new(),
+        );
+    }
+
+    (TraceFocusPayloadAvailability::Available, None, Vec::new())
 }
 
 fn short_trace_text(text: &str) -> String {
@@ -4772,5 +5595,30 @@ mod tests {
     #[test]
     fn default_cli_actor_ref_falls_back_when_requested_by_is_malformed() {
         assert_eq!(default_cli_actor_ref("primary-user"), "cli:operator");
+    }
+
+    #[test]
+    fn classify_audit_failure_detects_malformed_action_proposal() {
+        let node = TraceNode {
+            node_id: "audit_event:test".to_string(),
+            node_kind: "audit_event".to_string(),
+            source_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            status: Some("error".to_string()),
+            title: "foreground_execution_failed".to_string(),
+            summary: "Foreground execution failed.".to_string(),
+            payload: json!({
+                "payload": {
+                    "failure_kind": "malformed_action_proposal",
+                    "error": "model attempted a governed action without the required governed-action block"
+                }
+            }),
+            related_ids: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            classify_audit_failure(&node),
+            Some(TraceFailureClass::MalformedActionProposal)
+        );
     }
 }

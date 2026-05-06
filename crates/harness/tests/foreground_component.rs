@@ -1710,13 +1710,23 @@ async fn context_assembly_injects_retrieved_episode_and_memory_context() -> Resu
         )
         .await?;
 
-        assert!(
-            assembled
-                .context
-                .retrieved_context
-                .items
-                .iter()
-                .any(|item| matches!(item, contracts::RetrievedContextItem::Episode(_)))
+        let retrieved_episode = assembled
+            .context
+            .retrieved_context
+            .items
+            .iter()
+            .find_map(|item| match item {
+                contracts::RetrievedContextItem::Episode(episode) => Some(episode),
+                _ => None,
+            })
+            .expect("episode context should be retrieved");
+        assert_eq!(
+            retrieved_episode.latest_user_message.as_deref(),
+            Some("remember the travel preference")
+        );
+        assert_eq!(
+            retrieved_episode.latest_assistant_message.as_deref(),
+            Some("noted the travel preference")
         );
         assert!(
             assembled

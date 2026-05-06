@@ -9,8 +9,16 @@ assistant request or maintenance flow as a connected cause-and-effect graph. It
 normalizes existing durable records, model-call records, causal links, and
 scheduling state into one read-only management report.
 
-The explorer is CLI-first. It supports compact text output, machine-readable
-JSON, and static Mermaid graph rendering without requiring a live admin web UI.
+The explorer is CLI-first. It now supports:
+
+- diagnosis-first text and JSON output for one trace
+- detailed timeline output with a prepended diagnosis summary
+- focused failing-node inspection for the most relevant payload
+- static Mermaid graph rendering for architecture inspection
+
+Mermaid is no longer the recommended first-line troubleshooting path. Operators
+should start with `trace explain` or `trace show`, then use Mermaid only when
+they need causal-graph inspection.
 
 ---
 
@@ -20,11 +28,11 @@ JSON, and static Mermaid graph rendering without requiring a live admin web UI.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/management.rs` | `TraceReport` (line 392), `load_trace_report()` (line 1385), `list_recent_traces()` (line 1410), `load_trace_scheduled_task_nodes()` (line 2427), `load_trace_explicit_causal_links()` (line 2559) |
+| `crates/harness/src/management.rs` | `TraceReport` (line 398), `TraceDiagnosisSummary` (line 542), `TraceExplanationReport` (line 584), `load_trace_report()` (line 2165), `explain_trace_report()` (line 2190), `diagnose_trace_report()` (line 2199), `inspect_trace_report_focus()` (line 2278), `list_recent_traces()` (line 2307) |
 | `crates/harness/src/model_calls.rs` | `ModelCallRecord` (line 16), `insert_pending_model_call_record()` (line 41), `clear_expired_model_call_payloads()` (line 258), `background_job_run_for_execution()` (line 312) |
 | `crates/harness/src/causal_links.rs` | `NewCausalLink` (line 8), `insert()` (line 31), `list_for_trace()` (line 69) |
-| `crates/harness/src/worker.rs` | foreground model-call persistence (line 195), background model-call persistence (line 366) |
-| `crates/runtime/src/admin.rs` | `TraceCommand` (line 73), `TraceSubcommand` (line 79), `render_trace_report_text()` (line 1181), `render_trace_mermaid()` (line 1292) |
+| `crates/harness/src/worker.rs` | foreground model-call persistence (line 195), background model-call persistence (line 375) |
+| `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 85), `TraceExplainCommand` (line 119), `TraceShowCommand` (line 129), `render_trace_explanation_text()` (line 1431), `render_trace_report_text()` (line 1518), `render_trace_mermaid()` (line 1680) |
 | `migrations/0011__model_call_records.sql` | durable model-call records |
 | `migrations/0012__causal_links.sql` | durable causal graph edges |
 
@@ -50,6 +58,16 @@ The report contains:
 - `scheduling`: scheduling-specific projection for task status, cadence, due
   time, current execution, last execution, and last outcome.
 - `notes`: missing-data or compatibility notes.
+
+The diagnosis layer derives a second, operator-facing view from `TraceReport`:
+
+- `TraceDiagnosisSummary`: verdict, failure class, first failing step, last
+  successful step, side-effect status, user-reply status, retry safety, likely
+  cause, next-step hints, and notes. Failure classes include transport,
+  persistence, approval, governed-action blocking, and malformed governed-action
+  proposal cases when the assistant fails to emit a valid tagged action block.
+- `TraceFocusReport`: read-only inspection of the focused node payload,
+  including retained-payload availability and retention/missing-data notes.
 
 Explicit causal links replace matching inferred links when source, target, and
 edge kind are identical. Inferred links remain for historical records that
@@ -102,6 +120,10 @@ reason codes, or model-call request summaries.
 
 The runtime admin CLI exposes:
 
+- `cargo run -p runtime -- admin trace explain --trace-id <uuid>`
+- `cargo run -p runtime -- admin trace explain --execution-id <uuid>`
+- `cargo run -p runtime -- admin trace explain --trace-id <uuid> --focus failing-node`
+- `cargo run -p runtime -- admin trace explain --trace-id <uuid> --json`
 - `cargo run -p runtime -- admin trace show --trace-id <uuid>`
 - `cargo run -p runtime -- admin trace show --execution-id <uuid>`
 - `cargo run -p runtime -- admin trace show --trace-id <uuid> --json`
@@ -109,11 +131,29 @@ The runtime admin CLI exposes:
 - `cargo run -p runtime -- admin trace render --trace-id <uuid> --format mermaid`
 - `cargo run -p runtime -- admin trace cleanup-model-payloads`
 
-Text output is compact by default. JSON output contains the full normalized
-trace model, including retained model prompts/messages when still available.
-Mermaid output renders the same normalized node and edge model as a static
-flowchart. Cleanup clears expired bulky model-call prompt/message/request/
-response payloads according to the configured retention window.
+`trace explain` is the primary troubleshooting entrypoint. It renders a
+failure-first diagnosis summary and can optionally attach a focused failing-node
+inspection. `trace show` renders the same diagnosis summary first, then the full
+timeline, edges, scheduling projection, and trace notes. `trace show --json`
+continues to emit the normalized `TraceReport`. `trace explain --json` emits a
+`TraceExplanationReport` with `diagnosis` and optional `focus`.
+
+Focused inspection is conservative:
+
+- if the focused node exists, the payload is emitted together with an
+  availability classification
+- if retained bulky model-call payloads were cleared by retention, the report
+  marks that explicitly and keeps only retained metadata
+- if no failing node exists, focused failing-node inspection reports
+  `unavailable` rather than guessing
+
+`trace render --format mermaid` renders the normalized node and edge model as a
+static flowchart. Use it for architecture inspection, not as the default
+operator troubleshooting path.
+
+Cleanup clears expired bulky model-call prompt/message/request/response
+payloads according to the configured retention window while preserving the
+metadata required for trace correlation and conservative diagnosis.
 
 ---
 
@@ -121,7 +161,7 @@ response payloads according to the configured retention window.
 
 | Config key | Default | Valid range | Read by |
 |---|---:|---|---|
-| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `config.rs:126`, `worker.rs:195`, `worker.rs:366` |
+| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `config.rs:130`, `worker.rs:200`, `worker.rs:380` |
 
 To add a new traceable relationship:
 
@@ -140,6 +180,16 @@ To add a new trace node source:
 3. Add inferred edges only when they remain useful for old data.
 4. Add JSON shape assertions for fields intended for future UI reuse.
 
+To extend diagnosis:
+
+1. Add the durable evidence to `TraceReport` first if the current node set
+   cannot prove the new verdict safely.
+2. Extend `diagnose_trace_report()` with a deterministic rule that prefers
+   structured payload fields over title or summary text.
+3. Keep retry-safety and side-effect classification fail-closed when evidence is
+   missing or ambiguous.
+4. Extend management component tests and runtime CLI tests together.
+
 ---
 
 ## 4. Further Reading
@@ -153,4 +203,4 @@ To add a new trace node source:
 - `crates/runtime/src/admin.rs` contains the operator command parser and trace
   text/Mermaid renderers.
 
-Verified: 2026-04-30.
+Verified: 2026-05-06.

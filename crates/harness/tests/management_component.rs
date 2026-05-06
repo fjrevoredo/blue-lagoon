@@ -992,6 +992,109 @@ async fn model_call_payload_retention_clears_bulky_fields_but_keeps_metadata() -
             model_node.payload["payload_retention_reason"].as_str(),
             Some("retention_expired")
         );
+
+        let explanation = management::explain_trace_report(
+            &report,
+            Some(management::TraceFocusSelector::FailingNode),
+        );
+        let focus = explanation
+            .focus
+            .expect("focused failing node inspection should be present");
+        assert_eq!(
+            focus.payload_availability,
+            management::TraceFocusPayloadAvailability::Unavailable
+        );
+        assert_eq!(
+            focus.payload_availability_reason.as_deref(),
+            Some("No node was resolved for the requested focus target.")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn trace_diagnosis_marks_pending_approval_as_operator_gated() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Approval-gated subprocess".to_string(),
+            rationale: Some("Used to verify trace diagnosis.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: approval_required_scope(),
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("ok")),
+        };
+        let planned = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: proposal.clone(),
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned approval-gated action, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+        let approval_request = approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: proposal.title,
+                consequence_summary: "Used to verify pending approval trace diagnosis.".to_string(),
+                capability_scope: proposal.capability_scope,
+                requested_by: "telegram:primary-user".to_string(),
+                token: "diagnosis-approval".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+
+        let report = management::load_trace_report(
+            &ctx.config,
+            management::TraceLookupRequest {
+                trace_id: Some(planned.record.trace_id),
+                execution_id: None,
+            },
+        )
+        .await?;
+        let diagnosis = management::diagnose_trace_report(&report);
+        assert_eq!(
+            diagnosis.verdict,
+            management::TraceDiagnosisVerdict::AwaitingApproval
+        );
+        assert_eq!(
+            diagnosis.failure_class,
+            Some(management::TraceFailureClass::ApprovalPending)
+        );
+        assert_eq!(
+            diagnosis.retry_safety,
+            management::TraceRetrySafety::RequiresOperator
+        );
+        assert_eq!(
+            diagnosis.side_effect_status,
+            management::TraceSideEffectStatus::NoneExecuted
+        );
         Ok(())
     })
     .await

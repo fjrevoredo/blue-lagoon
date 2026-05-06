@@ -206,8 +206,20 @@ pub struct WorkerFailure {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerErrorCode {
     InvalidRequest,
+    InvalidModelOutput,
     UnsupportedWorker,
     InternalFailure,
+}
+
+impl WorkerErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::InvalidModelOutput => "invalid_model_output",
+            Self::UnsupportedWorker => "unsupported_worker",
+            Self::InternalFailure => "internal_failure",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1095,6 +1107,10 @@ pub struct RetrievedEpisodeContext {
     pub internal_conversation_ref: String,
     pub started_at: DateTime<Utc>,
     pub summary: String,
+    #[serde(default)]
+    pub latest_user_message: Option<String>,
+    #[serde(default)]
+    pub latest_assistant_message: Option<String>,
     pub outcome: String,
     pub relevance_reason: String,
 }
@@ -2222,6 +2238,8 @@ mod tests {
                         internal_conversation_ref: "telegram-primary".to_string(),
                         started_at: Utc::now(),
                         summary: "Discussed travel preferences.".to_string(),
+                        latest_user_message: Some("I prefer direct answers.".to_string()),
+                        latest_assistant_message: Some("Understood.".to_string()),
                         outcome: "completed".to_string(),
                         relevance_reason: "same_conversation_recent".to_string(),
                     }),

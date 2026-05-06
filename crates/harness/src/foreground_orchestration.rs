@@ -2141,16 +2141,23 @@ async fn deliver_foreground_failure_notice<D>(
 }
 
 fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
-    format!(
-        "I hit an internal runtime error while processing that message. Trace: {trace_id}. Failure kind: {}. Send another message to continue.",
-        failure_kind.as_str()
-    )
+    match failure_kind {
+        ForegroundFailureKind::MalformedActionProposal => format!(
+            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the trace with `admin trace explain --trace-id {trace_id}`.",
+            failure_kind.as_str()
+        ),
+        _ => format!(
+            "I hit an internal runtime error while processing that message. Trace: {trace_id}. Failure kind: {}. Send another message to continue.",
+            failure_kind.as_str()
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundFailureKind {
     ApprovalResolutionFailure,
     ContextAssemblyFailure,
+    MalformedActionProposal,
     WorkerProtocolFailure,
     ModelGatewayTransportFailure,
     ProviderRejected,
@@ -2163,6 +2170,7 @@ impl ForegroundFailureKind {
         match self {
             Self::ApprovalResolutionFailure => "approval_resolution_failure",
             Self::ContextAssemblyFailure => "context_assembly_failure",
+            Self::MalformedActionProposal => "malformed_action_proposal",
             Self::WorkerProtocolFailure => "worker_protocol_failure",
             Self::ModelGatewayTransportFailure => "model_gateway_transport_failure",
             Self::ProviderRejected => "provider_rejected",
@@ -2182,6 +2190,27 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
         || message.contains("failed to decode provider HTTP response body")
     {
         return ForegroundFailureKind::ModelGatewayTransportFailure;
+    }
+    if message.contains("worker_error_code=invalid_model_output")
+        && (message.contains("invalid governed-action proposal block")
+            || message.contains(
+                "attempted a governed action without the required governed-action block",
+            )
+            || message.contains(
+                "returned a likely governed-action payload outside the required governed-action block",
+            )
+            || message.contains(
+                "governed-action control block marker was present but the block was malformed or incomplete",
+            ))
+    {
+        return ForegroundFailureKind::MalformedActionProposal;
+    }
+    if message.contains("invalid governed-action proposal block")
+        || message.contains("attempted a governed action without the required governed-action block")
+        || message.contains("returned a likely governed-action payload outside the required governed-action block")
+        || message.contains("governed-action control block marker was present but the block was malformed or incomplete")
+    {
+        return ForegroundFailureKind::MalformedActionProposal;
     }
 
     ForegroundFailureKind::WorkerProtocolFailure
@@ -2973,6 +3002,32 @@ mod tests {
         assert!(notice.contains(&trace_id.to_string()));
         assert!(notice.contains("context_assembly_failure"));
         assert!(!notice.contains("missing foreground self-model seed configuration"));
+    }
+
+    #[test]
+    fn foreground_failure_notice_explains_malformed_action_proposal() {
+        let trace_id = Uuid::now_v7();
+        let notice = foreground_failure_notice_text(
+            trace_id,
+            ForegroundFailureKind::MalformedActionProposal,
+        );
+
+        assert!(notice.contains("valid governed-action proposal"));
+        assert!(notice.contains("malformed_action_proposal"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_malformed_action_proposal() {
+        let error = anyhow::anyhow!(
+            "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::MalformedActionProposal
+        );
     }
 
     fn identity_action_proposal(

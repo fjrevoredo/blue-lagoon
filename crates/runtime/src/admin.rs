@@ -16,9 +16,10 @@ use harness::{
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
         ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
-        SuperviseWorkerLeasesRequest, TraceLookupRequest, TraceReport, TraceSummary,
-        UpsertScheduledForegroundTaskRequest, WakeSignalSummary, WorkerLeaseInspectionSummary,
-        WorkspaceScriptRunSummary,
+        SuperviseWorkerLeasesRequest, TraceDiagnosisSummary, TraceExplanationReport,
+        TraceFocusPayloadAvailability, TraceFocusReport, TraceFocusSelector, TraceLookupRequest,
+        TraceReport, TraceSummary, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
+        WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
     },
 };
 
@@ -82,18 +83,52 @@ pub struct TraceCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TraceSubcommand {
+    #[command(about = "Explain one trace as an operator-facing diagnosis summary.")]
+    Explain(TraceExplainCommand),
+    #[command(about = "Show the detailed trace timeline and relationships.")]
     Show(TraceShowCommand),
     Recent(TraceRecentCommand),
+    #[command(about = "Render the trace as a causal graph for architecture inspection.")]
     Render(TraceRenderCommand),
     CleanupModelPayloads(TraceCleanupModelPayloadsCommand),
 }
 
 #[derive(Debug, Args)]
-pub struct TraceShowCommand {
+pub struct TraceLookupCommandArgs {
     #[arg(long, conflicts_with = "execution_id")]
     pub trace_id: Option<String>,
     #[arg(long, conflicts_with = "trace_id")]
     pub execution_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TraceFocusArg {
+    #[value(name = "failing-node")]
+    FailingNode,
+}
+
+impl From<TraceFocusArg> for TraceFocusSelector {
+    fn from(value: TraceFocusArg) -> Self {
+        match value {
+            TraceFocusArg::FailingNode => Self::FailingNode,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct TraceExplainCommand {
+    #[command(flatten)]
+    pub lookup: TraceLookupCommandArgs,
+    #[arg(long, value_enum)]
+    pub focus: Option<TraceFocusArg>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TraceShowCommand {
+    #[command(flatten)]
+    pub lookup: TraceLookupCommandArgs,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -955,16 +990,20 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
             },
         },
         AdminSubcommand::Trace(command) => match command.command {
+            TraceSubcommand::Explain(command) => {
+                let report = management::load_trace_report(
+                    config,
+                    trace_lookup_request_from_args(&command.lookup)?,
+                )
+                .await?;
+                let explanation =
+                    management::explain_trace_report(&report, command.focus.map(Into::into));
+                print_trace_explanation(explanation, command.json)?;
+            }
             TraceSubcommand::Show(command) => {
                 let report = management::load_trace_report(
                     config,
-                    TraceLookupRequest {
-                        trace_id: command.trace_id.map(|value| value.parse()).transpose()?,
-                        execution_id: command
-                            .execution_id
-                            .map(|value| value.parse())
-                            .transpose()?,
-                    },
+                    trace_lookup_request_from_args(&command.lookup)?,
                 )
                 .await?;
                 print_trace_report(report, command.json)?;
@@ -1352,6 +1391,16 @@ fn print_workspace_runs(runs: Vec<WorkspaceScriptRunSummary>, json: bool) -> Res
     Ok(())
 }
 
+fn print_trace_explanation(explanation: TraceExplanationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&explanation)?);
+        return Ok(());
+    }
+
+    println!("{}", render_trace_explanation_text(&explanation));
+    Ok(())
+}
+
 fn print_trace_report(report: TraceReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1362,6 +1411,13 @@ fn print_trace_report(report: TraceReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn trace_lookup_request_from_args(args: &TraceLookupCommandArgs) -> Result<TraceLookupRequest> {
+    Ok(TraceLookupRequest {
+        trace_id: args.trace_id.as_deref().map(str::parse).transpose()?,
+        execution_id: args.execution_id.as_deref().map(str::parse).transpose()?,
+    })
+}
+
 fn print_trace_summaries(summaries: Vec<TraceSummary>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
@@ -1370,6 +1426,93 @@ fn print_trace_summaries(summaries: Vec<TraceSummary>, json: bool) -> Result<()>
 
     println!("{}", render_trace_summaries_text(&summaries));
     Ok(())
+}
+
+fn render_trace_explanation_text(explanation: &TraceExplanationReport) -> String {
+    let mut output = render_trace_diagnosis_text(&explanation.diagnosis);
+    if let Some(focus) = &explanation.focus {
+        output.push('\n');
+        output.push_str(&render_trace_focus_text(focus));
+    }
+    output.trim_end().to_string()
+}
+
+fn render_trace_diagnosis_text(diagnosis: &TraceDiagnosisSummary) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Trace {}", diagnosis.trace_id);
+    let _ = writeln!(output, "{}", render_trace_diagnosis_section(diagnosis));
+    output.trim_end().to_string()
+}
+
+fn render_trace_diagnosis_section(diagnosis: &TraceDiagnosisSummary) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Summary");
+    let _ = writeln!(
+        output,
+        "  verdict={}",
+        format_trace_diagnosis_verdict(diagnosis)
+    );
+    let _ = writeln!(
+        output,
+        "  failure_class={}",
+        diagnosis
+            .failure_class
+            .map(format_trace_failure_class)
+            .unwrap_or_else(|| "none".to_string())
+    );
+    let _ = writeln!(
+        output,
+        "  first_failing_step={}",
+        diagnosis
+            .first_failing_node
+            .as_ref()
+            .map(format_trace_node_reference_compact)
+            .unwrap_or_else(|| "none".to_string())
+    );
+    let _ = writeln!(
+        output,
+        "  last_successful_step={}",
+        diagnosis
+            .last_successful_node
+            .as_ref()
+            .map(format_trace_node_reference_compact)
+            .unwrap_or_else(|| "none".to_string())
+    );
+    let _ = writeln!(
+        output,
+        "  side_effects={}",
+        format_trace_side_effect_status(diagnosis.side_effect_status)
+    );
+    let _ = writeln!(
+        output,
+        "  user_reply={}",
+        format_trace_user_reply_status(diagnosis.user_reply_status)
+    );
+    let _ = writeln!(
+        output,
+        "  retry_safety={}",
+        format_trace_retry_safety(diagnosis.retry_safety)
+    );
+    if let Some(cause) = diagnosis.likely_cause.as_deref() {
+        let basis = diagnosis
+            .likely_cause_kind
+            .map(format_trace_likely_cause_kind)
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = writeln!(output, "  likely_cause={} ({basis})", cause);
+    }
+    if !diagnosis.suggested_next_steps.is_empty() {
+        let _ = writeln!(output, "Suggested next steps");
+        for step in &diagnosis.suggested_next_steps {
+            let _ = writeln!(output, "  - {step}");
+        }
+    }
+    if !diagnosis.notes.is_empty() {
+        let _ = writeln!(output, "Notes");
+        for note in &diagnosis.notes {
+            let _ = writeln!(output, "  - {note}");
+        }
+    }
+    output.trim_end().to_string()
 }
 
 fn render_trace_report_text(report: &TraceReport) -> String {
@@ -1385,6 +1528,8 @@ fn render_trace_report_text(report: &TraceReport) -> String {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string())
     );
+    let diagnosis = management::diagnose_trace_report(report);
+    let _ = writeln!(output, "{}", render_trace_diagnosis_section(&diagnosis));
 
     if !report.nodes.is_empty() {
         let _ = writeln!(output, "Timeline");
@@ -1454,6 +1599,55 @@ fn render_trace_report_text(report: &TraceReport) -> String {
         }
     }
 
+    output.trim_end().to_string()
+}
+
+fn render_trace_focus_text(focus: &TraceFocusReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Focused node ({})",
+        format_trace_focus_selector(focus.selector)
+    );
+    let _ = writeln!(
+        output,
+        "  payload_availability={}",
+        format_trace_focus_payload_availability(focus.payload_availability)
+    );
+    if let Some(reason) = focus.payload_availability_reason.as_deref() {
+        let _ = writeln!(output, "  payload_reason={reason}");
+    }
+    match focus.resolved_node.as_ref() {
+        Some(node) => {
+            let _ = writeln!(
+                output,
+                "  node={} kind={} status={} occurred_at={}",
+                node.node_id,
+                node.node_kind,
+                node.status.as_deref().unwrap_or("none"),
+                node.occurred_at
+            );
+            let _ = writeln!(output, "  title={}", node.title);
+            if !node.summary.is_empty() {
+                let _ = writeln!(output, "  summary={}", node.summary);
+            }
+            let payload = serde_json::to_string_pretty(&node.payload)
+                .unwrap_or_else(|_| node.payload.to_string());
+            let _ = writeln!(output, "  payload:");
+            for line in truncate_multiline(&payload, 4000).lines() {
+                let _ = writeln!(output, "    {line}");
+            }
+        }
+        None => {
+            let _ = writeln!(output, "  node=none");
+        }
+    }
+    if !focus.notes.is_empty() {
+        let _ = writeln!(output, "  notes:");
+        for note in &focus.notes {
+            let _ = writeln!(output, "    - {note}");
+        }
+    }
     output.trim_end().to_string()
 }
 
@@ -1529,6 +1723,116 @@ fn mermaid_node_key(node_id: &str) -> String {
 
 fn mermaid_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn format_trace_diagnosis_verdict(diagnosis: &TraceDiagnosisSummary) -> String {
+    match diagnosis.verdict {
+        harness::management::TraceDiagnosisVerdict::Succeeded => "succeeded",
+        harness::management::TraceDiagnosisVerdict::Failed => "failed",
+        harness::management::TraceDiagnosisVerdict::AwaitingApproval => "awaiting_approval",
+        harness::management::TraceDiagnosisVerdict::Blocked => "blocked",
+        harness::management::TraceDiagnosisVerdict::Inconclusive => "inconclusive",
+    }
+    .to_string()
+}
+
+fn format_trace_failure_class(class: harness::management::TraceFailureClass) -> String {
+    match class {
+        harness::management::TraceFailureClass::ModelGatewayTransportFailure => {
+            "model_gateway_transport_failure"
+        }
+        harness::management::TraceFailureClass::ProviderRejected => "provider_rejected",
+        harness::management::TraceFailureClass::TelegramDeliveryFailure => {
+            "telegram_delivery_failure"
+        }
+        harness::management::TraceFailureClass::PersistenceFailure => "persistence_failure",
+        harness::management::TraceFailureClass::ContextAssemblyFailure => {
+            "context_assembly_failure"
+        }
+        harness::management::TraceFailureClass::MalformedActionProposal => {
+            "malformed_action_proposal"
+        }
+        harness::management::TraceFailureClass::ApprovalPending => "approval_pending",
+        harness::management::TraceFailureClass::ApprovalRejected => "approval_rejected",
+        harness::management::TraceFailureClass::ApprovalExpired => "approval_expired",
+        harness::management::TraceFailureClass::GovernedActionBlocked => "governed_action_blocked",
+        harness::management::TraceFailureClass::RecoveryInterrupted => "recovery_interrupted",
+        harness::management::TraceFailureClass::UnknownFailure => "unknown_failure",
+    }
+    .to_string()
+}
+
+fn format_trace_side_effect_status(status: harness::management::TraceSideEffectStatus) -> String {
+    match status {
+        harness::management::TraceSideEffectStatus::NoneExecuted => "none_executed",
+        harness::management::TraceSideEffectStatus::Executed => "executed",
+        harness::management::TraceSideEffectStatus::Possible => "possible",
+        harness::management::TraceSideEffectStatus::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn format_trace_user_reply_status(status: harness::management::TraceUserReplyStatus) -> String {
+    match status {
+        harness::management::TraceUserReplyStatus::Produced => "produced",
+        harness::management::TraceUserReplyStatus::NotProduced => "not_produced",
+        harness::management::TraceUserReplyStatus::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn format_trace_retry_safety(safety: harness::management::TraceRetrySafety) -> String {
+    match safety {
+        harness::management::TraceRetrySafety::Safe => "safe",
+        harness::management::TraceRetrySafety::Unsafe => "unsafe",
+        harness::management::TraceRetrySafety::RequiresOperator => "requires_operator",
+        harness::management::TraceRetrySafety::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn format_trace_likely_cause_kind(kind: harness::management::TraceLikelyCauseKind) -> String {
+    match kind {
+        harness::management::TraceLikelyCauseKind::DirectFact => "direct_fact",
+        harness::management::TraceLikelyCauseKind::Inference => "inference",
+    }
+    .to_string()
+}
+
+fn format_trace_focus_selector(selector: TraceFocusSelector) -> String {
+    match selector {
+        TraceFocusSelector::FailingNode => "failing_node",
+    }
+    .to_string()
+}
+
+fn format_trace_focus_payload_availability(availability: TraceFocusPayloadAvailability) -> String {
+    match availability {
+        TraceFocusPayloadAvailability::Available => "available",
+        TraceFocusPayloadAvailability::Partial => "partial",
+        TraceFocusPayloadAvailability::RetentionExpired => "retention_expired",
+        TraceFocusPayloadAvailability::NotRecorded => "not_recorded",
+        TraceFocusPayloadAvailability::Unavailable => "unavailable",
+    }
+    .to_string()
+}
+
+fn format_trace_node_reference_compact(node: &harness::management::TraceNodeReference) -> String {
+    format!(
+        "{}:{}:{}",
+        node.node_kind,
+        node.status.as_deref().unwrap_or("none"),
+        node.title
+    )
+}
+
+fn truncate_multiline(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn render_scheduled_foreground_tasks_text(tasks: &[ScheduledForegroundTaskSummary]) -> String {
@@ -2691,6 +2995,56 @@ mod tests {
         assert!(rendered.contains("reason=restart identity formation"));
     }
 
+    #[test]
+    fn parses_trace_explain_command_with_focus() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "trace",
+            "explain",
+            "--trace-id",
+            "00000000-0000-0000-0000-000000000041",
+            "--focus",
+            "failing-node",
+            "--json",
+        ])
+        .expect("trace explain command should parse");
+
+        match command.command {
+            AdminSubcommand::Trace(TraceCommand {
+                command: TraceSubcommand::Explain(command),
+            }) => {
+                assert_eq!(
+                    command.lookup.trace_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000041")
+                );
+                assert_eq!(command.focus, Some(TraceFocusArg::FailingNode));
+                assert!(command.json);
+            }
+            _ => panic!("expected trace explain command"),
+        }
+    }
+
+    #[test]
+    fn render_trace_explanation_text_includes_verdict_and_focus() {
+        let rendered = render_trace_explanation_text(&sample_trace_explanation_report());
+        assert!(rendered.contains("verdict=failed"));
+        assert!(rendered.contains("failure_class=model_gateway_transport_failure"));
+        assert!(rendered.contains("retry_safety=safe"));
+        assert!(rendered.contains("Focused node (failing_node)"));
+        assert!(rendered.contains("payload_availability=retention_expired"));
+    }
+
+    #[test]
+    fn render_trace_report_text_prepends_summary_block() {
+        let rendered = render_trace_report_text(&sample_trace_report());
+        assert!(rendered.contains("Summary"));
+        assert!(
+            rendered
+                .contains("first_failing_step=model_call:failed:Model call foreground_response")
+        );
+        assert!(rendered.contains("Timeline"));
+    }
+
     fn sample_identity_reset_report() -> IdentityResetReport {
         serde_json::from_value(json!({
             "trace_id": "00000000-0000-0000-0000-000000000081",
@@ -2720,6 +3074,109 @@ mod tests {
             "compact_summary": "Blue Lagoon"
         }))
         .expect("sample identity status report should deserialize")
+    }
+
+    fn sample_trace_report() -> TraceReport {
+        serde_json::from_value(json!({
+            "trace_id": "00000000-0000-0000-0000-000000000041",
+            "root_execution_id": "00000000-0000-0000-0000-000000000042",
+            "generated_at": "2026-05-06T10:00:00Z",
+            "node_count": 4,
+            "edge_count": 1,
+            "nodes": [
+                {
+                    "node_id": "execution:00000000-0000-0000-0000-000000000042",
+                    "node_kind": "execution",
+                    "source_id": "00000000-0000-0000-0000-000000000042",
+                    "occurred_at": "2026-05-06T10:00:00Z",
+                    "status": "failed",
+                    "title": "Execution telegram_pending_ingress",
+                    "summary": "status=failed worker=conscious completed_at=none",
+                    "payload": {},
+                    "related_ids": {}
+                },
+                {
+                    "node_id": "audit_event:00000000-0000-0000-0000-000000000043",
+                    "node_kind": "audit_event",
+                    "source_id": "00000000-0000-0000-0000-000000000043",
+                    "occurred_at": "2026-05-06T10:00:01Z",
+                    "status": "info",
+                    "title": "foreground_orchestration.foreground_context_assembled",
+                    "summary": "foreground context assembled",
+                    "payload": {
+                        "payload": {
+                            "summary": "foreground context assembled"
+                        }
+                    },
+                    "related_ids": {
+                        "execution_id": "00000000-0000-0000-0000-000000000042"
+                    }
+                },
+                {
+                    "node_id": "model_call:00000000-0000-0000-0000-000000000044",
+                    "node_kind": "model_call",
+                    "source_id": "00000000-0000-0000-0000-000000000044",
+                    "occurred_at": "2026-05-06T10:00:02Z",
+                    "status": "failed",
+                    "title": "Model call foreground_response",
+                    "summary": "provider=z_ai model=glm task_class=foreground input_tokens=unknown output_tokens=unknown finish_reason=none",
+                    "payload": {
+                        "execution_id": "00000000-0000-0000-0000-000000000042",
+                        "provider": "z_ai",
+                        "model": "glm",
+                        "purpose": "foreground_response",
+                        "error_summary": "request to provider timed out after 60000 ms",
+                        "request_payload_json": null,
+                        "response_payload_json": null,
+                        "system_prompt_text": null,
+                        "messages_json": null,
+                        "payload_cleared_at": "2026-05-06T11:00:00Z",
+                        "payload_retention_reason": "retention_expired"
+                    },
+                    "related_ids": {
+                        "execution_id": "00000000-0000-0000-0000-000000000042"
+                    }
+                },
+                {
+                    "node_id": "audit_event:00000000-0000-0000-0000-000000000045",
+                    "node_kind": "audit_event",
+                    "source_id": "00000000-0000-0000-0000-000000000045",
+                    "occurred_at": "2026-05-06T10:00:03Z",
+                    "status": "error",
+                    "title": "foreground_orchestration.foreground_execution_failed",
+                    "summary": "model gateway transport failed",
+                    "payload": {
+                        "payload": {
+                            "failure_kind": "model_gateway_transport_failure",
+                            "error": "request to provider timed out after 60000 ms"
+                        }
+                    },
+                    "related_ids": {
+                        "execution_id": "00000000-0000-0000-0000-000000000042"
+                    }
+                }
+            ],
+            "edges": [
+                {
+                    "source_node_id": "execution:00000000-0000-0000-0000-000000000042",
+                    "target_node_id": "model_call:00000000-0000-0000-0000-000000000044",
+                    "edge_kind": "invoked_model",
+                    "occurred_at": "2026-05-06T10:00:02Z",
+                    "detail": "foreground_response",
+                    "inference": "inferred"
+                }
+            ],
+            "scheduling": [],
+            "notes": []
+        }))
+        .expect("sample trace report should deserialize")
+    }
+
+    fn sample_trace_explanation_report() -> TraceExplanationReport {
+        management::explain_trace_report(
+            &sample_trace_report(),
+            Some(TraceFocusSelector::FailingNode),
+        )
     }
 
     fn sample_identity_show_report() -> IdentityShowReport {

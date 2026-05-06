@@ -255,7 +255,9 @@ fn run_conscious_worker() -> Result<()> {
 
     let response = match build_conscious_worker_response(&request, payload, model_response) {
         Ok(response) => response,
-        Err(message) => request_error_response(&request, WorkerErrorCode::InvalidRequest, message),
+        Err(message) => {
+            request_error_response(&request, WorkerErrorCode::InvalidModelOutput, message)
+        }
     };
     write_json_line(
         &mut handle,
@@ -515,13 +517,17 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         if let Some(user_message) = &episode.user_message {
             messages.push(ModelInputMessage {
                 role: ModelMessageRole::User,
-                content: user_message.clone(),
+                content: format_conversation_excerpt("User", episode.started_at, user_message),
             });
         }
         if let Some(assistant_message) = &episode.assistant_message {
             messages.push(ModelInputMessage {
                 role: ModelMessageRole::Assistant,
-                content: assistant_message.clone(),
+                content: format_conversation_excerpt(
+                    "Assistant",
+                    episode.started_at,
+                    assistant_message,
+                ),
             });
         }
     }
@@ -529,7 +535,11 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
     if let Some(trigger_text) = &context.trigger.ingress.text_body {
         messages.push(ModelInputMessage {
             role: ModelMessageRole::User,
-            content: trigger_text.clone(),
+            content: format_conversation_excerpt(
+                "User",
+                context.trigger.ingress.occurred_at,
+                trigger_text,
+            ),
         });
     }
 
@@ -610,7 +620,7 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
     } else {
         format!(
             " Active subgoals: {}.",
-            join_or_none(&context.self_model.current_subgoals)
+            join_or_none_foreground(&context.self_model.current_subgoals)
         )
     };
     let active_conditions_fragment = if context.internal_state.active_conditions.is_empty() {
@@ -631,15 +641,15 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
 
     ModelInput {
         system_prompt: format!(
-            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nRuntime state: load={load}%, health={health}%, confidence={confidence}%, mode={mode}.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed.",
-            name = context.self_model.stable_identity,
-            role = context.self_model.role,
-            style = context.self_model.communication_style,
-            preferences = join_or_none(&context.self_model.preferences),
+            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nOperational estimates from harness counters: load_estimate={load}%, health_estimate={health}%, confidence_estimate={confidence}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. When an action is required, never output only an action or payload name; emit the full tagged governed-action JSON block.",
+            name = foreground_label_or_default(&context.self_model.stable_identity, "blue-lagoon"),
+            role = foreground_label_or_default(&context.self_model.role, "personal_assistant"),
+            style = foreground_label_or_default(&context.self_model.communication_style, "direct"),
+            preferences = join_or_none_foreground(&context.self_model.preferences),
             identity = identity_fragment,
-            capabilities = join_or_none(&context.self_model.capabilities),
-            constraints = join_or_none(&context.self_model.constraints),
-            goals = join_or_none(&context.self_model.current_goals),
+            capabilities = join_or_none_foreground(&context.self_model.capabilities),
+            constraints = join_or_none_foreground(&context.self_model.constraints),
+            goals = join_or_none_foreground(&context.self_model.current_goals),
             subgoals = subgoals_fragment,
             conditions = active_conditions_fragment,
             current_time = current_time,
@@ -650,6 +660,19 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
         ),
         messages,
     }
+}
+
+fn format_conversation_excerpt(
+    author: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    text: &str,
+) -> String {
+    format!(
+        "[{}] {}: {}",
+        occurred_at.format("%Y-%m-%d %H:%M UTC"),
+        author,
+        text
+    )
 }
 
 fn identity_system_prompt_fragment(context: &ConsciousContext) -> String {
@@ -663,25 +686,34 @@ fn identity_system_prompt_fragment(context: &ConsciousContext) -> String {
 
     let mut parts = Vec::new();
     if !identity.identity_summary.is_empty() {
-        parts.push(format!("Identity: {}", identity.identity_summary));
+        push_foreground_identity_part(&mut parts, "Identity", &identity.identity_summary);
     }
     if let Some(description) = &identity.self_description {
-        parts.push(format!("Self-description: {description}"));
+        push_foreground_identity_part(&mut parts, "Self-description", description);
     }
     if !identity.values.is_empty() {
-        parts.push(format!("Values: {}", join_or_none(&identity.values)));
+        let values = foreground_visible_items(&identity.values);
+        if !values.is_empty() {
+            parts.push(format!("Values: {}", values.join(", ")));
+        }
     }
     if !identity.boundaries.is_empty() {
-        parts.push(format!(
-            "Boundaries: {}",
-            join_or_none(&identity.boundaries)
-        ));
+        let boundaries = foreground_visible_items(&identity.boundaries);
+        if !boundaries.is_empty() {
+            parts.push(format!("Boundaries: {}", boundaries.join(", ")));
+        }
     }
 
     if parts.is_empty() {
         String::new()
     } else {
         format!(" {}", parts.join(". "))
+    }
+}
+
+fn push_foreground_identity_part(parts: &mut Vec<String>, label: &str, value: &str) {
+    if is_foreground_visible_context_text(value) {
+        parts.push(format!("{label}: {value}"));
     }
 }
 
@@ -809,7 +841,7 @@ For a custom path, use action "start_custom_identity_interview" or "answer_custo
 fn governed_action_schema_message() -> String {
     let template = r#"GOVERNED ACTION SYSTEM
 
-To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block.
+To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block. Returning only an action name such as "list_workspace_artifacts" is invalid; you must emit the full tagged JSON block. Use the exact action-kind names listed below and do not invent aliases such as "read_workspace_artifacts". Tool-call wrappers such as {"governed-action": {"name": "...", "arguments": {...}}} are also invalid.
 
 Available action kinds:
 - inspect_workspace_artifact: inspect one non-script workspace artifact by UUID
@@ -874,7 +906,7 @@ Alternate payload shape for web_fetch:
 - capability_scope.environment: { "allow_variables": [] }
 - capability_scope.execution: { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 } (ignored for web_fetch)
 
-Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action per turn."#;
+Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action in each model response; if another action is needed after an observation, the harness will make another bounded same-turn model call."#;
     template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
@@ -924,6 +956,39 @@ fn build_governed_action_proposals(
     let envelope: GovernedActionEnvelope = serde_json::from_str(block_json)
         .map_err(|error| format!("invalid governed-action proposal block: {error}"))?;
     Ok(envelope.actions)
+}
+
+fn validate_governed_action_response_shape(
+    model_text: &str,
+    assistant_text: &str,
+    proposals: &[GovernedActionProposal],
+) -> std::result::Result<(), String> {
+    if !proposals.is_empty() {
+        return Ok(());
+    }
+
+    let action_marker = format!("```{GOVERNED_ACTIONS_BLOCK_TAG}");
+    if model_text.contains(&action_marker) && extract_governed_action_block(model_text).is_none() {
+        return Err(
+            "governed-action control block marker was present but the block was malformed or incomplete"
+                .to_string(),
+        );
+    }
+
+    let trimmed = assistant_text.trim();
+    if let Some(action_name) = detect_bare_governed_action_invocation(trimmed) {
+        return Err(format!(
+            "model attempted a governed action without the required governed-action block; returned bare action token '{action_name}'"
+        ));
+    }
+    if looks_like_untagged_governed_action_payload(trimmed) {
+        return Err(
+            "model returned a likely governed-action payload outside the required governed-action block"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn build_identity_kickstart_proposals(
@@ -1105,6 +1170,89 @@ fn strip_worker_control_blocks(model_text: &str) -> String {
     strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
+fn detect_bare_governed_action_invocation(text: &str) -> Option<&str> {
+    const GOVERNED_ACTION_BARE_TOKENS: &[&str] = &[
+        "inspect_workspace_artifact",
+        "list_workspace_artifacts",
+        "create_workspace_artifact",
+        "update_workspace_artifact",
+        "list_workspace_scripts",
+        "inspect_workspace_script",
+        "create_workspace_script",
+        "append_workspace_script_version",
+        "list_workspace_script_runs",
+        "upsert_scheduled_foreground_task",
+        "request_background_job",
+        "run_diagnostic",
+        "run_subprocess",
+        "run_workspace_script",
+        "web_fetch",
+    ];
+
+    GOVERNED_ACTION_BARE_TOKENS
+        .iter()
+        .copied()
+        .find(|token| text == *token)
+        .or_else(|| looks_like_bare_governed_action_alias(text).then_some(text))
+}
+
+fn looks_like_bare_governed_action_alias(text: &str) -> bool {
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return false;
+    }
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return false;
+    }
+
+    let actionish_prefix = [
+        "inspect_", "list_", "create_", "update_", "append_", "request_", "run_", "upsert_",
+        "read_",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix));
+    if !actionish_prefix {
+        return false;
+    }
+
+    text == "web_fetch"
+        || text.contains("workspace_")
+        || text.contains("artifact")
+        || text.contains("script")
+        || text.contains("diagnostic")
+        || text.contains("subprocess")
+        || text.contains("background_job")
+        || text.contains("foreground_task")
+}
+
+fn looks_like_untagged_governed_action_payload(text: &str) -> bool {
+    let jsonish = strip_json_language_prefix(text);
+    (jsonish.starts_with('{')
+        && jsonish.contains("\"actions\"")
+        && (jsonish.contains("\"action_kind\"") || jsonish.contains("\"payload\"")))
+        || (jsonish.starts_with('{')
+            && jsonish.contains("\"payload\"")
+            && jsonish.contains("\"kind\"")
+            && jsonish.contains("\"value\""))
+        || (jsonish.starts_with('{')
+            && jsonish.contains("\"governed-action\"")
+            && jsonish.contains("\"name\"")
+            && jsonish.contains("\"arguments\""))
+}
+
+fn strip_json_language_prefix(text: &str) -> &str {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("json\n") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = trimmed.strip_prefix("json\r\n") {
+        return rest.trim_start();
+    }
+    trimmed
+}
+
 fn strip_tagged_block(model_text: &str, tag: &str) -> String {
     match tagged_block_bounds(model_text, tag) {
         Some((start, _json_start, _json_end, _end)) => model_text[..start].trim_end().to_string(),
@@ -1237,6 +1385,11 @@ fn build_conscious_worker_response(
     )?);
     let governed_action_proposals = build_governed_action_proposals(&model_response.output.text)?;
     let assistant_text = strip_worker_control_blocks(&model_response.output.text);
+    validate_governed_action_response_shape(
+        &model_response.output.text,
+        &assistant_text,
+        &governed_action_proposals,
+    )?;
     Ok(WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
@@ -1637,6 +1790,57 @@ fn join_or_none(items: &[String]) -> String {
     items.join(", ")
 }
 
+fn join_or_none_foreground(items: &[String]) -> String {
+    let visible = foreground_visible_items(items);
+    if visible.is_empty() {
+        return "none".to_string();
+    }
+
+    visible.join(", ")
+}
+
+fn foreground_visible_items(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| is_foreground_visible_context_text(item))
+        .cloned()
+        .collect()
+}
+
+fn is_foreground_visible_context_text(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let looks_like_json_blob = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+    let maintenance_markers = [
+        "blue_lagoon_self_check",
+        "identity_reflection_output",
+        "unconscious maintenance worker",
+        "automated verification self model reflection",
+        "iterations_performed",
+        "token_budget_remaining",
+        "trigger_summary",
+        "reflection_id",
+        "wall_clock_time_ms",
+    ];
+
+    !looks_like_json_blob
+        && !maintenance_markers
+            .iter()
+            .any(|marker| lowered.contains(marker))
+}
+
+fn foreground_label_or_default<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if is_foreground_visible_context_text(value) {
+        value
+    } else {
+        fallback
+    }
+}
+
 fn foreground_execution_mode_as_str(mode: ForegroundExecutionMode) -> &'static str {
     match mode {
         ForegroundExecutionMode::SingleIngress => "single_ingress",
@@ -1681,19 +1885,56 @@ fn build_unconscious_wake_signals(
 fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> String {
     items
         .iter()
-        .map(|item| match item {
+        .enumerate()
+        .map(|(index, item)| match item {
             contracts::RetrievedContextItem::Episode(episode) => {
-                format!("episode:{}:{}", episode.episode_id, episode.summary)
+                let latest_messages = retrieved_episode_message_summary(episode);
+                format!(
+                    "{}. episode at {} ({}, relevance={}): {}{}",
+                    index + 1,
+                    episode.started_at.format("%Y-%m-%d %H:%M UTC"),
+                    episode.outcome,
+                    episode.relevance_reason,
+                    episode.summary,
+                    latest_messages
+                )
             }
             contracts::RetrievedContextItem::MemoryArtifact(artifact) => {
                 format!(
-                    "memory:{}:{}",
-                    artifact.memory_artifact_id, artifact.content_text
+                    "{}. memory artifact kind={} subject={} status={} relevance={}: {}",
+                    index + 1,
+                    artifact.artifact_kind,
+                    artifact.subject_ref,
+                    artifact.validity_status,
+                    artifact.relevance_reason,
+                    artifact.content_text
                 )
             }
         })
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join("\n")
+}
+
+fn retrieved_episode_message_summary(episode: &contracts::RetrievedEpisodeContext) -> String {
+    let mut parts = Vec::new();
+    if let Some(user_message) = non_empty_context_excerpt(&episode.latest_user_message) {
+        parts.push(format!("latest user: {user_message}"));
+    }
+    if let Some(assistant_message) = non_empty_context_excerpt(&episode.latest_assistant_message) {
+        parts.push(format!("latest assistant: {assistant_message}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join("; "))
+    }
+}
+
+fn non_empty_context_excerpt(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn build_candidate_proposals(
@@ -1972,10 +2213,22 @@ mod tests {
                 .system_prompt
                 .contains("reply_to_current_message")
         );
-        assert!(model_request.input.system_prompt.contains("load=15%"));
-        assert!(model_request.input.system_prompt.contains("confidence=80%"));
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("load_estimate=15%")
+        );
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("confidence_estimate=80%")
+        );
         assert!(model_request.input.messages.iter().any(|message| {
-            message.content == "remember that I prefer concise replies and be direct"
+            message
+                .content
+                .contains("User: remember that I prefer concise replies and be direct")
         }));
         assert!(
             model_request
@@ -2180,6 +2433,180 @@ mod tests {
     }
 
     #[test]
+    fn conscious_model_request_labels_conversation_history_with_author_and_time() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("UTC] User: older user"))
+        );
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("UTC] Assistant: older assistant"))
+        );
+        assert!(model_request.input.messages.iter().any(|message| {
+            message
+                .content
+                .contains("UTC] User: remember that I prefer concise replies")
+        }));
+    }
+
+    #[test]
+    fn conscious_model_request_surfaces_retrieved_context_content_first() {
+        let mut context = sample_context();
+        let memory_id = uuid::Uuid::now_v7();
+        let episode_id = uuid::Uuid::now_v7();
+        context.retrieved_context.items = vec![
+            contracts::RetrievedContextItem::MemoryArtifact(
+                contracts::RetrievedMemoryArtifactContext {
+                    memory_artifact_id: memory_id,
+                    artifact_kind: "task_list".to_string(),
+                    subject_ref: "workspace".to_string(),
+                    content_text: "Open task: fix context assembly.".to_string(),
+                    validity_status: "active".to_string(),
+                    relevance_reason: "lexical_match:2".to_string(),
+                },
+            ),
+            contracts::RetrievedContextItem::Episode(contracts::RetrievedEpisodeContext {
+                episode_id,
+                internal_conversation_ref: "telegram-primary".to_string(),
+                started_at: chrono::Utc::now(),
+                summary: "User asked for open tasks.".to_string(),
+                latest_user_message: Some("what tasks are open?".to_string()),
+                latest_assistant_message: Some("I will check the task list.".to_string()),
+                outcome: "completed".to_string(),
+                relevance_reason: "same_conversation_recent".to_string(),
+            }),
+        ];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let retrieved = model_request
+            .input
+            .messages
+            .iter()
+            .find(|message| message.content.contains("Retrieved canonical context"))
+            .expect("retrieved context message should exist");
+
+        assert!(
+            retrieved
+                .content
+                .contains("Open task: fix context assembly.")
+        );
+        assert!(retrieved.content.contains("User asked for open tasks."));
+        assert!(
+            retrieved
+                .content
+                .contains("latest user: what tasks are open?")
+        );
+        assert!(
+            retrieved
+                .content
+                .contains("latest assistant: I will check the task list.")
+        );
+        assert!(!retrieved.content.contains(&memory_id.to_string()));
+        assert!(!retrieved.content.contains(&episode_id.to_string()));
+    }
+
+    #[test]
+    fn conscious_model_request_filters_internal_reflection_from_foreground_identity_surface() {
+        let mut context = sample_context();
+        context.self_model.stable_identity =
+            "Blue Lagoon Unconscious Maintenance Worker".to_string();
+        context.self_model.preferences.push(
+            r#"{"reflection_id":"blue_lagoon_self_check_0x89a2","status":"COMPLETED"}"#.to_string(),
+        );
+        context.self_model.identity = Some(contracts::CompactIdentitySnapshot {
+            identity_summary: "Richard".to_string(),
+            self_description: Some(
+                "Automated verification self model reflection token_budget_remaining".to_string(),
+            ),
+            values: vec![
+                "helpful".to_string(),
+                "trigger_summary: Automated verification self model reflection".to_string(),
+            ],
+            boundaries: vec!["do not bypass harness policy".to_string()],
+            stable_items: Vec::new(),
+            evolving_items: Vec::new(),
+        });
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("You are blue-lagoon")
+        );
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("Identity: Richard")
+        );
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("Values: helpful")
+        );
+        assert!(
+            !model_request
+                .input
+                .system_prompt
+                .contains("blue_lagoon_self_check")
+        );
+        assert!(
+            !model_request
+                .input
+                .system_prompt
+                .contains("token_budget_remaining")
+        );
+        assert!(
+            !model_request
+                .input
+                .system_prompt
+                .contains("Unconscious Maintenance Worker")
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_marks_runtime_metrics_as_estimates() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            model_request
+                .input
+                .system_prompt
+                .contains("Operational estimates from harness counters")
+        );
+        assert!(!model_request.input.system_prompt.contains("Runtime state:"));
+    }
+
+    #[test]
     fn conscious_worker_response_wraps_model_output() {
         let request =
             WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
@@ -2310,6 +2737,106 @@ mod tests {
             }
             other => panic!("expected conscious worker result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn conscious_worker_response_rejects_bare_governed_action_token() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: "list_workspace_artifacts".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+            },
+        };
+
+        let error = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect_err("bare governed action token should be rejected");
+        assert!(error.contains(
+            "model attempted a governed action without the required governed-action block"
+        ));
+        assert!(error.contains("list_workspace_artifacts"));
+    }
+
+    #[test]
+    fn conscious_worker_response_rejects_bare_unknown_governed_action_alias() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let response = ModelCallResponse {
+            request_id: uuid::Uuid::now_v7(),
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            received_at: chrono::Utc::now(),
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            output: ModelOutput {
+                text: "read_workspace_artifacts".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+            },
+        };
+
+        let error = build_conscious_worker_response(&request, payload, response)
+            .expect_err("bare governed action alias should be rejected");
+        assert!(error.contains(
+            "model attempted a governed action without the required governed-action block"
+        ));
+        assert!(error.contains("read_workspace_artifacts"));
+    }
+
+    #[test]
+    fn conscious_worker_response_rejects_tool_call_style_governed_action_wrapper() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: "json\n{\"governed-action\": {\"name\": \"read_workspace_artifacts\", \"arguments\": {}}}".to_string(),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 16,
+                output_tokens: 8,
+            },
+        };
+
+        let error = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect_err("tool-call style governed action wrapper should be rejected");
+        assert!(error.contains(
+            "model returned a likely governed-action payload outside the required governed-action block"
+        ));
     }
 
     #[test]

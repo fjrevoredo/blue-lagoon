@@ -287,7 +287,8 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
     }
     if let WorkerResult::Error(error) = &response.result {
         bail!(
-            "conscious worker returned an error response: {}",
+            "conscious worker returned an error response: worker_error_code={} message={}",
+            error.code.as_str(),
             error.message
         );
     }
@@ -467,7 +468,8 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
     }
     if let WorkerResult::Error(error) = &response.result {
         bail!(
-            "unconscious worker returned an error response: {}",
+            "unconscious worker returned an error response: worker_error_code={} message={}",
+            error.code.as_str(),
             error.message
         );
     }

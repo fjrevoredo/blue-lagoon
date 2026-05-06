@@ -41,10 +41,29 @@ fn admin_trace_help_lists_operator_commands() -> Result<()> {
     command
         .assert()
         .success()
+        .stdout(predicate::str::contains("explain"))
         .stdout(predicate::str::contains("show"))
         .stdout(predicate::str::contains("recent"))
         .stdout(predicate::str::contains("render"))
         .stdout(predicate::str::contains("cleanup-model-payloads"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_explain_help_lists_lookup_and_focus_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("trace")
+        .arg("explain")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--execution-id"))
+        .stdout(predicate::str::contains("--focus"))
+        .stdout(predicate::str::contains("--json"));
     Ok(())
 }
 
