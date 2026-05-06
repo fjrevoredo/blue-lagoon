@@ -2065,18 +2065,14 @@ fn validate_run_diagnostic_action(action: &RunDiagnosticAction) -> Result<()> {
         contracts::DiagnosticQuery::TraceShow {
             trace_id,
             execution_id,
-        } => {
-            if trace_id.is_none() && execution_id.is_none() {
-                bail!("diagnostic trace_show requires trace_id or execution_id");
-            }
+        } if trace_id.is_none() && execution_id.is_none() => {
+            bail!("diagnostic trace_show requires trace_id or execution_id");
         }
         contracts::DiagnosticQuery::RecoveryLeases {
             soft_warning_threshold_percent,
             ..
-        } => {
-            if !(1..=100).contains(soft_warning_threshold_percent) {
-                bail!("diagnostic recovery_leases soft warning threshold must be 1-100");
-            }
+        } if !(1..=100).contains(soft_warning_threshold_percent) => {
+            bail!("diagnostic recovery_leases soft warning threshold must be 1-100");
         }
         _ => {}
     }
