@@ -114,6 +114,358 @@ async fn foreground_orchestration_executes_immediate_governed_action_and_runs_fo
 
 #[tokio::test]
 #[serial]
+async fn foreground_orchestration_auto_approves_cap_exceeded_continuation_when_configured()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.governed_actions.max_actions_per_foreground_turn = 1;
+        config.governed_actions.cap_exceeded_behavior =
+            contracts::GovernedActionCapExceededBehavior::AlwaysApprove;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "First artifact inspection",
+                "Need one bounded harness-native inspection before replying.",
+            ),
+        )));
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "Second artifact inspection",
+                "Need one more bounded harness-native inspection before replying.",
+            ),
+        )));
+        transport.push_response(Ok(provider_response(
+            "I completed both bounded artifact inspections in this turn.",
+        )));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(_) => {}
+            other => panic!("expected completed foreground outcome, got {other:?}"),
+        }
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "I completed both bounded artifact inspections in this turn."
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 3);
+        assert!(
+            seen_requests[1]
+                .body
+                .to_string()
+                .contains("Continue the foreground turn using these outcomes.")
+        );
+        assert!(
+            seen_requests[2]
+                .body
+                .to_string()
+                .contains("Foreground action loop state:")
+        );
+
+        let executed_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM governed_action_executions
+            WHERE action_kind = 'list_workspace_artifacts'
+              AND status = 'executed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(executed_count, 2);
+
+        let cap_auto_approved_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'governed_action_cap_auto_approved'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(cap_auto_approved_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_blocks_cap_exceeded_continuation_when_configured() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.governed_actions.max_actions_per_foreground_turn = 1;
+        config.governed_actions.cap_exceeded_behavior =
+            contracts::GovernedActionCapExceededBehavior::AlwaysDeny;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "First artifact inspection",
+                "Need one bounded harness-native inspection before replying.",
+            ),
+        )));
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "Second artifact inspection",
+                "Need one more bounded harness-native inspection before replying.",
+            ),
+        )));
+        transport.push_response(Ok(provider_response(
+            "I hit the configured per-turn action limit, so I stopped after the first inspection.",
+        )));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(_) => {}
+            other => panic!("expected completed foreground outcome, got {other:?}"),
+        }
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "I hit the configured per-turn action limit, so I stopped after the first inspection."
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 3);
+        assert!(
+            seen_requests[2]
+                .body
+                .to_string()
+                .contains("foreground governed-action limit reached")
+        );
+
+        let action_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT status, blocked_reason
+            FROM governed_action_executions
+            WHERE action_kind = 'list_workspace_artifacts'
+            ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&ctx.pool)
+        .await?;
+        assert_eq!(action_rows.len(), 2);
+        assert_eq!(action_rows[0].0, "executed");
+        assert_eq!(action_rows[1].0, "blocked");
+        assert!(
+            action_rows[1]
+                .1
+                .as_deref()
+                .is_some_and(|reason| reason.contains("foreground governed-action limit reached"))
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_escalates_cap_exceeded_continuation_into_approval() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.governed_actions.max_actions_per_foreground_turn = 1;
+        config.governed_actions.cap_exceeded_behavior =
+            contracts::GovernedActionCapExceededBehavior::Escalate;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "First artifact inspection",
+                "Need one bounded harness-native inspection before replying.",
+            ),
+        )));
+        transport.push_response(Ok(provider_response(
+            &harness_native_artifact_list_model_output(
+                "Second artifact inspection",
+                "Need one more bounded harness-native inspection before replying.",
+            ),
+        )));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(_) => {}
+            other => panic!("expected completed foreground outcome, got {other:?}"),
+        }
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 2);
+
+        assert_eq!(delivery.sent_messages().len(), 2);
+        assert!(delivery.sent_messages().iter().any(|message| {
+            message
+                .text
+                .contains("Action: Continue after action limit: Second artifact inspection")
+        }));
+        assert!(
+            delivery
+                .sent_messages()
+                .iter()
+                .any(|message| { message.text == "I will inspect current workspace artifacts." })
+        );
+
+        let approval_requests = approval::list_approval_requests(&ctx.pool, None, 10).await?;
+        assert_eq!(approval_requests.len(), 1);
+        assert_eq!(approval_requests[0].status, ApprovalRequestStatus::Pending);
+        assert!(
+            approval_requests[0]
+                .title
+                .contains("Continue after action limit: Second artifact inspection")
+        );
+        assert!(
+            approval_requests[0]
+                .consequence_summary
+                .contains("foreground governed-action limit reached")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn approval_resolution_executes_linked_governed_action_after_approval() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -638,6 +990,46 @@ fn immediate_action_model_output() -> String {
     });
     format!(
         "I will run a bounded workspace check.\n```blue-lagoon-governed-actions\n{}\n```",
+        action_block,
+    )
+}
+
+fn harness_native_artifact_list_model_output(title: &str, rationale: &str) -> String {
+    let action_block = serde_json::json!({
+        "actions": [{
+            "proposal_id": Uuid::now_v7(),
+            "title": title,
+            "rationale": rationale,
+            "action_kind": "list_workspace_artifacts",
+            "requested_risk_tier": serde_json::Value::Null,
+            "capability_scope": {
+                "filesystem": {
+                    "read_roots": [],
+                    "write_roots": [],
+                },
+                "network": "disabled",
+                "environment": {
+                    "allow_variables": [],
+                },
+                "execution": {
+                    "timeout_ms": 0,
+                    "max_stdout_bytes": 0,
+                    "max_stderr_bytes": 0,
+                },
+            },
+            "payload": {
+                "kind": "list_workspace_artifacts",
+                "value": {
+                    "artifact_kind": serde_json::Value::Null,
+                    "status": "active",
+                    "query": serde_json::Value::Null,
+                    "limit": 5,
+                },
+            },
+        }],
+    });
+    format!(
+        "I will inspect current workspace artifacts.\n```blue-lagoon-governed-actions\n{}\n```",
         action_block,
     )
 }

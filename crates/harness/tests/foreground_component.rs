@@ -3272,6 +3272,7 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
         }],
         retrieved_context: contracts::RetrievedContext::default(),
         governed_action_observations: Vec::new(),
+        governed_action_loop_state: None,
         recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }

@@ -196,6 +196,7 @@ The unconscious loop MUST be allowed to produce:
 - The system MUST include forced termination for runaway foreground or background work.
 - The system SHOULD include warning thresholds before hard termination.
 - The system SHOULD surface repeated budget exhaustion as an operational signal.
+- Foreground execution MAY include multiple harness-mediated governed actions inside one foreground turn, but every additional action MUST remain bounded by explicit budgets, a configured per-turn action cap, and normal approval or policy gates.
 
 ## 11. Self-model and identity
 
@@ -370,6 +371,7 @@ Each meaningful episodic record SHOULD capture:
 ### 18.2 Recovery
 - The system MUST support supervisor recovery after crashes, timeouts, or interrupted tasks.
 - Recovery SHOULD reconstruct the minimum safe context needed for continuation or graceful abandonment.
+- Recovery MUST NOT automatically replay a foreground turn when the interrupted execution already linked ambiguous or nonrepeatable governed actions unless the harness can prove the replay is safe from durable evidence.
 
 ### 18.3 Maintenance
 - The harness SHOULD support maintenance flows such as checkpoint compaction, index rebuild, failed-merge retry, and stalled-worker cleanup.

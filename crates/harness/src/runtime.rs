@@ -9,7 +9,7 @@ use chrono::Utc;
 use contracts::{WorkerRequest, WorkerResult};
 use serde_json::json;
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -89,6 +89,16 @@ pub struct TelegramProcessingSummary {
     pub trigger_rejected_count: usize,
     pub normalization_rejected_count: usize,
     pub ignored_count: usize,
+}
+
+#[derive(Debug)]
+struct BlockedTelegramForegroundRecovery<'a> {
+    chat_id: i64,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    primary_ingress: &'a foreground::IngressEventRecord,
+    selected_ingress_ids: &'a [Uuid],
+    outcome: &'a recovery::RecoveryTriggerOutcome,
 }
 
 pub async fn run_migrate(config: &RuntimeConfig) -> Result<migration::MigrationSummary> {
@@ -633,6 +643,7 @@ async fn recover_scheduled_foreground_task(
             recovery::ForegroundRestartRecoveryRequest {
                 trace_id,
                 execution_id,
+                interrupted_execution_id: Some(execution_id),
                 internal_conversation_ref: &recoverable.task.internal_conversation_ref,
                 recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
                 trigger_source: "scheduled_foreground_supervisor_recovery",
@@ -783,6 +794,7 @@ where
     let plan = foreground::PendingForegroundExecutionPlan {
         mode: contracts::ForegroundExecutionMode::SingleIngress,
         primary_ingress: ingress_record,
+        interrupted_execution_id: None,
         ordered_ingress: vec![contracts::OrderedIngressReference {
             ingress_id: ingress.ingress_id,
             occurred_at: ingress.occurred_at,
@@ -1133,14 +1145,16 @@ where
             .contains(&internal_conversation_ref)
             && !newly_staged_conversations.contains(&internal_conversation_ref);
 
+        let interrupted_execution_id = plan.interrupted_execution_id;
         if plan.decision_reason
             == foreground::ForegroundExecutionDecisionReason::StaleProcessingResume
         {
-            recovery::recover_foreground_restart_trigger(
+            let outcome = recovery::recover_foreground_restart_trigger(
                 context.pool,
                 recovery::ForegroundRestartRecoveryRequest {
                     trace_id,
                     execution_id,
+                    interrupted_execution_id,
                     internal_conversation_ref: &internal_conversation_ref,
                     recovery_reason_code: recovery::RecoveryReasonCode::Crash,
                     trigger_source: "telegram_foreground_processing_loop",
@@ -1153,12 +1167,33 @@ where
             )
             .await
             .context("failed to route stale foreground processing through recovery")?;
+            if outcome.decision.decision != recovery::RecoveryDecision::Continue {
+                handle_blocked_telegram_foreground_recovery(
+                    context.pool,
+                    delivery,
+                    BlockedTelegramForegroundRecovery {
+                        chat_id: context.telegram_config.allowed_chat_id,
+                        trace_id,
+                        execution_id,
+                        primary_ingress: &plan.primary_ingress,
+                        selected_ingress_ids: &selected_ingress_ids,
+                        outcome: &outcome,
+                    },
+                )
+                .await?;
+                if is_backlog_recovery {
+                    summary.backlog_recovery_count += 1;
+                }
+                summary.trigger_rejected_count += 1;
+                continue;
+            }
         } else if recovered_only_from_scan && is_backlog_recovery {
-            recovery::recover_foreground_restart_trigger(
+            let outcome = recovery::recover_foreground_restart_trigger(
                 context.pool,
                 recovery::ForegroundRestartRecoveryRequest {
                     trace_id,
                     execution_id,
+                    interrupted_execution_id,
                     internal_conversation_ref: &internal_conversation_ref,
                     recovery_reason_code: recovery::RecoveryReasonCode::SupervisorRestart,
                     trigger_source: "telegram_foreground_recovery_scan",
@@ -1171,6 +1206,24 @@ where
             )
             .await
             .context("failed to route foreground supervisor restart through recovery")?;
+            if outcome.decision.decision != recovery::RecoveryDecision::Continue {
+                handle_blocked_telegram_foreground_recovery(
+                    context.pool,
+                    delivery,
+                    BlockedTelegramForegroundRecovery {
+                        chat_id: context.telegram_config.allowed_chat_id,
+                        trace_id,
+                        execution_id,
+                        primary_ingress: &plan.primary_ingress,
+                        selected_ingress_ids: &selected_ingress_ids,
+                        outcome: &outcome,
+                    },
+                )
+                .await?;
+                summary.backlog_recovery_count += 1;
+                summary.trigger_rejected_count += 1;
+                continue;
+            }
         }
 
         match foreground_orchestration::orchestrate_telegram_foreground_plan(
@@ -1214,6 +1267,78 @@ where
     }
 
     Ok(summary)
+}
+
+async fn handle_blocked_telegram_foreground_recovery<D>(
+    pool: &PgPool,
+    delivery: &mut D,
+    blocked_recovery: BlockedTelegramForegroundRecovery<'_>,
+) -> Result<()>
+where
+    D: TelegramDelivery,
+{
+    let BlockedTelegramForegroundRecovery {
+        chat_id,
+        trace_id,
+        execution_id,
+        primary_ingress,
+        selected_ingress_ids,
+        outcome,
+    } = blocked_recovery;
+    execution::mark_failed(
+        pool,
+        execution_id,
+        &json!({
+            "kind": "foreground_recovery_blocked",
+            "recovery_decision": format!("{:?}", outcome.decision.decision).to_lowercase(),
+            "checkpoint_status": format!("{:?}", outcome.checkpoint.status).to_lowercase(),
+            "diagnostic_reason_code": outcome.diagnostic.reason_code.clone(),
+            "summary": outcome.decision.summary.clone(),
+        }),
+    )
+    .await?;
+    foreground::mark_ingress_events_processed(pool, selected_ingress_ids, execution_id).await?;
+
+    let reply_to_message_id = parse_telegram_reply_target_from_ingress_record(primary_ingress)?;
+    let text = format!(
+        "I could not automatically resume that interrupted request. Trace: {trace_id}. Recovery was blocked because the prior execution already linked governed actions and replay would not be safe."
+    );
+
+    match delivery
+        .send_message(&telegram::TelegramOutboundMessage {
+            chat_id,
+            text,
+            reply_to_message_id,
+            reply_markup: None,
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                error = %format_error_chain(&error),
+                "telegram blocked-recovery notice delivery failed"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_telegram_reply_target_from_ingress_record(
+    ingress: &foreground::IngressEventRecord,
+) -> Result<Option<i64>> {
+    ingress
+        .external_message_id
+        .as_deref()
+        .map(|message_id| {
+            message_id
+                .parse::<i64>()
+                .with_context(|| format!("failed to parse Telegram message id '{message_id}'"))
+        })
+        .transpose()
 }
 
 async fn record_telegram_normalization_rejected(

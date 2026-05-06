@@ -213,6 +213,7 @@ pub struct RecoveryTriggerOutcome {
 pub struct ForegroundRestartRecoveryRequest<'a> {
     pub trace_id: Uuid,
     pub execution_id: Uuid,
+    pub interrupted_execution_id: Option<Uuid>,
     pub internal_conversation_ref: &'a str,
     pub recovery_reason_code: RecoveryReasonCode,
     pub trigger_source: &'a str,
@@ -728,6 +729,30 @@ pub async fn recover_foreground_restart_trigger(
         bail!("foreground restart recovery requires at least one selected ingress");
     }
 
+    let inspected_execution_id = request
+        .interrupted_execution_id
+        .unwrap_or(request.execution_id);
+    let prior_governed_actions = governed_actions::list_governed_action_executions_by_execution_id(
+        pool,
+        inspected_execution_id,
+    )
+    .await?;
+    let replay_safe_prior_actions = prior_governed_actions.iter().all(|record| {
+        record.approval_request_id.is_none()
+            && governed_action_recovery_action_classification(record)
+                == RecoveryActionClassification::SafeReplay
+    });
+    let action_classification = if replay_safe_prior_actions {
+        RecoveryActionClassification::SafeReplay
+    } else {
+        RecoveryActionClassification::AmbiguousOrNonrepeatable
+    };
+    let evidence_state = if replay_safe_prior_actions {
+        RecoveryEvidenceState::DurableIncomplete
+    } else {
+        RecoveryEvidenceState::Ambiguous
+    };
+
     let checkpoint_payload = json!({
         "source": request.trigger_source,
         "internal_conversation_ref": request.internal_conversation_ref,
@@ -735,10 +760,23 @@ pub async fn recover_foreground_restart_trigger(
         "recovery_mode": request.recovery_mode,
         "selected_ingress_ids": request.selected_ingress_ids,
         "primary_ingress_id": request.primary_ingress_id,
+        "interrupted_execution_id": request.interrupted_execution_id,
+        "inspected_execution_id": inspected_execution_id,
+        "prior_governed_action_count": prior_governed_actions.len(),
+        "prior_governed_actions": prior_governed_actions.iter().map(|record| json!({
+            "governed_action_execution_id": record.governed_action_execution_id,
+            "action_kind": record.action_kind,
+            "status": record.status,
+            "approval_request_id": record.approval_request_id,
+        })).collect::<Vec<_>>(),
     });
-    let diagnostic_reason_code = match request.recovery_reason_code {
-        RecoveryReasonCode::Crash => "foreground_processing_crash_recovered",
-        RecoveryReasonCode::SupervisorRestart => "foreground_supervisor_restart_recovered",
+    let diagnostic_reason_code = match (request.recovery_reason_code, replay_safe_prior_actions) {
+        (RecoveryReasonCode::Crash, true) => "foreground_processing_crash_recovered",
+        (RecoveryReasonCode::Crash, false) => "foreground_processing_crash_replay_blocked",
+        (RecoveryReasonCode::SupervisorRestart, true) => "foreground_supervisor_restart_recovered",
+        (RecoveryReasonCode::SupervisorRestart, false) => {
+            "foreground_supervisor_restart_replay_blocked"
+        }
         _ => unreachable!("guarded above"),
     };
     let reason_summary = match request.recovery_reason_code {
@@ -750,6 +788,18 @@ pub async fn recover_foreground_restart_trigger(
         }
         _ => unreachable!("guarded above"),
     };
+
+    let decision_request = RecoveryDecisionRequest {
+        checkpoint_kind: RecoveryCheckpointKind::Foreground,
+        reason_code: request.recovery_reason_code,
+        action_classification,
+        evidence_state,
+        approval_state: RecoveryApprovalState::NotRequired,
+        policy_state: RecoveryPolicyState::Valid,
+        recovery_budget_remaining: 1,
+        clarification_available: false,
+    };
+    let decision = evaluate_recovery_decision(&decision_request)?;
 
     issue_recovery_trigger(
         pool,
@@ -766,16 +816,7 @@ pub async fn recover_foreground_restart_trigger(
             recovery_budget_remaining: 1,
             checkpoint_payload: checkpoint_payload.clone(),
         },
-        RecoveryDecisionRequest {
-            checkpoint_kind: RecoveryCheckpointKind::Foreground,
-            reason_code: request.recovery_reason_code,
-            action_classification: RecoveryActionClassification::SafeReplay,
-            evidence_state: RecoveryEvidenceState::DurableIncomplete,
-            approval_state: RecoveryApprovalState::NotRequired,
-            policy_state: RecoveryPolicyState::Valid,
-            recovery_budget_remaining: 1,
-            clarification_available: false,
-        },
+        decision_request,
         NewOperationalDiagnostic {
             operational_diagnostic_id: Uuid::now_v7(),
             trace_id: Some(request.trace_id),
@@ -785,7 +826,7 @@ pub async fn recover_foreground_restart_trigger(
             reason_code: diagnostic_reason_code.to_string(),
             summary: format!(
                 "{reason_summary}; recovery decision: {}",
-                RecoveryDecision::Continue.as_str()
+                decision.decision.as_str()
             ),
             diagnostic_payload: checkpoint_payload,
         },

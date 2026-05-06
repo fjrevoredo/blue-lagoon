@@ -25,11 +25,11 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1352), payload structs (line 1377), `GovernedActionPayload` (line 1505) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 739), `build_governed_action_proposals()` (line 823), `governed_action_kind_as_str()` (line 1003) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 482), `execute_inspect_workspace_artifact()` (line 826), `execute_create_workspace_script()` (line 1143), `execute_request_background_job()` (line 1361), `validate_capability_scope()` (line 1441), `governed_action_kind_as_str()` (line 2878), `CanonicalGovernedActionPayload` (line 3000) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 210), `evaluate_governed_action_identity_boundaries()` (line 217) |
-| `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1314) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1370), payload structs (line 1400), `GovernedActionPayload` (line 1606) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 809), `build_governed_action_proposals()` (line 912), `governed_action_kind_as_str()` (line 1137) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_inspect_workspace_artifact()` (line 871), `execute_create_workspace_script()` (line 1188), `execute_request_background_job()` (line 1406), `validate_capability_scope()` (line 1663), `governed_action_kind_as_str()` (line 3163), `CanonicalGovernedActionPayload` (line 3287) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
+| `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
@@ -54,6 +54,7 @@ The live governed-action enum contains these model-usable kinds:
 | `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
 | `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
 | `request_background_job` | Request bounded background maintenance work | Tier 1 |
+| `run_diagnostic` | Execute one harness-native read-only diagnostic query | Tier 0 |
 | `run_subprocess` | Execute a bounded subprocess | Tier 1-3 by scope |
 | `run_workspace_script` | Execute a registered script version | Tier 1-3 by scope |
 | `web_fetch` | Fetch one HTTP/HTTPS URL with bounded response capture | Tier 2 |
@@ -90,7 +91,11 @@ block tagged `blue-lagoon-governed-actions`:
 ````
 
 `build_governed_action_proposals()` extracts the last matching block. The
-orchestrator currently processes at most one action per immediate model turn.
+foreground orchestrator may continue through multiple governed-action rounds in
+the same foreground turn: the worker receives harness observations, may propose
+another action if one is still needed, and the harness then decides whether the
+next proposal is allowed, approval-gated, or denied under policy, remaining
+budgets, and the configured per-turn action cap.
 
 ### Payload Families
 
@@ -132,6 +137,12 @@ capped at 1,500 characters after content formatting. Full raw fetch bodies and
 harness-native payload details are stored in execution records, not injected
 unbounded into conscious context.
 
+When the harness is in a same-turn continuation path, the observation message
+also carries the current `ForegroundGovernedActionLoopState`: actions already
+used in the turn, remaining cap, and configured cap-exceeded posture. This
+keeps the worker aware of bounded continuation state without making the worker
+the authority for execution decisions.
+
 Approval-triggered action execution persists the model follow-up text first,
 then appends the harness observation to durable assistant history. Telegram
 delivery sends only user-facing text.
@@ -140,14 +151,19 @@ delivery sends only user-facing text.
 
 Read-only harness-native actions are replay-safe after a worker interruption:
 `inspect_workspace_artifact`, `list_workspace_artifacts`,
-`list_workspace_scripts`, `inspect_workspace_script`, and
-`list_workspace_script_runs`.
+`list_workspace_scripts`, `inspect_workspace_script`,
+`list_workspace_script_runs`, and `run_diagnostic`.
 
 Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
 produce side effects are classified as ambiguous or nonrepeatable during
 governed-action recovery. Recovery must not automatically retry them unless
 durable completion evidence proves the original action already reached a
 terminal state.
+
+Foreground replay follows the same proof-based rule. If an interrupted
+foreground execution already linked one or more governed actions and every
+linked action is not both replay-safe and approval-free, stale foreground
+recovery fails closed instead of blindly replaying the turn.
 
 ---
 
@@ -170,6 +186,8 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 | `approval_required_min_risk_tier` | `"tier_2"` |
 | `default_subprocess_timeout_ms` | `30000` |
 | `max_subprocess_timeout_ms` | `120000` |
+| `max_actions_per_foreground_turn` | `10` |
+| `cap_exceeded_behavior` | `"escalate"` |
 | `max_filesystem_roots_per_action` | `4` |
 | `default_network_access` | `"disabled"` |
 | `allowlisted_environment_variables` | `["BLUE_LAGOON_DATABASE_URL"]` |
@@ -220,4 +238,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-01.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-06.*

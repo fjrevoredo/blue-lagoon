@@ -234,6 +234,7 @@ The unconscious loop is **not** allowed to:
    - Harness classifies the event as a foreground trigger, background job trigger, or both.
 2. **Foreground and/or background work is scheduled**
    - For foreground: harness assembles context, initializes budgets, and wakes the conscious loop.
+   - For governed actions, the harness MAY repeat worker -> policy -> governed-action -> observation cycles multiple times inside the same foreground turn while the remaining budgets and per-turn action cap allow it.
    - For background: harness scopes inputs, sets budgets, and launches unconscious jobs.
 3. **Loops run in isolation**
    - Each loop operates within its process and scoped data view.
@@ -323,6 +324,7 @@ The unconscious loop is **not** allowed to:
    - Conscious loop wakes, receives the context (self-model, relevant memory, payload X), and:
      - Generates a user-facing message summarizing the next meeting and the weather.
      - Optionally offers actions (e.g., suggest what to bring, propose leaving time).
+     - May propose another governed action in the same foreground turn after receiving harness observations, but the harness remains the authority for execution, approval, denial, and bounded continuation.
    - The conscious loop runs within its iteration/compute budget.
 9. **Record & halt**
    - Conscious loop logs the episode and any candidate memories, then goes idle until the next trigger.

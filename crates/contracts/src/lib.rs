@@ -403,7 +403,25 @@ pub struct ConsciousContext {
     pub recent_history: Vec<EpisodeExcerpt>,
     pub retrieved_context: RetrievedContext,
     pub governed_action_observations: Vec<GovernedActionObservation>,
+    #[serde(default)]
+    pub governed_action_loop_state: Option<ForegroundGovernedActionLoopState>,
     pub recovery_context: ForegroundRecoveryContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedActionCapExceededBehavior {
+    Escalate,
+    AlwaysApprove,
+    AlwaysDeny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundGovernedActionLoopState {
+    pub executed_action_count: u32,
+    pub max_actions_per_turn: u32,
+    pub remaining_actions_before_cap: u32,
+    pub cap_exceeded_behavior: GovernedActionCapExceededBehavior,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1496,36 +1514,65 @@ pub enum DiagnosticDocument {
 pub enum DiagnosticQuery {
     RuntimeStatus,
     HealthSummary,
-    OperationalDiagnostics { limit: u32 },
-    TraceRecent { limit: u32 },
+    OperationalDiagnostics {
+        limit: u32,
+    },
+    TraceRecent {
+        limit: u32,
+    },
     TraceShow {
         trace_id: Option<Uuid>,
         execution_id: Option<Uuid>,
     },
-    ForegroundPending { limit: u32 },
-    ForegroundSchedules { limit: u32 },
-    BackgroundList { limit: u32 },
-    RecoveryCheckpoints { open_only: bool, limit: u32 },
+    ForegroundPending {
+        limit: u32,
+    },
+    ForegroundSchedules {
+        limit: u32,
+    },
+    BackgroundList {
+        limit: u32,
+    },
+    RecoveryCheckpoints {
+        open_only: bool,
+        limit: u32,
+    },
     RecoveryLeases {
         limit: u32,
         soft_warning_threshold_percent: u8,
     },
     SchemaStatus,
     SchemaUpgradePath,
-    ApprovalsList { limit: u32 },
-    ActionsList { limit: u32 },
-    WakeSignalsList { limit: u32 },
+    ApprovalsList {
+        limit: u32,
+    },
+    ActionsList {
+        limit: u32,
+    },
+    WakeSignalsList {
+        limit: u32,
+    },
     IdentityStatus,
     IdentityShow,
-    IdentityHistory { limit: u32 },
-    IdentityDiagnostics { limit: u32 },
-    WorkspaceArtifacts { limit: u32 },
-    WorkspaceScripts { limit: u32 },
+    IdentityHistory {
+        limit: u32,
+    },
+    IdentityDiagnostics {
+        limit: u32,
+    },
+    WorkspaceArtifacts {
+        limit: u32,
+    },
+    WorkspaceScripts {
+        limit: u32,
+    },
     WorkspaceRuns {
         script_id: Option<Uuid>,
         limit: u32,
     },
-    InternalDoc { document: DiagnosticDocument },
+    InternalDoc {
+        document: DiagnosticDocument,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2041,6 +2088,13 @@ mod tests {
             ForegroundExecutionMode::BacklogRecovery
         );
         assert_eq!(decoded.retrieved_context.items.len(), 2);
+        assert_eq!(
+            decoded
+                .governed_action_loop_state
+                .expect("loop state should round-trip")
+                .max_actions_per_turn,
+            10
+        );
     }
 
     #[test]
@@ -2182,6 +2236,12 @@ mod tests {
                 ],
             },
             governed_action_observations: Vec::new(),
+            governed_action_loop_state: Some(ForegroundGovernedActionLoopState {
+                executed_action_count: 0,
+                max_actions_per_turn: 10,
+                remaining_actions_before_cap: 10,
+                cap_exceeded_behavior: GovernedActionCapExceededBehavior::Escalate,
+            }),
             recovery_context: ForegroundRecoveryContext {
                 mode: ForegroundExecutionMode::BacklogRecovery,
                 ordered_ingress: vec![

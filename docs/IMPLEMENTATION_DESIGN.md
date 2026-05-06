@@ -508,6 +508,8 @@ Structured outputs should be the default whenever practical, especially for unco
 
 Tool execution stays outside the gateway. The gateway may return structured tool-call candidates or equivalent proposals, but actual tool execution, validation, approval, and routing remain inside the harness execution and policy layers.
 
+For foreground work, this harness-owned execution layer may perform multiple governed-action continuation rounds inside one foreground turn. The worker may propose another action after receiving harness observations, but the harness remains the authority for per-turn action limits, approval posture, denial, and final bounded continuation.
+
 ## Orchestration and worker model
 
 The current orchestration direction is now clear:
@@ -611,6 +613,7 @@ For conscious work, the checkpoint should preserve at least:
 - Approved plan state by reference.
 - Remaining budgets.
 - Relevant tool and action outcomes so far.
+- Current governed-action loop state where the foreground turn is in a multi-action continuation path.
 - Pending approvals.
 - References to already-written episodic or proposal artifacts.
 
@@ -647,11 +650,13 @@ Automatic continuation is allowed for:
 - Deterministic local work whose outcomes are already durably recorded.
 - External actions the harness can prove are idempotent and whose execution state is durably known.
 - Re-entry after approval resolution.
+- Read-only multi-action foreground continuation where every previously linked governed action in the interrupted turn is replay-safe and approval-free.
 
 Automatic continuation is not allowed for:
 
 - Ambiguous external side effects.
 - Non-repeatable external actions.
+- Foreground turns whose interrupted execution already linked ambiguous or nonrepeatable governed actions without proof that replay remains safe.
 - Corrupted or incomplete checkpoint state.
 - Exhausted recovery budget.
 

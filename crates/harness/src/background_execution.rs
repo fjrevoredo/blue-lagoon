@@ -1203,6 +1203,8 @@ mod tests {
                 approval_required_min_risk_tier: contracts::GovernedActionRiskTier::Tier2,
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
+                max_actions_per_foreground_turn: 10,
+                cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],

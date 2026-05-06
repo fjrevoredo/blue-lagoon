@@ -20,9 +20,9 @@ pending actions - enters through this pipeline. Nothing else reaches the model.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 205), assembly limit constants (lines 18-20) |
-| `crates/workers/src/main.rs` | `build_model_input()` (line 512), `build_model_call_request()` (line 419), `identity_kickstart_schema_message()` (line 671), `build_identity_kickstart_proposals()` (line 840) |
-| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 410), `predefined_identity_templates()` (line 616), `predefined_identity_delta()` (line 642) |
+| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 206), assembly limit constants (lines 18-20) |
+| `crates/workers/src/main.rs` | `build_model_input()` (line 512), `build_model_call_request()` (line 419), `identity_kickstart_schema_message()` (line 741), `build_identity_kickstart_proposals()` (line 929) |
+| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 428), `predefined_identity_templates()` (line 634), `predefined_identity_delta()` (line 660) |
 | `config/self_model_seed.toml` | Bootstrap self-model and seed identity values |
 | `config/default.toml` | `harness.default_foreground_token_budget` |
 
@@ -119,16 +119,18 @@ Messages are appended in this order by `build_model_input()`:
 | N+1 | User | Current trigger `text_body` | Only if `text_body` is `Some` |
 | N+2 | Developer | Backlog recovery notice with ordered ingress batch | Only in `BacklogRecovery` mode with non-empty `ordered_ingress` |
 | N+3 | Developer | `"Retrieved canonical context: ..."` summary | Only if `retrieved_context.items` is non-empty |
-| N+4 | Developer | Governed action observations | If `governed_action_observations` is non-empty |
+| N+4 | Developer | Governed action observations plus, when available, foreground action-loop state | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Full governed action schema | If `governed_action_observations` is empty |
 | N+5 (alt) | Developer | Troubleshooting capability guidance | If governed action observations are empty and the current trigger asks about errors, traces, logs, diagnostics, debugging, or failures |
 | N+6 (alt) | Developer | Identity kickstart action block schema and predefined template summaries | If governed action observations are empty and identity kickstart is available |
 
 `ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:474`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
 
-Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:677`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:706` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and lists read-only admin CLI commands that can be proposed through governed `run_subprocess` actions. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+When governed action observations are present, `build_model_input()` appends a Developer message that summarizes the observations, includes the current `ForegroundGovernedActionLoopState` when the harness supplied it, and explicitly tells the worker to continue the same foreground turn. The worker may propose another governed action in that same turn if it is still needed, but the harness remains the authority for whether the proposal is allowed, approval-gated, or denied under policy, the configured per-turn action cap, and the remaining loop budget.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2115` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2132`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:688`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:717` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2318` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2346`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:20`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 
@@ -136,7 +138,7 @@ Location: `config/self_model_seed.toml`. Loaded by
 `self_model::load_self_model_snapshot()`. Flat seed fields preserve the legacy
 bootstrap self-model, while `[identity]` seed fields provide initial rich
 identity context until a complete identity is selected. `SelfModelSnapshot` is
-defined in `crates/contracts/src/lib.rs:410`.
+defined in `crates/contracts/src/lib.rs:428`.
 
 | Field | Type | Semantic meaning |
 |---|---|---|
@@ -150,7 +152,7 @@ defined in `crates/contracts/src/lib.rs:410`.
 | `current_subgoals` | `Vec<String>` | Active sub-objectives — surfaced only if non-empty |
 | `[identity]` fields | TOML table | Rich seed identity values and lifecycle bootstrap defaults |
 
-`SelfModelSourceKind` (`crates/harness/src/self_model.rs:104`) records which source was used at runtime: `BootstrapSeed` or `CanonicalArtifact`. If a canonical artifact exists in the DB (written by the background loop), it takes precedence over the seed.
+`SelfModelSourceKind` (`crates/harness/src/self_model.rs:103`) records which source was used at runtime: `BootstrapSeed` or `CanonicalArtifact`. If a canonical artifact exists in the DB (written by the background loop), it takes precedence over the seed.
 
 ### Identity Kickstart
 
@@ -171,18 +173,18 @@ conversation can resume deterministically. Each answer is persisted in
 harness into canonical identity items and a complete lifecycle transition.
 
 Worker-side identity block parsing is intentionally tolerant:
-`build_identity_kickstart_proposals()` in `crates/workers/src/main.rs:920`
+`build_identity_kickstart_proposals()` in `crates/workers/src/main.rs:929`
 ignores malformed optional identity blocks rather than failing the whole worker
 turn. `parse_identity_interview_answer()` in
-`crates/workers/src/main.rs:1008` accepts the canonical structured answer shape,
+`crates/workers/src/main.rs:1017` accepts the canonical structured answer shape,
 a plain string answer, or a missing/null answer that can be inferred from the
 current trigger and `kickstart.next_step`.
 
 Foreground orchestration augments worker-emitted proposals through
 `foreground_candidate_proposals()`
-(`crates/harness/src/foreground_orchestration.rs:2141`). If the worker omits an
+(`crates/harness/src/foreground_orchestration.rs:2355`). If the worker omits an
 identity block, `inferred_identity_kickstart_proposals()`
-(`crates/harness/src/foreground_orchestration.rs:2247`) can still infer a
+(`crates/harness/src/foreground_orchestration.rs:2470`) can still infer a
 bounded harness-native proposal from obvious bootstrap custom-start or
 predefined-template intent, and from non-ambiguous answers while a custom
 interview is in progress. Ambiguous acknowledgements such as `ok` do not become
@@ -192,7 +194,7 @@ Foreground delivery treats the stripped control-block text as the primary
 assistant reply. If the model emits only a control block, or if the harness
 inferred an identity kickstart proposal, the harness falls back inside
 `foreground_assistant_delivery_text()`
-(`crates/harness/src/foreground_orchestration.rs:2155`): pending approvals use
+(`crates/harness/src/foreground_orchestration.rs:2369`): pending approvals use
 an approval-specific continuation prompt, and identity kickstart proposals use a
 bounded identity-specific prompt such as the first custom interview question.
 Custom interview prompt text is owned by
@@ -203,9 +205,9 @@ empty-response fallback.
 
 After Telegram chat metadata has been parsed, foreground failures are also
 reported back to the user through `record_and_deliver_foreground_failure()`
-(`crates/harness/src/foreground_orchestration.rs:1658`). The message generated
+(`crates/harness/src/foreground_orchestration.rs:1861`). The message generated
 by `foreground_failure_notice_text()`
-(`crates/harness/src/foreground_orchestration.rs:1940`) includes the trace id
+(`crates/harness/src/foreground_orchestration.rs:2143`) includes the trace id
 and failure kind, while the full error chain remains only in execution records,
 episode failure summaries, and audit events.
 
@@ -257,4 +259,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-02.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-06.*

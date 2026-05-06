@@ -163,6 +163,7 @@ fn sample_context() -> ConsciousContext {
         recent_history: vec![],
         retrieved_context: contracts::RetrievedContext::default(),
         governed_action_observations: Vec::new(),
+        governed_action_loop_state: None,
         recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }

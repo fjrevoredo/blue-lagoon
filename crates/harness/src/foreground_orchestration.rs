@@ -93,6 +93,88 @@ struct GovernedActionProcessingSummary {
     executed_count: usize,
     blocked_count: usize,
     pending_approval_count: usize,
+    action_limit_reached: bool,
+}
+
+impl GovernedActionProcessingSummary {
+    fn merge(&mut self, other: Self) {
+        self.observations.extend(other.observations);
+        self.proposed_count += other.proposed_count;
+        self.executed_count += other.executed_count;
+        self.blocked_count += other.blocked_count;
+        self.pending_approval_count += other.pending_approval_count;
+        self.action_limit_reached |= other.action_limit_reached;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ForegroundActionLoopTracker {
+    executed_action_count: u32,
+}
+
+impl ForegroundActionLoopTracker {
+    fn new(executed_action_count: u32) -> Self {
+        Self {
+            executed_action_count,
+        }
+    }
+
+    fn max_actions_per_turn(self, config: &RuntimeConfig) -> u32 {
+        config.governed_actions.max_actions_per_foreground_turn
+    }
+
+    fn remaining_actions_before_cap(self, config: &RuntimeConfig) -> u32 {
+        self.max_actions_per_turn(config)
+            .saturating_sub(self.executed_action_count)
+    }
+
+    fn is_at_cap(self, config: &RuntimeConfig) -> bool {
+        self.remaining_actions_before_cap(config) == 0
+    }
+
+    fn record_executed_action(&mut self) {
+        self.executed_action_count = self.executed_action_count.saturating_add(1);
+    }
+
+    fn as_contract_state(
+        self,
+        config: &RuntimeConfig,
+    ) -> contracts::ForegroundGovernedActionLoopState {
+        contracts::ForegroundGovernedActionLoopState {
+            executed_action_count: self.executed_action_count,
+            max_actions_per_turn: self.max_actions_per_turn(config),
+            remaining_actions_before_cap: self.remaining_actions_before_cap(config),
+            cap_exceeded_behavior: config.governed_actions.cap_exceeded_behavior,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConsciousTurnLoopOutcome {
+    response: contracts::WorkerResponse,
+    result: contracts::ConsciousWorkerResult,
+    governed_action_summary: GovernedActionProcessingSummary,
+}
+
+#[derive(Debug)]
+struct GovernedActionApprovalRoute<'a> {
+    trigger: &'a contracts::ForegroundTrigger,
+    proposal: &'a contracts::GovernedActionProposal,
+    record: &'a governed_actions::GovernedActionExecutionRecord,
+    approval_title: &'a str,
+    approval_consequence_summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct ConsciousTurnLoopRequest<'a, T> {
+    pool: &'a sqlx::PgPool,
+    config: &'a RuntimeConfig,
+    model_gateway_config: &'a ResolvedModelGatewayConfig,
+    trigger: &'a contracts::ForegroundTrigger,
+    context: contracts::ConsciousContext,
+    initial_executed_action_count: u32,
+    transport: &'a T,
+    chat_id: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,36 +627,26 @@ where
                 )
                 .await?;
                 assembly.context.governed_action_observations = vec![executed.observation.clone()];
-
-                let follow_up_request = contracts::WorkerRequest::conscious(
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    assembly.context.clone(),
-                );
-                let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
-                let follow_up_response = launch_leased_conscious_worker(
-                    pool,
-                    config,
-                    model_gateway_config,
-                    &trigger,
-                    &follow_up_request,
-                    transport,
-                    foreground_timeout_ms,
+                let turn_outcome = execute_conscious_turn_with_governed_action_loop(
+                    ConsciousTurnLoopRequest {
+                        pool,
+                        config,
+                        model_gateway_config,
+                        trigger: &trigger,
+                        context: assembly.context.clone(),
+                        initial_executed_action_count: 1,
+                        transport,
+                        chat_id,
+                    },
+                    delivery,
                 )
                 .await?;
-
-                let contracts::WorkerResult::Conscious(follow_up_conscious_result) =
-                    &follow_up_response.result
-                else {
-                    bail!("conscious approval follow-up worker returned a non-conscious result");
-                };
                 let persisted_follow_up_text = approval_follow_up_episode_text(
-                    &executed.observation,
-                    &follow_up_conscious_result.assistant_output.text,
+                    &turn_outcome.governed_action_summary.observations,
+                    &turn_outcome.result.assistant_output.text,
                 );
-                let delivered_follow_up_text = approval_follow_up_delivery_text(
-                    &follow_up_conscious_result.assistant_output.text,
-                );
+                let delivered_follow_up_text =
+                    approval_follow_up_delivery_text(&turn_outcome.result.assistant_output.text);
 
                 let follow_up_message_id = Uuid::now_v7();
                 foreground::insert_episode_message(
@@ -586,7 +658,7 @@ where
                         execution_id: trigger.execution_id,
                         message_order: 0,
                         message_role: "assistant".to_string(),
-                        channel_kind: follow_up_conscious_result.assistant_output.channel_kind,
+                        channel_kind: turn_outcome.result.assistant_output.channel_kind,
                         text_body: Some(persisted_follow_up_text.clone()),
                         external_message_id: None,
                     },
@@ -605,7 +677,7 @@ where
                     },
                     "foreground_orchestration",
                     None,
-                    &follow_up_conscious_result.candidate_proposals,
+                    &turn_outcome.result.candidate_proposals,
                 )
                 .await?;
 
@@ -1028,24 +1100,22 @@ where
         .await;
     }
 
-    let request = contracts::WorkerRequest::conscious(
-        trigger.trace_id,
-        trigger.execution_id,
-        assembly.context.clone(),
-    );
-    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
-    let initial_response = match launch_leased_conscious_worker(
-        pool,
-        config,
-        model_gateway_config,
-        &trigger,
-        &request,
-        transport,
-        foreground_timeout_ms,
+    let turn_outcome = match execute_conscious_turn_with_governed_action_loop(
+        ConsciousTurnLoopRequest {
+            pool,
+            config,
+            model_gateway_config,
+            trigger: &trigger,
+            context: assembly.context.clone(),
+            initial_executed_action_count: 0,
+            transport,
+            chat_id,
+        },
+        delivery,
     )
     .await
     {
-        Ok(response) => response,
+        Ok(outcome) => outcome,
         Err(error) => {
             record_and_deliver_foreground_failure(
                 pool,
@@ -1062,121 +1132,9 @@ where
             return Err(error);
         }
     };
-
-    let contracts::WorkerResult::Conscious(initial_result) = &initial_response.result else {
-        let message = "conscious worker returned a non-conscious result".to_string();
-        record_and_deliver_foreground_failure(
-            pool,
-            foreground_failure_context(
-                &trigger,
-                recorded_episode_id,
-                ForegroundFailureKind::WorkerProtocolFailure,
-            ),
-            &message,
-            delivery,
-            failure_delivery_target,
-        )
-        .await?;
-        bail!(message);
-    };
-
-    let governed_action_summary = match process_governed_action_proposals(
-        pool,
-        config,
-        &trigger,
-        &initial_result.governed_action_proposals,
-        delivery,
-    )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            return record_deliver_and_return_failure(
-                pool,
-                foreground_failure_context(
-                    &trigger,
-                    recorded_episode_id,
-                    ForegroundFailureKind::PersistenceFailure,
-                ),
-                error,
-                delivery,
-                failure_delivery_target,
-            )
-            .await;
-        }
-    };
-
-    let (response, result) = if !governed_action_summary.observations.is_empty()
-        && governed_action_summary.pending_approval_count == 0
-    {
-        emit_typing_chat_action(
-            delivery,
-            chat_id,
-            trigger.trace_id,
-            trigger.execution_id,
-            "foreground_follow_up",
-        )
-        .await;
-        let mut follow_up_context = assembly.context.clone();
-        follow_up_context.governed_action_observations =
-            governed_action_summary.observations.clone();
-        let follow_up_request = contracts::WorkerRequest::conscious(
-            trigger.trace_id,
-            trigger.execution_id,
-            follow_up_context,
-        );
-        let follow_up_response = match launch_leased_conscious_worker(
-            pool,
-            config,
-            model_gateway_config,
-            &trigger,
-            &follow_up_request,
-            transport,
-            foreground_timeout_ms,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                record_and_deliver_foreground_failure(
-                    pool,
-                    foreground_failure_context(
-                        &trigger,
-                        recorded_episode_id,
-                        classify_conscious_worker_failure(&error),
-                    ),
-                    &format_error_chain(&error),
-                    delivery,
-                    failure_delivery_target,
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        let follow_up_result = match &follow_up_response.result {
-            contracts::WorkerResult::Conscious(result) => result.clone(),
-            _ => {
-                let message =
-                    "conscious follow-up worker returned a non-conscious result".to_string();
-                record_and_deliver_foreground_failure(
-                    pool,
-                    foreground_failure_context(
-                        &trigger,
-                        recorded_episode_id,
-                        ForegroundFailureKind::WorkerProtocolFailure,
-                    ),
-                    &message,
-                    delivery,
-                    failure_delivery_target,
-                )
-                .await?;
-                bail!(message);
-            }
-        };
-        (follow_up_response, follow_up_result)
-    } else {
-        (initial_response.clone(), initial_result.clone())
-    };
+    let response = turn_outcome.response;
+    let result = turn_outcome.result;
+    let governed_action_summary = turn_outcome.governed_action_summary;
 
     let candidate_proposals =
         foreground_candidate_proposals(&assembly.context, &trigger, &result.candidate_proposals);
@@ -1460,6 +1418,7 @@ async fn process_governed_action_proposals<D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
     trigger: &contracts::ForegroundTrigger,
+    action_loop_tracker: &mut ForegroundActionLoopTracker,
     proposals: &[contracts::GovernedActionProposal],
     delivery: &mut D,
 ) -> Result<GovernedActionProcessingSummary>
@@ -1496,70 +1455,124 @@ where
                     });
             }
             governed_actions::GovernedActionPlanningOutcome::Planned(planned) => {
-                if planned.requires_approval {
-                    let approval_request =
-                        match approval::get_pending_approval_request_by_fingerprint(
-                            pool,
-                            &planned.record.action_fingerprint,
-                        )
-                        .await?
-                        {
-                            Some(existing) => existing,
-                            None => {
-                                approval::create_approval_request(
-                                    config,
+                let mut approval_title = proposal.title.clone();
+                let mut approval_consequence_summary = consequence_summary_for_proposal(proposal);
+                let mut requires_approval = planned.requires_approval;
+
+                if action_loop_tracker.is_at_cap(config) {
+                    let limit_summary =
+                        foreground_action_limit_summary(config, *action_loop_tracker);
+                    match config.governed_actions.cap_exceeded_behavior {
+                        contracts::GovernedActionCapExceededBehavior::AlwaysApprove => {
+                            governed_actions::write_governed_action_audit_event(
+                                pool,
+                                &planned.record,
+                                "governed_action_cap_auto_approved",
+                                "info",
+                                foreground_action_limit_payload(config, *action_loop_tracker),
+                            )
+                            .await?;
+                        }
+                        contracts::GovernedActionCapExceededBehavior::AlwaysDeny => {
+                            let blocked_record =
+                                governed_actions::update_governed_action_execution(
                                     pool,
-                                    &approval::NewApprovalRequestRecord {
-                                        approval_request_id: Uuid::now_v7(),
-                                        trace_id: trigger.trace_id,
-                                        execution_id: Some(trigger.execution_id),
-                                        action_proposal_id: planned.record.action_proposal_id,
-                                        action_fingerprint: planned
+                                    governed_actions::GovernedActionExecutionUpdate {
+                                        governed_action_execution_id: planned
                                             .record
-                                            .action_fingerprint
-                                            .clone(),
-                                        action_kind: planned.record.action_kind,
-                                        risk_tier: planned.record.risk_tier,
-                                        title: proposal.title.clone(),
-                                        consequence_summary: consequence_summary_for_proposal(
-                                            proposal,
-                                        ),
-                                        capability_scope: proposal.capability_scope.clone(),
-                                        requested_by: format!(
-                                            "telegram:{}",
-                                            trigger.ingress.internal_principal_ref
-                                        ),
-                                        token: Uuid::now_v7().to_string(),
-                                        requested_at: trigger.received_at,
-                                        expires_at: trigger.received_at
-                                            + chrono::Duration::seconds(
-                                                i64::try_from(config.approvals.default_ttl_seconds)
-                                                    .context("approval TTL exceeded i64 range")?,
-                                            ),
+                                            .governed_action_execution_id,
+                                        status: contracts::GovernedActionStatus::Blocked,
+                                        execution_id: None,
+                                        output_ref: None,
+                                        blocked_reason: Some(&limit_summary),
+                                        approval_request_id: None,
+                                        started_at: None,
+                                        completed_at: None,
                                     },
                                 )
-                                .await?
+                                .await?;
+                            governed_actions::write_governed_action_audit_event(
+                                pool,
+                                &blocked_record,
+                                "governed_action_blocked",
+                                "warn",
+                                json!({
+                                    "phase": "foreground_action_limit",
+                                    "reason": limit_summary,
+                                    "limit": foreground_action_limit_payload(
+                                        config,
+                                        *action_loop_tracker,
+                                    ),
+                                }),
+                            )
+                            .await?;
+                            summary.blocked_count += 1;
+                            summary.action_limit_reached = true;
+                            summary
+                                .observations
+                                .push(contracts::GovernedActionObservation {
+                                    observation_id: Uuid::now_v7(),
+                                    action_kind: blocked_record.action_kind,
+                                    outcome: contracts::GovernedActionExecutionOutcome {
+                                        status: contracts::GovernedActionStatus::Blocked,
+                                        summary: limit_summary,
+                                        fingerprint: Some(
+                                            blocked_record.action_fingerprint.clone(),
+                                        ),
+                                        output_ref: blocked_record.output_ref.clone(),
+                                    },
+                                });
+                            continue;
+                        }
+                        contracts::GovernedActionCapExceededBehavior::Escalate => {
+                            if !requires_approval {
+                                let approval_record =
+                                    governed_actions::update_governed_action_execution(
+                                        pool,
+                                        governed_actions::GovernedActionExecutionUpdate {
+                                            governed_action_execution_id: planned
+                                                .record
+                                                .governed_action_execution_id,
+                                            status:
+                                                contracts::GovernedActionStatus::AwaitingApproval,
+                                            execution_id: None,
+                                            output_ref: None,
+                                            blocked_reason: None,
+                                            approval_request_id: None,
+                                            started_at: None,
+                                            completed_at: None,
+                                        },
+                                    )
+                                    .await?;
+                                governed_actions::write_governed_action_audit_event(
+                                    pool,
+                                    &approval_record,
+                                    "governed_action_cap_escalated",
+                                    "info",
+                                    foreground_action_limit_payload(config, *action_loop_tracker),
+                                )
+                                .await?;
                             }
-                        };
-                    governed_actions::attach_approval_request(
+                            requires_approval = true;
+                            approval_title =
+                                format!("Continue after action limit: {}", proposal.title);
+                            approval_consequence_summary =
+                                format!("{}. {}", limit_summary, approval_consequence_summary);
+                        }
+                    }
+                }
+
+                if requires_approval {
+                    route_governed_action_for_approval(
                         pool,
-                        planned.record.governed_action_execution_id,
-                        approval_request.approval_request_id,
-                    )
-                    .await?;
-                    recovery::recover_approval_request_transition(
-                        pool,
-                        &approval_request,
-                        recovery::RecoveryApprovalState::Pending,
-                        Utc::now(),
-                        "approval_transition_pending",
-                    )
-                    .await
-                    .context("failed to route pending approval transition through recovery")?;
-                    deliver_telegram_approval_prompt(
-                        config.approvals.prompt_mode,
-                        &trigger.ingress,
-                        &approval_request,
+                        config,
+                        GovernedActionApprovalRoute {
+                            trigger,
+                            proposal,
+                            record: &planned.record,
+                            approval_title: &approval_title,
+                            approval_consequence_summary: &approval_consequence_summary,
+                        },
                         delivery,
                     )
                     .await?;
@@ -1572,6 +1585,7 @@ where
                         summary.blocked_count += 1;
                     } else {
                         summary.executed_count += 1;
+                        action_loop_tracker.record_executed_action();
                     }
                     summary.observations.push(executed.observation);
                 }
@@ -1580,6 +1594,195 @@ where
     }
 
     Ok(summary)
+}
+
+async fn route_governed_action_for_approval<D>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    route: GovernedActionApprovalRoute<'_>,
+    delivery: &mut D,
+) -> Result<()>
+where
+    D: TelegramDelivery,
+{
+    let approval_request = match approval::get_pending_approval_request_by_fingerprint(
+        pool,
+        &route.record.action_fingerprint,
+    )
+    .await?
+    {
+        Some(existing) => existing,
+        None => {
+            approval::create_approval_request(
+                config,
+                pool,
+                &approval::NewApprovalRequestRecord {
+                    approval_request_id: Uuid::now_v7(),
+                    trace_id: route.trigger.trace_id,
+                    execution_id: Some(route.trigger.execution_id),
+                    action_proposal_id: route.record.action_proposal_id,
+                    action_fingerprint: route.record.action_fingerprint.clone(),
+                    action_kind: route.record.action_kind,
+                    risk_tier: route.record.risk_tier,
+                    title: route.approval_title.to_string(),
+                    consequence_summary: route.approval_consequence_summary.to_string(),
+                    capability_scope: route.proposal.capability_scope.clone(),
+                    requested_by: format!(
+                        "telegram:{}",
+                        route.trigger.ingress.internal_principal_ref
+                    ),
+                    token: Uuid::now_v7().to_string(),
+                    requested_at: route.trigger.received_at,
+                    expires_at: route.trigger.received_at
+                        + chrono::Duration::seconds(
+                            i64::try_from(config.approvals.default_ttl_seconds)
+                                .context("approval TTL exceeded i64 range")?,
+                        ),
+                },
+            )
+            .await?
+        }
+    };
+    governed_actions::attach_approval_request(
+        pool,
+        route.record.governed_action_execution_id,
+        approval_request.approval_request_id,
+    )
+    .await?;
+    recovery::recover_approval_request_transition(
+        pool,
+        &approval_request,
+        recovery::RecoveryApprovalState::Pending,
+        Utc::now(),
+        "approval_transition_pending",
+    )
+    .await
+    .context("failed to route pending approval transition through recovery")?;
+    deliver_telegram_approval_prompt(
+        config.approvals.prompt_mode,
+        &route.trigger.ingress,
+        &approval_request,
+        delivery,
+    )
+    .await?;
+    Ok(())
+}
+
+fn foreground_action_limit_summary(
+    config: &RuntimeConfig,
+    action_loop_tracker: ForegroundActionLoopTracker,
+) -> String {
+    format!(
+        "foreground governed-action limit reached: {} action(s) already executed in this turn; configured maximum is {}",
+        action_loop_tracker.executed_action_count,
+        config.governed_actions.max_actions_per_foreground_turn
+    )
+}
+
+fn foreground_action_limit_payload(
+    config: &RuntimeConfig,
+    action_loop_tracker: ForegroundActionLoopTracker,
+) -> serde_json::Value {
+    json!({
+        "executed_action_count": action_loop_tracker.executed_action_count,
+        "max_actions_per_turn": config.governed_actions.max_actions_per_foreground_turn,
+        "remaining_actions_before_cap": action_loop_tracker.remaining_actions_before_cap(config),
+        "cap_exceeded_behavior": match config.governed_actions.cap_exceeded_behavior {
+            contracts::GovernedActionCapExceededBehavior::Escalate => "escalate",
+            contracts::GovernedActionCapExceededBehavior::AlwaysApprove => "always_approve",
+            contracts::GovernedActionCapExceededBehavior::AlwaysDeny => "always_deny",
+        },
+    })
+}
+
+async fn execute_conscious_turn_with_governed_action_loop<T, D>(
+    request: ConsciousTurnLoopRequest<'_, T>,
+    delivery: &mut D,
+) -> Result<ConsciousTurnLoopOutcome>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let ConsciousTurnLoopRequest {
+        pool,
+        config,
+        model_gateway_config,
+        trigger,
+        mut context,
+        initial_executed_action_count,
+        transport,
+        chat_id,
+    } = request;
+    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+    let max_worker_passes = config
+        .governed_actions
+        .max_actions_per_foreground_turn
+        .saturating_add(2);
+    let mut action_loop_tracker = ForegroundActionLoopTracker::new(initial_executed_action_count);
+    let mut governed_action_summary = GovernedActionProcessingSummary::default();
+    let mut limit_follow_up_consumed = false;
+    let mut worker_pass_count = 0u32;
+
+    loop {
+        if worker_pass_count > 0 {
+            emit_typing_chat_action(
+                delivery,
+                chat_id,
+                trigger.trace_id,
+                trigger.execution_id,
+                "foreground_follow_up",
+            )
+            .await;
+        }
+        worker_pass_count = worker_pass_count.saturating_add(1);
+        context.governed_action_loop_state = Some(action_loop_tracker.as_contract_state(config));
+        let request_context = context.clone();
+        let request = contracts::WorkerRequest::conscious(
+            trigger.trace_id,
+            trigger.execution_id,
+            request_context.clone(),
+        );
+        let response = launch_leased_conscious_worker(
+            pool,
+            config,
+            model_gateway_config,
+            trigger,
+            &request,
+            transport,
+            foreground_timeout_ms,
+        )
+        .await?;
+        let contracts::WorkerResult::Conscious(result) = &response.result else {
+            bail!("conscious follow-up worker returned a non-conscious result");
+        };
+        let round_summary = process_governed_action_proposals(
+            pool,
+            config,
+            trigger,
+            &mut action_loop_tracker,
+            &result.governed_action_proposals,
+            delivery,
+        )
+        .await?;
+        let should_continue = !round_summary.observations.is_empty()
+            && round_summary.pending_approval_count == 0
+            && worker_pass_count < max_worker_passes
+            && (!round_summary.action_limit_reached || !limit_follow_up_consumed);
+        if round_summary.action_limit_reached {
+            limit_follow_up_consumed = true;
+        }
+        governed_action_summary.merge(round_summary);
+        let result = result.clone();
+        if !should_continue {
+            return Ok(ConsciousTurnLoopOutcome {
+                response,
+                result,
+                governed_action_summary,
+            });
+        }
+        context = request_context;
+        context.governed_action_observations = governed_action_summary.observations.clone();
+    }
 }
 
 fn consequence_summary_for_proposal(proposal: &contracts::GovernedActionProposal) -> String {
@@ -2113,14 +2316,25 @@ fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) 
 }
 
 fn approval_follow_up_episode_text(
-    observation: &contracts::GovernedActionObservation,
+    observations: &[contracts::GovernedActionObservation],
     model_text: &str,
 ) -> String {
-    let observation_text = format!(
-        "Harness governed-action observation: {}:{}",
-        governed_action_kind_label(observation.action_kind),
-        observation.outcome.summary
-    );
+    let observation_text = if observations.is_empty() {
+        "Harness governed-action observation: approved action completed.".to_string()
+    } else {
+        let joined = observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{}:{}",
+                    governed_action_kind_label(observation.action_kind),
+                    observation.outcome.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("Harness governed-action observations: {joined}")
+    };
     let trimmed_model_text = model_text.trim();
     if trimmed_model_text.is_empty() {
         observation_text
@@ -2172,6 +2386,15 @@ fn foreground_assistant_delivery_text(
                 governed_action_summary.pending_approval_count
             )
         };
+    }
+
+    if let Some(blocked_observation) = governed_action_summary
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.outcome.status == contracts::GovernedActionStatus::Blocked)
+    {
+        return blocked_observation.outcome.summary.clone();
     }
 
     if let Some(identity_fallback) =
@@ -2582,11 +2805,13 @@ mod tests {
             },
         };
 
-        let stored =
-            approval_follow_up_episode_text(&observation, "I found the page. Let me summarize it.");
+        let stored = approval_follow_up_episode_text(
+            &[observation],
+            "I found the page. Let me summarize it.",
+        );
 
         assert!(stored.starts_with("I found the page. Let me summarize it."));
-        assert!(stored.contains("Harness governed-action observation: web_fetch:"));
+        assert!(stored.contains("Harness governed-action observations: web_fetch:"));
     }
 
     #[test]
@@ -2830,6 +3055,7 @@ mod tests {
             recent_history: Vec::new(),
             retrieved_context: contracts::RetrievedContext::default(),
             governed_action_observations: Vec::new(),
+            governed_action_loop_state: None,
             recovery_context: contracts::ForegroundRecoveryContext::default(),
         }
     }

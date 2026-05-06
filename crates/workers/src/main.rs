@@ -568,11 +568,22 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
     }
 
     if !context.governed_action_observations.is_empty() {
+        let loop_state_fragment = context
+            .governed_action_loop_state
+            .as_ref()
+            .map(|state| {
+                format!(
+                    " Foreground action loop state: {}.",
+                    governed_action_loop_state_summary(state)
+                )
+            })
+            .unwrap_or_default();
         messages.push(ModelInputMessage {
             role: ModelMessageRole::Developer,
             content: format!(
-                "Harness governed-action observations: {}. Continue the foreground turn using these outcomes. This immediate follow-up cannot execute another governed action; if another fetch or command is still required, say exactly what is missing and ask the user to request it in the next turn. Do not claim that you will perform another action now.",
-                governed_action_observation_summary(&context.governed_action_observations)
+                "Harness governed-action observations: {}.{} Continue the foreground turn using these outcomes. If another governed action is still needed, propose it in the same turn and let the harness decide whether it is allowed, approval-gated, or denied based on policy, the configured per-turn action limit, and the remaining loop budget. Do not claim that any follow-up action already happened unless it appears in the harness observations.",
+                governed_action_observation_summary(&context.governed_action_observations),
+                loop_state_fragment,
             ),
         });
     } else {
@@ -880,6 +891,22 @@ fn governed_action_observation_summary(observations: &[GovernedActionObservation
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn governed_action_loop_state_summary(
+    state: &contracts::ForegroundGovernedActionLoopState,
+) -> String {
+    format!(
+        "executed_actions={}; remaining_before_cap={}; max_actions_per_turn={}; cap_exceeded_behavior={}",
+        state.executed_action_count,
+        state.remaining_actions_before_cap,
+        state.max_actions_per_turn,
+        match state.cap_exceeded_behavior {
+            contracts::GovernedActionCapExceededBehavior::Escalate => "escalate",
+            contracts::GovernedActionCapExceededBehavior::AlwaysApprove => "always_approve",
+            contracts::GovernedActionCapExceededBehavior::AlwaysDeny => "always_deny",
+        }
+    )
 }
 
 fn build_governed_action_proposals(
@@ -2084,7 +2111,8 @@ mod tests {
             .find(|message| message.content.contains("TROUBLESHOOTING CAPABILITY"))
             .expect("troubleshooting guidance should be disclosed for error intent");
 
-        assert!(troubleshooting_message.content.contains("admin trace show"));
+        assert!(troubleshooting_message.content.contains("run_diagnostic"));
+        assert!(troubleshooting_message.content.contains("`trace_show`"));
         assert!(
             troubleshooting_message
                 .content
@@ -2137,17 +2165,17 @@ mod tests {
         assert!(
             developer_message
                 .content
-                .contains("cannot execute another governed action")
+                .contains("propose it in the same turn")
         );
         assert!(
             developer_message
                 .content
-                .contains("Do not claim that you will perform another action now")
+                .contains("let the harness decide whether it is allowed")
         );
         assert!(
-            !developer_message
+            developer_message
                 .content
-                .contains(GOVERNED_ACTIONS_BLOCK_TAG)
+                .contains("Foreground action loop state:")
         );
     }
 
@@ -2884,6 +2912,12 @@ mod tests {
             }],
             retrieved_context: contracts::RetrievedContext::default(),
             governed_action_observations: Vec::new(),
+            governed_action_loop_state: Some(contracts::ForegroundGovernedActionLoopState {
+                executed_action_count: 0,
+                max_actions_per_turn: 10,
+                remaining_actions_before_cap: 10,
+                cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
+            }),
             recovery_context: contracts::ForegroundRecoveryContext::default(),
         }
     }

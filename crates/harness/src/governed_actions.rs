@@ -11,8 +11,7 @@ use contracts::{
     ListWorkspaceScriptsAction, NetworkAccessPosture, RequestBackgroundJobAction,
     RunDiagnosticAction, SubprocessAction, UpdateWorkspaceArtifactAction,
     UpsertScheduledForegroundTaskAction, WebFetchAction, WorkspaceArtifactKind,
-    WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
-    WorkspaceScriptRunStatus,
+    WorkspaceArtifactStatusFilter, WorkspaceScriptAction, WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -38,7 +37,6 @@ use crate::{
 
 const WEB_FETCH_OBSERVATION_PREVIEW_CHARS: usize = 1_500;
 const WORKSPACE_OBSERVATION_PREVIEW_CHARS: usize = 2_000;
-const DIAGNOSTIC_OBSERVATION_PREVIEW_CHARS: usize = 4_000;
 const GOVERNED_ACTION_LIST_LIMIT_MAX: u32 = 25;
 
 #[derive(Debug, Clone)]
@@ -396,6 +394,47 @@ pub async fn list_governed_action_executions(
         .await
         .context("failed to list governed action executions")?
     };
+
+    rows.into_iter()
+        .map(decode_governed_action_execution_row)
+        .collect()
+}
+
+pub async fn list_governed_action_executions_by_execution_id(
+    pool: &PgPool,
+    execution_id: Uuid,
+) -> Result<Vec<GovernedActionExecutionRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_proposal_id,
+            action_fingerprint,
+            action_kind,
+            risk_tier,
+            status,
+            capability_scope_json,
+            payload_json,
+            workspace_script_id,
+            workspace_script_version_id,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at,
+            created_at,
+            updated_at
+        FROM governed_action_executions
+        WHERE execution_id = $1
+        ORDER BY created_at ASC, governed_action_execution_id ASC
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to list governed action executions by execution id")?;
 
     rows.into_iter()
         .map(decode_governed_action_execution_row)
@@ -3567,6 +3606,8 @@ mod tests {
                 approval_required_min_risk_tier: GovernedActionRiskTier::Tier2,
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
+                max_actions_per_foreground_turn: 10,
+                cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: NetworkAccessPosture::Disabled,
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],

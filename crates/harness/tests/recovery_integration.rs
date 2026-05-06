@@ -565,6 +565,7 @@ async fn foreground_stale_processing_routes_through_crash_recovery() -> Result<(
             recovery::ForegroundRestartRecoveryRequest {
                 trace_id,
                 execution_id,
+                interrupted_execution_id: None,
                 internal_conversation_ref: "telegram-primary",
                 recovery_reason_code: RecoveryReasonCode::Crash,
                 trigger_source: "telegram_foreground_processing_loop",
@@ -596,6 +597,10 @@ async fn foreground_stale_processing_routes_through_crash_recovery() -> Result<(
             outcome.checkpoint.checkpoint_payload["decision_reason"],
             json!("stale_processing_resume")
         );
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["prior_governed_action_count"],
+            json!(0)
+        );
 
         Ok(())
     })
@@ -626,6 +631,7 @@ async fn foreground_recovery_scan_routes_through_supervisor_restart_recovery() -
             recovery::ForegroundRestartRecoveryRequest {
                 trace_id,
                 execution_id,
+                interrupted_execution_id: None,
                 internal_conversation_ref: "telegram-primary",
                 recovery_reason_code: RecoveryReasonCode::SupervisorRestart,
                 trigger_source: "telegram_foreground_recovery_scan",
@@ -650,6 +656,100 @@ async fn foreground_recovery_scan_routes_through_supervisor_restart_recovery() -
         assert_eq!(
             outcome.checkpoint.checkpoint_payload["source"],
             json!("telegram_foreground_recovery_scan")
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_recovery_blocks_replay_when_prior_governed_action_is_nonrepeatable()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let interrupted_execution_id = Uuid::now_v7();
+        let interrupted_trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id: interrupted_execution_id,
+                trace_id: interrupted_trace_id,
+                trigger_kind: "recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({
+                    "test": "foreground_recovery_blocks_replay_when_prior_governed_action_is_nonrepeatable"
+                }),
+            },
+        )
+        .await?;
+
+        let planned = plan_governed_action_for_recovery_with_execution(
+            &ctx.config,
+            &ctx.pool,
+            false,
+            Some(interrupted_execution_id),
+        )
+        .await?;
+        assert_eq!(planned.record.execution_id, Some(interrupted_execution_id));
+
+        let recovery_execution_id = Uuid::now_v7();
+        let recovery_trace_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &NewExecutionRecord {
+                execution_id: recovery_execution_id,
+                trace_id: recovery_trace_id,
+                trigger_kind: "recovery_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: json!({
+                    "test": "foreground_recovery_blocks_replay_when_prior_governed_action_is_nonrepeatable_attempt"
+                }),
+            },
+        )
+        .await?;
+
+        let outcome = recovery::recover_foreground_restart_trigger(
+            &ctx.pool,
+            recovery::ForegroundRestartRecoveryRequest {
+                trace_id: recovery_trace_id,
+                execution_id: recovery_execution_id,
+                interrupted_execution_id: Some(interrupted_execution_id),
+                internal_conversation_ref: "telegram-primary",
+                recovery_reason_code: RecoveryReasonCode::Crash,
+                trigger_source: "telegram_foreground_processing_loop",
+                decision_reason: "stale_processing_resume",
+                selected_ingress_ids: &[Uuid::now_v7()],
+                primary_ingress_id: Uuid::now_v7(),
+                recovery_mode: "backlog_recovery",
+            },
+            Utc::now(),
+        )
+        .await?;
+
+        assert_eq!(outcome.decision.decision, RecoveryDecision::Abandon);
+        assert_eq!(outcome.checkpoint.status, RecoveryCheckpointStatus::Abandoned);
+        assert_eq!(
+            outcome.checkpoint.recovery_decision,
+            Some(RecoveryDecision::Abandon)
+        );
+        assert_eq!(
+            outcome.diagnostic.reason_code,
+            "foreground_processing_crash_replay_blocked"
+        );
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["inspected_execution_id"],
+            json!(interrupted_execution_id)
+        );
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["prior_governed_action_count"],
+            json!(1)
+        );
+        assert_eq!(
+            outcome.checkpoint.checkpoint_payload["prior_governed_actions"][0]["action_kind"],
+            json!("run_subprocess")
         );
 
         Ok(())
@@ -1049,6 +1149,15 @@ async fn plan_governed_action_for_recovery(
     pool: &sqlx::PgPool,
     approval_required: bool,
 ) -> Result<governed_actions::PlannedGovernedAction> {
+    plan_governed_action_for_recovery_with_execution(config, pool, approval_required, None).await
+}
+
+async fn plan_governed_action_for_recovery_with_execution(
+    config: &harness::config::RuntimeConfig,
+    pool: &sqlx::PgPool,
+    approval_required: bool,
+    execution_id: Option<Uuid>,
+) -> Result<governed_actions::PlannedGovernedAction> {
     let proposal = GovernedActionProposal {
         proposal_id: Uuid::now_v7(),
         title: if approval_required {
@@ -1091,7 +1200,7 @@ async fn plan_governed_action_for_recovery(
         &governed_actions::GovernedActionPlanningRequest {
             governed_action_execution_id: Uuid::now_v7(),
             trace_id: Uuid::now_v7(),
-            execution_id: None,
+            execution_id,
             proposal,
         },
     )

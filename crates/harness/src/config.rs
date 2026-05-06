@@ -4,7 +4,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use contracts::{GovernedActionRiskTier, ModelProviderKind, NetworkAccessPosture};
+use contracts::{
+    GovernedActionCapExceededBehavior, GovernedActionRiskTier, ModelProviderKind,
+    NetworkAccessPosture,
+};
 use serde::Deserialize;
 use toml::Value as TomlValue;
 
@@ -147,6 +150,8 @@ pub struct GovernedActionsConfig {
     pub approval_required_min_risk_tier: GovernedActionRiskTier,
     pub default_subprocess_timeout_ms: u64,
     pub max_subprocess_timeout_ms: u64,
+    pub max_actions_per_foreground_turn: u32,
+    pub cap_exceeded_behavior: GovernedActionCapExceededBehavior,
     pub max_filesystem_roots_per_action: u32,
     pub default_network_access: NetworkAccessPosture,
     pub allowlisted_environment_variables: Vec<String>,
@@ -620,6 +625,9 @@ impl GovernedActionsConfig {
                 "governed_actions.default_subprocess_timeout_ms must not exceed governed_actions.max_subprocess_timeout_ms"
             );
         }
+        if self.max_actions_per_foreground_turn == 0 {
+            bail!("governed_actions.max_actions_per_foreground_turn must be greater than zero");
+        }
         if self.max_filesystem_roots_per_action == 0 {
             bail!("governed_actions.max_filesystem_roots_per_action must be greater than zero");
         }
@@ -1049,6 +1057,8 @@ mod tests {
                 approval_required_min_risk_tier: GovernedActionRiskTier::Tier2,
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
+                max_actions_per_foreground_turn: 10,
+                cap_exceeded_behavior: GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: NetworkAccessPosture::Disabled,
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
@@ -1163,6 +1173,8 @@ prompt_mode = "inline_keyboard_with_fallback"
 approval_required_min_risk_tier = "tier_2"
 default_subprocess_timeout_ms = 30000
 max_subprocess_timeout_ms = 120000
+max_actions_per_foreground_turn = 10
+cap_exceeded_behavior = "escalate"
 max_filesystem_roots_per_action = 4
 default_network_access = "disabled"
 allowlisted_environment_variables = ["BLUE_LAGOON_DATABASE_URL"]
@@ -1239,6 +1251,18 @@ args = []
             error
                 .to_string()
                 .contains("approval_required_min_risk_tier")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_actions_per_foreground_turn() {
+        let mut config = sample_config();
+        config.governed_actions.max_actions_per_foreground_turn = 0;
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("max_actions_per_foreground_turn")
         );
     }
 

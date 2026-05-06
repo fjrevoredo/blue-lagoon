@@ -236,6 +236,7 @@ pub struct PendingForegroundExecutionOptions {
 pub struct PendingForegroundExecutionPlan {
     pub mode: ForegroundExecutionMode,
     pub primary_ingress: IngressEventRecord,
+    pub interrupted_execution_id: Option<Uuid>,
     pub ordered_ingress: Vec<OrderedIngressReference>,
     pub decision_reason: ForegroundExecutionDecisionReason,
 }
@@ -998,6 +999,10 @@ pub async fn plan_pending_foreground_execution(
             text_body: ingress.text_body.clone(),
         })
         .collect::<Vec<_>>();
+    let interrupted_execution_id = selected
+        .iter()
+        .find(|ingress| ingress.foreground_status == "processing")
+        .and_then(|ingress| ingress.execution_id);
 
     for (index, ingress) in selected.iter().enumerate() {
         mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
@@ -1078,6 +1083,7 @@ pub async fn plan_pending_foreground_execution(
     Ok(Some(PendingForegroundExecutionPlan {
         mode: decision.mode,
         primary_ingress,
+        interrupted_execution_id,
         ordered_ingress,
         decision_reason: decision.reason,
     }))
