@@ -81,6 +81,8 @@ timeout_ms = 10000
 # The harness now requires either:
 # - a packaged sibling `workers` binary next to the runtime binary, or
 # - an explicit worker command supplied here or through BLUE_LAGOON_WORKER_COMMAND.
+# If the explicit command points at the `workers` multiplexer binary and args are
+# empty, the harness appends the required per-worker subcommand automatically.
 # BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
 # worker.timeout_ms remains the generic worker timeout. Live Telegram foreground
 # derives its conscious worker timeout from harness.default_wall_clock_budget_ms

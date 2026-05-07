@@ -1867,6 +1867,7 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
 }
 
 #[tokio::test]
+#[serial]
 async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> Result<()> {
     support::with_clean_database(|_ctx| async move {
         let mut config = _ctx.config.clone();
@@ -1922,7 +1923,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
         });
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
-        config.worker.args = vec!["conscious-worker".to_string()];
+        config.worker.args = Vec::new();
 
         let update =
             telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?

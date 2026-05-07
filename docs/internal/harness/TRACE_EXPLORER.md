@@ -31,7 +31,7 @@ they need causal-graph inspection.
 | `crates/harness/src/management.rs` | `TraceReport` (line 398), `TraceFailureClass` (line 482), `TraceDiagnosisSummary` (line 542), `TraceExplanationReport` (line 584), `load_trace_report()` (line 2165), `diagnose_trace_report()` (line 2201), `classify_failure_text()` (line 3719), `derive_next_steps()` (line 3913), `trace_failure_class_label()` (line 4049) |
 | `crates/harness/src/model_calls.rs` | `ModelCallRecord` (line 16), `insert_pending_model_call_record()` (line 41), `clear_expired_model_call_payloads()` (line 258), `background_job_run_for_execution()` (line 312) |
 | `crates/harness/src/causal_links.rs` | `NewCausalLink` (line 8), `insert()` (line 31), `list_for_trace()` (line 69) |
-| `crates/harness/src/worker.rs` | `launch_conscious_worker_with_timeout()` (line 136), `launch_unconscious_worker_with_timeout()` (line 344), `collect_worker_protocol_failure_context()` (line 620), `stderr_excerpt()` (line 645) |
+| `crates/harness/src/worker.rs` | `launch_conscious_worker_with_timeout()` (line 136), `launch_unconscious_worker_with_timeout()` (line 344), `explicit_worker_args()` (line 609), `is_worker_multiplexer_command()` (line 621), `collect_worker_protocol_failure_context()` (line 658), `stderr_excerpt()` (line 683) |
 | `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 85), `TraceExplainCommand` (line 119), `TraceShowCommand` (line 129), `render_trace_explanation_text()` (line 1431), `render_trace_report_text()` (line 1518), `render_trace_mermaid()` (line 1680), `format_trace_failure_class()` (line 1739) |
 | `migrations/0011__model_call_records.sql` | durable model-call records |
 | `migrations/0012__causal_links.sql` | durable causal graph edges |
@@ -94,6 +94,16 @@ bounded cleanup timeout, and appends the child exit status plus a short stderr
 excerpt when available. `trace explain` classifies those errors as
 `worker_protocol_failure` and tells the operator to inspect the worker
 binary/configuration before retrying.
+
+Worker command resolution supports both packaged and explicitly configured
+worker binaries. With the default empty `worker.command`, the harness looks for a
+sibling `workers` or `workers.exe` binary next to the runtime and appends the
+per-worker subcommand at launch. If `worker.command` or
+`BLUE_LAGOON_WORKER_COMMAND` explicitly points at the `workers` multiplexer
+binary and `worker.args`/`BLUE_LAGOON_WORKER_ARGS` are empty, the harness still
+appends the required `smoke-worker`, `conscious-worker`, or `unconscious-worker`
+subcommand. Explicit one-purpose wrapper commands keep their configured args
+unchanged.
 
 Retention-managed fields are:
 
