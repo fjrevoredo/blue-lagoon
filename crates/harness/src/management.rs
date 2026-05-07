@@ -5618,6 +5618,7 @@ mod tests {
                     provider: contracts::ModelProviderKind::ZAi,
                     model: "foreground".to_string(),
                     api_base_url: None,
+                    reasoning_mode: None,
                     api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
                     timeout_ms: 60_000,
                 },

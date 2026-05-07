@@ -175,6 +175,31 @@ This remains a hard design posture:
 - Recovery coordination is harness-owned.
 - No worker self-recovery exists as an authority path.
 
+Model-provider reasoning policy follows the same posture. The harness owns
+reasoning-policy resolution for model calls before any provider request is
+constructed. Workers remain provider-agnostic: they request a bounded model
+call, but they do not choose provider-specific reasoning payload shapes. When a
+provider supports explicit reasoning levels or disablement, the harness maps the
+resolved policy into that provider's request format. When a route cannot safely
+satisfy the selected reasoning policy, the harness fails closed or applies a
+documented compatibility rule owned by the harness rather than letting workers
+silently degrade behavior.
+
+The implementation vocabulary for foreground reasoning policy is:
+
+- `off`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+- `provider_default`
+
+`off` means the harness should actively disable provider-controlled reasoning
+where the active route supports that control. `provider_default` means the
+harness intentionally omits any provider-specific reasoning-strength override
+and accepts the provider's native default behavior for the chosen route.
+
 Transaction boundaries remain harness-owned. The harness may expose reusable service-layer write paths, but low-level repositories or workers must not become de facto owners of business-critical transaction logic.
 
 ## Self-model, identity, and interoception

@@ -625,6 +625,7 @@ mod tests {
                     api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                     api_key: "secret".to_string(),
                     provider_headers: Vec::new(),
+                    reasoning_mode: crate::config::ForegroundReasoningMode::Off,
                     provider_reasoning: None,
                     timeout_ms: 45_000,
                 },

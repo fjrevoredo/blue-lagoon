@@ -3414,6 +3414,7 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 provider: contracts::ModelProviderKind::ZAi,
                 model: "glm-test".to_string(),
                 api_base_url: None,
+                reasoning_mode: None,
                 api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
                 timeout_ms: 30_000,
             },
@@ -3510,6 +3511,8 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "secret".to_string(),
             provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 20_000,
         },
     }

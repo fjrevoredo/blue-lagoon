@@ -198,6 +198,16 @@ The unconscious loop MUST be allowed to produce:
 - The system SHOULD surface repeated budget exhaustion as an operational signal.
 - Foreground execution MAY include multiple harness-mediated governed actions inside one foreground turn, but every additional action MUST remain bounded by explicit budgets, a configured per-turn action cap, and normal approval or policy gates.
 
+### 10.4 Model-call reasoning policy
+- The harness MUST support explicit reasoning-policy selection for model-call routes where the configured provider supports provider-controlled reasoning modes.
+- The minimum supported reasoning-policy outcomes MUST include:
+  - reasoning disabled
+  - reasoning enabled with an explicit policy-controlled level when the active route supports it
+  - provider-default behavior when the operator intentionally chooses it
+- Reasoning policy MUST be resolved by the harness before the model call is issued.
+- Provider-specific reasoning request encoding MUST remain a harness concern rather than a worker concern.
+- If the active route cannot safely satisfy the selected reasoning policy, the harness MUST fail closed or apply a documented safe compatibility rule owned by the harness.
+
 ## 11. Self-model and identity
 
 ### 11.1 Existence and use

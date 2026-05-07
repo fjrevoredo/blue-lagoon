@@ -211,8 +211,32 @@ pub struct ForegroundModelRouteConfig {
     pub model: String,
     #[serde(default)]
     pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub reasoning_mode: Option<ForegroundReasoningMode>,
     pub api_key_env: String,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ForegroundReasoningMode {
+    #[serde(rename = "off", alias = "none")]
+    Off,
+    #[serde(rename = "minimal")]
+    Minimal,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh", alias = "x_high", alias = "x-high")]
+    XHigh,
+    #[serde(
+        rename = "provider_default",
+        alias = "provider-default",
+        alias = "default"
+    )]
+    ProviderDefault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -247,6 +271,7 @@ pub struct OpenRouterProviderConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenRouterReasoningEffort {
+    #[serde(rename = "xhigh", alias = "x_high", alias = "x-high")]
     XHigh,
     High,
     Medium,
@@ -267,6 +292,7 @@ pub struct ResolvedForegroundModelRouteConfig {
     pub api_base_url: String,
     pub api_key: String,
     pub provider_headers: Vec<ProviderHttpHeaderConfig>,
+    pub reasoning_mode: ForegroundReasoningMode,
     pub provider_reasoning: Option<ProviderReasoningConfig>,
     pub timeout_ms: u64,
 }
@@ -281,6 +307,24 @@ pub struct ProviderHttpHeaderConfig {
 pub struct ProviderReasoningConfig {
     pub effort: Option<String>,
     pub exclude: Option<bool>,
+}
+
+impl ForegroundReasoningMode {
+    fn is_explicit_level(self) -> bool {
+        !matches!(self, Self::Off | Self::ProviderDefault)
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::ProviderDefault => "provider_default",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -357,11 +401,19 @@ impl RuntimeConfig {
             .as_deref()
             .map(parse_foreground_route_override)
             .transpose()?;
+        let foreground_reasoning_mode_override = env::var("BLUE_LAGOON_FOREGROUND_REASONING_MODE")
+            .ok()
+            .as_deref()
+            .map(parse_foreground_reasoning_mode_override)
+            .transpose()?;
 
         let model_gateway = file_config.model_gateway.map(|mut model_gateway| {
             if let Some((provider, model)) = &foreground_route_override {
                 model_gateway.foreground.provider = *provider;
                 model_gateway.foreground.model = model.clone();
+            }
+            if let Some(reasoning_mode) = foreground_reasoning_mode_override {
+                model_gateway.foreground.reasoning_mode = Some(reasoning_mode);
             }
             model_gateway
         });
@@ -471,6 +523,7 @@ impl RuntimeConfig {
             .as_ref()
             .context("missing foreground model gateway configuration")?;
         model_gateway.validate()?;
+        let reasoning_mode = resolve_foreground_reasoning_mode(model_gateway)?;
 
         Ok(ResolvedModelGatewayConfig {
             foreground: ResolvedForegroundModelRouteConfig {
@@ -479,7 +532,8 @@ impl RuntimeConfig {
                 api_base_url: require_foreground_api_base_url(model_gateway)?,
                 api_key: require_foreground_api_key(&model_gateway.foreground.api_key_env)?,
                 provider_headers: foreground_provider_headers(model_gateway)?,
-                provider_reasoning: foreground_provider_reasoning(model_gateway),
+                reasoning_mode,
+                provider_reasoning: foreground_provider_reasoning(model_gateway, reasoning_mode)?,
                 timeout_ms: model_gateway.foreground.timeout_ms,
             },
         })
@@ -617,6 +671,23 @@ fn parse_foreground_route_override(raw: &str) -> Result<(ModelProviderKind, Stri
         bail!("BLUE_LAGOON_FOREGROUND_ROUTE model segment must not be empty");
     }
     Ok((provider, model.to_string()))
+}
+
+fn parse_foreground_reasoning_mode_override(raw: &str) -> Result<ForegroundReasoningMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => Ok(ForegroundReasoningMode::Off),
+        "minimal" => Ok(ForegroundReasoningMode::Minimal),
+        "low" => Ok(ForegroundReasoningMode::Low),
+        "medium" => Ok(ForegroundReasoningMode::Medium),
+        "high" => Ok(ForegroundReasoningMode::High),
+        "xhigh" | "x_high" | "x-high" => Ok(ForegroundReasoningMode::XHigh),
+        "provider_default" | "provider-default" | "default" => {
+            Ok(ForegroundReasoningMode::ProviderDefault)
+        }
+        other => bail!(
+            "BLUE_LAGOON_FOREGROUND_REASONING_MODE must be one of: off, minimal, low, medium, high, xhigh, provider_default; got '{other}'"
+        ),
+    }
 }
 
 impl WorkspaceConfig {
@@ -827,6 +898,8 @@ impl ModelGatewayConfig {
                 bail!("model_gateway.openrouter.app_title must not be empty");
             }
         }
+        let reasoning_mode = resolve_foreground_reasoning_mode(self)?;
+        validate_foreground_reasoning_mode_support(self, reasoning_mode)?;
         Ok(())
     }
 }
@@ -1079,31 +1152,91 @@ fn foreground_provider_headers(
     }
 }
 
-fn foreground_provider_reasoning(config: &ModelGatewayConfig) -> Option<ProviderReasoningConfig> {
+fn resolve_foreground_reasoning_mode(
+    config: &ModelGatewayConfig,
+) -> Result<ForegroundReasoningMode> {
+    if let Some(reasoning_mode) = config.foreground.reasoning_mode {
+        return Ok(reasoning_mode);
+    }
+
+    if config.foreground.provider == ModelProviderKind::OpenRouter
+        && let Some(reasoning_effort) = config
+            .openrouter
+            .as_ref()
+            .and_then(|provider| provider.reasoning_effort)
+    {
+        return Ok(map_openrouter_reasoning_effort_compat(reasoning_effort));
+    }
+
+    Ok(ForegroundReasoningMode::Off)
+}
+
+fn validate_foreground_reasoning_mode_support(
+    config: &ModelGatewayConfig,
+    reasoning_mode: ForegroundReasoningMode,
+) -> Result<()> {
     match config.foreground.provider {
-        ModelProviderKind::ZAi => None,
+        ModelProviderKind::ZAi => {
+            if reasoning_mode.is_explicit_level() {
+                bail!(
+                    "model_gateway.foreground.reasoning_mode '{}' is unsupported for provider z_ai",
+                    reasoning_mode.as_label()
+                );
+            }
+        }
         ModelProviderKind::OpenRouter => {
-            let openrouter = config.openrouter.as_ref();
-            let effort = openrouter
-                .and_then(|provider| provider.reasoning_effort)
-                .unwrap_or(OpenRouterReasoningEffort::None);
-            let exclude = openrouter.and_then(|provider| provider.exclude_reasoning);
-            Some(ProviderReasoningConfig {
-                effort: Some(openrouter_reasoning_effort_label(effort).to_string()),
-                exclude,
-            })
+            if config.foreground.model.trim().eq_ignore_ascii_case("auto")
+                && reasoning_mode.is_explicit_level()
+            {
+                bail!(
+                    "model_gateway.foreground.reasoning_mode '{}' is unsupported for OpenRouter auto routing",
+                    reasoning_mode.as_label()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn foreground_provider_reasoning(
+    config: &ModelGatewayConfig,
+    reasoning_mode: ForegroundReasoningMode,
+) -> Result<Option<ProviderReasoningConfig>> {
+    match config.foreground.provider {
+        ModelProviderKind::ZAi => Ok(None),
+        ModelProviderKind::OpenRouter => {
+            let exclude = config
+                .openrouter
+                .as_ref()
+                .and_then(|provider| provider.exclude_reasoning);
+            let effort = match reasoning_mode {
+                ForegroundReasoningMode::Off => Some("none".to_string()),
+                ForegroundReasoningMode::Minimal => Some("minimal".to_string()),
+                ForegroundReasoningMode::Low => Some("low".to_string()),
+                ForegroundReasoningMode::Medium => Some("medium".to_string()),
+                ForegroundReasoningMode::High => Some("high".to_string()),
+                ForegroundReasoningMode::XHigh => Some("xhigh".to_string()),
+                ForegroundReasoningMode::ProviderDefault => None,
+            };
+            if effort.is_none() && exclude.is_none() {
+                Ok(None)
+            } else {
+                Ok(Some(ProviderReasoningConfig { effort, exclude }))
+            }
         }
     }
 }
 
-fn openrouter_reasoning_effort_label(effort: OpenRouterReasoningEffort) -> &'static str {
+fn map_openrouter_reasoning_effort_compat(
+    effort: OpenRouterReasoningEffort,
+) -> ForegroundReasoningMode {
     match effort {
-        OpenRouterReasoningEffort::XHigh => "xhigh",
-        OpenRouterReasoningEffort::High => "high",
-        OpenRouterReasoningEffort::Medium => "medium",
-        OpenRouterReasoningEffort::Low => "low",
-        OpenRouterReasoningEffort::Minimal => "minimal",
-        OpenRouterReasoningEffort::None => "none",
+        OpenRouterReasoningEffort::None => ForegroundReasoningMode::Off,
+        OpenRouterReasoningEffort::Minimal => ForegroundReasoningMode::Minimal,
+        OpenRouterReasoningEffort::Low => ForegroundReasoningMode::Low,
+        OpenRouterReasoningEffort::Medium => ForegroundReasoningMode::Medium,
+        OpenRouterReasoningEffort::High => ForegroundReasoningMode::High,
+        OpenRouterReasoningEffort::XHigh => ForegroundReasoningMode::XHigh,
     }
 }
 
@@ -1458,6 +1591,42 @@ args = []
     }
 
     #[test]
+    fn parse_foreground_reasoning_mode_override_accepts_supported_values() {
+        assert_eq!(
+            parse_foreground_reasoning_mode_override("off").expect("mode should parse"),
+            ForegroundReasoningMode::Off
+        );
+        assert_eq!(
+            parse_foreground_reasoning_mode_override("none").expect("alias should parse"),
+            ForegroundReasoningMode::Off
+        );
+        assert_eq!(
+            parse_foreground_reasoning_mode_override("minimal").expect("mode should parse"),
+            ForegroundReasoningMode::Minimal
+        );
+        assert_eq!(
+            parse_foreground_reasoning_mode_override("xhigh").expect("mode should parse"),
+            ForegroundReasoningMode::XHigh
+        );
+        assert_eq!(
+            parse_foreground_reasoning_mode_override("provider-default")
+                .expect("alias should parse"),
+            ForegroundReasoningMode::ProviderDefault
+        );
+    }
+
+    #[test]
+    fn parse_foreground_reasoning_mode_override_rejects_unknown_value() {
+        let error = parse_foreground_reasoning_mode_override("turbo")
+            .expect_err("unknown reasoning mode should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("BLUE_LAGOON_FOREGROUND_REASONING_MODE")
+        );
+    }
+
+    #[test]
     fn parse_foreground_route_override_accepts_exact_model_segment() {
         let (provider, model) =
             parse_foreground_route_override("zai/glm-5-turbo").expect("route should parse");
@@ -1682,6 +1851,7 @@ args = []
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: Some("https://api.z.ai".to_string()),
+                reasoning_mode: None,
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -1759,6 +1929,54 @@ api_surface = "coding"
     }
 
     #[test]
+    fn load_applies_foreground_reasoning_mode_env_override() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(
+            &format!(
+                r#"
+{}
+[model_gateway.foreground]
+provider = "openrouter"
+model = "configured-model"
+api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
+timeout_ms = 30000
+"#,
+                minimal_file_config()
+            ),
+            None,
+            None,
+        );
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        let original_reasoning_mode = env::var_os("BLUE_LAGOON_FOREGROUND_REASONING_MODE");
+
+        unsafe {
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+            env::set_var("BLUE_LAGOON_FOREGROUND_REASONING_MODE", "high");
+        }
+
+        let loaded =
+            RuntimeConfig::load_from_root(&temp_root).expect("config should load with overrides");
+        let foreground = loaded
+            .model_gateway
+            .expect("model gateway should be present")
+            .foreground;
+        assert_eq!(
+            foreground.reasoning_mode,
+            Some(ForegroundReasoningMode::High)
+        );
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        match original_reasoning_mode {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_REASONING_MODE", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_REASONING_MODE") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn load_accepts_provider_specific_zai_surface_without_legacy_foreground_api_base_url() {
         let _env_lock = env_lock();
         let temp_root = write_test_root(
@@ -1817,6 +2035,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: Some("https://api.z.ai".to_string()),
+                reasoning_mode: None,
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -1849,6 +2068,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+                reasoning_mode: None,
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -1893,6 +2113,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+                reasoning_mode: None,
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -1937,6 +2158,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::ZAi,
                 model: "zai-foreground".to_string(),
                 api_base_url: None,
+                reasoning_mode: None,
                 api_key_env: format!("BLUE_LAGOON_TEST_FOREGROUND_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -1981,6 +2203,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::OpenRouter,
                 model: "openai/gpt-5.2".to_string(),
                 api_base_url: None,
+                reasoning_mode: Some(ForegroundReasoningMode::Off),
                 api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -2030,6 +2253,10 @@ api_surface = "coding"
                 exclude: None,
             })
         );
+        assert_eq!(
+            resolved.foreground.reasoning_mode,
+            ForegroundReasoningMode::Off
+        );
 
         match original_api_key {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
@@ -2050,6 +2277,7 @@ api_surface = "coding"
                 provider: ModelProviderKind::OpenRouter,
                 model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
                 api_base_url: None,
+                reasoning_mode: Some(ForegroundReasoningMode::Minimal),
                 api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
                 timeout_ms: 30_000,
             },
@@ -2078,11 +2306,136 @@ api_surface = "coding"
                 exclude: Some(true),
             })
         );
+        assert_eq!(
+            resolved.foreground.reasoning_mode,
+            ForegroundReasoningMode::Minimal
+        );
 
         match original_api_key {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
             None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
         }
+    }
+
+    #[test]
+    fn require_model_gateway_config_maps_openrouter_reasoning_effort_compatibility_alias() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: None,
+                reasoning_mode: None,
+                api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: None,
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: Some(OpenRouterReasoningEffort::High),
+                exclude_reasoning: Some(true),
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "openrouter-key");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("openrouter compatibility alias should resolve");
+        assert_eq!(
+            resolved.foreground.reasoning_mode,
+            ForegroundReasoningMode::High
+        );
+        assert_eq!(
+            resolved.foreground.provider_reasoning,
+            Some(ProviderReasoningConfig {
+                effort: Some("high".to_string()),
+                exclude: Some(true),
+            })
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn require_model_gateway_config_prefers_generic_reasoning_mode_over_compatibility_alias() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: None,
+                reasoning_mode: Some(ForegroundReasoningMode::Low),
+                api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: None,
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: Some(OpenRouterReasoningEffort::High),
+                exclude_reasoning: Some(true),
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "openrouter-key");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("generic reasoning mode should take precedence");
+        assert_eq!(
+            resolved.foreground.reasoning_mode,
+            ForegroundReasoningMode::Low
+        );
+        assert_eq!(
+            resolved.foreground.provider_reasoning,
+            Some(ProviderReasoningConfig {
+                effort: Some("low".to_string()),
+                exclude: Some(true),
+            })
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn validate_rejects_explicit_reasoning_mode_for_unsupported_provider() {
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "zai-foreground".to_string(),
+                api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+                reasoning_mode: Some(ForegroundReasoningMode::Low),
+                api_key_env: "BLUE_LAGOON_TEST_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+            openrouter: None,
+        });
+
+        let error = config
+            .validate()
+            .expect_err("unsupported reasoning mode should fail");
+        assert!(error.to_string().contains("reasoning_mode"));
+        assert!(error.to_string().contains("z_ai"));
     }
 
     #[test]

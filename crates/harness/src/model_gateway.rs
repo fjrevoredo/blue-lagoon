@@ -649,6 +649,7 @@ mod tests {
                         value: "Blue Lagoon".to_string(),
                     },
                 ],
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
                 provider_reasoning: Some(crate::config::ProviderReasoningConfig {
                     effort: Some("none".to_string()),
                     exclude: None,
@@ -718,6 +719,7 @@ mod tests {
                 api_base_url: "https://openrouter.ai/api/v1".to_string(),
                 api_key: "openrouter-secret".to_string(),
                 provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
                 provider_reasoning: Some(crate::config::ProviderReasoningConfig {
                     effort: Some("none".to_string()),
                     exclude: None,
@@ -748,6 +750,45 @@ mod tests {
         assert_eq!(response.output.text, "fallback non-chat response");
         assert_eq!(response.usage.input_tokens, 9);
         assert_eq!(response.usage.output_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn omits_openrouter_reasoning_payload_for_provider_default_mode() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::ProviderDefault,
+                provider_reasoning: None,
+                timeout_ms: 20_000,
+            },
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "provider default response" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway should accept provider-default requests");
+        assert_eq!(response.output.text, "provider default response");
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].body.get("reasoning").is_none());
     }
 
     #[tokio::test]
@@ -800,6 +841,7 @@ mod tests {
                 api_base_url: "https://openrouter.ai/api/v1".to_string(),
                 api_key: "openrouter-secret".to_string(),
                 provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Minimal,
                 provider_reasoning: Some(crate::config::ProviderReasoningConfig {
                     effort: Some("minimal".to_string()),
                     exclude: None,
@@ -903,6 +945,7 @@ mod tests {
                 api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                 api_key: "secret".to_string(),
                 provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
                 provider_reasoning: None,
                 timeout_ms: 20_000,
             },

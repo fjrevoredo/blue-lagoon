@@ -783,6 +783,8 @@ async fn model_call_records_are_persisted_and_visible_in_trace_report() -> Resul
                 api_base_url: "https://example.invalid".to_string(),
                 api_key: "redacted-test-key".to_string(),
                 provider_headers: Vec::new(),
+                reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+                provider_reasoning: None,
                 timeout_ms: 30_000,
             },
         };
@@ -856,6 +858,7 @@ async fn model_call_records_are_persisted_and_visible_in_trace_report() -> Resul
             &ctx.pool,
             failed_model_call_id,
             "provider returned status 500",
+            None,
             Utc::now(),
         )
         .await?;
@@ -917,6 +920,8 @@ async fn model_call_payload_retention_clears_bulky_fields_but_keeps_metadata() -
                 api_base_url: "https://example.invalid".to_string(),
                 api_key: "redacted-test-key".to_string(),
                 provider_headers: Vec::new(),
+                reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+                provider_reasoning: None,
                 timeout_ms: 30_000,
             },
         };

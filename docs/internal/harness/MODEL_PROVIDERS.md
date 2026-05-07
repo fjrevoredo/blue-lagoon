@@ -24,7 +24,7 @@ the same foreground and background gateway path.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `ModelProviderKind` (line 1821), `ModelCallRequest` (line 1883), `ModelCallResponse` (line 1900) |
-| `crates/harness/src/config.rs` | `ModelGatewayConfig` (line 200), `ForegroundModelRouteConfig` (line 209), `OpenRouterProviderConfig` (line 234), `parse_model_provider_override()` (line 597), `require_foreground_api_base_url()` (line 1010), `foreground_provider_headers()` (line 1055), `foreground_provider_reasoning()` (line 1082) |
+| `crates/harness/src/config.rs` | `ModelGatewayConfig` (line 200), `ForegroundModelRouteConfig` (line 209), `ForegroundReasoningMode` (line 221), `OpenRouterProviderConfig` (line 258), `parse_model_provider_override()` (line 651), `parse_foreground_reasoning_mode_override()` (line 676), `require_foreground_api_base_url()` (line 1083), `foreground_provider_headers()` (line 1128), `resolve_foreground_reasoning_mode()` (line 1155), `foreground_provider_reasoning()` (line 1201) |
 | `crates/harness/src/model_gateway.rs` | `ProviderHttpRequest` (line 18), `ReqwestModelProviderTransport` (line 69), `execute_model_call_unchecked()` (line 213), `execute_z_ai_call()` (line 341), `execute_openrouter_call()` (line 369), `openai_compatible_request_body()` (line 401), `parse_openai_compatible_response()` (line 443) |
 | `crates/harness/src/model_calls.rs` | `insert_pending_model_call_record()` (line 41), `model_provider_label()` (line 348) |
 | `config/default.toml` | committed default model gateway provider and provider-specific defaults |
@@ -51,6 +51,18 @@ openrouter/openai/gpt-5.2
 
 resolves to provider `openrouter` and model `openai/gpt-5.2`.
 
+Foreground reasoning policy is provider-agnostic at the config and resolved
+route level. The active vocabulary is:
+
+| Mode | Meaning |
+|---|---|
+| `off` | actively disable provider-controlled reasoning where the route supports that control |
+| `minimal` / `low` / `medium` / `high` / `xhigh` | request an explicit reasoning level |
+| `provider_default` | omit reasoning-strength override and accept provider default behavior |
+
+The harness resolves the active reasoning mode before constructing any provider
+request. Workers remain unaware of provider-specific reasoning payload shapes.
+
 ### HTTP Request Shape
 
 Both supported providers use the same OpenAI-compatible chat completions body:
@@ -72,11 +84,34 @@ OpenRouter support follows the OpenRouter quickstart for direct API usage:
 base URL `https://openrouter.ai/api/v1`, bearer authorization, and optional
 `HTTP-Referer` and `X-OpenRouter-Title` attribution headers.
 
-For OpenRouter routes, the gateway also injects a provider-specific
-`reasoning` object when configured. The committed default is
-`{"effort":"none"}`. This follows OpenRouter's documented reasoning controls
-and avoids reasoning-capable models consuming the full completion budget on
-reasoning tokens and returning `choices[0].message.content = null`.
+For OpenRouter routes, the gateway derives a provider-specific `reasoning`
+object from the resolved foreground reasoning mode:
+
+| Resolved mode | OpenRouter payload |
+|---|---|
+| `off` | `{"effort":"none"}` |
+| `minimal` | `{"effort":"minimal"}` |
+| `low` | `{"effort":"low"}` |
+| `medium` | `{"effort":"medium"}` |
+| `high` | `{"effort":"high"}` |
+| `xhigh` | `{"effort":"xhigh"}` |
+| `provider_default` | omit the `effort` override entirely |
+
+If `model_gateway.openrouter.exclude_reasoning` is set, the gateway also adds
+`"exclude": true|false` to the OpenRouter `reasoning` object. That knob remains
+provider-specific because it changes OpenRouter response shaping, not the
+generic reasoning-policy vocabulary.
+
+Current compatibility rules:
+
+- `model_gateway.foreground.reasoning_mode` is the primary contract.
+- `BLUE_LAGOON_FOREGROUND_REASONING_MODE` overrides file config.
+- `model_gateway.openrouter.reasoning_effort` remains accepted as a
+  compatibility alias only when `model_gateway.foreground.reasoning_mode` is
+  absent.
+- Explicit reasoning levels are currently rejected for `z_ai` routes.
+- Explicit reasoning levels are currently rejected for OpenRouter `auto`
+  routing if that route is configured in the future.
 
 ### Response Parsing
 
@@ -97,6 +132,10 @@ For malformed or rejected provider responses, the raw response body is retained
 in `model_call_records.response_payload_json` so `admin trace explain --json`
 can show the failing payload.
 
+When OpenRouter returns `choices[0].message.content = null`, the gateway now
+adds a more specific invalid-response detail when it can prove the provider
+consumed the budget on reasoning instead of emitting final assistant content.
+
 ---
 
 ## 3. Configuration & Extension
@@ -105,30 +144,34 @@ can show the failing payload.
 
 | Config key | Default | Valid range | Read by |
 |---|---|---|---|
-| `model_gateway.foreground.provider` | `z_ai` | `z_ai` or `openrouter` | `config.rs:200`, `config.rs:574` |
-| `model_gateway.foreground.model` | `z-ai-foreground` | non-empty exact provider model ID | `config.rs:209`, `config.rs:453` |
-| `model_gateway.foreground.api_base_url` | provider-specific | optional non-empty URL override | `config.rs:209`, `config.rs:987` |
-| `model_gateway.foreground.api_key_env` | `BLUE_LAGOON_FOREGROUND_API_KEY` | non-empty environment variable name | `config.rs:209`, `config.rs:973` |
-| `model_gateway.foreground.timeout_ms` | `60000` | integer greater than zero | `config.rs:209`, `model_gateway.rs:336`, `model_gateway.rs:367` |
-| `model_gateway.z_ai.api_surface` | `coding` | `general` or `coding` | `config.rs:222`, `config.rs:1000` |
-| `model_gateway.z_ai.api_base_url` | unset | optional non-empty URL | `config.rs:219`, `config.rs:991` |
-| `model_gateway.openrouter.api_base_url` | `https://openrouter.ai/api/v1` | optional non-empty URL | `config.rs:234`, `config.rs:1016` |
-| `model_gateway.openrouter.http_referer` | unset | optional non-empty string | `config.rs:238`, `config.rs:1042` |
-| `model_gateway.openrouter.app_title` | unset | optional non-empty string | `config.rs:240`, `config.rs:1048` |
-| `model_gateway.openrouter.reasoning_effort` | `none` | `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `config.rs:242`, `config.rs:1088` |
-| `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `config.rs:244`, `config.rs:1094` |
+| `model_gateway.foreground.provider` | `z_ai` | `z_ai` or `openrouter` | `config.rs:209`, `config.rs:520` |
+| `model_gateway.foreground.model` | `z-ai-foreground` | non-empty exact provider model ID | `config.rs:209`, `config.rs:520` |
+| `model_gateway.foreground.reasoning_mode` | `off` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `config.rs:215`, `config.rs:1155` |
+| `model_gateway.foreground.api_base_url` | provider-specific | optional non-empty URL override | `config.rs:213`, `config.rs:1083` |
+| `model_gateway.foreground.api_key_env` | `BLUE_LAGOON_FOREGROUND_API_KEY` | non-empty environment variable name | `config.rs:216`, `config.rs:1069` |
+| `model_gateway.foreground.timeout_ms` | `60000` | integer greater than zero | `config.rs:217`, `model_gateway.rs:353`, `model_gateway.rs:385` |
+| `model_gateway.z_ai.api_surface` | `coding` | `general` or `coding` | `config.rs:245`, `config.rs:1099` |
+| `model_gateway.z_ai.api_base_url` | unset | optional non-empty URL | `config.rs:247`, `config.rs:1094` |
+| `model_gateway.openrouter.api_base_url` | `https://openrouter.ai/api/v1` | optional non-empty URL | `config.rs:260`, `config.rs:1106` |
+| `model_gateway.openrouter.http_referer` | unset | optional non-empty string | `config.rs:262`, `config.rs:1135` |
+| `model_gateway.openrouter.app_title` | unset | optional non-empty string | `config.rs:264`, `config.rs:1141` |
+| `model_gateway.openrouter.reasoning_effort` | unset | compatibility alias: `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `config.rs:266`, `config.rs:1163` |
+| `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `config.rs:268`, `config.rs:1211` |
 
 ### Environment Overrides
 
 | Environment variable | Default | Valid range | Read by |
 |---|---|---|---|
-| `BLUE_LAGOON_FOREGROUND_ROUTE` | unset | `<provider>/<exact-model>` | `config.rs:333`, `config.rs:586` |
-| `BLUE_LAGOON_FOREGROUND_API_KEY` | unset | non-empty secret | `config.rs:973` |
-| `BLUE_LAGOON_FOREGROUND_API_BASE_URL` | unset | non-empty URL | `config.rs:988` |
+| `BLUE_LAGOON_FOREGROUND_ROUTE` | unset | `<provider>/<exact-model>` | `config.rs:399`, `config.rs:651` |
+| `BLUE_LAGOON_FOREGROUND_REASONING_MODE` | unset | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `config.rs:404`, `config.rs:676` |
+| `BLUE_LAGOON_FOREGROUND_API_KEY` | unset | non-empty secret | `config.rs:1069` |
+| `BLUE_LAGOON_FOREGROUND_API_BASE_URL` | unset | non-empty URL | `config.rs:1083` |
 
 Direct `BLUE_LAGOON_FOREGROUND_API_KEY` takes precedence over the configured
 `api_key_env`. Direct `BLUE_LAGOON_FOREGROUND_API_BASE_URL` takes precedence
-over provider-specific base URLs.
+over provider-specific base URLs. Direct
+`BLUE_LAGOON_FOREGROUND_REASONING_MODE` takes precedence over
+`model_gateway.foreground.reasoning_mode`.
 
 ### OpenRouter Local Example
 
@@ -136,6 +179,7 @@ over provider-specific base URLs.
 [model_gateway.foreground]
 provider = "openrouter"
 model = "openai/gpt-5.2"
+reasoning_mode = "off"
 api_key_env = "OPENROUTER_API_KEY"
 timeout_ms = 60000
 
@@ -143,7 +187,6 @@ timeout_ms = 60000
 api_base_url = "https://openrouter.ai/api/v1"
 http_referer = "https://example.invalid"
 app_title = "Blue Lagoon"
-reasoning_effort = "none"
 exclude_reasoning = true
 ```
 
@@ -151,6 +194,7 @@ Equivalent emergency route override:
 
 ```text
 BLUE_LAGOON_FOREGROUND_ROUTE=openrouter/openai/gpt-5.2
+BLUE_LAGOON_FOREGROUND_REASONING_MODE=low
 BLUE_LAGOON_FOREGROUND_API_KEY=<secret>
 ```
 
@@ -159,13 +203,15 @@ BLUE_LAGOON_FOREGROUND_API_KEY=<secret>
 1. Add a `ModelProviderKind` variant with an explicit serialized label.
 2. Add provider-specific config only for defaults or required headers that do
    not belong in the provider-agnostic foreground route.
-3. Extend `parse_model_provider_override()`,
-   `require_foreground_api_base_url()`, `foreground_provider_headers()`, and
-   `execute_model_call_unchecked()`.
-4. Add or reuse a provider-specific request/response adapter in
+3. Extend the provider-agnostic reasoning policy resolution path before adding
+   provider-specific request encoding.
+4. Extend `parse_model_provider_override()`,
+   `require_foreground_api_base_url()`, `foreground_provider_headers()`,
+   `resolve_foreground_reasoning_mode()`, and `execute_model_call_unchecked()`.
+5. Add or reuse a provider-specific request/response adapter in
    `model_gateway.rs`.
-5. Add a stable provider label in `model_calls.rs` and management helpers.
-6. Add config and gateway tests before running the broader workspace checks.
+6. Add a stable provider label in `model_calls.rs` and management helpers.
+7. Add config and gateway tests before running the broader workspace checks.
 
 ---
 
