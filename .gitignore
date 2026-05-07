@@ -2,3 +2,5 @@
 /.env
 config/local.toml
 /.sqlx
+
+logs.txt
