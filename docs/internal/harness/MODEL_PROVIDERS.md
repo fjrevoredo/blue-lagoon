@@ -158,6 +158,12 @@ consumed the budget on reasoning instead of emitting final assistant content.
 | `model_gateway.openrouter.reasoning_effort` | unset | compatibility alias: `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `config.rs:266`, `config.rs:1163` |
 | `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `config.rs:268`, `config.rs:1211` |
 
+> **NOT IMPLEMENTED:** There is no separate unconscious/background model route
+> today. `model_gateway.foreground.*` is the only configured route, and
+> `execute_background_model_call()` reuses that same resolved provider/model
+> after validating the request shape (`model_gateway.rs:204`,
+> `model_gateway.rs:219`).
+
 ### Environment Overrides
 
 | Environment variable | Default | Valid range | Read by |

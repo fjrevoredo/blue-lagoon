@@ -22,6 +22,8 @@ docs/internal/
 ├── conscious_loop/
 │   ├── CONTEXT_ASSEMBLY.md         ← pipeline, limits, message layering, token budget
 │   └── GOVERNED_ACTIONS.md         ← JSON schema, capability_scope, validation, risk tiers
+├── unconscious_loop/
+│   └── BACKGROUND_JOBS.md          ← job planning, leasing, worker protocol, wake-signal flow
 └── harness/
     ├── MODEL_PROVIDERS.md          ← provider config, routing, request/response adapters
     ├── TRACE_EXPLORER.md           ← trace CLI, model-call records, causal links
@@ -29,7 +31,6 @@ docs/internal/
 ```
 
 Planned additions (not yet written):
-- `unconscious_loop/BACKGROUND_JOBS.md`
 - `self_model/SELF_MODEL_EVOLUTION.md`
 - `harness/POLICY.md`
 - `harness/RETRIEVAL.md`
