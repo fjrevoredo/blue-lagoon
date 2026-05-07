@@ -196,6 +196,7 @@ The unconscious loop MUST be allowed to produce:
 - The system MUST include forced termination for runaway foreground or background work.
 - The system SHOULD include warning thresholds before hard termination.
 - The system SHOULD surface repeated budget exhaustion as an operational signal.
+- Foreground execution MAY include multiple harness-mediated governed actions inside one foreground turn, but every additional action MUST remain bounded by explicit budgets, a configured per-turn action cap, and normal approval or policy gates.
 
 ## 11. Self-model and identity
 
@@ -207,6 +208,7 @@ The unconscious loop MUST be allowed to produce:
 ### 11.2 Minimum required contents
 The self-model MUST contain at least:
 - stable identity
+- evolving identity
 - capabilities
 - role
 - constraints
@@ -217,18 +219,34 @@ The self-model MUST contain at least:
 
 ### 11.3 Identity structure
 - The self-model MUST distinguish relatively stable identity attributes from evolving attributes.
-- Stable identity SHOULD include a persistent identifier, role, foundational constraints, and communication style.
-- Evolving identity SHOULD include preferences, habits, learned tendencies, and autobiographical refinements.
+- Stable identity MUST include a persistent identifier, role, and default communication style.
+- Stable identity SHOULD include name, identity form or species, archetype, origin or backstory, age framing, foundational traits, foundational values, and enduring boundaries.
+- Evolving identity SHOULD include preferences, likes, dislikes, habits, routines, learned tendencies, autobiographical refinements, recurring self-descriptions, interaction-style adaptations, goals, and subgoals.
+- Identity items MUST carry enough metadata for validation and audit, including stability class, category, confidence or weight where applicable, provenance, evidence references where available, validity or supersession state, source, and merge policy.
+- The worker-facing self-model projection MUST remain compact and bounded. It MUST be derived from canonical identity state and MUST NOT expose storage schemas, merge internals, or hidden maintenance machinery to the conscious loop.
 
-### 11.4 Action relevance
+### 11.4 Identity lifecycle and kickstart
+- The system MUST distinguish bootstrap-only identity state from complete active identity state.
+- A bootstrap-only system MUST support a one-time conscious identity kickstart workflow that forms the first complete identity with the user.
+- The identity kickstart workflow MUST support predefined complete identity templates and a custom directed interview path.
+- In-progress identity kickstart state MUST be durable enough to resume after interruption.
+- After successful identity kickstart completion, the kickstart capability MUST disappear from normal conscious-loop context.
+- Reopening identity kickstart after completion MUST require an operator-facing reset or equivalent controlled management workflow.
+- Identity reset MUST preserve audit history and MUST NOT expose raw storage mutation as the primary operator path.
+
+### 11.5 Action relevance
 - Identity MUST NOT be cosmetic only.
 - Self-model constraints and preferences MUST be able to influence planning and action selection.
+- Self-model values, boundaries, and internal-state signals SHOULD be available to policy, scheduling, wake-signal, and explanation decisions where appropriate.
 - The system SHOULD use identity and internal-state information to preserve coherent behavior over time.
 
-### 11.5 Reflection
+### 11.6 Reflection
 - The system SHOULD support scheduled reflection over recent episodes, goals, and internal-state trends.
 - Reflection SHOULD be able to produce updated traits, preference weights, and compact self-descriptions.
 - Reflection outputs MUST remain proposals until validated by the harness.
+- Reflection outputs that modify identity SHOULD be structured identity deltas with operation, category, stability class, value, evidence, confidence, and merge rationale.
+- Stable identity changes MUST be subject to stricter validation than evolving identity changes.
+- Identity merge MUST reduce duplicate growth, detect or defer contradictions, preserve protected stable identity, and log accepted, rejected, deferred, reinforced, superseded, weakened, or expired outcomes.
 
 ## 12. Internal state and agency
 
@@ -353,6 +371,7 @@ Each meaningful episodic record SHOULD capture:
 ### 18.2 Recovery
 - The system MUST support supervisor recovery after crashes, timeouts, or interrupted tasks.
 - Recovery SHOULD reconstruct the minimum safe context needed for continuation or graceful abandonment.
+- Recovery MUST NOT automatically replay a foreground turn when the interrupted execution already linked ambiguous or nonrepeatable governed actions unless the harness can prove the replay is safe from durable evidence.
 
 ### 18.3 Maintenance
 - The harness SHOULD support maintenance flows such as checkpoint compaction, index rebuild, failed-merge retry, and stalled-worker cleanup.

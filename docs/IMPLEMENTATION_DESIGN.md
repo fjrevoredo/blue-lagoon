@@ -184,6 +184,7 @@ Blue Lagoon maintains an explicit self-model representing who it is right now in
 At minimum the self-model contains:
 
 - Stable identity.
+- Evolving identity.
 - Capabilities.
 - Role.
 - Constraints.
@@ -196,13 +197,191 @@ The identity model remains split into two categories:
 
 ### Stable identity
 
-Persistent identifier, role, foundational temperament, communication style, enduring constraints, and similar continuity-preserving attributes.
+Stable identity is the continuity-preserving part of the assistant. It includes
+the persistent identifier, role, default communication style, and may include
+name, identity form or species, archetype, origin or backstory, age framing,
+foundational traits, foundational values, enduring boundaries, and similar
+attributes that should resist arbitrary drift.
 
 ### Evolving identity
 
-Preferences, habits, learned tendencies, autobiographical refinements, recurring self-descriptions, and other traits that may change through experience and reflection.
+Evolving identity includes preferences, likes, dislikes, habits, routines,
+learned tendencies, autobiographical refinements, recurring
+self-descriptions, interaction-style adaptations, goals, subgoals, and other
+traits that may change through experience and reflection.
+
+Canonical identity should be represented as typed identity items rather than as
+one unbounded prompt paragraph. Each item should carry a category, stability
+class, confidence or weight where applicable, provenance, evidence references
+where available, validity or supersession state, source, and merge policy. JSONB
+may be used for extension fields, but the primary identity dimensions should
+remain queryable and validatable.
+
+Stable identity categories are:
+
+- `name`: the user-facing name or handle for the assistant.
+- `identity_form`: species, form, or equivalent identity framing.
+- `role`: the assistant's durable relationship and functional role.
+- `archetype`: the high-level identity pattern or character posture.
+- `origin_backstory`: bounded origin or backstory material approved for
+  identity continuity.
+- `age_framing`: age-like framing when product-approved, without pretending to
+  have human biology or an unsupported real-world age.
+- `foundational_trait`: durable temperament and personality traits.
+- `foundational_value`: durable values that shape judgment and explanation.
+- `enduring_boundary`: stable boundaries that constrain behavior and policy.
+- `default_communication_style`: durable communication defaults.
+
+Evolving identity categories are:
+
+- `preference`: preferences that should influence choices or explanations.
+- `like`: positively weighted recurring likes.
+- `dislike`: negatively weighted recurring dislikes.
+- `habit`: repeated behavior patterns.
+- `routine`: recurring cadence or workflow preferences.
+- `learned_tendency`: tendencies learned from episodes and memory.
+- `autobiographical_refinement`: self-understanding grounded in accepted
+  episode or memory evidence.
+- `recurring_self_description`: compact descriptions the assistant can use when
+  explaining who it is.
+- `interaction_style_adaptation`: user-specific or context-specific style
+  adjustments.
+- `goal`: active or durable goals.
+- `subgoal`: narrower current or derived subgoals.
+
+Every identity item should have:
+
+- `stability_class`: stable, evolving, or transient projection input.
+- `category`: one of the stable or evolving identity categories.
+- `value`: the user-meaningful identity content.
+- `confidence`: the harness confidence that the item is valid.
+- `weight`: relative strength for preferences, tendencies, habits, and similar
+  evolving items.
+- `provenance`: the accepted source path such as seed, predefined template,
+  custom interview, user-authored edit, operator proposal, or reflection.
+- `evidence_refs`: references to episodes, memory artifacts, proposals, or
+  approvals that support inferred items.
+- `valid_from` and `valid_to`: temporal validity where the item is not
+  timeless.
+- `supersedes` and `superseded_by`: links for revision and replacement.
+- `source`: whether the item was user-authored, operator-authored,
+  seed-authored, template-authored, or model-inferred.
+- `merge_policy`: category-specific merge posture such as protected core,
+  reinforceable, revisable, expirable, or approval-required.
+
+The compact worker-facing self-model remains a projection, not the canonical
+identity store. The harness derives this projection from canonical identity
+items, current goals, internal state, and accepted self-description material. It
+must stay bounded and must not reveal storage schemas, merge rules, lifecycle
+implementation details, or hidden unconscious maintenance machinery to the
+conscious loop.
+
+The compact projection should contain:
+
+- A concise identity summary, not raw identity rows.
+- Stable identity highlights needed for continuity and relationship framing.
+- The highest-relevance evolving preferences, tendencies, values, boundaries,
+  current goals, and current subgoals.
+- A compact self-description when one has been accepted.
+- Internal-state signals needed for present-moment reasoning.
+- Identity-formation availability only as a user-facing capability flag or
+  instruction, never as schema or lifecycle machinery.
+
+### Identity lifecycle and kickstart
+
+The self-model lifecycle distinguishes at least these states:
+
+- `bootstrap_seed_only`: only the checked-in seed and bootstrap artifact are
+  available; the assistant does not yet have a complete formed identity.
+- `identity_kickstart_in_progress`: the first identity formation workflow has
+  started and durable interview or template-selection state may exist.
+- `complete_identity_active`: the first complete identity has been validated,
+  committed, and should be projected into normal conscious context.
+
+An operator reset may transition a complete identity back to bootstrap-only or a
+reset transitional state, but it must preserve audit history and supersession
+state rather than deleting continuity evidence.
+
+Identity kickstart is a conscious, user-facing relationship workflow. While the
+lifecycle is bootstrap-only or kickstart-in-progress, the conscious loop may be
+given a narrow identity-formation capability framed in user terms: it can help
+choose one of three predefined complete identities or conduct a directed custom
+interview. Once the lifecycle reaches complete active identity, that capability
+disappears from ordinary conscious context and cannot be run again without the
+controlled management reset path.
+
+The harness owns template validation, interview-state persistence, completion
+checks, proposal creation, merge, audit, and lifecycle transitions. The
+conscious loop may guide the conversation, but it must not directly write the
+canonical identity.
+
+Allowed lifecycle transitions are:
+
+- `bootstrap_seed_only` to `identity_kickstart_in_progress` when the user starts
+  predefined-template selection or the custom interview.
+- `bootstrap_seed_only` to `complete_identity_active` only when a predefined
+  identity template is selected and the harness can validate and commit the
+  complete template in one transaction.
+- `identity_kickstart_in_progress` to `complete_identity_active` when the
+  required template selection or interview fields are complete, the generated
+  identity proposal passes validation, and the harness commits the identity
+  items plus compact self-description.
+- `identity_kickstart_in_progress` to `bootstrap_seed_only` when the user
+  cancels before any complete identity is committed.
+- `complete_identity_active` to `bootstrap_seed_only` only through an explicit
+  management reset that supersedes or archives active identity state and records
+  an audit event.
+
+Blocked lifecycle transitions are:
+
+- A normal conscious-loop action must not move `complete_identity_active` back
+  to any earlier state.
+- A background reflection job must not start, complete, cancel, or reset
+  identity kickstart.
+- A partial custom interview must not be committed as `complete_identity_active`.
+- A second kickstart must not start while `complete_identity_active` is current.
+- A direct canonical identity write must not bypass proposal validation,
+  lifecycle transition recording, or audit emission.
+
+The kickstart capability is visible to the conscious loop only in
+`bootstrap_seed_only` and `identity_kickstart_in_progress`. In bootstrap-only
+state, the context should frame the assistant as not yet having a complete
+identity and able to form one with the user. In kickstart-in-progress state, the
+context should expose only the next user-meaningful step or a resume summary. In
+complete-active state, normal compact identity is projected and the kickstart
+capability is absent.
+
+The predefined-template path presents three complete identity templates. Each
+template must satisfy the stable and evolving identity categories required by
+the schema and must validate before it can be committed. Product copy may be
+revised later, but structurally incomplete templates are invalid.
+
+The custom interview path gathers the required stable fields and enough
+evolving fields to form the first complete identity. Durable interview state
+records answered fields, remaining fields, status, and last user-facing prompt
+or step. Interruption preserves progress. Resume continues from the next
+missing required field. Cancellation before completion returns to
+bootstrap-only and preserves audit history of the cancelled attempt. Completion
+creates the same kind of validated identity proposal as predefined-template
+selection.
+
+Identity lifecycle auditing records who or what initiated the transition, the
+previous state, the next state, the proposal or template reference where
+applicable, validation outcome, and timestamp. Management reset requires an
+explicit confirmation or force flag, supersedes active identity items rather
+than deleting audit history, and makes identity kickstart available again.
+
+### Identity proposals and merge
 
 Identity remains action-relevant. It is not a decorative persona block. Planning, prioritization, explanation, and boundary enforcement should all be able to depend on the self-model.
+
+Identity changes should enter the system as structured deltas with an operation
+such as add, reinforce, weaken, revise, supersede, or expire. Stable identity
+changes require stronger evidence or explicit user/operator authorization than
+evolving identity changes. Merge logic should reject unsupported categories,
+reduce exact duplicate growth, conservatively detect contradictions, protect
+core stable identity from drift, and record accepted, rejected, deferred,
+reinforced, superseded, weakened, or expired outcomes.
 
 Internal state also remains first-class. Blue Lagoon should explicitly track interoceptive or body-like internal variables such as:
 
@@ -329,6 +508,8 @@ Structured outputs should be the default whenever practical, especially for unco
 
 Tool execution stays outside the gateway. The gateway may return structured tool-call candidates or equivalent proposals, but actual tool execution, validation, approval, and routing remain inside the harness execution and policy layers.
 
+For foreground work, this harness-owned execution layer may perform multiple governed-action continuation rounds inside one foreground turn. The worker may propose another action after receiving harness observations, but the harness remains the authority for per-turn action limits, approval posture, denial, and final bounded continuation.
+
 ## Orchestration and worker model
 
 The current orchestration direction is now clear:
@@ -432,6 +613,7 @@ For conscious work, the checkpoint should preserve at least:
 - Approved plan state by reference.
 - Remaining budgets.
 - Relevant tool and action outcomes so far.
+- Current governed-action loop state where the foreground turn is in a multi-action continuation path.
 - Pending approvals.
 - References to already-written episodic or proposal artifacts.
 
@@ -468,11 +650,13 @@ Automatic continuation is allowed for:
 - Deterministic local work whose outcomes are already durably recorded.
 - External actions the harness can prove are idempotent and whose execution state is durably known.
 - Re-entry after approval resolution.
+- Read-only multi-action foreground continuation where every previously linked governed action in the interrupted turn is replay-safe and approval-free.
 
 Automatic continuation is not allowed for:
 
 - Ambiguous external side effects.
 - Non-repeatable external actions.
+- Foreground turns whose interrupted execution already linked ambiguous or nonrepeatable governed actions without proof that replay remains safe.
 - Corrupted or incomplete checkpoint state.
 - Exhausted recovery budget.
 

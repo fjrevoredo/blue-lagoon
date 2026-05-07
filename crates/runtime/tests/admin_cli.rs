@@ -25,6 +25,7 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .stdout(predicate::str::contains("schema"))
         .stdout(predicate::str::contains("foreground"))
         .stdout(predicate::str::contains("background"))
+        .stdout(predicate::str::contains("identity"))
         .stdout(predicate::str::contains("approvals"))
         .stdout(predicate::str::contains("actions"))
         .stdout(predicate::str::contains("workspace"))
@@ -40,10 +41,29 @@ fn admin_trace_help_lists_operator_commands() -> Result<()> {
     command
         .assert()
         .success()
+        .stdout(predicate::str::contains("explain"))
         .stdout(predicate::str::contains("show"))
         .stdout(predicate::str::contains("recent"))
         .stdout(predicate::str::contains("render"))
         .stdout(predicate::str::contains("cleanup-model-payloads"));
+    Ok(())
+}
+
+#[test]
+fn admin_trace_explain_help_lists_lookup_and_focus_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("trace")
+        .arg("explain")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--execution-id"))
+        .stdout(predicate::str::contains("--focus"))
+        .stdout(predicate::str::contains("--json"));
     Ok(())
 }
 
@@ -88,6 +108,40 @@ fn admin_trace_cleanup_help_lists_json_argument() -> Result<()> {
         .assert()
         .success()
         .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_identity_reset_help_lists_operator_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("identity")
+        .arg("reset")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--actor-ref"))
+        .stdout(predicate::str::contains("--reason"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_identity_help_lists_inspection_and_reset_commands() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command.arg("admin").arg("identity").arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("history"))
+        .stdout(predicate::str::contains("diagnostics"))
+        .stdout(predicate::str::contains("edit"))
+        .stdout(predicate::str::contains("reset"));
     Ok(())
 }
 
@@ -327,6 +381,31 @@ async fn phase_six_admin_json_commands_run_against_a_real_database() -> Result<(
         &database_url,
         &["admin", "schema", "upgrade-path", "--json"],
         "\"compatibility\": \"supported\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "identity", "status", "--json"],
+        "\"lifecycle_state\": \"bootstrap_seed_only\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "identity", "show", "--json"],
+        "\"compact_identity\"",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "identity", "history", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "identity", "diagnostics", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "identity", "edit", "list", "--json"],
+        "[]",
     )?;
 
     drop_database(&admin_database_url, &database_name).await?;

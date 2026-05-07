@@ -20,10 +20,10 @@ summary is safer than letting the model query state.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 714), `GovernedActionPayload` (line 867) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 442), `validate_capability_scope()` (line 1370), `CanonicalGovernedActionPayload` (line 2917) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 168) |
-| `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 592), `governed_action_kind_as_str()` (line 718) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `GovernedActionPayload` (line 1658) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `validate_capability_scope()` (line 1663), `CanonicalGovernedActionPayload` (line 3290) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171) |
+| `crates/workers/src/main.rs` | `governed_action_schema_message()` (line 888), `governed_action_kind_as_str()` (line 1334) |
 | `crates/harness/tests/governed_actions_component.rs` | governed-action component tests |
 | `migrations/` | reviewed SQL migrations for constrained action-kind columns |
 
@@ -36,7 +36,9 @@ summary is safer than letting the model query state.
 2. Add persistence compatibility.
    If `action_kind` is stored in constrained `TEXT` columns, add the next
    reviewed migration that drops and recreates checks on
-   `governed_action_executions` and `approval_requests`.
+   `governed_action_executions` and `approval_requests`. Never rely on editing
+   an already-applied migration to add a new action kind; existing operator
+   databases need a forward migration.
 
 3. Add parsing and canonicalization.
    Update `governed_action_kind_as_str()`, `parse_governed_action_kind()`, and
@@ -136,4 +138,4 @@ Required validation commands for most tool changes:
 
 ---
 
-*Last verified: branch `usage-improvements`, session 2026-04-29.*
+*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-07.*

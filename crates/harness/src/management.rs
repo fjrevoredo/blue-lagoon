@@ -7,8 +7,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use contracts::{
-    BackgroundTrigger, BackgroundTriggerKind, ChannelKind, ScheduledForegroundLastOutcome,
-    ScheduledForegroundTaskStatus, UnconsciousJobKind,
+    BackgroundTrigger, BackgroundTriggerKind, CanonicalProposal, CanonicalProposalKind,
+    CanonicalProposalPayload, CanonicalTargetKind, ChannelKind, CompactIdentitySnapshot,
+    IdentityDeltaOperation, IdentityDeltaProposal, IdentityEvidenceRef, IdentityItemCategory,
+    IdentityItemDelta, IdentityItemSource, IdentityLifecycleState, IdentityMergePolicy,
+    IdentityStabilityClass, ProposalConflictPosture, ProposalEvaluationOutcome, ProposalProvenance,
+    ProposalProvenanceKind, ScheduledForegroundLastOutcome, ScheduledForegroundTaskStatus,
+    UnconsciousJobKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -22,7 +27,8 @@ use crate::{
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     causal_links,
     config::RuntimeConfig,
-    db, governed_actions, migration, model_calls, model_gateway, recovery, scheduled_foreground,
+    continuity, db, execution, governed_actions, identity, migration, model_calls, model_gateway,
+    proposal, recovery, scheduled_foreground,
     schema::{self, SchemaCompatibility, SchemaPolicy},
     worker, workspace,
 };
@@ -461,6 +467,127 @@ pub struct TraceNote {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceDiagnosisVerdict {
+    Succeeded,
+    Failed,
+    AwaitingApproval,
+    Blocked,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFailureClass {
+    ModelGatewayTransportFailure,
+    ProviderRejected,
+    TelegramDeliveryFailure,
+    PersistenceFailure,
+    ContextAssemblyFailure,
+    MalformedActionProposal,
+    WorkerProtocolFailure,
+    ScheduledForegroundValidationFailure,
+    ApprovalPending,
+    ApprovalRejected,
+    ApprovalExpired,
+    GovernedActionBlocked,
+    RecoveryInterrupted,
+    UnknownFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceLikelyCauseKind {
+    DirectFact,
+    Inference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSideEffectStatus {
+    NoneExecuted,
+    Executed,
+    Possible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceUserReplyStatus {
+    Produced,
+    NotProduced,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceRetrySafety {
+    Safe,
+    Unsafe,
+    RequiresOperator,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceNodeReference {
+    pub node_id: String,
+    pub node_kind: String,
+    pub source_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub status: Option<String>,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceDiagnosisSummary {
+    pub trace_id: Uuid,
+    pub root_execution_id: Option<Uuid>,
+    pub verdict: TraceDiagnosisVerdict,
+    pub failure_class: Option<TraceFailureClass>,
+    pub first_failing_node: Option<TraceNodeReference>,
+    pub last_successful_node: Option<TraceNodeReference>,
+    pub side_effect_status: TraceSideEffectStatus,
+    pub user_reply_status: TraceUserReplyStatus,
+    pub retry_safety: TraceRetrySafety,
+    pub likely_cause: Option<String>,
+    pub likely_cause_kind: Option<TraceLikelyCauseKind>,
+    pub suggested_next_steps: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFocusSelector {
+    FailingNode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceFocusPayloadAvailability {
+    Available,
+    Partial,
+    RetentionExpired,
+    NotRecorded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceFocusReport {
+    pub selector: TraceFocusSelector,
+    pub resolved_node: Option<TraceNode>,
+    pub payload_availability: TraceFocusPayloadAvailability,
+    pub payload_availability_reason: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceExplanationReport {
+    pub diagnosis: TraceDiagnosisSummary,
+    pub focus: Option<TraceFocusReport>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolveApprovalRequest {
     pub approval_request_id: Uuid,
@@ -488,6 +615,132 @@ pub struct SuperviseWorkerLeasesRequest {
     pub soft_warning_threshold_percent: u8,
     pub actor_ref: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityResetRequest {
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResetReport {
+    pub trace_id: Uuid,
+    pub reset_at: DateTime<Utc>,
+    pub actor_ref: String,
+    pub reason: Option<String>,
+    pub previous_lifecycle_state: Option<String>,
+    pub lifecycle_state: String,
+    pub superseded_identity_item_count: u32,
+    pub cancelled_interview_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityStatusReport {
+    pub lifecycle_state: String,
+    pub lifecycle_status: Option<String>,
+    pub lifecycle_transition_reason: Option<String>,
+    pub kickstart_available: bool,
+    pub active_item_count: u32,
+    pub stable_item_count: u32,
+    pub evolving_item_count: u32,
+    pub boundary_count: u32,
+    pub value_count: u32,
+    pub self_description_present: bool,
+    pub compact_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityShowReport {
+    pub status: IdentityStatusReport,
+    pub compact_identity: CompactIdentitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityHistorySummary {
+    pub identity_item_id: Uuid,
+    pub proposal_id: Option<Uuid>,
+    pub trace_id: Option<Uuid>,
+    pub stability_class: String,
+    pub category: String,
+    pub item_key: String,
+    pub value_text: String,
+    pub status: String,
+    pub supersedes_item_id: Option<Uuid>,
+    pub superseded_by_item_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityDiagnosticSummary {
+    pub identity_diagnostic_id: Uuid,
+    pub diagnostic_kind: String,
+    pub severity: String,
+    pub status: String,
+    pub identity_item_id: Option<Uuid>,
+    pub proposal_id: Option<Uuid>,
+    pub trace_id: Option<Uuid>,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityEditProposalRequest {
+    pub actor_ref: String,
+    pub reason: String,
+    pub operation: String,
+    pub stability_class: String,
+    pub category: String,
+    pub item_key: String,
+    pub value: String,
+    pub confidence_pct: u8,
+    pub weight_pct: Option<u8>,
+    pub target_identity_item_id: Option<Uuid>,
+    pub confirm_stable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityEditResolutionRequest {
+    pub proposal_id: Uuid,
+    pub actor_ref: String,
+    pub decision: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditProposalReport {
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub proposal_id: Uuid,
+    pub status: String,
+    pub validation_reason: String,
+    pub stable_identity_change: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditProposalSummary {
+    pub proposal_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub status: String,
+    pub confidence_pct: u8,
+    pub category: Option<String>,
+    pub item_key: Option<String>,
+    pub value_text: String,
+    pub rationale: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEditResolutionReport {
+    pub proposal_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Uuid,
+    pub decision: String,
+    pub status: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +811,386 @@ pub async fn load_schema_upgrade_assessment(
 ) -> Result<SchemaUpgradeAssessmentReport> {
     let pool = db::connect(config).await?;
     inspect_schema_upgrade_assessment(&pool, config).await
+}
+
+pub async fn load_identity_status(config: &RuntimeConfig) -> Result<IdentityStatusReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    load_identity_status_from_pool(&pool).await
+}
+
+pub async fn load_identity_show(config: &RuntimeConfig) -> Result<IdentityShowReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let status = load_identity_status_from_pool(&pool).await?;
+    let compact_identity = identity::reconstruct_compact_identity_snapshot(&pool, 64).await?;
+    Ok(IdentityShowReport {
+        status,
+        compact_identity,
+    })
+}
+
+pub async fn list_identity_history(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityHistorySummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT identity_item_id, proposal_id, trace_id, stability_class, category, item_key,
+               value_text, status, supersedes_item_id, superseded_by_item_id, created_at,
+               updated_at
+        FROM identity_items
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(IdentityHistorySummary {
+                identity_item_id: row.try_get("identity_item_id")?,
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                stability_class: row.try_get("stability_class")?,
+                category: row.try_get("category")?,
+                item_key: row.try_get("item_key")?,
+                value_text: row.try_get("value_text")?,
+                status: row.try_get("status")?,
+                supersedes_item_id: row.try_get("supersedes_item_id")?,
+                superseded_by_item_id: row.try_get("superseded_by_item_id")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn list_identity_diagnostics(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityDiagnosticSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT identity_diagnostic_id, diagnostic_kind, severity, status, identity_item_id,
+               proposal_id, trace_id, message, created_at
+        FROM identity_diagnostics
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(IdentityDiagnosticSummary {
+                identity_diagnostic_id: row.try_get("identity_diagnostic_id")?,
+                diagnostic_kind: row.try_get("diagnostic_kind")?,
+                severity: row.try_get("severity")?,
+                status: row.try_get("status")?,
+                identity_item_id: row.try_get("identity_item_id")?,
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                message: row.try_get("message")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn propose_identity_edit(
+    config: &RuntimeConfig,
+    request: IdentityEditProposalRequest,
+) -> Result<IdentityEditProposalReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity edit actor_ref must not be empty");
+    }
+    let reason = request.reason.trim();
+    if reason.is_empty() {
+        bail!("identity edit reason must not be empty");
+    }
+
+    let stability_class = parse_identity_stability_class(&request.stability_class)?;
+    let stable_identity_change = matches!(stability_class, IdentityStabilityClass::Stable);
+    if stable_identity_change && !request.confirm_stable {
+        bail!("stable identity edit proposals require --confirm-stable");
+    }
+
+    let operation = parse_identity_delta_operation(&request.operation)?;
+    let category = parse_identity_item_category(&request.category)?;
+    let now = Utc::now();
+    let trace_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    let proposal_id = Uuid::now_v7();
+    let proposal = CanonicalProposal {
+        proposal_id,
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: request.confidence_pct,
+        conflict_posture: match operation {
+            IdentityDeltaOperation::Revise => ProposalConflictPosture::Revises,
+            IdentityDeltaOperation::Supersede => ProposalConflictPosture::Supersedes,
+            _ => ProposalConflictPosture::Independent,
+        },
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(reason.to_string()),
+        valid_from: Some(now),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![trace_id],
+            source_episode_id: None,
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+            item_deltas: vec![IdentityItemDelta {
+                operation,
+                stability_class,
+                category,
+                item_key: request.item_key.trim().to_string(),
+                value: request.value.trim().to_string(),
+                confidence_pct: request.confidence_pct,
+                weight_pct: request.weight_pct,
+                source: IdentityItemSource::OperatorAuthored,
+                merge_policy: if stable_identity_change {
+                    IdentityMergePolicy::ApprovalRequired
+                } else {
+                    IdentityMergePolicy::Revisable
+                },
+                evidence_refs: vec![IdentityEvidenceRef {
+                    source_kind: "operator".to_string(),
+                    source_id: None,
+                    summary: reason.to_string(),
+                }],
+                valid_from: Some(now),
+                valid_to: None,
+                target_identity_item_id: request.target_identity_item_id,
+            }],
+            self_description_delta: None,
+            interview_action: None,
+            rationale: reason.to_string(),
+        }),
+    };
+
+    let validation = proposal::validate_proposal(&proposal);
+    if validation.outcome == ProposalEvaluationOutcome::Rejected {
+        bail!(validation.reason);
+    }
+
+    execution::insert(
+        &pool,
+        &execution::NewExecutionRecord {
+            execution_id,
+            trace_id,
+            trigger_kind: "operator_identity_edit".to_string(),
+            synthetic_trigger: Some("identity_edit_proposal".to_string()),
+            status: "completed".to_string(),
+            request_payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason,
+                "proposal_id": proposal_id,
+            }),
+        },
+    )
+    .await?;
+    continuity::insert_proposal(
+        &pool,
+        &continuity::NewProposalRecord {
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            source_ingress_id: None,
+            source_loop_kind: "operator".to_string(),
+            proposal_kind: "identity_delta".to_string(),
+            canonical_target: "identity_items".to_string(),
+            status: "pending_operator_review".to_string(),
+            confidence: f64::from(request.confidence_pct) / 100.0,
+            conflict_posture: conflict_posture_as_str(proposal.conflict_posture).to_string(),
+            subject_ref: proposal.subject_ref.clone(),
+            content_text: request.value.trim().to_string(),
+            rationale: proposal.rationale.clone(),
+            valid_from: proposal.valid_from,
+            valid_to: None,
+            supersedes_artifact_id: None,
+            supersedes_artifact_kind: None,
+            payload: serde_json::to_value(&proposal.payload)?,
+        },
+    )
+    .await?;
+    continuity::insert_merge_decision(
+        &pool,
+        &continuity::NewMergeDecision {
+            merge_decision_id: Uuid::now_v7(),
+            proposal_id,
+            trace_id,
+            execution_id,
+            episode_id: None,
+            decision_kind: "pending_operator_review".to_string(),
+            decision_reason: validation.reason.clone(),
+            accepted_memory_artifact_id: None,
+            accepted_self_model_artifact_id: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "stable_identity_change": stable_identity_change,
+            }),
+        },
+    )
+    .await?;
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_edit_proposed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: Some(execution_id),
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "proposal_id": proposal_id,
+                "stable_identity_change": stable_identity_change,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(IdentityEditProposalReport {
+        trace_id,
+        execution_id,
+        proposal_id,
+        status: "pending_operator_review".to_string(),
+        validation_reason: validation.reason,
+        stable_identity_change,
+    })
+}
+
+pub async fn list_identity_edit_proposals(
+    config: &RuntimeConfig,
+    limit: u32,
+) -> Result<Vec<IdentityEditProposalSummary>> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT proposal_id, trace_id, execution_id, status, confidence, content_text,
+               rationale, payload_json, created_at
+        FROM proposals
+        WHERE proposal_kind = 'identity_delta'
+          AND canonical_target = 'identity_items'
+          AND source_loop_kind = 'operator'
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let payload: JsonValue = row.try_get("payload_json")?;
+            Ok(IdentityEditProposalSummary {
+                proposal_id: row.try_get("proposal_id")?,
+                trace_id: row.try_get("trace_id")?,
+                execution_id: row.try_get("execution_id")?,
+                status: row.try_get("status")?,
+                confidence_pct: pct_from_f64(row.try_get::<f64, _>("confidence")?),
+                category: payload
+                    .pointer("/value/item_deltas/0/category")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                item_key: payload
+                    .pointer("/value/item_deltas/0/item_key")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
+                value_text: row.try_get("content_text")?,
+                rationale: row.try_get("rationale")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn resolve_identity_edit_proposal(
+    config: &RuntimeConfig,
+    request: IdentityEditResolutionRequest,
+) -> Result<IdentityEditResolutionReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity edit resolution actor_ref must not be empty");
+    }
+    let decision = request.decision.trim();
+    if decision != "approve" && decision != "reject" {
+        bail!("identity edit resolution decision must be approve or reject");
+    }
+
+    let proposal = load_identity_edit_proposal(&pool, request.proposal_id).await?;
+    let reason = request
+        .reason
+        .unwrap_or_else(|| format!("operator {decision}"));
+
+    if decision == "reject" {
+        sqlx::query("UPDATE proposals SET status = 'rejected' WHERE proposal_id = $1")
+            .bind(request.proposal_id)
+            .execute(&pool)
+            .await?;
+        continuity::update_merge_decision_outcome(&pool, request.proposal_id, "rejected", &reason)
+            .await?;
+        return Ok(IdentityEditResolutionReport {
+            proposal_id: request.proposal_id,
+            trace_id: proposal.0.trace_id,
+            execution_id: proposal.0.execution_id,
+            decision: decision.to_string(),
+            status: "rejected".to_string(),
+            reason,
+        });
+    }
+
+    let context = proposal::ProposalProcessingContext {
+        trace_id: proposal.0.trace_id,
+        execution_id: proposal.0.execution_id,
+        episode_id: None,
+        source_ingress_id: None,
+        source_loop_kind: "operator".to_string(),
+    };
+    let evaluation =
+        identity::apply_identity_delta_proposal_merge(&pool, &context, &proposal.1).await?;
+    let status = if evaluation.outcome == ProposalEvaluationOutcome::Accepted {
+        "merged"
+    } else {
+        "rejected"
+    };
+    sqlx::query("UPDATE proposals SET status = $2 WHERE proposal_id = $1")
+        .bind(request.proposal_id)
+        .bind(status)
+        .execute(&pool)
+        .await?;
+
+    Ok(IdentityEditResolutionReport {
+        proposal_id: request.proposal_id,
+        trace_id: proposal.0.trace_id,
+        execution_id: proposal.0.execution_id,
+        decision: decision.to_string(),
+        status: status.to_string(),
+        reason: evaluation.reason,
+    })
 }
 
 pub async fn load_operational_health_summary(
@@ -686,6 +1319,155 @@ pub async fn supervise_worker_leases(
             .into_iter()
             .map(recovered_worker_lease_summary)
             .collect(),
+    })
+}
+
+pub async fn reset_identity(
+    config: &RuntimeConfig,
+    request: IdentityResetRequest,
+) -> Result<IdentityResetReport> {
+    let pool = db::connect(config).await?;
+    verify_schema(&pool, config).await?;
+
+    if !request.force {
+        bail!("identity reset requires --force");
+    }
+
+    let actor_ref = request.actor_ref.trim();
+    if actor_ref.is_empty() {
+        bail!("identity reset actor_ref must not be empty");
+    }
+
+    let trace_id = Uuid::now_v7();
+    let reason = request.reason.clone();
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_reset_requested".to_string(),
+            severity: "warn".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "force": request.force,
+            }),
+        },
+    )
+    .await?;
+
+    let outcome =
+        match identity::reset_to_bootstrap(&pool, trace_id, actor_ref, reason.as_deref()).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = audit::insert(
+                    &pool,
+                    &NewAuditEvent {
+                        loop_kind: "operator".to_string(),
+                        subsystem: "management".to_string(),
+                        event_kind: "management_identity_reset_failed".to_string(),
+                        severity: "error".to_string(),
+                        trace_id,
+                        execution_id: None,
+                        worker_pid: None,
+                        payload: json!({
+                            "actor_ref": actor_ref,
+                            "reason": reason.clone(),
+                            "error": error.to_string(),
+                        }),
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        };
+
+    audit::insert(
+        &pool,
+        &NewAuditEvent {
+            loop_kind: "operator".to_string(),
+            subsystem: "management".to_string(),
+            event_kind: "management_identity_reset_completed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "actor_ref": actor_ref,
+                "reason": reason.clone(),
+                "previous_lifecycle_state": outcome.previous_lifecycle_state.clone(),
+                "lifecycle_state": "bootstrap_seed_only",
+                "superseded_identity_item_count": outcome.superseded_identity_item_count,
+                "cancelled_interview_count": outcome.cancelled_interview_count,
+            }),
+        },
+    )
+    .await?;
+
+    Ok(IdentityResetReport {
+        trace_id,
+        reset_at: outcome.reset_at,
+        actor_ref: actor_ref.to_string(),
+        reason,
+        previous_lifecycle_state: outcome.previous_lifecycle_state,
+        lifecycle_state: "bootstrap_seed_only".to_string(),
+        superseded_identity_item_count: outcome.superseded_identity_item_count,
+        cancelled_interview_count: outcome.cancelled_interview_count,
+    })
+}
+
+async fn load_identity_status_from_pool(pool: &PgPool) -> Result<IdentityStatusReport> {
+    let lifecycle = identity::get_current_lifecycle(pool).await?;
+    let compact_identity = identity::reconstruct_compact_identity_snapshot(pool, 64).await?;
+    let active_item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active'")
+            .fetch_one(pool)
+            .await?;
+    let stable_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active' AND stability_class = 'stable'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let evolving_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM identity_items WHERE status = 'active' AND stability_class = 'evolving'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let lifecycle_state = lifecycle
+        .as_ref()
+        .map(|record| record.lifecycle_state.clone())
+        .unwrap_or_else(|| "bootstrap_seed_only".to_string());
+    let compact_summary = if compact_identity.identity_summary.trim().is_empty() {
+        "(not formed)".to_string()
+    } else {
+        compact_identity.identity_summary.clone()
+    };
+
+    Ok(IdentityStatusReport {
+        kickstart_available: matches!(
+            lifecycle_state.as_str(),
+            "bootstrap_seed_only" | "identity_kickstart_in_progress"
+        ),
+        lifecycle_status: lifecycle.as_ref().map(|record| record.status.clone()),
+        lifecycle_transition_reason: lifecycle
+            .as_ref()
+            .map(|record| record.transition_reason.clone()),
+        lifecycle_state,
+        active_item_count: active_item_count.try_into().unwrap_or(u32::MAX),
+        stable_item_count: stable_item_count.try_into().unwrap_or(u32::MAX),
+        evolving_item_count: evolving_item_count.try_into().unwrap_or(u32::MAX),
+        boundary_count: compact_identity
+            .boundaries
+            .len()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        value_count: compact_identity.values.len().try_into().unwrap_or(u32::MAX),
+        self_description_present: compact_identity.self_description.is_some(),
+        compact_summary,
     })
 }
 
@@ -1405,6 +2187,123 @@ pub async fn load_trace_report(
     load_trace_explicit_causal_links(&pool, trace_id, &mut builder).await?;
 
     Ok(builder.finish())
+}
+
+pub fn explain_trace_report(
+    report: &TraceReport,
+    focus: Option<TraceFocusSelector>,
+) -> TraceExplanationReport {
+    let diagnosis = diagnose_trace_report(report);
+    let focus = focus.map(|selector| inspect_trace_report_focus(report, &diagnosis, selector));
+    TraceExplanationReport { diagnosis, focus }
+}
+
+pub fn diagnose_trace_report(report: &TraceReport) -> TraceDiagnosisSummary {
+    let pending_approval = find_pending_approval_node(report);
+    let blocked_node = find_blocked_node(report);
+    let first_failing_node = find_first_failing_node(report);
+    let primary_failure = pending_approval
+        .or(blocked_node)
+        .or(first_failing_node)
+        .map(trace_node_reference);
+    let last_successful_node = primary_failure
+        .as_ref()
+        .and_then(|failure| find_last_nonfailing_before(report, &failure.node_id))
+        .or_else(|| {
+            report
+                .nodes
+                .iter()
+                .rev()
+                .find(|node| node_is_nonfailing(node))
+                .map(trace_node_reference)
+        });
+    let failure_class =
+        classify_trace_failure(report, pending_approval, blocked_node, first_failing_node);
+    let verdict = derive_trace_verdict(report, pending_approval, blocked_node, failure_class);
+    let side_effect_status = derive_side_effect_status(report);
+    let user_reply_status = derive_user_reply_status(report);
+    let retry_safety = derive_retry_safety(verdict, side_effect_status, failure_class);
+    let (likely_cause, likely_cause_kind) = derive_likely_cause(
+        report,
+        failure_class,
+        pending_approval,
+        blocked_node,
+        first_failing_node,
+    );
+    let mut notes = report
+        .notes
+        .iter()
+        .map(|note| format!("{}: {}", note.note_kind, note.message))
+        .collect::<Vec<_>>();
+    if first_failing_node.is_none() && pending_approval.is_none() && blocked_node.is_none() {
+        notes.push("No explicit failing node was found in the durable trace.".to_string());
+    }
+    let suggested_next_steps = derive_next_steps(
+        failure_class,
+        retry_safety,
+        side_effect_status,
+        pending_approval.is_some(),
+    );
+
+    TraceDiagnosisSummary {
+        trace_id: report.trace_id,
+        root_execution_id: report.root_execution_id,
+        verdict,
+        failure_class,
+        first_failing_node: primary_failure,
+        last_successful_node,
+        side_effect_status,
+        user_reply_status,
+        retry_safety,
+        likely_cause,
+        likely_cause_kind,
+        suggested_next_steps,
+        notes,
+    }
+}
+
+fn find_last_nonfailing_before(
+    report: &TraceReport,
+    failing_node_id: &str,
+) -> Option<TraceNodeReference> {
+    let failure_index = report
+        .nodes
+        .iter()
+        .position(|node| node.node_id == failing_node_id)?;
+    report.nodes[..failure_index]
+        .iter()
+        .rev()
+        .find(|node| node_is_nonfailing(node))
+        .map(trace_node_reference)
+}
+
+pub fn inspect_trace_report_focus(
+    report: &TraceReport,
+    diagnosis: &TraceDiagnosisSummary,
+    selector: TraceFocusSelector,
+) -> TraceFocusReport {
+    let resolved_node = match selector {
+        TraceFocusSelector::FailingNode => diagnosis.first_failing_node.as_ref().and_then(|node| {
+            report
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == node.node_id)
+                .cloned()
+        }),
+    };
+    let (payload_availability, payload_availability_reason, mut notes) =
+        classify_focus_payload_availability(resolved_node.as_ref());
+    if resolved_node.is_none() {
+        notes.push("The requested focus target is not present in this trace.".to_string());
+    }
+
+    TraceFocusReport {
+        selector,
+        resolved_node,
+        payload_availability,
+        payload_availability_reason,
+        notes,
+    }
 }
 
 pub async fn list_recent_traces(config: &RuntimeConfig, limit: u32) -> Result<Vec<TraceSummary>> {
@@ -2623,6 +3522,651 @@ fn trace_node_id(kind: &str, id: Uuid) -> String {
     format!("{kind}:{id}")
 }
 
+fn trace_node_reference(node: &TraceNode) -> TraceNodeReference {
+    TraceNodeReference {
+        node_id: node.node_id.clone(),
+        node_kind: node.node_kind.clone(),
+        source_id: node.source_id,
+        occurred_at: node.occurred_at,
+        status: node.status.clone(),
+        title: node.title.clone(),
+        summary: node.summary.clone(),
+    }
+}
+
+fn find_pending_approval_node(report: &TraceReport) -> Option<&TraceNode> {
+    report.nodes.iter().find(|node| {
+        node.node_kind == "approval_request" && matches!(node.status.as_deref(), Some("pending"))
+    })
+}
+
+fn find_blocked_node(report: &TraceReport) -> Option<&TraceNode> {
+    report.nodes.iter().find(|node| {
+        (node.node_kind == "governed_action_execution"
+            && matches!(node.status.as_deref(), Some("blocked")))
+            || (node.node_kind == "approval_request"
+                && matches!(node.status.as_deref(), Some("rejected" | "expired")))
+    })
+}
+
+fn find_first_failing_node(report: &TraceReport) -> Option<&TraceNode> {
+    report
+        .nodes
+        .iter()
+        .filter(|node| node_is_failure(node))
+        .min_by(|left, right| {
+            trace_failure_priority(left)
+                .cmp(&trace_failure_priority(right))
+                .then_with(|| left.occurred_at.cmp(&right.occurred_at))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        })
+}
+
+fn node_is_failure(node: &TraceNode) -> bool {
+    match node.node_kind.as_str() {
+        "audit_event" => matches!(node.status.as_deref(), Some("error" | "critical")),
+        _ => matches!(
+            node.status.as_deref(),
+            Some("failed" | "blocked" | "rejected" | "expired" | "invalidated")
+        ),
+    }
+}
+
+fn node_is_nonfailing(node: &TraceNode) -> bool {
+    !node_is_failure(node) && !matches!(node.status.as_deref(), Some("pending"))
+}
+
+fn trace_failure_priority(node: &TraceNode) -> u8 {
+    match node.node_kind.as_str() {
+        "model_call" | "governed_action_execution" | "approval_request" => 0,
+        "audit_event" => 1,
+        "execution" | "episode" => 2,
+        _ => 3,
+    }
+}
+
+fn derive_trace_verdict(
+    report: &TraceReport,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    failure_class: Option<TraceFailureClass>,
+) -> TraceDiagnosisVerdict {
+    if pending_approval.is_some() {
+        return TraceDiagnosisVerdict::AwaitingApproval;
+    }
+    if blocked_node.is_some() {
+        return TraceDiagnosisVerdict::Blocked;
+    }
+    if failure_class.is_some() {
+        return TraceDiagnosisVerdict::Failed;
+    }
+    if report.nodes.iter().any(|node| {
+        matches!(
+            node.status.as_deref(),
+            Some("succeeded" | "executed" | "resolved" | "completed")
+        )
+    }) || report.nodes.iter().any(|node| {
+        node.node_kind == "episode_message"
+            && node.payload.get("message_role").and_then(JsonValue::as_str) == Some("assistant")
+    }) {
+        return TraceDiagnosisVerdict::Succeeded;
+    }
+    TraceDiagnosisVerdict::Inconclusive
+}
+
+fn classify_trace_failure(
+    report: &TraceReport,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    first_failing_node: Option<&TraceNode>,
+) -> Option<TraceFailureClass> {
+    if pending_approval.is_some() {
+        return Some(TraceFailureClass::ApprovalPending);
+    }
+    if let Some(node) = blocked_node {
+        return match node.status.as_deref() {
+            Some("rejected") => Some(TraceFailureClass::ApprovalRejected),
+            Some("expired") => Some(TraceFailureClass::ApprovalExpired),
+            _ => Some(TraceFailureClass::GovernedActionBlocked),
+        };
+    }
+    let node = first_failing_node?;
+    match node.node_kind.as_str() {
+        "model_call" => {
+            classify_model_call_failure(report, node).or(Some(TraceFailureClass::UnknownFailure))
+        }
+        "audit_event" => classify_audit_failure(node),
+        "execution" | "episode" => classify_failure_from_related_audit(report, node)
+            .or(Some(TraceFailureClass::UnknownFailure)),
+        "governed_action_execution" => Some(TraceFailureClass::GovernedActionBlocked),
+        _ => Some(TraceFailureClass::UnknownFailure),
+    }
+}
+
+fn classify_model_call_failure(
+    report: &TraceReport,
+    node: &TraceNode,
+) -> Option<TraceFailureClass> {
+    if let Some(failure_class) = classify_failure_from_related_audit(report, node) {
+        return Some(failure_class);
+    }
+    let error_summary = node
+        .payload
+        .get("error_summary")
+        .and_then(JsonValue::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    match error_summary.as_deref() {
+        Some(summary) if summary.contains("timeout") || summary.contains("transport") => {
+            Some(TraceFailureClass::ModelGatewayTransportFailure)
+        }
+        Some(summary) if summary.contains("status 4") || summary.contains("status 5") => {
+            Some(TraceFailureClass::ProviderRejected)
+        }
+        Some(summary) if summary.contains("persist") || summary.contains("database") => {
+            Some(TraceFailureClass::PersistenceFailure)
+        }
+        _ => None,
+    }
+}
+
+fn classify_failure_from_related_audit(
+    report: &TraceReport,
+    node: &TraceNode,
+) -> Option<TraceFailureClass> {
+    let execution_id = node.related_ids.get("execution_id").copied().or_else(|| {
+        node.payload
+            .get("execution_id")
+            .and_then(JsonValue::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+    });
+    report
+        .nodes
+        .iter()
+        .filter(|candidate| {
+            candidate.node_kind == "audit_event"
+                && candidate.occurred_at >= node.occurred_at
+                && execution_id.map(|id| candidate.related_ids.get("execution_id") == Some(&id))
+                    != Some(false)
+        })
+        .find_map(classify_audit_failure)
+}
+
+fn classify_audit_failure(node: &TraceNode) -> Option<TraceFailureClass> {
+    let payload = node.payload.get("payload")?;
+    if let Some(class) = classify_failure_text(&format!("{} {}", node.summary, payload)) {
+        return Some(class);
+    }
+    let failure_kind = payload
+        .get("failure_kind")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("reason_code").and_then(JsonValue::as_str))?;
+    match failure_kind {
+        "model_gateway_transport_failure" => Some(TraceFailureClass::ModelGatewayTransportFailure),
+        "provider_rejected" => Some(TraceFailureClass::ProviderRejected),
+        "telegram_delivery_failure" => Some(TraceFailureClass::TelegramDeliveryFailure),
+        "persistence_failure" => Some(TraceFailureClass::PersistenceFailure),
+        "context_assembly_failure" => Some(TraceFailureClass::ContextAssemblyFailure),
+        "malformed_action_proposal" => Some(TraceFailureClass::MalformedActionProposal),
+        "worker_protocol_failure" => Some(TraceFailureClass::WorkerProtocolFailure),
+        "scheduled_foreground_validation_failure" => {
+            Some(TraceFailureClass::ScheduledForegroundValidationFailure)
+        }
+        "recovery_interrupted" => Some(TraceFailureClass::RecoveryInterrupted),
+        _ => Some(TraceFailureClass::UnknownFailure),
+    }
+}
+
+fn classify_failure_text(text: &str) -> Option<TraceFailureClass> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("violates check constraint")
+        || text.contains("failed to insert governed action execution")
+        || text.contains("failed to insert scheduled foreground task")
+        || text.contains("failed to update scheduled foreground task")
+    {
+        return Some(TraceFailureClass::PersistenceFailure);
+    }
+    if text.contains("scheduled foreground cadence_seconds")
+        || text.contains("scheduled foreground task key")
+        || text.contains("scheduled foreground message_text")
+    {
+        return Some(TraceFailureClass::ScheduledForegroundValidationFailure);
+    }
+    if text.contains("worker_protocol_phase=")
+        || text.contains("failed to write worker protocol line")
+        || text.contains("broken pipe")
+    {
+        return Some(TraceFailureClass::WorkerProtocolFailure);
+    }
+    None
+}
+
+fn derive_side_effect_status(report: &TraceReport) -> TraceSideEffectStatus {
+    let actions = report
+        .nodes
+        .iter()
+        .filter(|node| node.node_kind == "governed_action_execution")
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        return TraceSideEffectStatus::NoneExecuted;
+    }
+    if actions
+        .iter()
+        .any(|node| matches!(node.status.as_deref(), Some("executed")))
+    {
+        return TraceSideEffectStatus::Executed;
+    }
+    if actions.iter().any(|node| {
+        matches!(node.status.as_deref(), Some("failed"))
+            || node
+                .payload
+                .get("started_at")
+                .is_some_and(|value| !value.is_null())
+    }) {
+        return TraceSideEffectStatus::Possible;
+    }
+    if actions.iter().all(|node| {
+        matches!(
+            node.status.as_deref(),
+            Some(
+                "proposed"
+                    | "awaiting_approval"
+                    | "approved"
+                    | "blocked"
+                    | "rejected"
+                    | "expired"
+                    | "invalidated"
+            )
+        )
+    }) {
+        return TraceSideEffectStatus::NoneExecuted;
+    }
+    TraceSideEffectStatus::Unknown
+}
+
+fn derive_user_reply_status(report: &TraceReport) -> TraceUserReplyStatus {
+    if report.nodes.iter().any(|node| {
+        node.node_kind == "episode_message"
+            && node.payload.get("message_role").and_then(JsonValue::as_str) == Some("assistant")
+    }) {
+        return TraceUserReplyStatus::Produced;
+    }
+    if report
+        .nodes
+        .iter()
+        .any(|node| matches!(node.node_kind.as_str(), "execution" | "episode" | "ingress"))
+    {
+        return TraceUserReplyStatus::NotProduced;
+    }
+    TraceUserReplyStatus::Unknown
+}
+
+fn derive_retry_safety(
+    verdict: TraceDiagnosisVerdict,
+    side_effect_status: TraceSideEffectStatus,
+    failure_class: Option<TraceFailureClass>,
+) -> TraceRetrySafety {
+    if verdict == TraceDiagnosisVerdict::AwaitingApproval
+        || matches!(
+            failure_class,
+            Some(TraceFailureClass::ApprovalPending)
+                | Some(TraceFailureClass::ApprovalRejected)
+                | Some(TraceFailureClass::ApprovalExpired)
+        )
+    {
+        return TraceRetrySafety::RequiresOperator;
+    }
+    match side_effect_status {
+        TraceSideEffectStatus::NoneExecuted => match verdict {
+            TraceDiagnosisVerdict::Succeeded => TraceRetrySafety::Unsafe,
+            TraceDiagnosisVerdict::Failed
+            | TraceDiagnosisVerdict::Blocked
+            | TraceDiagnosisVerdict::Inconclusive => TraceRetrySafety::Safe,
+            TraceDiagnosisVerdict::AwaitingApproval => TraceRetrySafety::RequiresOperator,
+        },
+        TraceSideEffectStatus::Executed | TraceSideEffectStatus::Possible => {
+            TraceRetrySafety::Unsafe
+        }
+        TraceSideEffectStatus::Unknown => TraceRetrySafety::Unknown,
+    }
+}
+
+fn derive_likely_cause(
+    report: &TraceReport,
+    failure_class: Option<TraceFailureClass>,
+    pending_approval: Option<&TraceNode>,
+    blocked_node: Option<&TraceNode>,
+    first_failing_node: Option<&TraceNode>,
+) -> (Option<String>, Option<TraceLikelyCauseKind>) {
+    if let Some(node) = pending_approval {
+        return (
+            Some(format!(
+                "Approval request is pending: {}",
+                short_trace_text(&node.summary)
+            )),
+            Some(TraceLikelyCauseKind::DirectFact),
+        );
+    }
+    if let Some(node) = blocked_node {
+        let detail = node
+            .payload
+            .get("blocked_reason")
+            .and_then(JsonValue::as_str)
+            .or_else(|| {
+                node.payload
+                    .get("consequence_summary")
+                    .and_then(JsonValue::as_str)
+            })
+            .unwrap_or(node.summary.as_str());
+        return (
+            Some(short_trace_text(detail)),
+            Some(TraceLikelyCauseKind::DirectFact),
+        );
+    }
+    if let Some(node) = first_failing_node {
+        if node.node_kind == "model_call" {
+            if let Some(error_summary) = node
+                .payload
+                .get("error_summary")
+                .and_then(JsonValue::as_str)
+            {
+                return (
+                    Some(short_trace_text(error_summary)),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                );
+            }
+        }
+        if node.node_kind == "audit_event" {
+            if let Some(error) = node
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(JsonValue::as_str)
+            {
+                return (
+                    Some(short_trace_text(error)),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                );
+            }
+        }
+    }
+    match failure_class {
+        Some(class) => (
+            Some(short_trace_text(&trace_failure_class_label(class))),
+            Some(TraceLikelyCauseKind::Inference),
+        ),
+        None => {
+            if report.nodes.is_empty() {
+                (
+                    Some(
+                        "No durable trace records were found for this trace identifier."
+                            .to_string(),
+                    ),
+                    Some(TraceLikelyCauseKind::DirectFact),
+                )
+            } else {
+                (None, None)
+            }
+        }
+    }
+}
+
+fn derive_next_steps(
+    failure_class: Option<TraceFailureClass>,
+    retry_safety: TraceRetrySafety,
+    side_effect_status: TraceSideEffectStatus,
+    awaiting_approval: bool,
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    match failure_class {
+        Some(TraceFailureClass::ModelGatewayTransportFailure) => {
+            steps.push("Check model gateway and provider availability.".to_string());
+            steps.push(
+                "Inspect recent operational diagnostics for repeated transport failures."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ProviderRejected) => {
+            steps.push(
+                "Inspect the failing model-call payload and provider error summary.".to_string(),
+            );
+            steps.push("Check recent diagnostics for repeated provider rejections.".to_string());
+        }
+        Some(TraceFailureClass::ContextAssemblyFailure) => {
+            steps.push("Inspect the latest foreground context assembly audit events.".to_string());
+            steps.push(
+                "Review recent diagnostics for self-model or context assembly issues.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::MalformedActionProposal) => {
+            steps.push(
+                "Inspect the failing worker output and governed-action proposal formatting."
+                    .to_string(),
+            );
+            steps.push(
+                "Retry the request only after confirming the assistant produced a valid tagged action block."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::WorkerProtocolFailure) => {
+            steps.push(
+                "Inspect the worker protocol phase, child exit status, and stderr excerpt."
+                    .to_string(),
+            );
+            steps.push(
+                "Restart or rebuild the worker/runtime if the child exited unexpectedly."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ScheduledForegroundValidationFailure) => {
+            steps.push(
+                "Inspect the scheduled foreground task payload and one-shot versus recurring schedule shape."
+                    .to_string(),
+            );
+            steps.push(
+                "Correct or disable the scheduled foreground task before retrying.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::GovernedActionBlocked) => {
+            steps.push(
+                "Inspect the blocked reason and capability scope on the governed action."
+                    .to_string(),
+            );
+            steps.push(
+                "Use the governed-action and approval management surfaces before retrying."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ApprovalPending) => {
+            steps.push(
+                "Resolve the pending approval request through the management CLI.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::ApprovalRejected | TraceFailureClass::ApprovalExpired) => {
+            steps.push(
+                "Inspect the approval outcome and decide whether a new request is needed."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::PersistenceFailure) => {
+            steps.push(
+                "Inspect recent diagnostics and recovery health for persistence errors."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::RecoveryInterrupted) => {
+            steps.push(
+                "Inspect recovery checkpoints and worker leases before retrying.".to_string(),
+            );
+        }
+        Some(TraceFailureClass::TelegramDeliveryFailure) => {
+            steps.push(
+                "Inspect channel delivery diagnostics before retrying the foreground turn."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::UnknownFailure) | None => {}
+    }
+    if awaiting_approval && !steps.iter().any(|step| step.contains("approval")) {
+        steps.push(
+            "Resolve the pending approval request before attempting further work.".to_string(),
+        );
+    }
+    match retry_safety {
+        TraceRetrySafety::Safe => {
+            steps.push("Retry is safe once the underlying issue is addressed.".to_string());
+        }
+        TraceRetrySafety::Unsafe => {
+            steps.push(
+                "Do not retry blindly; the trace may already include side effects.".to_string(),
+            );
+        }
+        TraceRetrySafety::RequiresOperator => {
+            steps.push("Operator action is required before continuation.".to_string());
+        }
+        TraceRetrySafety::Unknown => {
+            steps.push(
+                "Treat retry safety as unknown until the ambiguous state is resolved.".to_string(),
+            );
+        }
+    }
+    if side_effect_status == TraceSideEffectStatus::NoneExecuted
+        && !steps
+            .iter()
+            .any(|step| step.contains("Inspect the failing model-call payload"))
+        && failure_class == Some(TraceFailureClass::ModelGatewayTransportFailure)
+    {
+        steps.push("No governed action side effects executed before the failure.".to_string());
+    }
+    if steps.is_empty() {
+        steps.push(
+            "Use trace show for the full timeline and inspect the most relevant node payload."
+                .to_string(),
+        );
+    }
+    steps
+}
+
+fn trace_failure_class_label(class: TraceFailureClass) -> String {
+    match class {
+        TraceFailureClass::ModelGatewayTransportFailure => {
+            "The trace failed at the model gateway transport boundary.".to_string()
+        }
+        TraceFailureClass::ProviderRejected => {
+            "The model provider rejected or failed the request.".to_string()
+        }
+        TraceFailureClass::TelegramDeliveryFailure => {
+            "Delivery back to the conversation channel failed.".to_string()
+        }
+        TraceFailureClass::PersistenceFailure => {
+            "Persistence failed during foreground processing.".to_string()
+        }
+        TraceFailureClass::ContextAssemblyFailure => {
+            "Foreground context assembly failed before model completion.".to_string()
+        }
+        TraceFailureClass::MalformedActionProposal => {
+            "The assistant attempted a governed action but returned an invalid action proposal shape."
+                .to_string()
+        }
+        TraceFailureClass::WorkerProtocolFailure => {
+            "The worker subprocess protocol failed before a valid final response returned."
+                .to_string()
+        }
+        TraceFailureClass::ScheduledForegroundValidationFailure => {
+            "A scheduled foreground action failed validation before execution could complete."
+                .to_string()
+        }
+        TraceFailureClass::ApprovalPending => {
+            "The foreground turn is waiting on a pending approval request.".to_string()
+        }
+        TraceFailureClass::ApprovalRejected => "The required approval was rejected.".to_string(),
+        TraceFailureClass::ApprovalExpired => {
+            "The required approval expired before execution.".to_string()
+        }
+        TraceFailureClass::GovernedActionBlocked => {
+            "A governed action was blocked by policy or validation.".to_string()
+        }
+        TraceFailureClass::RecoveryInterrupted => {
+            "Recovery interrupted the normal foreground continuation path.".to_string()
+        }
+        TraceFailureClass::UnknownFailure => {
+            "The trace contains a failure, but the exact class could not be derived safely."
+                .to_string()
+        }
+    }
+}
+
+fn classify_focus_payload_availability(
+    node: Option<&TraceNode>,
+) -> (TraceFocusPayloadAvailability, Option<String>, Vec<String>) {
+    let Some(node) = node else {
+        return (
+            TraceFocusPayloadAvailability::Unavailable,
+            Some("No node was resolved for the requested focus target.".to_string()),
+            Vec::new(),
+        );
+    };
+
+    if node.node_kind == "model_call" {
+        let retained_fields = [
+            "request_payload_json",
+            "response_payload_json",
+            "system_prompt_text",
+            "messages_json",
+        ];
+        let available_fields = retained_fields
+            .iter()
+            .filter(|field| {
+                node.payload
+                    .get(**field)
+                    .is_some_and(|value| !value.is_null())
+            })
+            .count();
+        if let Some(reason) = node
+            .payload
+            .get("payload_retention_reason")
+            .and_then(JsonValue::as_str)
+        {
+            return (
+                TraceFocusPayloadAvailability::RetentionExpired,
+                Some(format!(
+                    "Model-call payload fields were cleared by retention: {reason}."
+                )),
+                vec!["Only retained metadata remains available for this model call.".to_string()],
+            );
+        }
+        if available_fields == retained_fields.len() {
+            return (TraceFocusPayloadAvailability::Available, None, Vec::new());
+        }
+        if available_fields == 0 {
+            return (
+                TraceFocusPayloadAvailability::NotRecorded,
+                Some(
+                    "The retained model-call payload fields are not available on this trace."
+                        .to_string(),
+                ),
+                Vec::new(),
+            );
+        }
+        return (
+            TraceFocusPayloadAvailability::Partial,
+            Some(
+                "Some model-call payload fields are available, but others are absent.".to_string(),
+            ),
+            Vec::new(),
+        );
+    }
+
+    if node.payload.is_null() {
+        return (
+            TraceFocusPayloadAvailability::Unavailable,
+            Some("No payload is stored for this node.".to_string()),
+            Vec::new(),
+        );
+    }
+
+    (TraceFocusPayloadAvailability::Available, None, Vec::new())
+}
+
 fn short_trace_text(text: &str) -> String {
     const MAX_CHARS: usize = 240;
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2646,6 +4190,143 @@ fn audit_payload_summary(payload: &JsonValue) -> Option<String> {
 
 pub fn default_list_limit() -> u32 {
     DEFAULT_LIST_LIMIT
+}
+
+#[derive(Debug, Clone)]
+struct LoadedIdentityEditProposal {
+    trace_id: Uuid,
+    execution_id: Uuid,
+    confidence_pct: u8,
+    conflict_posture: ProposalConflictPosture,
+    subject_ref: String,
+    rationale: Option<String>,
+    valid_from: Option<DateTime<Utc>>,
+}
+
+async fn load_identity_edit_proposal(
+    pool: &PgPool,
+    proposal_id: Uuid,
+) -> Result<(LoadedIdentityEditProposal, CanonicalProposal)> {
+    let row = sqlx::query(
+        r#"
+        SELECT trace_id, execution_id, status, confidence, conflict_posture, subject_ref,
+               rationale, valid_from, payload_json
+        FROM proposals
+        WHERE proposal_id = $1
+          AND proposal_kind = 'identity_delta'
+          AND canonical_target = 'identity_items'
+          AND source_loop_kind = 'operator'
+        "#,
+    )
+    .bind(proposal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("identity edit proposal {proposal_id} was not found"))?;
+    let status: String = row.try_get("status")?;
+    if status != "pending_operator_review" {
+        bail!("identity edit proposal {proposal_id} is not pending operator review");
+    }
+    let payload: CanonicalProposalPayload = serde_json::from_value(row.try_get("payload_json")?)?;
+    let conflict_posture = parse_proposal_conflict_posture(row.try_get("conflict_posture")?)?;
+    let loaded = LoadedIdentityEditProposal {
+        trace_id: row.try_get("trace_id")?,
+        execution_id: row.try_get("execution_id")?,
+        confidence_pct: pct_from_f64(row.try_get("confidence")?),
+        conflict_posture,
+        subject_ref: row.try_get("subject_ref")?,
+        rationale: row.try_get("rationale")?,
+        valid_from: row.try_get("valid_from")?,
+    };
+    let proposal = CanonicalProposal {
+        proposal_id,
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: loaded.confidence_pct,
+        conflict_posture: loaded.conflict_posture,
+        subject_ref: loaded.subject_ref.clone(),
+        rationale: loaded.rationale.clone(),
+        valid_from: loaded.valid_from,
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![loaded.trace_id],
+            source_episode_id: None,
+        },
+        payload,
+    };
+    Ok((loaded, proposal))
+}
+
+fn parse_identity_delta_operation(value: &str) -> Result<IdentityDeltaOperation> {
+    match value {
+        "add" => Ok(IdentityDeltaOperation::Add),
+        "reinforce" => Ok(IdentityDeltaOperation::Reinforce),
+        "weaken" => Ok(IdentityDeltaOperation::Weaken),
+        "revise" => Ok(IdentityDeltaOperation::Revise),
+        "supersede" => Ok(IdentityDeltaOperation::Supersede),
+        "expire" => Ok(IdentityDeltaOperation::Expire),
+        _ => bail!("unsupported identity edit operation {value}"),
+    }
+}
+
+fn parse_identity_stability_class(value: &str) -> Result<IdentityStabilityClass> {
+    match value {
+        "stable" => Ok(IdentityStabilityClass::Stable),
+        "evolving" => Ok(IdentityStabilityClass::Evolving),
+        "transient_projection" => Ok(IdentityStabilityClass::TransientProjection),
+        _ => bail!("unsupported identity stability class {value}"),
+    }
+}
+
+fn parse_identity_item_category(value: &str) -> Result<IdentityItemCategory> {
+    match value {
+        "name" => Ok(IdentityItemCategory::Name),
+        "identity_form" => Ok(IdentityItemCategory::IdentityForm),
+        "role" => Ok(IdentityItemCategory::Role),
+        "archetype" => Ok(IdentityItemCategory::Archetype),
+        "origin_backstory" => Ok(IdentityItemCategory::OriginBackstory),
+        "age_framing" => Ok(IdentityItemCategory::AgeFraming),
+        "foundational_trait" => Ok(IdentityItemCategory::FoundationalTrait),
+        "foundational_value" => Ok(IdentityItemCategory::FoundationalValue),
+        "enduring_boundary" => Ok(IdentityItemCategory::EnduringBoundary),
+        "default_communication_style" => Ok(IdentityItemCategory::DefaultCommunicationStyle),
+        "preference" => Ok(IdentityItemCategory::Preference),
+        "like" => Ok(IdentityItemCategory::Like),
+        "dislike" => Ok(IdentityItemCategory::Dislike),
+        "habit" => Ok(IdentityItemCategory::Habit),
+        "routine" => Ok(IdentityItemCategory::Routine),
+        "learned_tendency" => Ok(IdentityItemCategory::LearnedTendency),
+        "autobiographical_refinement" => Ok(IdentityItemCategory::AutobiographicalRefinement),
+        "recurring_self_description" => Ok(IdentityItemCategory::RecurringSelfDescription),
+        "interaction_style_adaptation" => Ok(IdentityItemCategory::InteractionStyleAdaptation),
+        "goal" => Ok(IdentityItemCategory::Goal),
+        "subgoal" => Ok(IdentityItemCategory::Subgoal),
+        _ => bail!("unsupported identity item category {value}"),
+    }
+}
+
+fn parse_proposal_conflict_posture(value: String) -> Result<ProposalConflictPosture> {
+    match value.as_str() {
+        "independent" => Ok(ProposalConflictPosture::Independent),
+        "revises" => Ok(ProposalConflictPosture::Revises),
+        "supersedes" => Ok(ProposalConflictPosture::Supersedes),
+        "conflicts" => Ok(ProposalConflictPosture::Conflicts),
+        _ => bail!("unsupported proposal conflict posture {value}"),
+    }
+}
+
+fn conflict_posture_as_str(value: ProposalConflictPosture) -> &'static str {
+    match value {
+        ProposalConflictPosture::Independent => "independent",
+        ProposalConflictPosture::Revises => "revises",
+        ProposalConflictPosture::Supersedes => "supersedes",
+        ProposalConflictPosture::Conflicts => "conflicts",
+    }
+}
+
+fn pct_from_f64(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 fn inspect_worker_status(config: &RuntimeConfig) -> WorkerStatusReport {
@@ -3606,6 +5287,7 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
             "upsert_scheduled_foreground_task"
         }
         contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        contracts::GovernedActionKind::RunDiagnostic => "run_diagnostic",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
     }
     .to_string()
@@ -3904,6 +5586,8 @@ mod tests {
                 approval_required_min_risk_tier: contracts::GovernedActionRiskTier::Tier2,
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
+                max_actions_per_foreground_turn: 10,
+                cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
@@ -3971,5 +5655,30 @@ mod tests {
     #[test]
     fn default_cli_actor_ref_falls_back_when_requested_by_is_malformed() {
         assert_eq!(default_cli_actor_ref("primary-user"), "cli:operator");
+    }
+
+    #[test]
+    fn classify_audit_failure_detects_malformed_action_proposal() {
+        let node = TraceNode {
+            node_id: "audit_event:test".to_string(),
+            node_kind: "audit_event".to_string(),
+            source_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            status: Some("error".to_string()),
+            title: "foreground_execution_failed".to_string(),
+            summary: "Foreground execution failed.".to_string(),
+            payload: json!({
+                "payload": {
+                    "failure_kind": "malformed_action_proposal",
+                    "error": "model attempted a governed action without the required governed-action block"
+                }
+            }),
+            related_ids: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            classify_audit_failure(&node),
+            Some(TraceFailureClass::MalformedActionProposal)
+        );
     }
 }

@@ -122,6 +122,7 @@ fn sample_context() -> UnconsciousContext {
             internal_conversation_ref: Some("telegram-primary".to_string()),
             summary: "Consolidate the latest scoped memory batch.".to_string(),
         },
+        evidence: None,
         budget: BackgroundExecutionBudget {
             iteration_budget: 2,
             wall_clock_budget_ms: 120_000,

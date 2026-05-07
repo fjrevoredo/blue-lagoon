@@ -5,9 +5,9 @@ use chrono::{Duration, Utc};
 use contracts::{
     ApprovalRequestStatus, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
     ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
-    GovernedActionKind, GovernedActionRiskTier, LoopKind, ModelCallPurpose, ModelCallRequest,
-    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, NetworkAccessPosture,
-    ToolPolicy,
+    GovernedActionKind, GovernedActionRiskTier, IdentityLifecycleState, LoopKind, ModelCallPurpose,
+    ModelCallRequest, ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode,
+    NetworkAccessPosture, ToolPolicy,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
@@ -16,8 +16,8 @@ use harness::{
         ForegroundModelRouteConfig, ModelGatewayConfig, ResolvedForegroundModelRouteConfig,
         ResolvedModelGatewayConfig, ResolvedTelegramConfig, SelfModelConfig,
     },
-    context, continuity, execution, foreground, foreground_orchestration, ingress, model_gateway,
-    runtime, scheduled_foreground, telegram, worker,
+    context, continuity, execution, foreground, foreground_orchestration, identity, ingress,
+    model_gateway, runtime, scheduled_foreground, telegram, worker,
 };
 use serial_test::serial;
 use sqlx::{Connection, PgConnection, Row};
@@ -1411,6 +1411,42 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
 
         assert_eq!(assembled.context.self_model.stable_identity, "blue-lagoon");
         assert_eq!(
+            assembled.context.self_model.identity_lifecycle.state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+        assert_eq!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart
+                .as_ref()
+                .expect("seed-only state should expose kickstart context")
+                .predefined_templates
+                .len(),
+            3
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity
+                .as_ref()
+                .is_some_and(|identity| !identity.stable_items.is_empty())
+        );
+        assert_eq!(
+            assembled.metadata.identity_lifecycle_state,
+            "bootstrap_seed_only"
+        );
+        assert!(assembled.metadata.identity_kickstart_available);
+        assert_eq!(
             assembled.context.trigger.ingress.text_body.as_deref(),
             Some("trigger text")
         );
@@ -1437,6 +1473,147 @@ async fn context_assembly_v0_loads_seed_and_bounded_recent_history() -> Result<(
         assert!(assembled.metadata.trigger_text_truncated);
         assert_eq!(assembled.metadata.selected_recent_history_count, 2);
         assert_eq!(assembled.metadata.truncated_history_message_count, 4);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn context_assembly_uses_complete_identity_lifecycle_snapshot() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        identity::record_lifecycle_transition(
+            &ctx.pool,
+            &identity::NewIdentityLifecycle {
+                identity_lifecycle_id: Uuid::now_v7(),
+                status: "current".to_string(),
+                lifecycle_state: "complete_identity_active".to_string(),
+                active_self_model_artifact_id: None,
+                active_interview_id: None,
+                transition_reason: "component test complete identity".to_string(),
+                transitioned_by: "test".to_string(),
+                kickstart_started_at: None,
+                kickstart_completed_at: Some(Utc::now()),
+                reset_at: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: None,
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Lagoon Complete".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "component_test".to_string(),
+                source_kind: "custom_interview".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: serde_json::json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: None,
+                stability_class: "stable".to_string(),
+                category: "foundational_value".to_string(),
+                item_key: "value:clarity".to_string(),
+                value_text: "clarity".to_string(),
+                confidence: 0.95,
+                weight: Some(0.9),
+                provenance_kind: "component_test".to_string(),
+                source_kind: "custom_interview".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: serde_json::json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await?;
+
+        let mut trigger = sample_conscious_context().trigger;
+        trigger.received_at = Utc::now();
+        trigger.ingress.occurred_at = trigger.received_at;
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id: trigger.execution_id,
+                trace_id: trigger.trace_id,
+                trigger_kind: "identity_context_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({ "kind": "identity_context_test" }),
+            },
+        )
+        .await?;
+
+        let assembled = context::assemble_foreground_context(
+            &ctx.pool,
+            &config,
+            trigger,
+            context::ContextAssemblyOptions::default(),
+        )
+        .await?;
+
+        assert_eq!(
+            assembled.context.self_model.identity_lifecycle.state,
+            IdentityLifecycleState::CompleteIdentityActive
+        );
+        assert!(
+            !assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart_available
+        );
+        assert!(
+            assembled
+                .context
+                .self_model
+                .identity_lifecycle
+                .kickstart
+                .is_none()
+        );
+
+        let identity = assembled
+            .context
+            .self_model
+            .identity
+            .as_ref()
+            .expect("complete identity should inject compact identity snapshot");
+        assert_eq!(identity.identity_summary, "Lagoon Complete");
+        assert_eq!(identity.values, vec!["clarity".to_string()]);
+        assert_eq!(
+            assembled.metadata.identity_lifecycle_state,
+            "complete_identity_active"
+        );
+        assert!(!assembled.metadata.identity_kickstart_available);
         Ok(())
     })
     .await
@@ -1533,13 +1710,23 @@ async fn context_assembly_injects_retrieved_episode_and_memory_context() -> Resu
         )
         .await?;
 
-        assert!(
-            assembled
-                .context
-                .retrieved_context
-                .items
-                .iter()
-                .any(|item| matches!(item, contracts::RetrievedContextItem::Episode(_)))
+        let retrieved_episode = assembled
+            .context
+            .retrieved_context
+            .items
+            .iter()
+            .find_map(|item| match item {
+                contracts::RetrievedContextItem::Episode(episode) => Some(episode),
+                _ => None,
+            })
+            .expect("episode context should be retrieved");
+        assert_eq!(
+            retrieved_episode.latest_user_message.as_deref(),
+            Some("remember the travel preference")
+        );
+        assert_eq!(
+            retrieved_episode.latest_assistant_message.as_deref(),
+            Some("noted the travel preference")
         );
         assert!(
             assembled
@@ -1674,6 +1861,50 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
         let seen = transport.seen_requests();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].url, "https://api.z.ai/api/paas/v4/chat/completions");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> Result<()> {
+    support::with_clean_database(|_ctx| async move {
+        let mut config = _ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["exit-after-model-request-worker".to_string()];
+
+        let gateway = sample_model_gateway_config();
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply from fake provider" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 13,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+
+        let request = contracts::WorkerRequest::conscious(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            sample_conscious_context(),
+        );
+
+        let error = worker::launch_conscious_worker(&config, &gateway, &request, &transport)
+            .await
+            .expect_err("early worker exit should fail the protocol boundary");
+        let message = error.to_string();
+        assert!(message.contains("conscious worker protocol failure"));
+        assert!(message.contains("worker_protocol_phase=write_model_response"));
+        assert!(message.contains("worker_exit_status="));
+        assert!(message.contains("worker_stderr_excerpt="));
+        assert!(message.contains("intentionally exiting before final response"));
         Ok(())
     })
     .await
@@ -1847,6 +2078,102 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
                 .iter()
                 .any(|event| event.event_kind == "foreground_execution_completed")
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_infers_custom_identity_start_without_worker_block() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let mut ingress = ingress;
+        ingress.text_body = Some("let's create a custom one".to_string());
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 13,
+                    "completion_tokens": 0
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed orchestration, got {other:?}"),
+        };
+
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Starting the custom identity interview. What name should this assistant identity use?"
+        );
+
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("identity lifecycle should be current");
+        assert_eq!(lifecycle.lifecycle_state, "identity_kickstart_in_progress");
+        let interview_id = lifecycle
+            .active_interview_id
+            .expect("custom interview should be active");
+        let interview = identity::get_identity_interview(&ctx.pool, interview_id)
+            .await?
+            .expect("identity interview should be stored");
+        assert_eq!(interview.current_step, "name");
+
+        let episode = foreground::get_episode(&ctx.pool, completed.episode_id).await?;
+        assert!(
+            episode
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("proposals evaluated=1"))
+        );
+
         Ok(())
     })
     .await
@@ -2073,6 +2400,7 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
             ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
             other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
         };
+        let ingress_id = ingress.ingress_id;
 
         let transport = model_gateway::FakeModelProviderTransport::new();
         let mut delivery = telegram::FakeTelegramDelivery::default();
@@ -2107,6 +2435,10 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
         let execution = execution::get(&ctx.pool, execution_id).await?;
         assert_eq!(execution.status, "failed");
 
+        let stored_ingress = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+        assert_eq!(stored_ingress.foreground_status, "processed");
+        assert_eq!(stored_ingress.execution_id, Some(execution_id));
+
         let episode_row = sqlx::query(
             r#"
             SELECT episode_id
@@ -2134,7 +2466,123 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
                 .any(|event| event.event_kind == "foreground_execution_failed")
         );
         assert!(transport.seen_requests().is_empty());
-        assert!(delivery.sent_messages().is_empty());
+        assert_eq!(delivery.sent_messages().len(), 1);
+        let failure_notice = &delivery.sent_messages()[0];
+        assert_eq!(failure_notice.chat_id, 42);
+        assert_eq!(failure_notice.reply_to_message_id, Some(42));
+        assert!(failure_notice.text.contains("internal runtime error"));
+        assert!(failure_notice.text.contains("context_assembly_failure"));
+        assert!(
+            failure_notice
+                .text
+                .contains(&execution.trace_id.to_string())
+        );
+        assert!(
+            !failure_notice
+                .text
+                .contains("missing foreground self-model seed configuration")
+        );
+
+        let messages = foreground::list_episode_messages(&ctx.pool, episode_id).await?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].message_role, "user");
+        assert_eq!(messages[1].message_role, "assistant");
+        assert_eq!(
+            messages[1].text_body.as_deref(),
+            Some(failure_notice.text.as_str())
+        );
+        assert_eq!(messages[1].external_message_id.as_deref(), Some("1"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_closes_planned_ingress_batch_on_terminal_failure() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let now = Utc::now();
+        let first = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(2),
+            "first planned message",
+        )
+        .await?;
+        let second = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(1),
+            "second planned message",
+        )
+        .await?;
+        let trace_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "planned_terminal_failure_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({
+                    "kind": "planned_terminal_failure_test"
+                }),
+            },
+        )
+        .await?;
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions {
+                force_recovery: true,
+            },
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_plan(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            foreground_orchestration::TelegramForegroundPlanExecution {
+                execution: foreground_orchestration::ForegroundExecutionIds {
+                    trace_id,
+                    execution_id,
+                },
+                trigger_kind_override: None,
+                plan,
+            },
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("missing self-model config should fail orchestration");
+        assert!(
+            error
+                .to_string()
+                .contains("missing foreground self-model seed configuration")
+        );
+
+        for ingress_id in [first.ingress_id, second.ingress_id] {
+            let stored = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+            assert_eq!(stored.foreground_status, "processed");
+            assert_eq!(stored.execution_id, Some(execution_id));
+        }
+        assert_eq!(delivery.sent_messages().len(), 1);
         Ok(())
     })
     .await
@@ -2526,6 +2974,107 @@ async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> R
 
 #[tokio::test]
 #[serial]
+async fn scheduled_foreground_runtime_executes_one_shot_task_and_disables_after_success()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "oneoff_success_20260507".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "One-shot scheduled check-in".to_string(),
+                cadence_seconds: 0,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "one-shot proactive reply" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let handled = runtime::run_scheduled_foreground_iteration_with(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let task = scheduled_foreground::get_task_by_key(&ctx.pool, "oneoff_success_20260507")
+            .await?
+            .expect("one-shot scheduled task should still be traceable");
+        assert_eq!(handled, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(delivery.sent_messages()[0].text, "one-shot proactive reply");
+        assert_eq!(
+            task.status,
+            contracts::ScheduledForegroundTaskStatus::Disabled
+        );
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Completed)
+        );
+        assert!(task.last_execution_id.is_some());
+
+        let due_tasks = scheduled_foreground::list_tasks(
+            &ctx.pool,
+            scheduled_foreground::ScheduledForegroundTaskListFilter {
+                status: Some(contracts::ScheduledForegroundTaskStatus::Active),
+                due_only: true,
+                limit: 10,
+            },
+        )
+        .await?;
+        assert!(due_tasks.is_empty());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn scheduled_foreground_runtime_suppresses_when_binding_disappears() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let binding = foreground::upsert_conversation_binding(
@@ -2630,6 +3179,85 @@ async fn scheduled_foreground_runtime_suppresses_when_binding_disappears() -> Re
         .fetch_one(&ctx.pool)
         .await?;
         assert_eq!(suppressed_audit_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_one_shot_failure_disables_task_and_stops_retry() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &ctx.config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "oneoff_test_20260507".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "One-shot scheduled message".to_string(),
+                cadence_seconds: 0,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let claimed = scheduled_foreground::claim_next_due_task(
+            &ctx.pool,
+            execution_id,
+            Uuid::now_v7(),
+            Utc::now(),
+        )
+        .await?
+        .expect("one-shot task should be claimable");
+        let completed_at = Utc::now();
+        let task = scheduled_foreground::mark_task_failed(
+            &ctx.pool,
+            &claimed.task,
+            execution_id,
+            completed_at,
+            "execution_failed",
+            "worker protocol failure",
+        )
+        .await?;
+
+        assert_eq!(
+            task.status,
+            contracts::ScheduledForegroundTaskStatus::Disabled
+        );
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Failed)
+        );
+
+        let due_tasks = scheduled_foreground::list_tasks(
+            &ctx.pool,
+            scheduled_foreground::ScheduledForegroundTaskListFilter {
+                status: Some(contracts::ScheduledForegroundTaskStatus::Active),
+                due_only: true,
+                limit: 10,
+            },
+        )
+        .await?;
+        assert!(due_tasks.is_empty());
         Ok(())
     })
     .await
@@ -2962,6 +3590,8 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
             preferences: vec!["concise".to_string()],
             current_goals: vec!["support_the_user".to_string()],
             current_subgoals: vec!["reply_to_current_message".to_string()],
+            identity: None,
+            identity_lifecycle: Default::default(),
         },
         internal_state: contracts::InternalStateSnapshot {
             load_pct: 15,
@@ -2982,6 +3612,7 @@ fn sample_conscious_context() -> contracts::ConsciousContext {
         }],
         retrieved_context: contracts::RetrievedContext::default(),
         governed_action_observations: Vec::new(),
+        governed_action_loop_state: None,
         recovery_context: contracts::ForegroundRecoveryContext::default(),
     }
 }

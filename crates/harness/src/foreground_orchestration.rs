@@ -11,7 +11,7 @@ use crate::{
     config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
-    governed_actions,
+    governed_actions, identity,
     model_gateway::ModelProviderTransport,
     policy, proposal, recovery,
     telegram::{self, TelegramChatAction, TelegramDelivery, TelegramOutboundMessage},
@@ -93,6 +93,103 @@ struct GovernedActionProcessingSummary {
     executed_count: usize,
     blocked_count: usize,
     pending_approval_count: usize,
+    action_limit_reached: bool,
+}
+
+impl GovernedActionProcessingSummary {
+    fn merge(&mut self, other: Self) {
+        self.observations.extend(other.observations);
+        self.proposed_count += other.proposed_count;
+        self.executed_count += other.executed_count;
+        self.blocked_count += other.blocked_count;
+        self.pending_approval_count += other.pending_approval_count;
+        self.action_limit_reached |= other.action_limit_reached;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ForegroundActionLoopTracker {
+    executed_action_count: u32,
+}
+
+impl ForegroundActionLoopTracker {
+    fn new(executed_action_count: u32) -> Self {
+        Self {
+            executed_action_count,
+        }
+    }
+
+    fn max_actions_per_turn(self, config: &RuntimeConfig) -> u32 {
+        config.governed_actions.max_actions_per_foreground_turn
+    }
+
+    fn remaining_actions_before_cap(self, config: &RuntimeConfig) -> u32 {
+        self.max_actions_per_turn(config)
+            .saturating_sub(self.executed_action_count)
+    }
+
+    fn is_at_cap(self, config: &RuntimeConfig) -> bool {
+        self.remaining_actions_before_cap(config) == 0
+    }
+
+    fn record_executed_action(&mut self) {
+        self.executed_action_count = self.executed_action_count.saturating_add(1);
+    }
+
+    fn as_contract_state(
+        self,
+        config: &RuntimeConfig,
+    ) -> contracts::ForegroundGovernedActionLoopState {
+        contracts::ForegroundGovernedActionLoopState {
+            executed_action_count: self.executed_action_count,
+            max_actions_per_turn: self.max_actions_per_turn(config),
+            remaining_actions_before_cap: self.remaining_actions_before_cap(config),
+            cap_exceeded_behavior: config.governed_actions.cap_exceeded_behavior,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConsciousTurnLoopOutcome {
+    response: contracts::WorkerResponse,
+    result: contracts::ConsciousWorkerResult,
+    governed_action_summary: GovernedActionProcessingSummary,
+}
+
+#[derive(Debug)]
+struct GovernedActionApprovalRoute<'a> {
+    trigger: &'a contracts::ForegroundTrigger,
+    proposal: &'a contracts::GovernedActionProposal,
+    record: &'a governed_actions::GovernedActionExecutionRecord,
+    approval_title: &'a str,
+    approval_consequence_summary: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct ConsciousTurnLoopRequest<'a, T> {
+    pool: &'a sqlx::PgPool,
+    config: &'a RuntimeConfig,
+    model_gateway_config: &'a ResolvedModelGatewayConfig,
+    trigger: &'a contracts::ForegroundTrigger,
+    context: contracts::ConsciousContext,
+    initial_executed_action_count: u32,
+    transport: &'a T,
+    chat_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForegroundFailureContext {
+    trace_id: Uuid,
+    execution_id: Uuid,
+    episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
+    terminal_ingress_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundFailureDeliveryTarget {
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
 }
 
 pub async fn orchestrate_telegram_foreground_ingress<T, D>(
@@ -531,36 +628,26 @@ where
                 )
                 .await?;
                 assembly.context.governed_action_observations = vec![executed.observation.clone()];
-
-                let follow_up_request = contracts::WorkerRequest::conscious(
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    assembly.context.clone(),
-                );
-                let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
-                let follow_up_response = launch_leased_conscious_worker(
-                    pool,
-                    config,
-                    model_gateway_config,
-                    &trigger,
-                    &follow_up_request,
-                    transport,
-                    foreground_timeout_ms,
+                let turn_outcome = execute_conscious_turn_with_governed_action_loop(
+                    ConsciousTurnLoopRequest {
+                        pool,
+                        config,
+                        model_gateway_config,
+                        trigger: &trigger,
+                        context: assembly.context.clone(),
+                        initial_executed_action_count: 1,
+                        transport,
+                        chat_id,
+                    },
+                    delivery,
                 )
                 .await?;
-
-                let contracts::WorkerResult::Conscious(follow_up_conscious_result) =
-                    &follow_up_response.result
-                else {
-                    bail!("conscious approval follow-up worker returned a non-conscious result");
-                };
                 let persisted_follow_up_text = approval_follow_up_episode_text(
-                    &executed.observation,
-                    &follow_up_conscious_result.assistant_output.text,
+                    &turn_outcome.governed_action_summary.observations,
+                    &turn_outcome.result.assistant_output.text,
                 );
-                let delivered_follow_up_text = approval_follow_up_delivery_text(
-                    &follow_up_conscious_result.assistant_output.text,
-                );
+                let delivered_follow_up_text =
+                    approval_follow_up_delivery_text(&turn_outcome.result.assistant_output.text);
 
                 let follow_up_message_id = Uuid::now_v7();
                 foreground::insert_episode_message(
@@ -572,7 +659,7 @@ where
                         execution_id: trigger.execution_id,
                         message_order: 0,
                         message_role: "assistant".to_string(),
-                        channel_kind: follow_up_conscious_result.assistant_output.channel_kind,
+                        channel_kind: turn_outcome.result.assistant_output.channel_kind,
                         text_body: Some(persisted_follow_up_text.clone()),
                         external_message_id: None,
                     },
@@ -591,7 +678,7 @@ where
                     },
                     "foreground_orchestration",
                     None,
-                    &follow_up_conscious_result.candidate_proposals,
+                    &turn_outcome.result.candidate_proposals,
                 )
                 .await?;
 
@@ -925,6 +1012,10 @@ where
             .await;
         }
     };
+    let failure_delivery_target = ForegroundFailureDeliveryTarget {
+        chat_id,
+        reply_to_message_id,
+    };
     emit_typing_chat_action(
         delivery,
         chat_id,
@@ -948,13 +1039,17 @@ where
     {
         Ok(assembly) => assembly,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::ContextAssemblyFailure,
+                foreground_failure_context(
+                    &trigger,
+                    &recovery_context,
+                    recorded_episode_id,
+                    ForegroundFailureKind::ContextAssemblyFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -964,13 +1059,17 @@ where
     {
         Ok(payload) => payload,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    &recovery_context,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -990,154 +1089,67 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
 
-    let request = contracts::WorkerRequest::conscious(
-        trigger.trace_id,
-        trigger.execution_id,
-        assembly.context.clone(),
-    );
-    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
-    let initial_response = match launch_leased_conscious_worker(
-        pool,
-        config,
-        model_gateway_config,
-        &trigger,
-        &request,
-        transport,
-        foreground_timeout_ms,
+    let turn_outcome = match execute_conscious_turn_with_governed_action_loop(
+        ConsciousTurnLoopRequest {
+            pool,
+            config,
+            model_gateway_config,
+            trigger: &trigger,
+            context: assembly.context.clone(),
+            initial_executed_action_count: 0,
+            transport,
+            chat_id,
+        },
+        delivery,
     )
     .await
     {
-        Ok(response) => response,
+        Ok(outcome) => outcome,
         Err(error) => {
-            record_foreground_failure(
+            record_and_deliver_foreground_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                classify_conscious_worker_failure(&error),
+                foreground_failure_context(
+                    &trigger,
+                    &recovery_context,
+                    recorded_episode_id,
+                    classify_conscious_worker_failure(&error),
+                ),
                 &format_error_chain(&error),
+                delivery,
+                failure_delivery_target,
             )
             .await?;
             return Err(error);
         }
     };
+    let response = turn_outcome.response;
+    let result = turn_outcome.result;
+    let governed_action_summary = turn_outcome.governed_action_summary;
 
-    let contracts::WorkerResult::Conscious(initial_result) = &initial_response.result else {
-        let message = "conscious worker returned a non-conscious result".to_string();
-        record_foreground_failure(
-            pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::WorkerProtocolFailure,
-            &message,
-        )
-        .await?;
-        bail!(message);
-    };
+    let candidate_proposals =
+        foreground_candidate_proposals(&assembly.context, &trigger, &result.candidate_proposals);
 
-    let governed_action_summary = match process_governed_action_proposals(
-        pool,
-        config,
-        &trigger,
-        &initial_result.governed_action_proposals,
-        delivery,
-    )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            return record_and_return_failure(
-                pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
-                error,
-            )
-            .await;
-        }
-    };
-
-    let (response, result) = if !governed_action_summary.observations.is_empty()
-        && governed_action_summary.pending_approval_count == 0
-    {
-        emit_typing_chat_action(
-            delivery,
-            chat_id,
-            trigger.trace_id,
-            trigger.execution_id,
-            "foreground_follow_up",
-        )
-        .await;
-        let mut follow_up_context = assembly.context.clone();
-        follow_up_context.governed_action_observations =
-            governed_action_summary.observations.clone();
-        let follow_up_request = contracts::WorkerRequest::conscious(
-            trigger.trace_id,
-            trigger.execution_id,
-            follow_up_context,
-        );
-        let follow_up_response = match launch_leased_conscious_worker(
-            pool,
-            config,
-            model_gateway_config,
-            &trigger,
-            &follow_up_request,
-            transport,
-            foreground_timeout_ms,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                record_foreground_failure(
-                    pool,
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    recorded_episode_id,
-                    classify_conscious_worker_failure(&error),
-                    &format_error_chain(&error),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        let follow_up_result = match &follow_up_response.result {
-            contracts::WorkerResult::Conscious(result) => result.clone(),
-            _ => {
-                let message =
-                    "conscious follow-up worker returned a non-conscious result".to_string();
-                record_foreground_failure(
-                    pool,
-                    trigger.trace_id,
-                    trigger.execution_id,
-                    recorded_episode_id,
-                    ForegroundFailureKind::WorkerProtocolFailure,
-                    &message,
-                )
-                .await?;
-                bail!(message);
-            }
-        };
-        (follow_up_response, follow_up_result)
-    } else {
-        (initial_response.clone(), initial_result.clone())
-    };
-
-    let assistant_text =
-        foreground_assistant_delivery_text(&result.assistant_output.text, &governed_action_summary);
+    let assistant_text = foreground_assistant_delivery_text(
+        &result.assistant_output.text,
+        &governed_action_summary,
+        &candidate_proposals,
+        &assembly.context,
+    );
     let assistant_episode_message_id = Uuid::now_v7();
     if let Err(error) = foreground::insert_episode_message(
         pool,
@@ -1155,13 +1167,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1196,13 +1212,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1219,19 +1239,23 @@ where
         },
         "foreground_orchestration",
         None,
-        &result.candidate_proposals,
+        &candidate_proposals,
     )
     .await
     {
         Ok(summary) => summary,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    &recovery_context,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -1242,13 +1266,17 @@ where
     let response_payload = match response_payload {
         Ok(response_payload) => response_payload,
         Err(error) => {
-            return record_and_return_failure(
+            return record_deliver_and_return_failure(
                 pool,
-                trigger.trace_id,
-                trigger.execution_id,
-                recorded_episode_id,
-                ForegroundFailureKind::PersistenceFailure,
+                foreground_failure_context(
+                    &trigger,
+                    &recovery_context,
+                    recorded_episode_id,
+                    ForegroundFailureKind::PersistenceFailure,
+                ),
                 error,
+                delivery,
+                failure_delivery_target,
             )
             .await;
         }
@@ -1262,13 +1290,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1291,13 +1323,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1317,13 +1353,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1343,7 +1383,7 @@ where
                 "processed_ingress_ids": processed_ingress_ids,
                 "outbound_message_id": delivery_receipt.message_id,
                 "assistant_summary": result.episode_summary.summary,
-                "candidate_proposal_count": result.candidate_proposals.len(),
+                "candidate_proposal_count": candidate_proposals.len(),
                 "governed_action_summary": {
                     "proposed": governed_action_summary.proposed_count,
                     "executed": governed_action_summary.executed_count,
@@ -1361,13 +1401,17 @@ where
     )
     .await
     {
-        return record_and_return_failure(
+        return record_deliver_and_return_failure(
             pool,
-            trigger.trace_id,
-            trigger.execution_id,
-            recorded_episode_id,
-            ForegroundFailureKind::PersistenceFailure,
+            foreground_failure_context(
+                &trigger,
+                &recovery_context,
+                recorded_episode_id,
+                ForegroundFailureKind::PersistenceFailure,
+            ),
             error,
+            delivery,
+            failure_delivery_target,
         )
         .await;
     }
@@ -1387,6 +1431,7 @@ async fn process_governed_action_proposals<D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
     trigger: &contracts::ForegroundTrigger,
+    action_loop_tracker: &mut ForegroundActionLoopTracker,
     proposals: &[contracts::GovernedActionProposal],
     delivery: &mut D,
 ) -> Result<GovernedActionProcessingSummary>
@@ -1423,70 +1468,124 @@ where
                     });
             }
             governed_actions::GovernedActionPlanningOutcome::Planned(planned) => {
-                if planned.requires_approval {
-                    let approval_request =
-                        match approval::get_pending_approval_request_by_fingerprint(
-                            pool,
-                            &planned.record.action_fingerprint,
-                        )
-                        .await?
-                        {
-                            Some(existing) => existing,
-                            None => {
-                                approval::create_approval_request(
-                                    config,
+                let mut approval_title = proposal.title.clone();
+                let mut approval_consequence_summary = consequence_summary_for_proposal(proposal);
+                let mut requires_approval = planned.requires_approval;
+
+                if action_loop_tracker.is_at_cap(config) {
+                    let limit_summary =
+                        foreground_action_limit_summary(config, *action_loop_tracker);
+                    match config.governed_actions.cap_exceeded_behavior {
+                        contracts::GovernedActionCapExceededBehavior::AlwaysApprove => {
+                            governed_actions::write_governed_action_audit_event(
+                                pool,
+                                &planned.record,
+                                "governed_action_cap_auto_approved",
+                                "info",
+                                foreground_action_limit_payload(config, *action_loop_tracker),
+                            )
+                            .await?;
+                        }
+                        contracts::GovernedActionCapExceededBehavior::AlwaysDeny => {
+                            let blocked_record =
+                                governed_actions::update_governed_action_execution(
                                     pool,
-                                    &approval::NewApprovalRequestRecord {
-                                        approval_request_id: Uuid::now_v7(),
-                                        trace_id: trigger.trace_id,
-                                        execution_id: Some(trigger.execution_id),
-                                        action_proposal_id: planned.record.action_proposal_id,
-                                        action_fingerprint: planned
+                                    governed_actions::GovernedActionExecutionUpdate {
+                                        governed_action_execution_id: planned
                                             .record
-                                            .action_fingerprint
-                                            .clone(),
-                                        action_kind: planned.record.action_kind,
-                                        risk_tier: planned.record.risk_tier,
-                                        title: proposal.title.clone(),
-                                        consequence_summary: consequence_summary_for_proposal(
-                                            proposal,
-                                        ),
-                                        capability_scope: proposal.capability_scope.clone(),
-                                        requested_by: format!(
-                                            "telegram:{}",
-                                            trigger.ingress.internal_principal_ref
-                                        ),
-                                        token: Uuid::now_v7().to_string(),
-                                        requested_at: trigger.received_at,
-                                        expires_at: trigger.received_at
-                                            + chrono::Duration::seconds(
-                                                i64::try_from(config.approvals.default_ttl_seconds)
-                                                    .context("approval TTL exceeded i64 range")?,
-                                            ),
+                                            .governed_action_execution_id,
+                                        status: contracts::GovernedActionStatus::Blocked,
+                                        execution_id: None,
+                                        output_ref: None,
+                                        blocked_reason: Some(&limit_summary),
+                                        approval_request_id: None,
+                                        started_at: None,
+                                        completed_at: None,
                                     },
                                 )
-                                .await?
+                                .await?;
+                            governed_actions::write_governed_action_audit_event(
+                                pool,
+                                &blocked_record,
+                                "governed_action_blocked",
+                                "warn",
+                                json!({
+                                    "phase": "foreground_action_limit",
+                                    "reason": limit_summary,
+                                    "limit": foreground_action_limit_payload(
+                                        config,
+                                        *action_loop_tracker,
+                                    ),
+                                }),
+                            )
+                            .await?;
+                            summary.blocked_count += 1;
+                            summary.action_limit_reached = true;
+                            summary
+                                .observations
+                                .push(contracts::GovernedActionObservation {
+                                    observation_id: Uuid::now_v7(),
+                                    action_kind: blocked_record.action_kind,
+                                    outcome: contracts::GovernedActionExecutionOutcome {
+                                        status: contracts::GovernedActionStatus::Blocked,
+                                        summary: limit_summary,
+                                        fingerprint: Some(
+                                            blocked_record.action_fingerprint.clone(),
+                                        ),
+                                        output_ref: blocked_record.output_ref.clone(),
+                                    },
+                                });
+                            continue;
+                        }
+                        contracts::GovernedActionCapExceededBehavior::Escalate => {
+                            if !requires_approval {
+                                let approval_record =
+                                    governed_actions::update_governed_action_execution(
+                                        pool,
+                                        governed_actions::GovernedActionExecutionUpdate {
+                                            governed_action_execution_id: planned
+                                                .record
+                                                .governed_action_execution_id,
+                                            status:
+                                                contracts::GovernedActionStatus::AwaitingApproval,
+                                            execution_id: None,
+                                            output_ref: None,
+                                            blocked_reason: None,
+                                            approval_request_id: None,
+                                            started_at: None,
+                                            completed_at: None,
+                                        },
+                                    )
+                                    .await?;
+                                governed_actions::write_governed_action_audit_event(
+                                    pool,
+                                    &approval_record,
+                                    "governed_action_cap_escalated",
+                                    "info",
+                                    foreground_action_limit_payload(config, *action_loop_tracker),
+                                )
+                                .await?;
                             }
-                        };
-                    governed_actions::attach_approval_request(
+                            requires_approval = true;
+                            approval_title =
+                                format!("Continue after action limit: {}", proposal.title);
+                            approval_consequence_summary =
+                                format!("{}. {}", limit_summary, approval_consequence_summary);
+                        }
+                    }
+                }
+
+                if requires_approval {
+                    route_governed_action_for_approval(
                         pool,
-                        planned.record.governed_action_execution_id,
-                        approval_request.approval_request_id,
-                    )
-                    .await?;
-                    recovery::recover_approval_request_transition(
-                        pool,
-                        &approval_request,
-                        recovery::RecoveryApprovalState::Pending,
-                        Utc::now(),
-                        "approval_transition_pending",
-                    )
-                    .await
-                    .context("failed to route pending approval transition through recovery")?;
-                    deliver_telegram_approval_prompt(
-                        config.approvals.prompt_mode,
-                        &trigger.ingress,
-                        &approval_request,
+                        config,
+                        GovernedActionApprovalRoute {
+                            trigger,
+                            proposal,
+                            record: &planned.record,
+                            approval_title: &approval_title,
+                            approval_consequence_summary: &approval_consequence_summary,
+                        },
                         delivery,
                     )
                     .await?;
@@ -1499,6 +1598,7 @@ where
                         summary.blocked_count += 1;
                     } else {
                         summary.executed_count += 1;
+                        action_loop_tracker.record_executed_action();
                     }
                     summary.observations.push(executed.observation);
                 }
@@ -1507,6 +1607,195 @@ where
     }
 
     Ok(summary)
+}
+
+async fn route_governed_action_for_approval<D>(
+    pool: &sqlx::PgPool,
+    config: &RuntimeConfig,
+    route: GovernedActionApprovalRoute<'_>,
+    delivery: &mut D,
+) -> Result<()>
+where
+    D: TelegramDelivery,
+{
+    let approval_request = match approval::get_pending_approval_request_by_fingerprint(
+        pool,
+        &route.record.action_fingerprint,
+    )
+    .await?
+    {
+        Some(existing) => existing,
+        None => {
+            approval::create_approval_request(
+                config,
+                pool,
+                &approval::NewApprovalRequestRecord {
+                    approval_request_id: Uuid::now_v7(),
+                    trace_id: route.trigger.trace_id,
+                    execution_id: Some(route.trigger.execution_id),
+                    action_proposal_id: route.record.action_proposal_id,
+                    action_fingerprint: route.record.action_fingerprint.clone(),
+                    action_kind: route.record.action_kind,
+                    risk_tier: route.record.risk_tier,
+                    title: route.approval_title.to_string(),
+                    consequence_summary: route.approval_consequence_summary.to_string(),
+                    capability_scope: route.proposal.capability_scope.clone(),
+                    requested_by: format!(
+                        "telegram:{}",
+                        route.trigger.ingress.internal_principal_ref
+                    ),
+                    token: Uuid::now_v7().to_string(),
+                    requested_at: route.trigger.received_at,
+                    expires_at: route.trigger.received_at
+                        + chrono::Duration::seconds(
+                            i64::try_from(config.approvals.default_ttl_seconds)
+                                .context("approval TTL exceeded i64 range")?,
+                        ),
+                },
+            )
+            .await?
+        }
+    };
+    governed_actions::attach_approval_request(
+        pool,
+        route.record.governed_action_execution_id,
+        approval_request.approval_request_id,
+    )
+    .await?;
+    recovery::recover_approval_request_transition(
+        pool,
+        &approval_request,
+        recovery::RecoveryApprovalState::Pending,
+        Utc::now(),
+        "approval_transition_pending",
+    )
+    .await
+    .context("failed to route pending approval transition through recovery")?;
+    deliver_telegram_approval_prompt(
+        config.approvals.prompt_mode,
+        &route.trigger.ingress,
+        &approval_request,
+        delivery,
+    )
+    .await?;
+    Ok(())
+}
+
+fn foreground_action_limit_summary(
+    config: &RuntimeConfig,
+    action_loop_tracker: ForegroundActionLoopTracker,
+) -> String {
+    format!(
+        "foreground governed-action limit reached: {} action(s) already executed in this turn; configured maximum is {}",
+        action_loop_tracker.executed_action_count,
+        config.governed_actions.max_actions_per_foreground_turn
+    )
+}
+
+fn foreground_action_limit_payload(
+    config: &RuntimeConfig,
+    action_loop_tracker: ForegroundActionLoopTracker,
+) -> serde_json::Value {
+    json!({
+        "executed_action_count": action_loop_tracker.executed_action_count,
+        "max_actions_per_turn": config.governed_actions.max_actions_per_foreground_turn,
+        "remaining_actions_before_cap": action_loop_tracker.remaining_actions_before_cap(config),
+        "cap_exceeded_behavior": match config.governed_actions.cap_exceeded_behavior {
+            contracts::GovernedActionCapExceededBehavior::Escalate => "escalate",
+            contracts::GovernedActionCapExceededBehavior::AlwaysApprove => "always_approve",
+            contracts::GovernedActionCapExceededBehavior::AlwaysDeny => "always_deny",
+        },
+    })
+}
+
+async fn execute_conscious_turn_with_governed_action_loop<T, D>(
+    request: ConsciousTurnLoopRequest<'_, T>,
+    delivery: &mut D,
+) -> Result<ConsciousTurnLoopOutcome>
+where
+    T: ModelProviderTransport,
+    D: TelegramDelivery,
+{
+    let ConsciousTurnLoopRequest {
+        pool,
+        config,
+        model_gateway_config,
+        trigger,
+        mut context,
+        initial_executed_action_count,
+        transport,
+        chat_id,
+    } = request;
+    let foreground_timeout_ms = policy::effective_foreground_worker_timeout_ms(config);
+    let max_worker_passes = config
+        .governed_actions
+        .max_actions_per_foreground_turn
+        .saturating_add(2);
+    let mut action_loop_tracker = ForegroundActionLoopTracker::new(initial_executed_action_count);
+    let mut governed_action_summary = GovernedActionProcessingSummary::default();
+    let mut limit_follow_up_consumed = false;
+    let mut worker_pass_count = 0u32;
+
+    loop {
+        if worker_pass_count > 0 {
+            emit_typing_chat_action(
+                delivery,
+                chat_id,
+                trigger.trace_id,
+                trigger.execution_id,
+                "foreground_follow_up",
+            )
+            .await;
+        }
+        worker_pass_count = worker_pass_count.saturating_add(1);
+        context.governed_action_loop_state = Some(action_loop_tracker.as_contract_state(config));
+        let request_context = context.clone();
+        let request = contracts::WorkerRequest::conscious(
+            trigger.trace_id,
+            trigger.execution_id,
+            request_context.clone(),
+        );
+        let response = launch_leased_conscious_worker(
+            pool,
+            config,
+            model_gateway_config,
+            trigger,
+            &request,
+            transport,
+            foreground_timeout_ms,
+        )
+        .await?;
+        let contracts::WorkerResult::Conscious(result) = &response.result else {
+            bail!("conscious follow-up worker returned a non-conscious result");
+        };
+        let round_summary = process_governed_action_proposals(
+            pool,
+            config,
+            trigger,
+            &mut action_loop_tracker,
+            &result.governed_action_proposals,
+            delivery,
+        )
+        .await?;
+        let should_continue = !round_summary.observations.is_empty()
+            && round_summary.pending_approval_count == 0
+            && worker_pass_count < max_worker_passes
+            && (!round_summary.action_limit_reached || !limit_follow_up_consumed);
+        if round_summary.action_limit_reached {
+            limit_follow_up_consumed = true;
+        }
+        governed_action_summary.merge(round_summary);
+        let result = result.clone();
+        if !should_continue {
+            return Ok(ConsciousTurnLoopOutcome {
+                response,
+                result,
+                governed_action_summary,
+            });
+        }
+        context = request_context;
+        context.governed_action_observations = governed_action_summary.observations.clone();
+    }
 }
 
 fn consequence_summary_for_proposal(proposal: &contracts::GovernedActionProposal) -> String {
@@ -1567,6 +1856,150 @@ async fn record_foreground_failure(
     )
     .await?;
     Ok(())
+}
+
+fn foreground_failure_context(
+    trigger: &contracts::ForegroundTrigger,
+    recovery_context: &contracts::ForegroundRecoveryContext,
+    episode_id: Option<Uuid>,
+    failure_kind: ForegroundFailureKind,
+) -> ForegroundFailureContext {
+    ForegroundFailureContext {
+        trace_id: trigger.trace_id,
+        execution_id: trigger.execution_id,
+        episode_id,
+        failure_kind,
+        terminal_ingress_ids: terminal_failure_ingress_ids(trigger, recovery_context),
+    }
+}
+
+fn terminal_failure_ingress_ids(
+    trigger: &contracts::ForegroundTrigger,
+    recovery_context: &contracts::ForegroundRecoveryContext,
+) -> Vec<Uuid> {
+    if recovery_context.ordered_ingress.is_empty() {
+        vec![trigger.ingress.ingress_id]
+    } else {
+        recovery_context
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect()
+    }
+}
+
+async fn record_and_deliver_foreground_failure<D>(
+    pool: &sqlx::PgPool,
+    context: ForegroundFailureContext,
+    error_message: &str,
+    delivery: &mut D,
+    target: ForegroundFailureDeliveryTarget,
+) -> Result<()>
+where
+    D: TelegramDelivery,
+{
+    let notice_text = foreground_failure_notice_text(context.trace_id, context.failure_kind);
+    let record_result = record_foreground_failure(
+        pool,
+        context.trace_id,
+        context.execution_id,
+        context.episode_id,
+        context.failure_kind,
+        error_message,
+    )
+    .await;
+    let persist_result = if record_result.is_ok() {
+        persist_foreground_failure_notice(pool, &context, &notice_text).await
+    } else {
+        Ok(None)
+    };
+    let delivery_receipt = deliver_foreground_failure_notice(
+        delivery,
+        target.chat_id,
+        target.reply_to_message_id,
+        context.trace_id,
+        context.execution_id,
+        context.failure_kind,
+        notice_text,
+    )
+    .await;
+    let close_ingress_result = if record_result.is_ok() {
+        mark_terminal_failure_ingress_processed(pool, &context).await
+    } else {
+        Ok(())
+    };
+    record_result?;
+    let persisted_message_id = persist_result?;
+    if let (Some(episode_message_id), Some(outbound_message_id)) =
+        (persisted_message_id, delivery_receipt)
+    {
+        foreground::update_episode_message_external_message_id(
+            pool,
+            episode_message_id,
+            &outbound_message_id.to_string(),
+        )
+        .await
+        .context("failed to attach delivered failure notice id to episode message")?;
+    }
+    close_ingress_result?;
+    Ok(())
+}
+
+async fn persist_foreground_failure_notice(
+    pool: &sqlx::PgPool,
+    context: &ForegroundFailureContext,
+    notice_text: &str,
+) -> Result<Option<Uuid>> {
+    let Some(episode_id) = context.episode_id else {
+        return Ok(None);
+    };
+    let message_order: i32 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(MAX(message_order), -1) + 1
+        FROM episode_messages
+        WHERE episode_id = $1
+        "#,
+    )
+    .bind(episode_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to allocate foreground failure notice message order")?;
+
+    let episode_message_id = Uuid::now_v7();
+    foreground::insert_episode_message(
+        pool,
+        &NewEpisodeMessage {
+            episode_message_id,
+            episode_id,
+            trace_id: context.trace_id,
+            execution_id: context.execution_id,
+            message_order,
+            message_role: "assistant".to_string(),
+            channel_kind: contracts::ChannelKind::Telegram,
+            text_body: Some(notice_text.to_string()),
+            external_message_id: None,
+        },
+    )
+    .await
+    .context("failed to persist foreground failure notice episode message")?;
+    Ok(Some(episode_message_id))
+}
+
+async fn mark_terminal_failure_ingress_processed(
+    pool: &sqlx::PgPool,
+    context: &ForegroundFailureContext,
+) -> Result<()> {
+    if context.terminal_ingress_ids.is_empty() {
+        return Ok(());
+    }
+
+    foreground::mark_ingress_events_processed(
+        pool,
+        &context.terminal_ingress_ids,
+        context.execution_id,
+    )
+    .await
+    .context("failed to close terminally failed foreground ingress")
 }
 
 async fn launch_leased_conscious_worker<T>(
@@ -1680,6 +2113,28 @@ async fn record_and_return_failure<T>(
     Err(error)
 }
 
+async fn record_deliver_and_return_failure<T, D>(
+    pool: &sqlx::PgPool,
+    context: ForegroundFailureContext,
+    error: Error,
+    delivery: &mut D,
+    target: ForegroundFailureDeliveryTarget,
+) -> Result<T>
+where
+    D: TelegramDelivery,
+{
+    let error_message = format_error_chain(&error);
+    if let Err(record_error) =
+        record_and_deliver_foreground_failure(pool, context, &error_message, delivery, target).await
+    {
+        return Err(error.context(format!(
+            "failed to record foreground execution failure: {record_error}"
+        )));
+    }
+
+    Err(error)
+}
+
 async fn record_and_return_approval_resolution_failure<T>(
     pool: &sqlx::PgPool,
     trigger: &contracts::ForegroundTrigger,
@@ -1757,11 +2212,78 @@ fn format_error_chain(error: &Error) -> String {
         .join(": ")
 }
 
+async fn deliver_foreground_failure_notice<D>(
+    delivery: &mut D,
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
+    trace_id: Uuid,
+    execution_id: Uuid,
+    failure_kind: ForegroundFailureKind,
+    text: String,
+) -> Option<i64>
+where
+    D: TelegramDelivery,
+{
+    match delivery
+        .send_message(&TelegramOutboundMessage {
+            chat_id,
+            text,
+            reply_to_message_id,
+            reply_markup: None,
+        })
+        .await
+    {
+        Ok(receipt) => {
+            info!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                outbound_message_id = receipt.message_id,
+                failure_kind = failure_kind.as_str(),
+                "foreground failure notice delivered"
+            );
+            Some(receipt.message_id)
+        }
+        Err(error) => {
+            warn!(
+                trace_id = %trace_id,
+                execution_id = %execution_id,
+                failure_kind = failure_kind.as_str(),
+                error = %format_error_chain(&error),
+                "foreground failure notice delivery failed"
+            );
+            None
+        }
+    }
+}
+
+fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
+    match failure_kind {
+        ForegroundFailureKind::MalformedActionProposal => format!(
+            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the trace with `admin trace explain --trace-id {trace_id}`.",
+            failure_kind.as_str()
+        ),
+        ForegroundFailureKind::WorkerProtocolFailure => format!(
+            "I couldn't complete that because the worker protocol failed while processing the request. Trace: {trace_id}. Failure kind: {}. Inspect the trace with `admin trace explain --trace-id {trace_id}` before retrying.",
+            failure_kind.as_str()
+        ),
+        ForegroundFailureKind::ScheduledForegroundValidationFailure => format!(
+            "I couldn't complete that because the scheduled foreground action was invalid. Trace: {trace_id}. Failure kind: {}. Inspect the trace with `admin trace explain --trace-id {trace_id}` before retrying.",
+            failure_kind.as_str()
+        ),
+        _ => format!(
+            "I hit an internal runtime error while processing that message. Trace: {trace_id}. Failure kind: {}. Send another message to continue.",
+            failure_kind.as_str()
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundFailureKind {
     ApprovalResolutionFailure,
     ContextAssemblyFailure,
+    MalformedActionProposal,
     WorkerProtocolFailure,
+    ScheduledForegroundValidationFailure,
     ModelGatewayTransportFailure,
     ProviderRejected,
     TelegramDeliveryFailure,
@@ -1773,7 +2295,9 @@ impl ForegroundFailureKind {
         match self {
             Self::ApprovalResolutionFailure => "approval_resolution_failure",
             Self::ContextAssemblyFailure => "context_assembly_failure",
+            Self::MalformedActionProposal => "malformed_action_proposal",
             Self::WorkerProtocolFailure => "worker_protocol_failure",
+            Self::ScheduledForegroundValidationFailure => "scheduled_foreground_validation_failure",
             Self::ModelGatewayTransportFailure => "model_gateway_transport_failure",
             Self::ProviderRejected => "provider_rejected",
             Self::TelegramDeliveryFailure => "telegram_delivery_failure",
@@ -1787,11 +2311,45 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     if message.contains("provider returned status") {
         return ForegroundFailureKind::ProviderRejected;
     }
+    if message.contains("scheduled foreground cadence_seconds")
+        || message.contains("scheduled foreground task key")
+        || message.contains("scheduled foreground message_text")
+    {
+        return ForegroundFailureKind::ScheduledForegroundValidationFailure;
+    }
+    if message.contains("violates check constraint")
+        || message.contains("failed to insert governed action execution")
+        || message.contains("failed to insert scheduled foreground task")
+        || message.contains("failed to update scheduled foreground task")
+    {
+        return ForegroundFailureKind::PersistenceFailure;
+    }
     if message.contains("model gateway transport failed")
         || message.contains("error sending request for url")
         || message.contains("failed to decode provider HTTP response body")
     {
         return ForegroundFailureKind::ModelGatewayTransportFailure;
+    }
+    if message.contains("worker_error_code=invalid_model_output")
+        && (message.contains("invalid governed-action proposal block")
+            || message.contains(
+                "attempted a governed action without the required governed-action block",
+            )
+            || message.contains(
+                "returned a likely governed-action payload outside the required governed-action block",
+            )
+            || message.contains(
+                "governed-action control block marker was present but the block was malformed or incomplete",
+            ))
+    {
+        return ForegroundFailureKind::MalformedActionProposal;
+    }
+    if message.contains("invalid governed-action proposal block")
+        || message.contains("attempted a governed action without the required governed-action block")
+        || message.contains("returned a likely governed-action payload outside the required governed-action block")
+        || message.contains("governed-action control block marker was present but the block was malformed or incomplete")
+    {
+        return ForegroundFailureKind::MalformedActionProposal;
     }
 
     ForegroundFailureKind::WorkerProtocolFailure
@@ -1926,14 +2484,25 @@ fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) 
 }
 
 fn approval_follow_up_episode_text(
-    observation: &contracts::GovernedActionObservation,
+    observations: &[contracts::GovernedActionObservation],
     model_text: &str,
 ) -> String {
-    let observation_text = format!(
-        "Harness governed-action observation: {}:{}",
-        governed_action_kind_label(observation.action_kind),
-        observation.outcome.summary
-    );
+    let observation_text = if observations.is_empty() {
+        "Harness governed-action observation: approved action completed.".to_string()
+    } else {
+        let joined = observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{}:{}",
+                    governed_action_kind_label(observation.action_kind),
+                    observation.outcome.summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("Harness governed-action observations: {joined}")
+    };
     let trimmed_model_text = model_text.trim();
     if trimmed_model_text.is_empty() {
         observation_text
@@ -1951,9 +2520,25 @@ fn approval_follow_up_delivery_text(model_text: &str) -> String {
     }
 }
 
+fn foreground_candidate_proposals(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    worker_proposals: &[contracts::CanonicalProposal],
+) -> Vec<contracts::CanonicalProposal> {
+    let mut proposals = worker_proposals.to_vec();
+    proposals.extend(inferred_identity_kickstart_proposals(
+        context,
+        trigger,
+        worker_proposals,
+    ));
+    proposals
+}
+
 fn foreground_assistant_delivery_text(
     model_text: &str,
     governed_action_summary: &GovernedActionProcessingSummary,
+    candidate_proposals: &[contracts::CanonicalProposal],
+    context: &contracts::ConsciousContext,
 ) -> String {
     let trimmed = model_text.trim();
     if !trimmed.is_empty() {
@@ -1971,7 +2556,332 @@ fn foreground_assistant_delivery_text(
         };
     }
 
+    if let Some(blocked_observation) = governed_action_summary
+        .observations
+        .iter()
+        .rev()
+        .find(|observation| observation.outcome.status == contracts::GovernedActionStatus::Blocked)
+    {
+        return blocked_observation.outcome.summary.clone();
+    }
+
+    if let Some(identity_fallback) =
+        identity_kickstart_delivery_fallback(candidate_proposals, context)
+    {
+        return identity_fallback;
+    }
+
     "No assistant response was generated.".to_string()
+}
+
+fn identity_kickstart_delivery_fallback(
+    candidate_proposals: &[contracts::CanonicalProposal],
+    context: &contracts::ConsciousContext,
+) -> Option<String> {
+    candidate_proposals.iter().find_map(|proposal| {
+        let contracts::CanonicalProposalPayload::IdentityDelta(payload) = &proposal.payload else {
+            return None;
+        };
+
+        match payload.interview_action.as_ref() {
+            Some(contracts::IdentityKickstartAction::StartCustomInterview) => Some(format!(
+                "Starting the custom identity interview. {}",
+                identity::custom_identity_step_user_prompt("name")
+            )),
+            Some(contracts::IdentityKickstartAction::AnswerCustomInterview(_)) => {
+                Some(identity_answer_delivery_fallback(context, payload))
+            }
+            Some(contracts::IdentityKickstartAction::SelectPredefinedTemplate { .. }) => {
+                Some("Identity template selected.".to_string())
+            }
+            Some(contracts::IdentityKickstartAction::Cancel { .. }) => {
+                Some("Identity kickstart cancelled.".to_string())
+            }
+            None if payload.lifecycle_state
+                == contracts::IdentityLifecycleState::CompleteIdentityActive =>
+            {
+                Some("Identity update prepared.".to_string())
+            }
+            None => None,
+        }
+    })
+}
+
+fn identity_answer_delivery_fallback(
+    context: &contracts::ConsciousContext,
+    payload: &contracts::IdentityDeltaProposal,
+) -> String {
+    if payload.lifecycle_state == contracts::IdentityLifecycleState::CompleteIdentityActive {
+        return "Identity interview completed.".to_string();
+    }
+
+    let Some(current_step) = context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .and_then(|kickstart| kickstart.next_step.as_deref())
+    else {
+        return "Saved that identity interview answer. Continue with the next identity detail when ready.".to_string();
+    };
+
+    let Some(next_step) = next_custom_identity_step(current_step) else {
+        return "Identity interview completed.".to_string();
+    };
+
+    format!(
+        "Saved that identity interview answer. {}",
+        identity::custom_identity_step_user_prompt(next_step)
+    )
+}
+
+fn inferred_identity_kickstart_proposals(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    existing_proposals: &[contracts::CanonicalProposal],
+) -> Vec<contracts::CanonicalProposal> {
+    if !context.self_model.identity_lifecycle.kickstart_available
+        || existing_proposals.iter().any(|proposal| {
+            matches!(
+                proposal.payload,
+                contracts::CanonicalProposalPayload::IdentityDelta(_)
+            )
+        })
+    {
+        return Vec::new();
+    }
+
+    let Some(user_text) = trigger.ingress.text_body.as_deref().map(str::trim) else {
+        return Vec::new();
+    };
+    if user_text.is_empty() {
+        return Vec::new();
+    }
+
+    match context.self_model.identity_lifecycle.state {
+        contracts::IdentityLifecycleState::BootstrapSeedOnly => {
+            infer_bootstrap_identity_proposal(context, trigger, user_text)
+                .into_iter()
+                .collect()
+        }
+        contracts::IdentityLifecycleState::IdentityKickstartInProgress => {
+            infer_in_progress_identity_proposal(context, trigger, user_text)
+                .into_iter()
+                .collect()
+        }
+        contracts::IdentityLifecycleState::CompleteIdentityActive
+        | contracts::IdentityLifecycleState::IdentityResetPending => Vec::new(),
+    }
+}
+
+fn infer_bootstrap_identity_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    user_text: &str,
+) -> Option<contracts::CanonicalProposal> {
+    let normalized = normalize_identity_intent_text(user_text);
+    if is_custom_identity_start_intent(&normalized) {
+        return Some(identity_interview_action_proposal(
+            context,
+            trigger,
+            contracts::IdentityKickstartAction::StartCustomInterview,
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            "User started a custom identity interview.",
+        ));
+    }
+
+    let template_key = predefined_identity_template_intent(&normalized)?;
+    let payload = contracts::predefined_identity_delta(&template_key, trigger.ingress.occurred_at)?;
+    Some(identity_delta_proposal(
+        context,
+        trigger,
+        payload,
+        format!("User selected predefined identity template '{template_key}'."),
+    ))
+}
+
+fn infer_in_progress_identity_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    user_text: &str,
+) -> Option<contracts::CanonicalProposal> {
+    let normalized = normalize_identity_intent_text(user_text);
+    if is_identity_cancel_intent(&normalized) {
+        return Some(identity_interview_action_proposal(
+            context,
+            trigger,
+            contracts::IdentityKickstartAction::Cancel {
+                reason: Some(user_text.to_string()),
+            },
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            "User cancelled identity formation.",
+        ));
+    }
+    if is_ambiguous_identity_answer(&normalized) {
+        return None;
+    }
+    let step_key = context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .and_then(|kickstart| kickstart.next_step.as_deref())?;
+    if !CUSTOM_IDENTITY_STEPS.contains(&step_key) {
+        return None;
+    }
+    Some(identity_interview_action_proposal(
+        context,
+        trigger,
+        contracts::IdentityKickstartAction::AnswerCustomInterview(
+            contracts::IdentityInterviewAnswer {
+                step_key: step_key.to_string(),
+                answer_text: user_text.to_string(),
+            },
+        ),
+        contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+        "User answered a custom identity interview step.",
+    ))
+}
+
+fn identity_interview_action_proposal(
+    context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    action: contracts::IdentityKickstartAction,
+    lifecycle_state: contracts::IdentityLifecycleState,
+    rationale: &str,
+) -> contracts::CanonicalProposal {
+    identity_delta_proposal(
+        context,
+        trigger,
+        contracts::IdentityDeltaProposal {
+            lifecycle_state,
+            item_deltas: Vec::new(),
+            self_description_delta: None,
+            interview_action: Some(action),
+            rationale: rationale.to_string(),
+        },
+        rationale.to_string(),
+    )
+}
+
+fn identity_delta_proposal(
+    _context: &contracts::ConsciousContext,
+    trigger: &contracts::ForegroundTrigger,
+    payload: contracts::IdentityDeltaProposal,
+    rationale: String,
+) -> contracts::CanonicalProposal {
+    contracts::CanonicalProposal {
+        proposal_id: Uuid::now_v7(),
+        proposal_kind: contracts::CanonicalProposalKind::IdentityDelta,
+        canonical_target: contracts::CanonicalTargetKind::IdentityItems,
+        confidence_pct: 100,
+        conflict_posture: contracts::ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some(rationale),
+        valid_from: Some(trigger.ingress.occurred_at),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: contracts::ProposalProvenance {
+            provenance_kind: contracts::ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![trigger.ingress.ingress_id],
+            source_episode_id: None,
+        },
+        payload: contracts::CanonicalProposalPayload::IdentityDelta(payload),
+    }
+}
+
+const CUSTOM_IDENTITY_STEPS: &[&str] = &[
+    "name",
+    "identity_form",
+    "archetype_role",
+    "temperament",
+    "communication_style",
+    "backstory",
+    "age_framing",
+    "likes",
+    "dislikes",
+    "values",
+    "boundaries",
+    "tendencies",
+    "goals",
+    "relationship_to_user",
+];
+
+fn next_custom_identity_step(current_step: &str) -> Option<&'static str> {
+    let current_index = CUSTOM_IDENTITY_STEPS
+        .iter()
+        .position(|step| *step == current_step)?;
+    CUSTOM_IDENTITY_STEPS.get(current_index + 1).copied()
+}
+
+fn normalize_identity_intent_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn is_custom_identity_start_intent(normalized: &str) -> bool {
+    let has_custom = normalized.contains("custom")
+        || normalized.contains("scratch")
+        || normalized.contains("from zero")
+        || normalized.contains("from the ground");
+    let has_identity = normalized.contains("identity")
+        || normalized.contains("one")
+        || normalized.contains("path")
+        || normalized.contains("create")
+        || normalized.contains("build");
+    has_custom && has_identity
+}
+
+fn predefined_identity_template_intent(normalized: &str) -> Option<String> {
+    let trimmed = normalized.trim();
+    if matches!(trimmed, "1" | "one" | "option 1" | "first") {
+        return Some("continuity_operator".to_string());
+    }
+    if matches!(trimmed, "2" | "two" | "option 2" | "second") {
+        return Some("reflective_companion".to_string());
+    }
+    if matches!(trimmed, "3" | "three" | "option 3" | "third") {
+        return Some("pragmatic_copilot".to_string());
+    }
+
+    let options: [(&str, &[&str]); 3] = [
+        ("continuity_operator", &["continuity operator"]),
+        ("reflective_companion", &["reflective companion"]),
+        (
+            "pragmatic_copilot",
+            &["pragmatic copilot", "pragmatic co pilot"],
+        ),
+    ];
+    options
+        .iter()
+        .find(|(_, needles)| needles.iter().any(|needle| normalized.contains(needle)))
+        .map(|(template_key, _)| (*template_key).to_string())
+}
+
+fn is_identity_cancel_intent(normalized: &str) -> bool {
+    if normalized.contains("never mind") {
+        return true;
+    }
+    normalized
+        .split_whitespace()
+        .any(|word| matches!(word, "cancel" | "stop" | "abort" | "nevermind" | "quit"))
+}
+
+fn is_ambiguous_identity_answer(normalized: &str) -> bool {
+    let trimmed = normalized.trim();
+    trimmed.is_empty()
+        || matches!(
+            trimmed,
+            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no"
+        )
 }
 
 async fn emit_typing_chat_action<D>(
@@ -2026,6 +2936,7 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
             "upsert_scheduled_foreground_task"
         }
         contracts::GovernedActionKind::RequestBackgroundJob => "request_background_job",
+        contracts::GovernedActionKind::RunDiagnostic => "run_diagnostic",
         contracts::GovernedActionKind::RunSubprocess => "run_subprocess",
         contracts::GovernedActionKind::RunWorkspaceScript => "run_workspace_script",
         contracts::GovernedActionKind::WebFetch => "web_fetch",
@@ -2062,11 +2973,13 @@ mod tests {
             },
         };
 
-        let stored =
-            approval_follow_up_episode_text(&observation, "I found the page. Let me summarize it.");
+        let stored = approval_follow_up_episode_text(
+            &[observation],
+            "I found the page. Let me summarize it.",
+        );
 
         assert!(stored.starts_with("I found the page. Let me summarize it."));
-        assert!(stored.contains("Harness governed-action observation: web_fetch:"));
+        assert!(stored.contains("Harness governed-action observations: web_fetch:"));
     }
 
     #[test]
@@ -2083,9 +2996,14 @@ mod tests {
             pending_approval_count: 1,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary),
+            foreground_assistant_delivery_text("  Waiting on approval.  ", &summary, &[], &context),
             "Waiting on approval."
         );
     }
@@ -2096,9 +3014,14 @@ mod tests {
             pending_approval_count: 1,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text("", &summary),
+            foreground_assistant_delivery_text("", &summary, &[], &context),
             "Approval requested. Use the approval prompt above to continue."
         );
     }
@@ -2109,10 +3032,312 @@ mod tests {
             pending_approval_count: 2,
             ..GovernedActionProcessingSummary::default()
         };
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
 
         assert_eq!(
-            foreground_assistant_delivery_text(" \n", &summary),
+            foreground_assistant_delivery_text(" \n", &summary, &[], &context),
             "2 approvals requested. Use the approval prompts above to continue."
         );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_falls_back_for_identity_kickstart_control_only() {
+        let summary = GovernedActionProcessingSummary::default();
+        let proposal = identity_action_proposal(
+            contracts::IdentityKickstartAction::StartCustomInterview,
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+        );
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "let's create a custom one",
+        );
+
+        assert_eq!(
+            foreground_assistant_delivery_text(" \n", &summary, &[proposal], &context),
+            "Starting the custom identity interview. What name should this assistant identity use?"
+        );
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_infers_custom_identity_start_when_worker_omits_block() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "let's create a custom one",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert_eq!(proposals.len(), 1);
+        let contracts::CanonicalProposalPayload::IdentityDelta(delta) = &proposals[0].payload
+        else {
+            panic!("expected identity delta");
+        };
+        assert_eq!(
+            delta.interview_action,
+            Some(contracts::IdentityKickstartAction::StartCustomInterview)
+        );
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_ignores_ambiguous_identity_answer() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            Some("name"),
+            "ok",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn foreground_candidate_proposals_infers_identity_interview_answer() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::IdentityKickstartInProgress,
+            Some("name"),
+            "Lagoon Forge",
+        );
+
+        let proposals = foreground_candidate_proposals(&context, &context.trigger, &[]);
+
+        assert_eq!(proposals.len(), 1);
+        let contracts::CanonicalProposalPayload::IdentityDelta(delta) = &proposals[0].payload
+        else {
+            panic!("expected identity delta");
+        };
+        assert_eq!(
+            delta.interview_action,
+            Some(contracts::IdentityKickstartAction::AnswerCustomInterview(
+                contracts::IdentityInterviewAnswer {
+                    step_key: "name".to_string(),
+                    answer_text: "Lagoon Forge".to_string(),
+                },
+            ))
+        );
+        assert_eq!(
+            foreground_assistant_delivery_text(
+                " \n",
+                &GovernedActionProcessingSummary::default(),
+                &proposals,
+                &context
+            ),
+            "Saved that identity interview answer. What kind of identity form should this assistant have?"
+        );
+    }
+
+    #[test]
+    fn foreground_failure_notice_includes_trace_and_kind_without_internal_error() {
+        let trace_id = Uuid::now_v7();
+        let notice =
+            foreground_failure_notice_text(trace_id, ForegroundFailureKind::ContextAssemblyFailure);
+
+        assert!(notice.contains(&trace_id.to_string()));
+        assert!(notice.contains("context_assembly_failure"));
+        assert!(!notice.contains("missing foreground self-model seed configuration"));
+    }
+
+    #[test]
+    fn foreground_failure_notice_explains_malformed_action_proposal() {
+        let trace_id = Uuid::now_v7();
+        let notice = foreground_failure_notice_text(
+            trace_id,
+            ForegroundFailureKind::MalformedActionProposal,
+        );
+
+        assert!(notice.contains("valid governed-action proposal"));
+        assert!(notice.contains("malformed_action_proposal"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
+    fn foreground_failure_notice_explains_worker_protocol_failure() {
+        let trace_id = Uuid::now_v7();
+        let notice =
+            foreground_failure_notice_text(trace_id, ForegroundFailureKind::WorkerProtocolFailure);
+
+        assert!(notice.contains("worker protocol failed"));
+        assert!(notice.contains("worker_protocol_failure"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("before retrying"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
+    fn foreground_failure_notice_explains_scheduled_validation_failure() {
+        let trace_id = Uuid::now_v7();
+        let notice = foreground_failure_notice_text(
+            trace_id,
+            ForegroundFailureKind::ScheduledForegroundValidationFailure,
+        );
+
+        assert!(notice.contains("scheduled foreground action was invalid"));
+        assert!(notice.contains("scheduled_foreground_validation_failure"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("before retrying"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_malformed_action_proposal() {
+        let error = anyhow::anyhow!(
+            "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_worker_protocol_failure() {
+        let error = anyhow::anyhow!(
+            "conscious worker protocol failure: worker_protocol_phase=write_model_response failed to write worker protocol line: Broken pipe (os error 32)"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::WorkerProtocolFailure
+        );
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_scheduled_validation_failure() {
+        let error = anyhow::anyhow!(
+            "conscious worker returned an error response: scheduled foreground cadence_seconds must be greater than zero unless task_key uses the one-shot prefix"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::ScheduledForegroundValidationFailure
+        );
+    }
+
+    fn identity_action_proposal(
+        action: contracts::IdentityKickstartAction,
+        lifecycle_state: contracts::IdentityLifecycleState,
+    ) -> contracts::CanonicalProposal {
+        contracts::CanonicalProposal {
+            proposal_id: Uuid::now_v7(),
+            proposal_kind: contracts::CanonicalProposalKind::IdentityDelta,
+            canonical_target: contracts::CanonicalTargetKind::IdentityItems,
+            confidence_pct: 100,
+            conflict_posture: contracts::ProposalConflictPosture::Independent,
+            subject_ref: "self:blue-lagoon".to_string(),
+            rationale: Some("Identity kickstart action.".to_string()),
+            valid_from: Some(Utc::now()),
+            valid_to: None,
+            supersedes_artifact_id: None,
+            provenance: contracts::ProposalProvenance {
+                provenance_kind: contracts::ProposalProvenanceKind::EpisodeObservation,
+                source_ingress_ids: vec![Uuid::now_v7()],
+                source_episode_id: Some(Uuid::now_v7()),
+            },
+            payload: contracts::CanonicalProposalPayload::IdentityDelta(
+                contracts::IdentityDeltaProposal {
+                    lifecycle_state,
+                    item_deltas: Vec::new(),
+                    self_description_delta: None,
+                    interview_action: Some(action),
+                    rationale: "Identity kickstart action.".to_string(),
+                },
+            ),
+        }
+    }
+
+    fn test_conscious_context(
+        state: contracts::IdentityLifecycleState,
+        next_step: Option<&str>,
+        user_text: &str,
+    ) -> contracts::ConsciousContext {
+        let trigger = test_foreground_trigger(user_text);
+        contracts::ConsciousContext {
+            context_id: Uuid::now_v7(),
+            assembled_at: Utc::now(),
+            trigger,
+            self_model: contracts::SelfModelSnapshot {
+                stable_identity: "blue-lagoon".to_string(),
+                role: "Personal AI assistant".to_string(),
+                communication_style: "Direct".to_string(),
+                capabilities: Vec::new(),
+                constraints: Vec::new(),
+                preferences: Vec::new(),
+                current_goals: Vec::new(),
+                current_subgoals: Vec::new(),
+                identity: None,
+                identity_lifecycle: contracts::IdentityLifecycleContext {
+                    state,
+                    kickstart_available: true,
+                    kickstart: Some(contracts::IdentityKickstartContext {
+                        available_actions: vec![
+                            contracts::IdentityKickstartActionKind::SelectPredefinedTemplate,
+                            contracts::IdentityKickstartActionKind::StartCustomInterview,
+                            contracts::IdentityKickstartActionKind::AnswerCustomInterview,
+                            contracts::IdentityKickstartActionKind::Cancel,
+                        ],
+                        next_step: next_step.map(str::to_string),
+                        resume_summary: None,
+                        predefined_templates: contracts::predefined_identity_templates(),
+                    }),
+                },
+            },
+            internal_state: contracts::InternalStateSnapshot {
+                load_pct: 0,
+                health_pct: 100,
+                reliability_pct: 100,
+                resource_pressure_pct: 0,
+                confidence_pct: 100,
+                connection_quality_pct: 100,
+                active_conditions: Vec::new(),
+            },
+            recent_history: Vec::new(),
+            retrieved_context: contracts::RetrievedContext::default(),
+            governed_action_observations: Vec::new(),
+            governed_action_loop_state: None,
+            recovery_context: contracts::ForegroundRecoveryContext::default(),
+        }
+    }
+
+    fn test_foreground_trigger(user_text: &str) -> contracts::ForegroundTrigger {
+        let ingress_id = Uuid::now_v7();
+        contracts::ForegroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: Uuid::now_v7(),
+            trigger_kind: contracts::ForegroundTriggerKind::UserIngress,
+            ingress: contracts::NormalizedIngress {
+                ingress_id,
+                channel_kind: contracts::ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                external_event_id: format!("event-{ingress_id}"),
+                external_message_id: Some(format!("message-{ingress_id}")),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                event_kind: contracts::IngressEventKind::MessageCreated,
+                occurred_at: Utc::now(),
+                text_body: Some(user_text.to_string()),
+                reply_to: None,
+                attachments: Vec::new(),
+                command_hint: None,
+                approval_payload: None,
+                raw_payload_ref: None,
+            },
+            received_at: Utc::now(),
+            deduplication_key: format!("test:{ingress_id}"),
+            budget: contracts::ForegroundBudget {
+                iteration_budget: 1,
+                wall_clock_budget_ms: 30_000,
+                token_budget: 4_000,
+            },
+        }
     }
 }

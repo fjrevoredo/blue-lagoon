@@ -3,12 +3,14 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use contracts::{
-    CanonicalProposal, CanonicalProposalPayload, InternalStateSnapshot, MergeDecisionTarget,
-    ProposalEvaluation, ProposalEvaluationOutcome, SelfModelObservationProposal, SelfModelSnapshot,
+    CanonicalProposal, CanonicalProposalPayload, CompactIdentityItem, CompactIdentitySnapshot,
+    IdentityItemCategory, IdentityLifecycleContext, IdentityLifecycleState, InternalStateSnapshot,
+    MergeDecisionTarget, ProposalEvaluation, ProposalEvaluationOutcome,
+    SelfModelObservationProposal, SelfModelSnapshot,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +21,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct SelfModelSeedDocument {
+    seed_version: Option<u32>,
     stable_identity: String,
     role: String,
     communication_style: String,
@@ -27,6 +30,43 @@ struct SelfModelSeedDocument {
     preferences: Vec<String>,
     current_goals: Vec<String>,
     current_subgoals: Vec<String>,
+    identity: Option<RichIdentitySeed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RichIdentitySeed {
+    stable: StableIdentitySeed,
+    evolving: EvolvingIdentitySeed,
+    compact_self_description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct StableIdentitySeed {
+    name: String,
+    identity_form: String,
+    role: String,
+    archetype: String,
+    origin_backstory: String,
+    age_framing: Option<String>,
+    foundational_traits: Vec<String>,
+    foundational_values: Vec<String>,
+    enduring_boundaries: Vec<String>,
+    default_communication_style: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EvolvingIdentitySeed {
+    preferences: Vec<String>,
+    likes: Vec<String>,
+    dislikes: Vec<String>,
+    habits: Vec<String>,
+    routines: Vec<String>,
+    learned_tendencies: Vec<String>,
+    autobiographical_refinements: Vec<String>,
+    recurring_self_descriptions: Vec<String>,
+    interaction_style_adaptations: Vec<String>,
+    goals: Vec<String>,
+    subgoals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +180,7 @@ pub fn load_seed_self_model_snapshot(config: &RuntimeConfig) -> Result<SelfModel
     })?;
     let seed: SelfModelSeedDocument =
         toml::from_str(&raw).context("failed to parse self-model seed artifact as TOML")?;
-    let snapshot = seed.into_snapshot();
+    let snapshot = seed.into_snapshot()?;
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
 }
@@ -158,6 +198,120 @@ pub fn build_internal_state_snapshot(
         connection_quality_pct: seed.connection_quality_pct,
         active_conditions,
     }
+}
+
+pub async fn derive_live_internal_state_snapshot(
+    pool: &PgPool,
+    seed: InternalStateSeed,
+    active_conditions: Vec<String>,
+) -> Result<InternalStateSnapshot> {
+    let signals = load_internal_state_signals(pool).await?;
+    Ok(build_internal_state_from_signals(
+        seed,
+        active_conditions,
+        signals,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InternalStateSignals {
+    pub active_background_runs: i64,
+    pub pending_approvals: i64,
+    pub pending_wake_signals: i64,
+    pub recent_failed_runs: i64,
+    pub recent_critical_diagnostics: i64,
+}
+
+fn build_internal_state_from_signals(
+    seed: InternalStateSeed,
+    mut active_conditions: Vec<String>,
+    signals: InternalStateSignals,
+) -> InternalStateSnapshot {
+    if signals.active_background_runs > 0 {
+        active_conditions.push(format!(
+            "active_background_runs:{}",
+            signals.active_background_runs
+        ));
+    }
+    if signals.pending_approvals > 0 {
+        active_conditions.push(format!("pending_approvals:{}", signals.pending_approvals));
+    }
+    if signals.pending_wake_signals > 0 {
+        active_conditions.push(format!(
+            "pending_wake_signals:{}",
+            signals.pending_wake_signals
+        ));
+    }
+    if signals.recent_failed_runs > 0 {
+        active_conditions.push(format!("recent_failed_runs:{}", signals.recent_failed_runs));
+    }
+    if signals.recent_critical_diagnostics > 0 {
+        active_conditions.push(format!(
+            "recent_critical_diagnostics:{}",
+            signals.recent_critical_diagnostics
+        ));
+    }
+
+    let load_pressure = signals.active_background_runs * 12
+        + signals.pending_approvals * 4
+        + signals.pending_wake_signals * 3;
+    let reliability_penalty =
+        signals.recent_failed_runs * 12 + signals.recent_critical_diagnostics * 8;
+    let resource_pressure = signals.active_background_runs * 10
+        + signals.pending_wake_signals * 4
+        + signals.pending_approvals * 2;
+
+    InternalStateSnapshot {
+        load_pct: add_bounded(seed.load_pct, load_pressure, 100),
+        health_pct: subtract_bounded(seed.health_pct, reliability_penalty, 0),
+        reliability_pct: subtract_bounded(seed.reliability_pct, reliability_penalty, 0),
+        resource_pressure_pct: add_bounded(seed.resource_pressure_pct, resource_pressure, 100),
+        confidence_pct: subtract_bounded(seed.confidence_pct, reliability_penalty / 2, 0),
+        connection_quality_pct: subtract_bounded(
+            seed.connection_quality_pct,
+            signals.recent_critical_diagnostics * 5,
+            0,
+        ),
+        active_conditions,
+    }
+}
+
+async fn load_internal_state_signals(pool: &PgPool) -> Result<InternalStateSignals> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM background_job_runs WHERE status IN ('leased', 'running')) AS active_background_runs,
+            (SELECT COUNT(*) FROM approval_requests WHERE status = 'pending') AS pending_approvals,
+            (SELECT COUNT(*) FROM wake_signals WHERE status = 'pending_review') AS pending_wake_signals,
+            (SELECT COUNT(*) FROM background_job_runs WHERE status IN ('failed', 'timed_out') AND lease_acquired_at > NOW() - INTERVAL '1 hour') AS recent_failed_runs,
+            (SELECT COUNT(*) FROM operational_diagnostics WHERE severity = 'critical' AND created_at > NOW() - INTERVAL '1 hour') AS recent_critical_diagnostics
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to load internal-state runtime signals")?;
+
+    Ok(InternalStateSignals {
+        active_background_runs: row.get("active_background_runs"),
+        pending_approvals: row.get("pending_approvals"),
+        pending_wake_signals: row.get("pending_wake_signals"),
+        recent_failed_runs: row.get("recent_failed_runs"),
+        recent_critical_diagnostics: row.get("recent_critical_diagnostics"),
+    })
+}
+
+fn add_bounded(base: u8, delta: i64, max_value: u8) -> u8 {
+    let value = i64::from(base)
+        .saturating_add(delta)
+        .clamp(0, i64::from(max_value));
+    value as u8
+}
+
+fn subtract_bounded(base: u8, penalty: i64, min_value: u8) -> u8 {
+    let value = i64::from(base)
+        .saturating_sub(penalty)
+        .max(i64::from(min_value));
+    value as u8
 }
 
 pub fn compact_self_model_view(snapshot: &SelfModelSnapshot) -> Result<Value> {
@@ -325,6 +479,8 @@ fn snapshot_from_canonical_artifact(
         preferences: artifact.preferences.clone(),
         current_goals: artifact.current_goals.clone(),
         current_subgoals: artifact.current_subgoals.clone(),
+        identity: None,
+        identity_lifecycle: Default::default(),
     };
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
@@ -346,6 +502,38 @@ fn validate_snapshot(snapshot: &SelfModelSnapshot) -> Result<()> {
     if snapshot.current_goals.is_empty() {
         bail!("self-model current_goals must not be empty");
     }
+    if let Some(identity) = &snapshot.identity {
+        validate_rich_identity_seed(identity)?;
+    }
+    Ok(())
+}
+
+fn validate_rich_identity_seed(identity: &CompactIdentitySnapshot) -> Result<()> {
+    if identity.identity_summary.trim().is_empty() {
+        bail!("rich self-model identity summary must not be empty");
+    }
+    for category in [
+        IdentityItemCategory::Name,
+        IdentityItemCategory::IdentityForm,
+        IdentityItemCategory::Role,
+        IdentityItemCategory::Archetype,
+        IdentityItemCategory::OriginBackstory,
+        IdentityItemCategory::FoundationalTrait,
+        IdentityItemCategory::FoundationalValue,
+        IdentityItemCategory::EnduringBoundary,
+        IdentityItemCategory::DefaultCommunicationStyle,
+    ] {
+        if !identity
+            .stable_items
+            .iter()
+            .any(|item| item.category == category && !item.value.trim().is_empty())
+        {
+            bail!("rich self-model identity missing required stable category {category:?}");
+        }
+    }
+    if identity.evolving_items.is_empty() {
+        bail!("rich self-model identity must include at least one evolving item");
+    }
     Ok(())
 }
 
@@ -364,8 +552,12 @@ fn merge_self_model_observation(
 }
 
 impl SelfModelSeedDocument {
-    fn into_snapshot(self) -> SelfModelSnapshot {
-        SelfModelSnapshot {
+    fn into_snapshot(self) -> Result<SelfModelSnapshot> {
+        if matches!(self.seed_version, Some(0)) {
+            bail!("self-model seed_version must be 1 or greater when present");
+        }
+        let identity = self.identity.map(RichIdentitySeed::into_compact_snapshot);
+        Ok(SelfModelSnapshot {
             stable_identity: self.stable_identity,
             role: self.role,
             communication_style: self.communication_style,
@@ -374,7 +566,175 @@ impl SelfModelSeedDocument {
             preferences: self.preferences,
             current_goals: self.current_goals,
             current_subgoals: self.current_subgoals,
+            identity,
+            identity_lifecycle: IdentityLifecycleContext {
+                state: IdentityLifecycleState::BootstrapSeedOnly,
+                kickstart_available: true,
+                kickstart: None,
+            },
+        })
+    }
+}
+
+impl RichIdentitySeed {
+    fn into_compact_snapshot(self) -> CompactIdentitySnapshot {
+        let values = self.stable.foundational_values.clone();
+        let boundaries = self.stable.enduring_boundaries.clone();
+        let mut stable_items = vec![
+            compact_identity_item(IdentityItemCategory::Name, self.stable.name, 100, None),
+            compact_identity_item(
+                IdentityItemCategory::IdentityForm,
+                self.stable.identity_form,
+                100,
+                None,
+            ),
+            compact_identity_item(IdentityItemCategory::Role, self.stable.role, 100, None),
+            compact_identity_item(
+                IdentityItemCategory::Archetype,
+                self.stable.archetype,
+                100,
+                None,
+            ),
+            compact_identity_item(
+                IdentityItemCategory::OriginBackstory,
+                self.stable.origin_backstory,
+                90,
+                None,
+            ),
+            compact_identity_item(
+                IdentityItemCategory::DefaultCommunicationStyle,
+                self.stable.default_communication_style,
+                100,
+                None,
+            ),
+        ];
+        if let Some(age_framing) = self.stable.age_framing {
+            stable_items.push(compact_identity_item(
+                IdentityItemCategory::AgeFraming,
+                age_framing,
+                80,
+                None,
+            ));
         }
+        stable_items.extend(self.stable.foundational_traits.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::FoundationalTrait, value, 90, Some(80))
+        }));
+        stable_items.extend(self.stable.foundational_values.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::FoundationalValue, value, 90, Some(80))
+        }));
+        stable_items.extend(
+            self.stable
+                .enduring_boundaries
+                .iter()
+                .cloned()
+                .map(|value| {
+                    compact_identity_item(
+                        IdentityItemCategory::EnduringBoundary,
+                        value,
+                        95,
+                        Some(90),
+                    )
+                }),
+        );
+
+        let mut evolving_items = Vec::new();
+        evolving_items.extend(self.evolving.preferences.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::Preference, value, 75, Some(60))
+        }));
+        evolving_items.extend(
+            self.evolving.likes.into_iter().map(|value| {
+                compact_identity_item(IdentityItemCategory::Like, value, 70, Some(50))
+            }),
+        );
+        evolving_items.extend(self.evolving.dislikes.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::Dislike, value, 70, Some(50))
+        }));
+        evolving_items.extend(
+            self.evolving.habits.into_iter().map(|value| {
+                compact_identity_item(IdentityItemCategory::Habit, value, 65, Some(45))
+            }),
+        );
+        evolving_items.extend(self.evolving.routines.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::Routine, value, 65, Some(45))
+        }));
+        evolving_items.extend(self.evolving.learned_tendencies.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::LearnedTendency, value, 65, Some(45))
+        }));
+        evolving_items.extend(self.evolving.autobiographical_refinements.into_iter().map(
+            |value| {
+                compact_identity_item(
+                    IdentityItemCategory::AutobiographicalRefinement,
+                    value,
+                    65,
+                    Some(45),
+                )
+            },
+        ));
+        evolving_items.extend(
+            self.evolving
+                .recurring_self_descriptions
+                .into_iter()
+                .map(|value| {
+                    compact_identity_item(
+                        IdentityItemCategory::RecurringSelfDescription,
+                        value,
+                        70,
+                        Some(50),
+                    )
+                }),
+        );
+        evolving_items.extend(self.evolving.interaction_style_adaptations.into_iter().map(
+            |value| {
+                compact_identity_item(
+                    IdentityItemCategory::InteractionStyleAdaptation,
+                    value,
+                    70,
+                    Some(55),
+                )
+            },
+        ));
+        evolving_items.extend(
+            self.evolving.goals.into_iter().map(|value| {
+                compact_identity_item(IdentityItemCategory::Goal, value, 80, Some(70))
+            }),
+        );
+        evolving_items.extend(self.evolving.subgoals.into_iter().map(|value| {
+            compact_identity_item(IdentityItemCategory::Subgoal, value, 75, Some(60))
+        }));
+
+        let identity_summary = self
+            .compact_self_description
+            .clone()
+            .or_else(|| {
+                stable_items
+                    .iter()
+                    .find(|item| item.category == IdentityItemCategory::Name)
+                    .map(|item| item.value.clone())
+            })
+            .unwrap_or_else(|| "Bootstrap identity seed".to_string());
+
+        CompactIdentitySnapshot {
+            identity_summary,
+            stable_items,
+            evolving_items,
+            values,
+            boundaries,
+            self_description: self.compact_self_description,
+        }
+    }
+}
+
+fn compact_identity_item(
+    category: IdentityItemCategory,
+    value: String,
+    confidence_pct: u8,
+    weight_pct: Option<u8>,
+) -> CompactIdentityItem {
+    CompactIdentityItem {
+        category,
+        value,
+        confidence_pct,
+        weight_pct,
     }
 }
 
@@ -469,6 +829,8 @@ mod tests {
                 approval_required_min_risk_tier: contracts::GovernedActionRiskTier::Tier2,
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
+                max_actions_per_foreground_turn: 10,
+                cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,
                 allowlisted_environment_variables: vec!["BLUE_LAGOON_DATABASE_URL".to_string()],
@@ -517,6 +879,18 @@ mod tests {
                 .current_goals
                 .contains(&"support_the_user".to_string())
         );
+        let identity = snapshot.identity.expect("rich identity seed should load");
+        assert!(
+            identity
+                .stable_items
+                .iter()
+                .any(|item| item.category == IdentityItemCategory::IdentityForm)
+        );
+        assert_eq!(
+            snapshot.identity_lifecycle.state,
+            IdentityLifecycleState::BootstrapSeedOnly
+        );
+        assert!(snapshot.identity_lifecycle.kickstart_available);
     }
 
     #[test]
@@ -560,6 +934,45 @@ mod tests {
     }
 
     #[test]
+    fn live_internal_state_signals_adjust_bounded_metrics() {
+        let snapshot = build_internal_state_from_signals(
+            InternalStateSeed {
+                load_pct: 20,
+                health_pct: 95,
+                reliability_pct: 90,
+                resource_pressure_pct: 30,
+                confidence_pct: 70,
+                connection_quality_pct: 85,
+            },
+            vec!["postgres_ready".to_string()],
+            InternalStateSignals {
+                active_background_runs: 2,
+                pending_approvals: 3,
+                pending_wake_signals: 1,
+                recent_failed_runs: 1,
+                recent_critical_diagnostics: 2,
+            },
+        );
+
+        assert_eq!(snapshot.load_pct, 59);
+        assert_eq!(snapshot.resource_pressure_pct, 60);
+        assert_eq!(snapshot.reliability_pct, 62);
+        assert_eq!(snapshot.health_pct, 67);
+        assert_eq!(snapshot.confidence_pct, 56);
+        assert_eq!(snapshot.connection_quality_pct, 75);
+        assert!(
+            snapshot
+                .active_conditions
+                .contains(&"pending_approvals:3".to_string())
+        );
+        assert!(
+            snapshot
+                .active_conditions
+                .contains(&"recent_critical_diagnostics:2".to_string())
+        );
+    }
+
+    #[test]
     fn compact_views_serialize_for_conscious_context() {
         let self_model = SelfModelSnapshot {
             stable_identity: "blue-lagoon".to_string(),
@@ -570,6 +983,8 @@ mod tests {
             preferences: vec!["concise".to_string()],
             current_goals: vec!["support_the_user".to_string()],
             current_subgoals: vec![],
+            identity: None,
+            identity_lifecycle: Default::default(),
         };
         let internal_state = build_internal_state_snapshot(InternalStateSeed::default(), vec![]);
 

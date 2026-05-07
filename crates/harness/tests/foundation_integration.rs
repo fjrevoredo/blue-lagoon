@@ -256,7 +256,21 @@ async fn background_runtime_runs_due_job_end_to_end_and_stages_approved_wake_sig
             status: 200,
             body: json!({
                 "choices": [{
-                    "message": { "content": "Prefer concise progress updates during long maintenance runs." },
+                    "message": {
+                        "content": json!({
+                            "identity_delta": null,
+                            "no_change_rationale": "No durable identity change is warranted from this maintenance review.",
+                            "diagnostics": [],
+                            "wake_signals": [{
+                                "signal_id": "018f0000-0000-7000-8000-000000000601",
+                                "reason": "maintenance_insight_ready",
+                                "priority": "normal",
+                                "reason_code": "maintenance_review_ready",
+                                "summary": "Background maintenance found an update worth surfacing.",
+                                "payload_ref": "background_job:self_model_reflection"
+                            }]
+                        }).to_string()
+                    },
                     "finish_reason": "stop"
                 }],
                 "usage": {

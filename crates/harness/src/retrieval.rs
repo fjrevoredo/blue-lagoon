@@ -572,7 +572,32 @@ async fn load_episode_context(
 ) -> Result<RetrievedEpisodeContext> {
     let row = sqlx::query(
         r#"
-        SELECT episode_id, internal_conversation_ref, started_at, COALESCE(summary, '') AS summary, COALESCE(outcome, status) AS outcome
+        SELECT
+            episode_id,
+            internal_conversation_ref,
+            started_at,
+            COALESCE(summary, '') AS summary,
+            NULLIF(
+                (
+                    SELECT text_body
+                    FROM episode_messages
+                    WHERE episode_id = episodes.episode_id AND message_role = 'user'
+                    ORDER BY message_order DESC
+                    LIMIT 1
+                ),
+                ''
+            ) AS latest_user_message,
+            NULLIF(
+                (
+                    SELECT text_body
+                    FROM episode_messages
+                    WHERE episode_id = episodes.episode_id AND message_role = 'assistant'
+                    ORDER BY message_order DESC
+                    LIMIT 1
+                ),
+                ''
+            ) AS latest_assistant_message,
+            COALESCE(outcome, status) AS outcome
         FROM episodes
         WHERE episode_id = $1
         "#,
@@ -587,6 +612,8 @@ async fn load_episode_context(
         internal_conversation_ref: row.get("internal_conversation_ref"),
         started_at: row.get("started_at"),
         summary: row.get("summary"),
+        latest_user_message: row.get("latest_user_message"),
+        latest_assistant_message: row.get("latest_assistant_message"),
         outcome: row.get("outcome"),
         relevance_reason,
     })

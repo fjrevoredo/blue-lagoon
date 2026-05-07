@@ -4,19 +4,22 @@ use anyhow::Result;
 use chrono::Utc;
 use contracts::{
     CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload, CanonicalTargetKind,
-    ChannelKind, IngressEventKind, MemoryArtifactProposal, MergeDecisionTarget, NormalizedIngress,
-    ProposalConflictPosture, ProposalEvaluationOutcome, ProposalProvenance, ProposalProvenanceKind,
+    ChannelKind, IdentityDeltaOperation, IdentityDeltaProposal, IdentityEvidenceRef,
+    IdentityItemCategory, IdentityItemDelta, IdentityItemSource, IdentityLifecycleState,
+    IdentityMergePolicy, IdentityStabilityClass, IngressEventKind, MemoryArtifactProposal,
+    MergeDecisionTarget, NormalizedIngress, ProposalConflictPosture, ProposalEvaluationOutcome,
+    ProposalProvenance, ProposalProvenanceKind, SelfDescriptionDelta,
 };
 use harness::{
     audit,
     config::SelfModelConfig,
     continuity, execution,
     foreground::{self, NewEpisode, NewIngressEvent},
-    memory, proposal, self_model,
+    identity, memory, proposal, self_model,
 };
 use serde_json::json;
 use serial_test::serial;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -113,6 +116,540 @@ async fn proposal_memory_and_merge_history_persist() -> Result<()> {
         let active = continuity::list_active_memory_artifacts(&ctx.pool, 10).await?;
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].memory_artifact_id, memory_artifact_id);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_repository_persists_lifecycle_items_templates_interviews_and_diagnostics()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture = seed_foreground_fixture(&ctx.pool).await?;
+        let lifecycle_id = Uuid::now_v7();
+        identity::record_lifecycle_transition(
+            &ctx.pool,
+            &identity::NewIdentityLifecycle {
+                identity_lifecycle_id: lifecycle_id,
+                status: "current".to_string(),
+                lifecycle_state: "bootstrap_seed_only".to_string(),
+                active_self_model_artifact_id: None,
+                active_interview_id: None,
+                transition_reason: "component test bootstrap".to_string(),
+                transitioned_by: "test".to_string(),
+                kickstart_started_at: None,
+                kickstart_completed_at: None,
+                reset_at: None,
+                payload: json!({ "test": true }),
+            },
+        )
+        .await?;
+        let lifecycle = identity::get_current_lifecycle(&ctx.pool)
+            .await?
+            .expect("current lifecycle should exist");
+        assert_eq!(lifecycle.identity_lifecycle_id, lifecycle_id);
+        assert_eq!(lifecycle.lifecycle_state, "bootstrap_seed_only");
+
+        let name_item_id = Uuid::now_v7();
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: name_item_id,
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Blue Lagoon".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "seed".to_string(),
+                source_kind: "seed".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                stability_class: "stable".to_string(),
+                category: "foundational_value".to_string(),
+                item_key: "continuity".to_string(),
+                value_text: "continuity".to_string(),
+                confidence: 0.9,
+                weight: Some(0.8),
+                provenance_kind: "seed".to_string(),
+                source_kind: "seed".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: Uuid::now_v7(),
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                stability_class: "stable".to_string(),
+                category: "enduring_boundary".to_string(),
+                item_key: "policy".to_string(),
+                value_text: "respect harness policy".to_string(),
+                confidence: 0.95,
+                weight: Some(0.9),
+                provenance_kind: "seed".to_string(),
+                source_kind: "seed".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+        let snapshot = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 10).await?;
+        assert_eq!(snapshot.identity_summary, "Blue Lagoon");
+        assert!(snapshot.values.contains(&"continuity".to_string()));
+        assert!(
+            snapshot
+                .boundaries
+                .contains(&"respect harness policy".to_string())
+        );
+
+        let replacement_id = Uuid::now_v7();
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: replacement_id,
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Blue Lagoon Prime".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "operator".to_string(),
+                source_kind: "operator_authored".to_string(),
+                merge_policy: "approval_required".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: Some(name_item_id),
+                payload: json!({}),
+            },
+        )
+        .await?;
+        identity::supersede_identity_item(&ctx.pool, name_item_id, replacement_id).await?;
+        let active_items = identity::list_active_identity_items(&ctx.pool, 10).await?;
+        assert!(
+            active_items
+                .iter()
+                .all(|item| item.identity_item_id != name_item_id)
+        );
+
+        let template_id = Uuid::now_v7();
+        identity::insert_identity_template(
+            &ctx.pool,
+            &identity::NewIdentityTemplate {
+                identity_template_id: template_id,
+                template_key: "direct_operator".to_string(),
+                display_name: "Direct Operator".to_string(),
+                description: "A direct continuity-focused assistant.".to_string(),
+                status: "active".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_template_item(
+            &ctx.pool,
+            &identity::NewIdentityTemplateItem {
+                identity_template_item_id: Uuid::now_v7(),
+                identity_template_id: template_id,
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Blue Lagoon".to_string(),
+                confidence: 1.0,
+                weight: None,
+                merge_policy: "protected_core".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+        let templates = identity::list_active_identity_templates(&ctx.pool).await?;
+        assert_eq!(templates.len(), 1);
+
+        identity::insert_identity_interview(
+            &ctx.pool,
+            &identity::NewIdentityInterview {
+                identity_interview_id: Uuid::now_v7(),
+                status: "in_progress".to_string(),
+                current_step: "name".to_string(),
+                answered_fields: json!({}),
+                required_fields: json!(["name"]),
+                last_prompt_text: Some("What should I be called?".to_string()),
+                selected_template_id: Some(template_id),
+                payload: json!({}),
+            },
+        )
+        .await?;
+        identity::insert_identity_diagnostic(
+            &ctx.pool,
+            &identity::NewIdentityDiagnostic {
+                identity_diagnostic_id: Uuid::now_v7(),
+                diagnostic_kind: "drift_check".to_string(),
+                severity: "warning".to_string(),
+                status: "open".to_string(),
+                identity_item_id: Some(replacement_id),
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                message: "Potential protected-core change requires review.".to_string(),
+                evidence_refs: json!([]),
+                payload: json!({}),
+            },
+        )
+        .await?;
+        let diagnostics = identity::list_open_identity_diagnostics(&ctx.pool, 10).await?;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic_kind, "drift_check");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_delta_merge_applies_reinforce_weaken_revise_and_expire() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture = seed_foreground_fixture(&ctx.pool).await?;
+        let processing_context = proposal_context(&fixture);
+
+        let add_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Add,
+                IdentityItemCategory::Preference,
+                "reply_cadence",
+                "Prefers concise replies.",
+                50,
+                Some(40),
+                None,
+            )],
+            None,
+        );
+        let added_item_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &add_proposal).await?;
+
+        let reinforce_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Reinforce,
+                IdentityItemCategory::Preference,
+                "reply_cadence",
+                "Prefers concise replies.",
+                80,
+                Some(90),
+                Some(added_item_id),
+            )],
+            None,
+        );
+        let reinforced_item_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &reinforce_proposal).await?;
+        assert_eq!(reinforced_item_id, added_item_id);
+
+        let reinforced = identity_item_state(&ctx.pool, added_item_id).await?;
+        assert_eq!(reinforced.status, "active");
+        assert_eq!(reinforced.confidence_pct(), 80);
+        assert_eq!(reinforced.weight_pct(), Some(90));
+
+        let weaken_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Weaken,
+                IdentityItemCategory::Preference,
+                "reply_cadence",
+                "Prefers concise replies.",
+                20,
+                Some(30),
+                Some(added_item_id),
+            )],
+            None,
+        );
+        let weakened_item_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &weaken_proposal).await?;
+        assert_eq!(weakened_item_id, added_item_id);
+
+        let weakened = identity_item_state(&ctx.pool, added_item_id).await?;
+        assert_eq!(weakened.status, "active");
+        assert_eq!(weakened.confidence_pct(), 60);
+        assert_eq!(weakened.weight_pct(), Some(60));
+
+        let revise_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Revise,
+                IdentityItemCategory::Preference,
+                "reply_cadence",
+                "Prefers concise replies with decision context.",
+                85,
+                Some(75),
+                Some(added_item_id),
+            )],
+            None,
+        );
+        let revised_item_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &revise_proposal).await?;
+        assert_ne!(revised_item_id, added_item_id);
+
+        let superseded = identity_item_state(&ctx.pool, added_item_id).await?;
+        assert_eq!(superseded.status, "superseded");
+        assert_eq!(superseded.superseded_by_item_id, Some(revised_item_id));
+
+        let revised = identity_item_state(&ctx.pool, revised_item_id).await?;
+        assert_eq!(revised.status, "active");
+        assert_eq!(
+            revised.value_text,
+            "Prefers concise replies with decision context."
+        );
+        assert_eq!(revised.supersedes_item_id, Some(added_item_id));
+
+        let snapshot = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert!(snapshot.evolving_items.iter().any(|item| {
+            item.category == IdentityItemCategory::Preference
+                && item.value == "Prefers concise replies with decision context."
+        }));
+        assert!(
+            !snapshot
+                .evolving_items
+                .iter()
+                .any(|item| item.value == "Prefers concise replies.")
+        );
+
+        let expire_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Expire,
+                IdentityItemCategory::Preference,
+                "reply_cadence",
+                "Prefers concise replies with decision context.",
+                80,
+                Some(75),
+                Some(revised_item_id),
+            )],
+            None,
+        );
+        let expired_item_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &expire_proposal).await?;
+        assert_eq!(expired_item_id, revised_item_id);
+
+        let expired = identity_item_state(&ctx.pool, revised_item_id).await?;
+        assert_eq!(expired.status, "expired");
+        assert!(expired.valid_to.is_some());
+
+        let snapshot = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert!(
+            !snapshot
+                .evolving_items
+                .iter()
+                .any(|item| item.category == IdentityItemCategory::Preference)
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn self_description_delta_merge_revises_and_expires_compact_projection() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture = seed_foreground_fixture(&ctx.pool).await?;
+        let processing_context = proposal_context(&fixture);
+
+        let add_proposal = identity_delta_proposal(
+            Vec::new(),
+            Some(self_description_delta(
+                IdentityDeltaOperation::Add,
+                "Blue Lagoon is a direct personal assistant.",
+            )),
+        );
+        let original_description_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &add_proposal).await?;
+
+        let revise_proposal = identity_delta_proposal(
+            Vec::new(),
+            Some(self_description_delta(
+                IdentityDeltaOperation::Revise,
+                "Blue Lagoon is a direct personal assistant with durable continuity.",
+            )),
+        );
+        let revised_description_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &revise_proposal).await?;
+        assert_ne!(revised_description_id, original_description_id);
+
+        let original = identity_item_state(&ctx.pool, original_description_id).await?;
+        assert_eq!(original.status, "superseded");
+        assert_eq!(original.superseded_by_item_id, Some(revised_description_id));
+
+        let snapshot = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert_eq!(
+            snapshot.self_description.as_deref(),
+            Some("Blue Lagoon is a direct personal assistant with durable continuity.")
+        );
+
+        let expire_proposal = identity_delta_proposal(
+            Vec::new(),
+            Some(self_description_delta(
+                IdentityDeltaOperation::Expire,
+                "Blue Lagoon is a direct personal assistant with durable continuity.",
+            )),
+        );
+        let expired_description_id =
+            apply_identity_delta(&ctx.pool, &processing_context, &expire_proposal).await?;
+        assert_eq!(expired_description_id, revised_description_id);
+
+        let expired = identity_item_state(&ctx.pool, revised_description_id).await?;
+        assert_eq!(expired.status, "expired");
+
+        let snapshot = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        assert_eq!(snapshot.self_description, None);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_delta_controls_reject_duplicates_and_record_diagnostics() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture = seed_foreground_fixture(&ctx.pool).await?;
+        let processing_context = proposal_context(&fixture);
+
+        let add_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Add,
+                IdentityItemCategory::Like,
+                "verification",
+                "Likes verified implementation work.",
+                80,
+                Some(70),
+                None,
+            )],
+            None,
+        );
+        apply_identity_delta(&ctx.pool, &processing_context, &add_proposal).await?;
+
+        let duplicate_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Add,
+                IdentityItemCategory::Like,
+                "verification",
+                "Likes verified implementation work.",
+                80,
+                Some(70),
+                None,
+            )],
+            None,
+        );
+        let rejection =
+            apply_rejected_identity_delta(&ctx.pool, &processing_context, &duplicate_proposal)
+                .await?;
+        assert!(rejection.contains("duplicate"));
+
+        let active = identity::list_active_identity_items(&ctx.pool, 16).await?;
+        assert_eq!(
+            active
+                .iter()
+                .filter(|item| item.category == "like" && item.item_key == "verification")
+                .count(),
+            1
+        );
+
+        let diagnostics = identity::list_open_identity_diagnostics(&ctx.pool, 16).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.diagnostic_kind == "identity_delta_rejected"
+                && diagnostic.message.contains("duplicate")
+        }));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn identity_delta_controls_reject_protected_core_drift() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture = seed_foreground_fixture(&ctx.pool).await?;
+        let processing_context = proposal_context(&fixture);
+        let stable_item_id = Uuid::now_v7();
+        identity::insert_identity_item(
+            &ctx.pool,
+            &identity::NewIdentityItem {
+                identity_item_id: stable_item_id,
+                self_model_artifact_id: None,
+                proposal_id: None,
+                trace_id: Some(fixture.trace_id),
+                stability_class: "stable".to_string(),
+                category: "name".to_string(),
+                item_key: "name".to_string(),
+                value_text: "Blue Lagoon".to_string(),
+                confidence: 1.0,
+                weight: None,
+                provenance_kind: "seed".to_string(),
+                source_kind: "seed".to_string(),
+                merge_policy: "protected_core".to_string(),
+                status: "active".to_string(),
+                evidence_refs: json!([]),
+                valid_from: Some(Utc::now()),
+                valid_to: None,
+                supersedes_item_id: None,
+                payload: json!({}),
+            },
+        )
+        .await?;
+
+        let revise_proposal = identity_delta_proposal(
+            vec![identity_item_delta(
+                IdentityDeltaOperation::Revise,
+                IdentityItemCategory::Name,
+                "name",
+                "Different Name",
+                90,
+                None,
+                Some(stable_item_id),
+            )],
+            None,
+        );
+        let rejection =
+            apply_rejected_identity_delta(&ctx.pool, &processing_context, &revise_proposal).await?;
+        assert!(rejection.contains("protected stable identity"));
+
+        let stable = identity_item_state(&ctx.pool, stable_item_id).await?;
+        assert_eq!(stable.status, "active");
+        assert_eq!(stable.value_text, "Blue Lagoon");
+
+        let diagnostics = identity::list_open_identity_diagnostics(&ctx.pool, 16).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.diagnostic_kind == "identity_delta_rejected"
+                && diagnostic.message.contains("protected stable identity")
+        }));
         Ok(())
     })
     .await
@@ -670,6 +1207,174 @@ async fn insert_memory_proposal(
     )
     .await?;
     Ok(proposal_id)
+}
+
+fn proposal_context(fixture: &ForegroundFixture) -> proposal::ProposalProcessingContext {
+    proposal::ProposalProcessingContext {
+        trace_id: fixture.trace_id,
+        execution_id: fixture.execution_id,
+        episode_id: Some(fixture.episode_id),
+        source_ingress_id: Some(fixture.ingress_id),
+        source_loop_kind: "conscious".to_string(),
+    }
+}
+
+async fn apply_identity_delta(
+    pool: &PgPool,
+    context: &proposal::ProposalProcessingContext,
+    proposal: &CanonicalProposal,
+) -> Result<Uuid> {
+    let validation = proposal::validate_and_record_proposal(pool, context, proposal).await?;
+    assert_eq!(validation.outcome, ProposalEvaluationOutcome::Accepted);
+
+    let merge = identity::apply_identity_delta_proposal_merge(pool, context, proposal).await?;
+    assert_eq!(merge.outcome, ProposalEvaluationOutcome::Accepted);
+    let Some(MergeDecisionTarget::IdentityItems(identity_item_ids)) = merge.target else {
+        panic!("expected identity item target, got {:?}", merge.target);
+    };
+    assert_eq!(identity_item_ids.len(), 1);
+    Ok(identity_item_ids[0])
+}
+
+async fn apply_rejected_identity_delta(
+    pool: &PgPool,
+    context: &proposal::ProposalProcessingContext,
+    proposal: &CanonicalProposal,
+) -> Result<String> {
+    let validation = proposal::validate_and_record_proposal(pool, context, proposal).await?;
+    assert_eq!(validation.outcome, ProposalEvaluationOutcome::Accepted);
+
+    let merge = identity::apply_identity_delta_proposal_merge(pool, context, proposal).await?;
+    assert_eq!(merge.outcome, ProposalEvaluationOutcome::Rejected);
+    assert_eq!(merge.target, None);
+    Ok(merge.reason)
+}
+
+#[derive(Debug)]
+struct IdentityItemState {
+    status: String,
+    value_text: String,
+    confidence: f64,
+    weight: Option<f64>,
+    valid_to: Option<chrono::DateTime<Utc>>,
+    supersedes_item_id: Option<Uuid>,
+    superseded_by_item_id: Option<Uuid>,
+}
+
+impl IdentityItemState {
+    fn confidence_pct(&self) -> u8 {
+        (self.confidence * 100.0).round() as u8
+    }
+
+    fn weight_pct(&self) -> Option<u8> {
+        self.weight.map(|weight| (weight * 100.0).round() as u8)
+    }
+}
+
+async fn identity_item_state(pool: &PgPool, identity_item_id: Uuid) -> Result<IdentityItemState> {
+    let row = sqlx::query(
+        r#"
+        SELECT status, value_text, confidence, weight, valid_to, supersedes_item_id,
+               superseded_by_item_id
+        FROM identity_items
+        WHERE identity_item_id = $1
+        "#,
+    )
+    .bind(identity_item_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(IdentityItemState {
+        status: row.get("status"),
+        value_text: row.get("value_text"),
+        confidence: row.get("confidence"),
+        weight: row.get("weight"),
+        valid_to: row.get("valid_to"),
+        supersedes_item_id: row.get("supersedes_item_id"),
+        superseded_by_item_id: row.get("superseded_by_item_id"),
+    })
+}
+
+fn identity_delta_proposal(
+    item_deltas: Vec<IdentityItemDelta>,
+    self_description_delta: Option<SelfDescriptionDelta>,
+) -> CanonicalProposal {
+    CanonicalProposal {
+        proposal_id: Uuid::now_v7(),
+        proposal_kind: CanonicalProposalKind::IdentityDelta,
+        canonical_target: CanonicalTargetKind::IdentityItems,
+        confidence_pct: 90,
+        conflict_posture: ProposalConflictPosture::Independent,
+        subject_ref: "self:blue-lagoon".to_string(),
+        rationale: Some("Identity component test proposal.".to_string()),
+        valid_from: Some(Utc::now()),
+        valid_to: None,
+        supersedes_artifact_id: None,
+        provenance: ProposalProvenance {
+            provenance_kind: ProposalProvenanceKind::EpisodeObservation,
+            source_ingress_ids: vec![Uuid::now_v7()],
+            source_episode_id: Some(Uuid::now_v7()),
+        },
+        payload: CanonicalProposalPayload::IdentityDelta(IdentityDeltaProposal {
+            lifecycle_state: IdentityLifecycleState::CompleteIdentityActive,
+            item_deltas,
+            self_description_delta,
+            interview_action: None,
+            rationale: "Identity component test proposal.".to_string(),
+        }),
+    }
+}
+
+fn identity_item_delta(
+    operation: IdentityDeltaOperation,
+    category: IdentityItemCategory,
+    item_key: &str,
+    value: &str,
+    confidence_pct: u8,
+    weight_pct: Option<u8>,
+    target_identity_item_id: Option<Uuid>,
+) -> IdentityItemDelta {
+    IdentityItemDelta {
+        operation,
+        stability_class: IdentityStabilityClass::Evolving,
+        category,
+        item_key: item_key.to_string(),
+        value: value.to_string(),
+        confidence_pct,
+        weight_pct,
+        source: IdentityItemSource::UserAuthored,
+        merge_policy: match operation {
+            IdentityDeltaOperation::Add => IdentityMergePolicy::Revisable,
+            IdentityDeltaOperation::Reinforce => IdentityMergePolicy::Reinforceable,
+            IdentityDeltaOperation::Weaken => IdentityMergePolicy::Reinforceable,
+            IdentityDeltaOperation::Revise | IdentityDeltaOperation::Supersede => {
+                IdentityMergePolicy::Revisable
+            }
+            IdentityDeltaOperation::Expire => IdentityMergePolicy::Expirable,
+        },
+        evidence_refs: vec![identity_evidence_ref()],
+        valid_from: Some(Utc::now()),
+        valid_to: None,
+        target_identity_item_id,
+    }
+}
+
+fn self_description_delta(
+    operation: IdentityDeltaOperation,
+    description: &str,
+) -> SelfDescriptionDelta {
+    SelfDescriptionDelta {
+        operation,
+        description: description.to_string(),
+        evidence_refs: vec![identity_evidence_ref()],
+    }
+}
+
+fn identity_evidence_ref() -> IdentityEvidenceRef {
+    IdentityEvidenceRef {
+        source_kind: "component_test".to_string(),
+        source_id: Some(Uuid::now_v7()),
+        summary: "Continuity component test evidence.".to_string(),
+    }
 }
 
 fn sample_contract_memory_proposal(content_text: &str) -> CanonicalProposal {

@@ -25,7 +25,11 @@ The conscious loop is the foreground executive that handles perception, present-
    - Allowed triggers are defined in section 3.1.
 2. **Context assembly (via harness)**
    - Harness composes:
-     - Compact self-model snapshot for this agent.
+     - Compact self-model snapshot for this agent, derived from canonical
+       identity and self-model state.
+     - Identity lifecycle context, including a user-facing identity formation
+       capability only when the assistant is still bootstrap-only or an
+       identity kickstart is already in progress.
      - Selected long-term and session memories relevant to the trigger.
      - Current internal state snapshot (load, health, etc.).
 3. **Budget initialization**
@@ -80,7 +84,7 @@ The unconscious loop is a background maintenance and transformation system imple
      - Summarization and abstraction.
      - Entity and relationship extraction.
      - Conflict detection and drift analysis.
-     - Self-model delta proposal generation.
+     - Structured self-model or identity delta proposal generation.
 5. **Produce proposals**
    - Worker returns structured outputs only, such as:
      - Memory deltas (add/update/delete proposals with provenance).
@@ -102,6 +106,9 @@ The unconscious loop is a background maintenance and transformation system imple
 - **Data isolation**: no shared writable memory; all reads and writes go through harness APIs.
 - **Context isolation**:
   - Conscious loop sees present context plus compact self-model and selected memory.
+    It may see that identity formation is available or in progress, but it must
+    not see storage schemas, merge internals, lifecycle implementation details,
+    or unconscious maintenance machinery.
   - Unconscious workers see only the minimal slices needed for their job.
 
 ### 2.2 Harness as sole mediator
@@ -115,7 +122,8 @@ All cross-loop interactions are mediated by the harness:
   - Unconscious worker may emit a wake signal with a typed reason and a reason code (e.g., `critical_conflict`, `proactive_briefing_ready`, `self_state_anomaly`).
   - Harness applies policy and decides whether to convert it into a foreground trigger, possibly throttling or dropping low-priority signals.
 - Both loops to memory and self-model:
-  - Both may emit proposals (episodic entries, memory deltas, self-model deltas).
+  - Both may emit proposals (episodic entries, memory deltas, self-model or
+    identity deltas).
   - Only the harness can commit changes to canonical storage.
 
 No direct calls or shared references between the conscious and unconscious loops are allowed.
@@ -226,6 +234,7 @@ The unconscious loop is **not** allowed to:
    - Harness classifies the event as a foreground trigger, background job trigger, or both.
 2. **Foreground and/or background work is scheduled**
    - For foreground: harness assembles context, initializes budgets, and wakes the conscious loop.
+   - For governed actions, the harness MAY repeat worker -> policy -> governed-action -> observation cycles multiple times inside the same foreground turn while the remaining budgets and per-turn action cap allow it.
    - For background: harness scopes inputs, sets budgets, and launches unconscious jobs.
 3. **Loops run in isolation**
    - Each loop operates within its process and scoped data view.
@@ -315,6 +324,7 @@ The unconscious loop is **not** allowed to:
    - Conscious loop wakes, receives the context (self-model, relevant memory, payload X), and:
      - Generates a user-facing message summarizing the next meeting and the weather.
      - Optionally offers actions (e.g., suggest what to bring, propose leaving time).
+     - May propose another governed action in the same foreground turn after receiving harness observations, but the harness remains the authority for execution, approval, denial, and bounded continuation.
    - The conscious loop runs within its iteration/compute budget.
 9. **Record & halt**
    - Conscious loop logs the episode and any candidate memories, then goes idle until the next trigger.

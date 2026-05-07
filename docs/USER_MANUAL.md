@@ -10,6 +10,7 @@ Use this document when you want to:
 - set up the runtime locally
 - start or stop the services
 - manage scheduled foreground tasks
+- inspect and manage assistant identity
 - review approvals, diagnostics, and recovery state
 - run safe one-shot checks
 - troubleshoot common local problems
@@ -159,6 +160,54 @@ cargo run -p runtime -- admin workspace scripts list
 cargo run -p runtime -- admin workspace runs list
 cargo run -p runtime -- admin foreground schedules list
 cargo run -p runtime -- admin background list
+```
+
+### Identity formation and inspection
+
+On a fresh or reset runtime, the assistant can form its first complete identity
+with the user through the foreground conversation. The harness exposes the
+identity formation capability only while the identity lifecycle is
+bootstrap-only or an identity interview is in progress. After completion, the
+formation capability disappears from the conscious context.
+
+Inspect identity lifecycle and compact identity state:
+
+```bash
+cargo run -p runtime -- admin identity status
+cargo run -p runtime -- admin identity show
+cargo run -p runtime -- admin identity history list
+cargo run -p runtime -- admin identity diagnostics list
+```
+
+Reset identity formation when an operator intentionally needs to reopen the
+first-identity flow:
+
+```bash
+cargo run -p runtime -- admin identity reset \
+  --force \
+  --actor-ref operator:local \
+  --reason "restart identity formation"
+```
+
+Controlled identity edits after first identity completion are proposal-based,
+not direct writes. Stable identity edits require explicit confirmation:
+
+```bash
+cargo run -p runtime -- admin identity edit propose \
+  --actor-ref operator:local \
+  --reason "operator-reviewed preference update" \
+  --stability-class evolving \
+  --category preference \
+  --item-key concise_operator_summaries \
+  --value "Prefer concise operator summaries."
+
+cargo run -p runtime -- admin identity edit list
+
+cargo run -p runtime -- admin identity edit resolve \
+  --proposal-id <uuid> \
+  --decision approve \
+  --actor-ref operator:local \
+  --reason "approved after review"
 ```
 
 ### Managing scheduled foreground tasks

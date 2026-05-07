@@ -6,6 +6,12 @@
 
 The governed action system is the conscious loop's proposal-only tool surface.
 The model emits plain text plus, when needed, one fenced JSON proposal block.
+Returning only an action or payload name such as `list_workspace_artifacts` is
+invalid. Invented aliases such as `read_workspace_artifacts` are also invalid.
+These shapes are treated as malformed governed-action proposals.
+Each model response may propose at most one governed action. If another action
+is needed after the harness returns an observation, the harness performs another
+bounded same-turn model call and revalidates the next proposal.
 The harness parses the proposal, validates the requested scope, classifies risk,
 persists an auditable execution record, optionally requests approval, and only
 then executes the action through harness-owned services.
@@ -25,17 +31,18 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 714), payload structs (line 739), `GovernedActionPayload` (line 867) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 24), `governed_action_schema_message()` (line 592), `build_governed_action_proposals()` (line 676), `governed_action_kind_as_str()` (line 718) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 442), `execute_inspect_workspace_artifact()` (line 773), `execute_create_workspace_script()` (line 1090), `execute_request_background_job()` (line 1290), `validate_capability_scope()` (line 1370), `governed_action_kind_as_str()` (line 2795), `CanonicalGovernedActionPayload` (line 2917) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 168), `governed_action_requires_approval()` (line 207) |
-| `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1314) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 888), `build_governed_action_proposals()` (line 993), `governed_action_kind_as_str()` (line 1334) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
+| `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
 | `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
 | `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
-| `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for new action-kind strings |
+| `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for the completed conscious-loop action-kind strings |
+| `migrations/0014__diagnostic_action_kind.sql` | forward constraint update for the later `run_diagnostic` action kind on existing operator databases |
 
 ### Model-Facing Action Kinds
 
@@ -54,6 +61,7 @@ The live governed-action enum contains these model-usable kinds:
 | `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
 | `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
 | `request_background_job` | Request bounded background maintenance work | Tier 1 |
+| `run_diagnostic` | Execute one harness-native read-only diagnostic query | Tier 0 |
 | `run_subprocess` | Execute a bounded subprocess | Tier 1-3 by scope |
 | `run_workspace_script` | Execute a registered script version | Tier 1-3 by scope |
 | `web_fetch` | Fetch one HTTP/HTTPS URL with bounded response capture | Tier 2 |
@@ -90,7 +98,22 @@ block tagged `blue-lagoon-governed-actions`:
 ````
 
 `build_governed_action_proposals()` extracts the last matching block. The
-orchestrator currently processes at most one action per immediate model turn.
+foreground orchestrator may continue through multiple governed-action rounds in
+the same foreground turn: the worker receives harness observations, may propose
+another action if one is still needed, and the harness then decides whether the
+next proposal is allowed, approval-gated, or denied under policy, remaining
+budgets, and the configured per-turn action cap.
+
+Read-only list and diagnostic payloads should include an explicit `limit`.
+For parser robustness, the contracts layer applies a bounded default of `10`
+when that field is omitted from list/search payloads or diagnostic list
+queries. Workspace artifact and script list payloads also default omitted
+`status` to `active`; recovery checkpoint diagnostics default omitted
+`open_only` to `false`; recovery lease diagnostics default omitted
+`soft_warning_threshold_percent` to `80`. This compatibility default is
+intentionally limited to read-only discovery actions; mutating payload fields,
+identifiers, and required diagnostic selectors still fail as malformed
+proposals when absent.
 
 ### Payload Families
 
@@ -118,10 +141,20 @@ Schedule, background, subprocess, and fetch payloads:
 
 ```json
 { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
+{ "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "oneoff_check_in_20260429", "title": "One-time check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 0, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
 { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
 { "kind": "run_subprocess", "value": { "command": "<executable>", "args": [], "working_directory": "<absolute path or null>" } }
 { "kind": "web_fetch", "value": { "url": "https://example.com", "timeout_ms": 10000, "max_response_bytes": 524288 } }
 ```
+
+Scheduled foreground tasks are recurring by default. Recurring tasks must use a
+positive `cadence_seconds` that passes `scheduled_foreground` validation.
+One-shot tasks are represented without a schema migration by using a task key
+with the `oneoff_` or `one_shot_` prefix and `cadence_seconds: 0`. The harness
+stores a bounded placeholder cadence internally because the database column is
+non-null, but terminal outcomes disable prefixed one-shot tasks after success,
+suppression, or failure. This prevents reminders from turning into retry loops
+unless a future action explicitly creates or reactivates a recurring task.
 
 ### Observation Feedback
 
@@ -132,6 +165,12 @@ capped at 1,500 characters after content formatting. Full raw fetch bodies and
 harness-native payload details are stored in execution records, not injected
 unbounded into conscious context.
 
+When the harness is in a same-turn continuation path, the observation message
+also carries the current `ForegroundGovernedActionLoopState`: actions already
+used in the turn, remaining cap, and configured cap-exceeded posture. This
+keeps the worker aware of bounded continuation state without making the worker
+the authority for execution decisions.
+
 Approval-triggered action execution persists the model follow-up text first,
 then appends the harness observation to durable assistant history. Telegram
 delivery sends only user-facing text.
@@ -140,14 +179,19 @@ delivery sends only user-facing text.
 
 Read-only harness-native actions are replay-safe after a worker interruption:
 `inspect_workspace_artifact`, `list_workspace_artifacts`,
-`list_workspace_scripts`, `inspect_workspace_script`, and
-`list_workspace_script_runs`.
+`list_workspace_scripts`, `inspect_workspace_script`,
+`list_workspace_script_runs`, and `run_diagnostic`.
 
 Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
 produce side effects are classified as ambiguous or nonrepeatable during
 governed-action recovery. Recovery must not automatically retry them unless
 durable completion evidence proves the original action already reached a
 terminal state.
+
+Foreground replay follows the same proof-based rule. If an interrupted
+foreground execution already linked one or more governed actions and every
+linked action is not both replay-safe and approval-free, stale foreground
+recovery fails closed instead of blindly replaying the turn.
 
 ---
 
@@ -170,6 +214,8 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 | `approval_required_min_risk_tier` | `"tier_2"` |
 | `default_subprocess_timeout_ms` | `30000` |
 | `max_subprocess_timeout_ms` | `120000` |
+| `max_actions_per_foreground_turn` | `10` |
+| `cap_exceeded_behavior` | `"escalate"` |
 | `max_filesystem_roots_per_action` | `4` |
 | `default_network_access` | `"disabled"` |
 | `allowlisted_environment_variables` | `["BLUE_LAGOON_DATABASE_URL"]` |
@@ -181,6 +227,17 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 `requested_risk_tier` may raise the final tier, but it cannot lower the
 intrinsic tier computed by `policy::classify_governed_action_risk()`.
 
+### Identity Boundary Rules
+
+After capability-scope validation, planning and execution both load the compact
+identity snapshot and evaluate active identity boundaries through
+`policy::evaluate_governed_action_identity_boundaries()`. A matching enduring
+boundary can deterministically block network access, subprocess execution, or
+workspace write effects before approval or execution proceeds. This is a
+harness policy decision, not a model preference: the model can propose an
+action, but identity boundaries are rechecked by the harness at planning time
+and again immediately before execution.
+
 ### Extension Checklist
 
 Use `docs/internal/harness/TOOL_IMPLEMENTATION.md` for the full E2E workflow.
@@ -188,6 +245,9 @@ The short version is:
 
 - Add contract enum and payload variants.
 - Add the migration for constrained `action_kind` columns.
+- When adding action kinds after an operator database may already have applied
+  earlier migrations, add a new forward migration rather than editing an
+  already-applied migration file.
 - Add shape validation, scope validation, risk classification, canonical
   fingerprinting, execution dispatch, observation formatting, and audit payloads.
 - Update worker schema text and every exhaustive action-kind match.
@@ -209,4 +269,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/causal-trace-explorer`, session 2026-04-30.*
+*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-07.*

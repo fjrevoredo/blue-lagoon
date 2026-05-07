@@ -100,7 +100,7 @@ pub async fn upsert_task(
     validate_upsert_request(config, request)?;
 
     if let Some(existing) = get_task_by_key(pool, &request.task_key).await? {
-        let record = update_task(pool, &existing, request).await?;
+        let record = update_task(pool, config, &existing, request).await?;
         Ok(ScheduledForegroundTaskWriteResult {
             action: ScheduledForegroundTaskWriteAction::Updated,
             record,
@@ -680,7 +680,14 @@ fn validate_upsert_request(
     if request.message_text.trim().is_empty() {
         bail!("scheduled foreground message_text must not be empty");
     }
-    if request.cadence_seconds < config.scheduled_foreground.min_cadence_seconds {
+    if request.cadence_seconds == 0 && !is_one_shot_task_key(&request.task_key) {
+        bail!(
+            "scheduled foreground cadence_seconds must be greater than zero unless task_key uses the one-shot prefix"
+        );
+    }
+    if request.cadence_seconds > 0
+        && request.cadence_seconds < config.scheduled_foreground.min_cadence_seconds
+    {
         bail!(
             "scheduled foreground cadence_seconds must be at least {}",
             config.scheduled_foreground.min_cadence_seconds
@@ -694,6 +701,18 @@ fn validate_upsert_request(
     Ok(())
 }
 
+fn stored_cadence_seconds(config: &RuntimeConfig, request: &UpsertScheduledForegroundTask) -> u64 {
+    if request.cadence_seconds == 0 && is_one_shot_task_key(&request.task_key) {
+        return config.scheduled_foreground.min_cadence_seconds;
+    }
+    request.cadence_seconds
+}
+
+fn is_one_shot_task_key(task_key: &str) -> bool {
+    let task_key = task_key.trim().to_ascii_lowercase();
+    task_key.starts_with("oneoff_") || task_key.starts_with("one_shot_")
+}
+
 async fn insert_task(
     pool: &PgPool,
     config: &RuntimeConfig,
@@ -702,6 +721,7 @@ async fn insert_task(
     let cooldown_seconds = request
         .cooldown_seconds
         .unwrap_or(config.scheduled_foreground.default_cooldown_seconds);
+    let cadence_seconds = stored_cadence_seconds(config, request);
     let next_due_at = request.next_due_at.unwrap_or_else(Utc::now);
     let row = sqlx::query(
         r#"
@@ -768,7 +788,7 @@ async fn insert_task(
     .bind(request.internal_principal_ref.trim())
     .bind(request.internal_conversation_ref.trim())
     .bind(request.message_text.trim())
-    .bind(i64::try_from(request.cadence_seconds).context("cadence_seconds exceeds i64")?)
+    .bind(i64::try_from(cadence_seconds).context("cadence_seconds exceeds i64")?)
     .bind(i64::try_from(cooldown_seconds).context("cooldown_seconds exceeds i64")?)
     .bind(next_due_at)
     .bind(request.actor_ref.trim())
@@ -782,9 +802,11 @@ async fn insert_task(
 
 async fn update_task(
     pool: &PgPool,
+    config: &RuntimeConfig,
     existing: &ScheduledForegroundTaskRecord,
     request: &UpsertScheduledForegroundTask,
 ) -> Result<ScheduledForegroundTaskRecord> {
+    let cadence_seconds = stored_cadence_seconds(config, request);
     let row = sqlx::query(
         r#"
         UPDATE scheduled_foreground_tasks
@@ -829,7 +851,7 @@ async fn update_task(
     .bind(request.internal_principal_ref.trim())
     .bind(request.internal_conversation_ref.trim())
     .bind(request.message_text.trim())
-    .bind(i64::try_from(request.cadence_seconds).context("cadence_seconds exceeds i64")?)
+    .bind(i64::try_from(cadence_seconds).context("cadence_seconds exceeds i64")?)
     .bind(
         i64::try_from(
             request
@@ -997,6 +1019,7 @@ async fn update_task_run_outcome(
         SET
             current_execution_id = NULL,
             current_run_started_at = NULL,
+            status = CASE WHEN $8 THEN 'disabled' ELSE status END,
             last_execution_id = $3,
             last_run_started_at = COALESCE(current_run_started_at, $2),
             last_run_completed_at = $2,
@@ -1039,6 +1062,7 @@ async fn update_task_run_outcome(
     .bind(outcome_data.reason)
     .bind(outcome_data.summary)
     .bind(next_due_at)
+    .bind(is_one_shot_task_key(&task.task_key))
     .fetch_optional(pool)
     .await
     .with_context(|| {

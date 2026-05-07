@@ -155,3 +155,47 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 **Gap**: Each mechanism (claim, recovery, re-execution) is tested in isolation. No single test covers the full acquire→crash→recover→re-execute lifecycle.
 
 **Test**: `uc8_worker_crash_creates_checkpoint_and_task_is_clean_after_recovery`
+
+---
+
+## Identity Use Cases
+
+These identity scenarios are covered across the foreground, continuity,
+management, and governed-action suites rather than being part of the original
+eight runtime smoke use cases.
+
+### ID-1: First Identity Kickstart
+
+**Goal**: A bootstrap-only runtime can form a complete assistant identity with
+the user, then hides the formation capability after completion.
+
+**Current Status**: Working
+
+**Coverage**: `use_case_scenarios`,
+`foreground_integration`, `foreground_component`, and worker parser tests cover
+predefined selection, custom interview progress, resume, cancellation, and
+completed-state tool hiding.
+
+### ID-2: Identity-Informed Policy
+
+**Goal**: Enduring identity boundaries can affect harness decisions instead of
+only changing prompt wording.
+
+**Current Status**: Working
+
+**Coverage**: `governed_actions_component` proves identity boundaries can block
+matching governed action capabilities, and `unconscious_integration` proves
+degraded internal state can defer non-urgent wake signals.
+
+### ID-3: Operator Identity Workflows
+
+**Goal**: Operators can inspect identity, review history and diagnostics, reset
+first identity formation, and propose controlled post-kickstart identity edits
+without raw SQL.
+
+**Current Status**: Working
+
+**Coverage**: `management_component`, `management_integration`, runtime admin
+unit tests, and `admin_cli` cover status/show, history, diagnostics, reset,
+proposal creation, proposal listing, and approval/rejection of identity edit
+proposals.
