@@ -107,5 +107,12 @@ timeout_ms = 60000
 [model_gateway.z_ai]
 api_surface = "coding"
 
+[model_gateway.openrouter]
+# OpenRouter is available by setting model_gateway.foreground.provider to
+# "openrouter" in local config or BLUE_LAGOON_FOREGROUND_ROUTE to
+# "openrouter/<provider-model-id>". The default endpoint follows the
+# OpenRouter OpenAI-compatible chat completions API.
+api_base_url = "https://openrouter.ai/api/v1"
+
 [self_model]
 seed_path = "config/self_model_seed.toml"

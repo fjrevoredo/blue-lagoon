@@ -5495,6 +5495,7 @@ impl ModelProviderKindExt for contracts::ModelProviderKind {
     fn identifier(self) -> &'static str {
         match self {
             contracts::ModelProviderKind::ZAi => "z_ai",
+            contracts::ModelProviderKind::OpenRouter => "openrouter",
         }
     }
 }
@@ -5621,6 +5622,7 @@ mod tests {
                     timeout_ms: 60_000,
                 },
                 z_ai: None,
+                openrouter: None,
             }),
             self_model: Some(SelfModelConfig {
                 seed_path: PathBuf::from("config/self_model_seed.toml"),

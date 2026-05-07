@@ -3421,6 +3421,7 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 api_surface: Some(harness::config::ZAiApiSurface::Coding),
                 api_base_url: None,
             }),
+            openrouter: None,
         });
 
         let error = runtime::run_telegram_once(
@@ -3508,6 +3509,7 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "secret".to_string(),
+            provider_headers: Vec::new(),
             timeout_ms: 20_000,
         },
     }

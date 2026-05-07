@@ -356,6 +356,7 @@ fn configure_management_execution(config: &mut harness::config::RuntimeConfig) {
             timeout_ms: 20_000,
         },
         z_ai: None,
+        openrouter: None,
     });
 }
 

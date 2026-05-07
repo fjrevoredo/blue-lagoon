@@ -782,6 +782,7 @@ async fn model_call_records_are_persisted_and_visible_in_trace_report() -> Resul
                 model: "test-model".to_string(),
                 api_base_url: "https://example.invalid".to_string(),
                 api_key: "redacted-test-key".to_string(),
+                provider_headers: Vec::new(),
                 timeout_ms: 30_000,
             },
         };
@@ -915,6 +916,7 @@ async fn model_call_payload_retention_clears_bulky_fields_but_keeps_metadata() -
                 model: "test-model".to_string(),
                 api_base_url: "https://example.invalid".to_string(),
                 api_key: "redacted-test-key".to_string(),
+                provider_headers: Vec::new(),
                 timeout_ms: 30_000,
             },
         };

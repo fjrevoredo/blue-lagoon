@@ -837,6 +837,7 @@ fn sample_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             api_surface: None,
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
         }),
+        openrouter: None,
     }
 }
 

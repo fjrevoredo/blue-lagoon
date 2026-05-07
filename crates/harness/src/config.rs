@@ -201,6 +201,8 @@ pub struct ModelGatewayConfig {
     pub foreground: ForegroundModelRouteConfig,
     #[serde(default)]
     pub z_ai: Option<ZAiProviderConfig>,
+    #[serde(default)]
+    pub openrouter: Option<OpenRouterProviderConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -228,6 +230,16 @@ pub enum ZAiApiSurface {
     Coding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OpenRouterProviderConfig {
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub http_referer: Option<String>,
+    #[serde(default)]
+    pub app_title: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelGatewayConfig {
     pub foreground: ResolvedForegroundModelRouteConfig,
@@ -239,7 +251,14 @@ pub struct ResolvedForegroundModelRouteConfig {
     pub model: String,
     pub api_base_url: String,
     pub api_key: String,
+    pub provider_headers: Vec<ProviderHttpHeaderConfig>,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHttpHeaderConfig {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -437,6 +456,7 @@ impl RuntimeConfig {
                 model: model_gateway.foreground.model.clone(),
                 api_base_url: require_foreground_api_base_url(model_gateway)?,
                 api_key: require_foreground_api_key(&model_gateway.foreground.api_key_env)?,
+                provider_headers: foreground_provider_headers(model_gateway)?,
                 timeout_ms: model_gateway.foreground.timeout_ms,
             },
         })
@@ -554,7 +574,10 @@ fn parse_worker_args_override(raw: &str) -> Result<Vec<String>> {
 fn parse_model_provider_override(raw: &str) -> Result<ModelProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "z_ai" | "zai" | "z-ai" => Ok(ModelProviderKind::ZAi),
-        other => bail!("BLUE_LAGOON_FOREGROUND_ROUTE provider must be one of: z_ai; got '{other}'"),
+        "openrouter" | "open_router" | "open-router" => Ok(ModelProviderKind::OpenRouter),
+        other => bail!(
+            "BLUE_LAGOON_FOREGROUND_ROUTE provider must be one of: z_ai, openrouter; got '{other}'"
+        ),
     }
 }
 
@@ -735,6 +758,15 @@ impl ModelGatewayConfig {
                 "model_gateway.foreground.api_base_url must not be empty unless model_gateway.z_ai config defines api_surface or api_base_url"
             );
         }
+        if self.foreground.provider == ModelProviderKind::OpenRouter
+            && self
+                .foreground
+                .api_base_url
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("model_gateway.foreground.api_base_url must not be empty");
+        }
         if self.foreground.api_key_env.trim().is_empty() {
             bail!("model_gateway.foreground.api_key_env must not be empty");
         }
@@ -748,6 +780,29 @@ impl ModelGatewayConfig {
                 .is_some_and(|value| value.trim().is_empty())
         {
             bail!("model_gateway.z_ai.api_base_url must not be empty");
+        }
+        if let Some(openrouter) = &self.openrouter {
+            if openrouter
+                .api_base_url
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("model_gateway.openrouter.api_base_url must not be empty");
+            }
+            if openrouter
+                .http_referer
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("model_gateway.openrouter.http_referer must not be empty");
+            }
+            if openrouter
+                .app_title
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("model_gateway.openrouter.app_title must not be empty");
+            }
         }
         Ok(())
     }
@@ -957,6 +1012,46 @@ fn require_foreground_api_base_url(config: &ModelGatewayConfig) -> Result<String
                 .api_base_url
                 .clone()
                 .context("missing foreground api base url after provider-specific resolution")
+        }
+        ModelProviderKind::OpenRouter => {
+            if let Some(openrouter) = &config.openrouter
+                && let Some(api_base_url) = openrouter.api_base_url.as_deref()
+                && !api_base_url.trim().is_empty()
+            {
+                return Ok(api_base_url.to_string());
+            }
+            Ok(config
+                .foreground
+                .api_base_url
+                .clone()
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()))
+        }
+    }
+}
+
+fn foreground_provider_headers(
+    config: &ModelGatewayConfig,
+) -> Result<Vec<ProviderHttpHeaderConfig>> {
+    match config.foreground.provider {
+        ModelProviderKind::ZAi => Ok(Vec::new()),
+        ModelProviderKind::OpenRouter => {
+            let Some(openrouter) = &config.openrouter else {
+                return Ok(Vec::new());
+            };
+            let mut headers = Vec::new();
+            if let Some(http_referer) = openrouter.http_referer.as_deref() {
+                headers.push(ProviderHttpHeaderConfig {
+                    name: "HTTP-Referer".to_string(),
+                    value: http_referer.to_string(),
+                });
+            }
+            if let Some(app_title) = openrouter.app_title.as_deref() {
+                headers.push(ProviderHttpHeaderConfig {
+                    name: "X-OpenRouter-Title".to_string(),
+                    value: app_title.to_string(),
+                });
+            }
+            Ok(headers)
         }
     }
 }
@@ -1294,6 +1389,14 @@ args = []
             parse_model_provider_override("z-ai").expect("provider should parse"),
             ModelProviderKind::ZAi
         );
+        assert_eq!(
+            parse_model_provider_override("openrouter").expect("provider should parse"),
+            ModelProviderKind::OpenRouter
+        );
+        assert_eq!(
+            parse_model_provider_override("open_router").expect("provider should parse"),
+            ModelProviderKind::OpenRouter
+        );
     }
 
     #[test]
@@ -1309,6 +1412,11 @@ args = []
             parse_foreground_route_override("zai/glm-5-turbo").expect("route should parse");
         assert_eq!(provider, ModelProviderKind::ZAi);
         assert_eq!(model, "glm-5-turbo");
+
+        let (provider, model) = parse_foreground_route_override("openrouter/openai/gpt-5.2")
+            .expect("openrouter route should preserve provider model id");
+        assert_eq!(provider, ModelProviderKind::OpenRouter);
+        assert_eq!(model, "openai/gpt-5.2");
     }
 
     #[test]
@@ -1527,6 +1635,7 @@ args = []
                 timeout_ms: 30_000,
             },
             z_ai: None,
+            openrouter: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -1661,6 +1770,7 @@ api_surface = "coding"
                 timeout_ms: 30_000,
             },
             z_ai: None,
+            openrouter: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -1692,6 +1802,7 @@ api_surface = "coding"
                 timeout_ms: 30_000,
             },
             z_ai: None,
+            openrouter: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -1738,6 +1849,7 @@ api_surface = "coding"
                 api_surface: None,
                 api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
             }),
+            openrouter: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -1781,6 +1893,7 @@ api_surface = "coding"
                 api_surface: Some(ZAiApiSurface::Coding),
                 api_base_url: None,
             }),
+            openrouter: None,
         });
 
         let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
@@ -1806,6 +1919,118 @@ api_surface = "coding"
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
             None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
         }
+    }
+
+    #[test]
+    fn require_model_gateway_config_resolves_openrouter_defaults() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: None,
+                api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: None,
+                http_referer: Some("https://blue-lagoon.local".to_string()),
+                app_title: Some("Blue Lagoon".to_string()),
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        let original_api_base_url = env::var_os("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "openrouter-key");
+            env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("openrouter defaults should resolve");
+        assert_eq!(resolved.foreground.provider, ModelProviderKind::OpenRouter);
+        assert_eq!(resolved.foreground.model, "openai/gpt-5.2");
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            resolved.foreground.provider_headers,
+            vec![
+                ProviderHttpHeaderConfig {
+                    name: "HTTP-Referer".to_string(),
+                    value: "https://blue-lagoon.local".to_string(),
+                },
+                ProviderHttpHeaderConfig {
+                    name: "X-OpenRouter-Title".to_string(),
+                    value: "Blue Lagoon".to_string(),
+                },
+            ]
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        match original_api_base_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
+        }
+    }
+
+    #[test]
+    fn load_accepts_openrouter_provider_from_file_config() {
+        let _env_lock = env_lock();
+        let temp_root = write_test_root(
+            &format!(
+                r#"
+{}
+[model_gateway.foreground]
+provider = "openrouter"
+model = "openai/gpt-5.2"
+api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
+timeout_ms = 30000
+
+[model_gateway.openrouter]
+http_referer = "https://blue-lagoon.local"
+app_title = "Blue Lagoon"
+"#,
+                minimal_file_config()
+            ),
+            None,
+            None,
+        );
+        let original_database_url = env::var_os("BLUE_LAGOON_DATABASE_URL");
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+
+        unsafe {
+            env::set_var("BLUE_LAGOON_DATABASE_URL", "postgres://example");
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "provider-key");
+        }
+
+        let loaded = RuntimeConfig::load_from_root(&temp_root)
+            .expect("config should load with provider-specific openrouter config");
+        let resolved = loaded
+            .require_model_gateway_config()
+            .expect("openrouter route should resolve");
+        assert_eq!(resolved.foreground.provider, ModelProviderKind::OpenRouter);
+        assert_eq!(
+            resolved.foreground.api_base_url,
+            "https://openrouter.ai/api/v1"
+        );
+
+        match original_database_url {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_DATABASE_URL", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_DATABASE_URL") },
+        }
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
+        }
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

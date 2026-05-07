@@ -8,3 +8,18 @@ internal_conversation_ref = "telegram-primary"
 # and response payloads for 30 days before cleanup clears bulky text fields.
 [observability]
 model_call_payload_retention_days = 30
+
+# Optional foreground model provider override for OpenRouter testing.
+# Use an OpenRouter model id after the provider prefix, preserving any slash in
+# the model id, for example "openrouter/openai/gpt-5.2".
+#
+# [model_gateway.foreground]
+# provider = "openrouter"
+# model = "openai/gpt-5.2"
+# api_key_env = "OPENROUTER_API_KEY"
+# timeout_ms = 60000
+#
+# [model_gateway.openrouter]
+# api_base_url = "https://openrouter.ai/api/v1"
+# http_referer = "https://example.invalid"
+# app_title = "Blue Lagoon"

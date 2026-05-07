@@ -345,5 +345,6 @@ fn model_call_purpose_label(purpose: ModelCallPurpose) -> &'static str {
 fn model_provider_label(provider: ModelProviderKind) -> &'static str {
     match provider {
         ModelProviderKind::ZAi => "z_ai",
+        ModelProviderKind::OpenRouter => "openrouter",
     }
 }

@@ -18,6 +18,7 @@ use crate::config::{ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConf
 pub struct ProviderHttpRequest {
     pub url: String,
     pub api_key: String,
+    pub headers: Vec<(String, String)>,
     pub timeout_ms: u64,
     pub body: Value,
 }
@@ -65,22 +66,23 @@ impl ModelProviderTransport for ReqwestModelProviderTransport {
         &self,
         request: ProviderHttpRequest,
     ) -> std::result::Result<ProviderHttpResponse, ModelGatewayError> {
-        let response = self
+        let mut builder = self
             .client
             .post(&request.url)
             .timeout(Duration::from_millis(request.timeout_ms))
             .bearer_auth(&request.api_key)
-            .json(&request.body)
-            .send()
-            .await
-            .map_err(|error| {
-                ModelGatewayError::Transport(format_reqwest_transport_error(
-                    "send request",
-                    &request.url,
-                    request.timeout_ms,
-                    &error,
-                ))
-            })?;
+            .json(&request.body);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder.send().await.map_err(|error| {
+            ModelGatewayError::Transport(format_reqwest_transport_error(
+                "send request",
+                &request.url,
+                request.timeout_ms,
+                &error,
+            ))
+        })?;
 
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.map_err(|error| {
@@ -201,6 +203,7 @@ async fn execute_model_call_unchecked<T: ModelProviderTransport>(
 
     match route.provider {
         ModelProviderKind::ZAi => execute_z_ai_call(request, route, transport).await,
+        ModelProviderKind::OpenRouter => execute_openrouter_call(request, route, transport).await,
     }
 }
 
@@ -329,8 +332,9 @@ async fn execute_z_ai_call<T: ModelProviderTransport>(
             route.api_base_url.trim_end_matches('/')
         ),
         api_key: route.api_key.clone(),
+        headers: Vec::new(),
         timeout_ms: request.budget.timeout_ms.min(route.timeout_ms),
-        body: z_ai_request_body(request, route),
+        body: openai_compatible_request_body(request, route),
     };
 
     let response = transport.send_json(http_request).await?;
@@ -341,10 +345,41 @@ async fn execute_z_ai_call<T: ModelProviderTransport>(
         });
     }
 
-    parse_z_ai_response(request, route, response.body)
+    parse_openai_compatible_response(request, route, response.body)
 }
 
-fn z_ai_request_body(
+async fn execute_openrouter_call<T: ModelProviderTransport>(
+    request: &ModelCallRequest,
+    route: &ResolvedForegroundModelRouteConfig,
+    transport: &T,
+) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
+    let http_request = ProviderHttpRequest {
+        url: format!(
+            "{}/chat/completions",
+            route.api_base_url.trim_end_matches('/')
+        ),
+        api_key: route.api_key.clone(),
+        headers: route
+            .provider_headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect(),
+        timeout_ms: request.budget.timeout_ms.min(route.timeout_ms),
+        body: openai_compatible_request_body(request, route),
+    };
+
+    let response = transport.send_json(http_request).await?;
+    if !(200..300).contains(&response.status) {
+        return Err(ModelGatewayError::ProviderRejected {
+            status: response.status,
+            message: provider_error_message(&response.body),
+        });
+    }
+
+    parse_openai_compatible_response(request, route, response.body)
+}
+
+fn openai_compatible_request_body(
     request: &ModelCallRequest,
     route: &ResolvedForegroundModelRouteConfig,
 ) -> Value {
@@ -374,7 +409,7 @@ fn z_ai_request_body(
     body
 }
 
-fn parse_z_ai_response(
+fn parse_openai_compatible_response(
     request: &ModelCallRequest,
     route: &ResolvedForegroundModelRouteConfig,
     body: Value,
@@ -520,6 +555,73 @@ mod tests {
             seen[0].body.get("model").and_then(Value::as_str),
             Some("z-ai-foreground")
         );
+        assert!(seen[0].headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn executes_foreground_call_through_openrouter_route() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: vec![
+                    crate::config::ProviderHttpHeaderConfig {
+                        name: "HTTP-Referer".to_string(),
+                        value: "https://blue-lagoon.local".to_string(),
+                    },
+                    crate::config::ProviderHttpHeaderConfig {
+                        name: "X-OpenRouter-Title".to_string(),
+                        value: "Blue Lagoon".to_string(),
+                    },
+                ],
+                timeout_ms: 20_000,
+            },
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "hello from openrouter" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 7
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway call should succeed");
+
+        assert_eq!(response.provider, ModelProviderKind::OpenRouter);
+        assert_eq!(response.model, "openai/gpt-5.2");
+        assert_eq!(response.output.text, "hello from openrouter");
+        assert_eq!(response.usage.input_tokens, 20);
+
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(seen[0].api_key, "openrouter-secret");
+        assert_eq!(
+            seen[0].headers,
+            vec![
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://blue-lagoon.local".to_string()
+                ),
+                ("X-OpenRouter-Title".to_string(), "Blue Lagoon".to_string()),
+            ]
+        );
+        assert_eq!(
+            seen[0].body.get("model").and_then(Value::as_str),
+            Some("openai/gpt-5.2")
+        );
     }
 
     #[tokio::test]
@@ -623,6 +725,7 @@ mod tests {
                 model: "z-ai-foreground".to_string(),
                 api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                 api_key: "secret".to_string(),
+                provider_headers: Vec::new(),
                 timeout_ms: 20_000,
             },
         }

@@ -1820,6 +1820,8 @@ pub enum LoopKind {
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderKind {
     ZAi,
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2017,6 +2019,16 @@ mod tests {
                 preferred_model: Some("z-ai-foreground".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn model_provider_kind_serializes_stable_openrouter_label() {
+        let json = serde_json::to_string(&ModelProviderKind::OpenRouter)
+            .expect("provider should serialize");
+        assert_eq!(json, r#""openrouter""#);
+        let decoded: ModelProviderKind =
+            serde_json::from_str(r#""open_router""#).expect("legacy alias should deserialize");
+        assert_eq!(decoded, ModelProviderKind::OpenRouter);
     }
 
     #[test]

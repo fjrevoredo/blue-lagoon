@@ -271,6 +271,7 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
             timeout_ms: 30_000,
         },
     }
