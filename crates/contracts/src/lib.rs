@@ -1426,11 +1426,27 @@ pub enum WorkspaceArtifactStatusFilter {
     Any,
 }
 
+pub const DEFAULT_GOVERNED_ACTION_LIST_LIMIT: u32 = 10;
+
+fn default_governed_action_list_limit() -> u32 {
+    DEFAULT_GOVERNED_ACTION_LIST_LIMIT
+}
+
+fn default_workspace_artifact_status_filter() -> WorkspaceArtifactStatusFilter {
+    WorkspaceArtifactStatusFilter::Active
+}
+
+fn default_recovery_lease_soft_warning_threshold_percent() -> u8 {
+    80
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListWorkspaceArtifactsAction {
     pub artifact_kind: Option<WorkspaceArtifactKind>,
+    #[serde(default = "default_workspace_artifact_status_filter")]
     pub status: WorkspaceArtifactStatusFilter,
     pub query: Option<String>,
+    #[serde(default = "default_governed_action_list_limit")]
     pub limit: u32,
 }
 
@@ -1453,9 +1469,11 @@ pub struct UpdateWorkspaceArtifactAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListWorkspaceScriptsAction {
+    #[serde(default = "default_workspace_artifact_status_filter")]
     pub status: WorkspaceArtifactStatusFilter,
     pub language: Option<String>,
     pub query: Option<String>,
+    #[serde(default = "default_governed_action_list_limit")]
     pub limit: u32,
 }
 
@@ -1488,6 +1506,7 @@ pub struct AppendWorkspaceScriptVersionAction {
 pub struct ListWorkspaceScriptRunsAction {
     pub script_id: Uuid,
     pub status: Option<WorkspaceScriptRunStatus>,
+    #[serde(default = "default_governed_action_list_limit")]
     pub limit: u32,
 }
 
@@ -1531,9 +1550,11 @@ pub enum DiagnosticQuery {
     RuntimeStatus,
     HealthSummary,
     OperationalDiagnostics {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     TraceRecent {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     TraceShow {
@@ -1541,49 +1562,64 @@ pub enum DiagnosticQuery {
         execution_id: Option<Uuid>,
     },
     ForegroundPending {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     ForegroundSchedules {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     BackgroundList {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     RecoveryCheckpoints {
+        #[serde(default)]
         open_only: bool,
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     RecoveryLeases {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
+        #[serde(default = "default_recovery_lease_soft_warning_threshold_percent")]
         soft_warning_threshold_percent: u8,
     },
     SchemaStatus,
     SchemaUpgradePath,
     ApprovalsList {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     ActionsList {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     WakeSignalsList {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     IdentityStatus,
     IdentityShow,
     IdentityHistory {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     IdentityDiagnostics {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     WorkspaceArtifacts {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     WorkspaceScripts {
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     WorkspaceRuns {
         script_id: Option<Uuid>,
+        #[serde(default = "default_governed_action_list_limit")]
         limit: u32,
     },
     InternalDoc {
@@ -2148,6 +2184,58 @@ mod tests {
             decoded.requested_risk_tier,
             Some(GovernedActionRiskTier::Tier2)
         );
+    }
+
+    #[test]
+    fn governed_action_list_payloads_default_harmless_read_bounds() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("list_workspace_artifacts");
+        value["payload"] = serde_json::json!({
+            "kind": "list_workspace_artifacts",
+            "value": {}
+        });
+
+        let decoded: GovernedActionProposal =
+            serde_json::from_value(value).expect("missing list bounds should default");
+        let GovernedActionPayload::ListWorkspaceArtifacts(payload) = decoded.payload else {
+            panic!("expected list workspace artifacts payload");
+        };
+        assert_eq!(payload.status, WorkspaceArtifactStatusFilter::Active);
+        assert_eq!(payload.limit, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn diagnostic_query_limits_default_to_bounded_read_limit() {
+        let decoded: RunDiagnosticAction = serde_json::from_value(serde_json::json!({
+            "query": {
+                "query": "workspace_artifacts",
+                "params": {}
+            }
+        }))
+        .expect("diagnostic query should default missing limit");
+
+        let DiagnosticQuery::WorkspaceArtifacts { limit } = decoded.query else {
+            panic!("expected workspace artifacts diagnostic query");
+        };
+        assert_eq!(limit, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+
+        let decoded: RunDiagnosticAction = serde_json::from_value(serde_json::json!({
+            "query": {
+                "query": "recovery_leases",
+                "params": {}
+            }
+        }))
+        .expect("recovery lease diagnostics should default optional read parameters");
+        let DiagnosticQuery::RecoveryLeases {
+            limit,
+            soft_warning_threshold_percent,
+        } = decoded.query
+        else {
+            panic!("expected recovery leases diagnostic query");
+        };
+        assert_eq!(limit, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+        assert_eq!(soft_warning_threshold_percent, 80);
     }
 
     #[test]

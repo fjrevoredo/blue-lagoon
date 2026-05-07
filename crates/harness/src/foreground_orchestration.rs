@@ -177,12 +177,13 @@ struct ConsciousTurnLoopRequest<'a, T> {
     chat_id: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ForegroundFailureContext {
     trace_id: Uuid,
     execution_id: Uuid,
     episode_id: Option<Uuid>,
     failure_kind: ForegroundFailureKind,
+    terminal_ingress_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1042,6 +1043,7 @@ where
                 pool,
                 foreground_failure_context(
                     &trigger,
+                    &recovery_context,
                     recorded_episode_id,
                     ForegroundFailureKind::ContextAssemblyFailure,
                 ),
@@ -1061,6 +1063,7 @@ where
                 pool,
                 foreground_failure_context(
                     &trigger,
+                    &recovery_context,
                     recorded_episode_id,
                     ForegroundFailureKind::PersistenceFailure,
                 ),
@@ -1090,6 +1093,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1121,6 +1125,7 @@ where
                 pool,
                 foreground_failure_context(
                     &trigger,
+                    &recovery_context,
                     recorded_episode_id,
                     classify_conscious_worker_failure(&error),
                 ),
@@ -1166,6 +1171,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1210,6 +1216,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1242,6 +1249,7 @@ where
                 pool,
                 foreground_failure_context(
                     &trigger,
+                    &recovery_context,
                     recorded_episode_id,
                     ForegroundFailureKind::PersistenceFailure,
                 ),
@@ -1262,6 +1270,7 @@ where
                 pool,
                 foreground_failure_context(
                     &trigger,
+                    &recovery_context,
                     recorded_episode_id,
                     ForegroundFailureKind::PersistenceFailure,
                 ),
@@ -1285,6 +1294,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1317,6 +1327,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1346,6 +1357,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1393,6 +1405,7 @@ where
             pool,
             foreground_failure_context(
                 &trigger,
+                &recovery_context,
                 recorded_episode_id,
                 ForegroundFailureKind::PersistenceFailure,
             ),
@@ -1847,6 +1860,7 @@ async fn record_foreground_failure(
 
 fn foreground_failure_context(
     trigger: &contracts::ForegroundTrigger,
+    recovery_context: &contracts::ForegroundRecoveryContext,
     episode_id: Option<Uuid>,
     failure_kind: ForegroundFailureKind,
 ) -> ForegroundFailureContext {
@@ -1855,6 +1869,22 @@ fn foreground_failure_context(
         execution_id: trigger.execution_id,
         episode_id,
         failure_kind,
+        terminal_ingress_ids: terminal_failure_ingress_ids(trigger, recovery_context),
+    }
+}
+
+fn terminal_failure_ingress_ids(
+    trigger: &contracts::ForegroundTrigger,
+    recovery_context: &contracts::ForegroundRecoveryContext,
+) -> Vec<Uuid> {
+    if recovery_context.ordered_ingress.is_empty() {
+        vec![trigger.ingress.ingress_id]
+    } else {
+        recovery_context
+            .ordered_ingress
+            .iter()
+            .map(|ingress| ingress.ingress_id)
+            .collect()
     }
 }
 
@@ -1868,6 +1898,7 @@ async fn record_and_deliver_foreground_failure<D>(
 where
     D: TelegramDelivery,
 {
+    let notice_text = foreground_failure_notice_text(context.trace_id, context.failure_kind);
     let record_result = record_foreground_failure(
         pool,
         context.trace_id,
@@ -1877,16 +1908,98 @@ where
         error_message,
     )
     .await;
-    deliver_foreground_failure_notice(
+    let persist_result = if record_result.is_ok() {
+        persist_foreground_failure_notice(pool, &context, &notice_text).await
+    } else {
+        Ok(None)
+    };
+    let delivery_receipt = deliver_foreground_failure_notice(
         delivery,
         target.chat_id,
         target.reply_to_message_id,
         context.trace_id,
         context.execution_id,
         context.failure_kind,
+        notice_text,
     )
     .await;
-    record_result
+    let close_ingress_result = if record_result.is_ok() {
+        mark_terminal_failure_ingress_processed(pool, &context).await
+    } else {
+        Ok(())
+    };
+    record_result?;
+    let persisted_message_id = persist_result?;
+    if let (Some(episode_message_id), Some(outbound_message_id)) =
+        (persisted_message_id, delivery_receipt)
+    {
+        foreground::update_episode_message_external_message_id(
+            pool,
+            episode_message_id,
+            &outbound_message_id.to_string(),
+        )
+        .await
+        .context("failed to attach delivered failure notice id to episode message")?;
+    }
+    close_ingress_result?;
+    Ok(())
+}
+
+async fn persist_foreground_failure_notice(
+    pool: &sqlx::PgPool,
+    context: &ForegroundFailureContext,
+    notice_text: &str,
+) -> Result<Option<Uuid>> {
+    let Some(episode_id) = context.episode_id else {
+        return Ok(None);
+    };
+    let message_order: i32 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(MAX(message_order), -1) + 1
+        FROM episode_messages
+        WHERE episode_id = $1
+        "#,
+    )
+    .bind(episode_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to allocate foreground failure notice message order")?;
+
+    let episode_message_id = Uuid::now_v7();
+    foreground::insert_episode_message(
+        pool,
+        &NewEpisodeMessage {
+            episode_message_id,
+            episode_id,
+            trace_id: context.trace_id,
+            execution_id: context.execution_id,
+            message_order,
+            message_role: "assistant".to_string(),
+            channel_kind: contracts::ChannelKind::Telegram,
+            text_body: Some(notice_text.to_string()),
+            external_message_id: None,
+        },
+    )
+    .await
+    .context("failed to persist foreground failure notice episode message")?;
+    Ok(Some(episode_message_id))
+}
+
+async fn mark_terminal_failure_ingress_processed(
+    pool: &sqlx::PgPool,
+    context: &ForegroundFailureContext,
+) -> Result<()> {
+    if context.terminal_ingress_ids.is_empty() {
+        return Ok(());
+    }
+
+    foreground::mark_ingress_events_processed(
+        pool,
+        &context.terminal_ingress_ids,
+        context.execution_id,
+    )
+    .await
+    .context("failed to close terminally failed foreground ingress")
 }
 
 async fn launch_leased_conscious_worker<T>(
@@ -2106,10 +2219,11 @@ async fn deliver_foreground_failure_notice<D>(
     trace_id: Uuid,
     execution_id: Uuid,
     failure_kind: ForegroundFailureKind,
-) where
+    text: String,
+) -> Option<i64>
+where
     D: TelegramDelivery,
 {
-    let text = foreground_failure_notice_text(trace_id, failure_kind);
     match delivery
         .send_message(&TelegramOutboundMessage {
             chat_id,
@@ -2127,6 +2241,7 @@ async fn deliver_foreground_failure_notice<D>(
                 failure_kind = failure_kind.as_str(),
                 "foreground failure notice delivered"
             );
+            Some(receipt.message_id)
         }
         Err(error) => {
             warn!(
@@ -2136,6 +2251,7 @@ async fn deliver_foreground_failure_notice<D>(
                 error = %format_error_chain(&error),
                 "foreground failure notice delivery failed"
             );
+            None
         }
     }
 }

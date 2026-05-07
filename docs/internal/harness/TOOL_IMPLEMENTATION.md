@@ -36,7 +36,9 @@ summary is safer than letting the model query state.
 2. Add persistence compatibility.
    If `action_kind` is stored in constrained `TEXT` columns, add the next
    reviewed migration that drops and recreates checks on
-   `governed_action_executions` and `approval_requests`.
+   `governed_action_executions` and `approval_requests`. Never rely on editing
+   an already-applied migration to add a new action kind; existing operator
+   databases need a forward migration.
 
 3. Add parsing and canonicalization.
    Update `governed_action_kind_as_str()`, `parse_governed_action_kind()`, and

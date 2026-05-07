@@ -1528,6 +1528,7 @@ async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
             GovernedActionKind::ListWorkspaceScriptRuns,
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionKind::RequestBackgroundJob,
+            GovernedActionKind::RunDiagnostic,
             GovernedActionKind::RunSubprocess,
             GovernedActionKind::RunWorkspaceScript,
             GovernedActionKind::WebFetch,

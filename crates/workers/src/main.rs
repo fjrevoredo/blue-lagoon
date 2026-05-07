@@ -898,6 +898,7 @@ Harness-native payload examples:
 - "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "trace_show", "params": { "trace_id": "<uuid>", "execution_id": null } } } }
 - "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "internal_doc", "params": { "document": "context_assembly" } } } }
 - For harness-native payloads, capability_scope.filesystem read_roots/write_roots must be [], network must be "disabled", environment allow_variables must be [], and execution values may be 0.
+- List and diagnostic payloads should include limit: 10. If omitted, the harness applies a bounded read-only default of 10 instead of treating the proposal as malformed.
 
 Alternate payload shape for web_fetch:
 - "payload": { "kind": "web_fetch", "value": { "url": "https://...", "timeout_ms": 10000, "max_response_bytes": 524288 } }
@@ -2734,6 +2735,86 @@ mod tests {
                     result.governed_action_proposals[0].action_kind,
                     contracts::GovernedActionKind::RunSubprocess
                 );
+            }
+            other => panic!("expected conscious worker result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conscious_worker_response_defaults_read_only_list_action_limit() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let action_block = serde_json::json!({
+            "actions": [{
+                "proposal_id": uuid::Uuid::now_v7(),
+                "title": "List workspace artifacts",
+                "rationale": "Need to inspect existing workspace state",
+                "action_kind": "list_workspace_artifacts",
+                "requested_risk_tier": serde_json::Value::Null,
+                "capability_scope": {
+                    "filesystem": {
+                        "read_roots": [],
+                        "write_roots": [],
+                    },
+                    "network": "disabled",
+                    "environment": {
+                        "allow_variables": [],
+                    },
+                    "execution": {
+                        "timeout_ms": 30_000,
+                        "max_stdout_bytes": 4_096,
+                        "max_stderr_bytes": 4_096,
+                    },
+                },
+                "payload": {
+                    "kind": "list_workspace_artifacts",
+                    "value": {},
+                },
+            }],
+        });
+        let model_response = ModelCallResponse {
+            request_id: model_request.request_id,
+            trace_id: request.trace_id,
+            execution_id: request.execution_id,
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-foreground".to_string(),
+            received_at: chrono::Utc::now(),
+            output: ModelOutput {
+                text: format!(
+                    "I will check the workspace list.\n```{GOVERNED_ACTIONS_BLOCK_TAG}\n{}\n```",
+                    action_block
+                ),
+                json: None,
+                finish_reason: "stop".to_string(),
+            },
+            usage: ModelUsage {
+                input_tokens: 20,
+                output_tokens: 12,
+            },
+        };
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("missing read-only list bounds should default");
+        match response.result {
+            WorkerResult::Conscious(result) => {
+                let proposal = result
+                    .governed_action_proposals
+                    .first()
+                    .expect("proposal should be extracted");
+                let contracts::GovernedActionPayload::ListWorkspaceArtifacts(payload) =
+                    &proposal.payload
+                else {
+                    panic!("expected list workspace artifacts payload");
+                };
+                assert_eq!(
+                    payload.status,
+                    contracts::WorkspaceArtifactStatusFilter::Active
+                );
+                assert_eq!(payload.limit, contracts::DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
             }
             other => panic!("expected conscious worker result, got {other:?}"),
         }

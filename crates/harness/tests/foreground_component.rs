@@ -2356,6 +2356,7 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
             ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
             other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
         };
+        let ingress_id = ingress.ingress_id;
 
         let transport = model_gateway::FakeModelProviderTransport::new();
         let mut delivery = telegram::FakeTelegramDelivery::default();
@@ -2389,6 +2390,10 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
         let execution_id: Uuid = execution_row.get("execution_id");
         let execution = execution::get(&ctx.pool, execution_id).await?;
         assert_eq!(execution.status, "failed");
+
+        let stored_ingress = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+        assert_eq!(stored_ingress.foreground_status, "processed");
+        assert_eq!(stored_ingress.execution_id, Some(execution_id));
 
         let episode_row = sqlx::query(
             r#"
@@ -2433,6 +2438,107 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
                 .text
                 .contains("missing foreground self-model seed configuration")
         );
+
+        let messages = foreground::list_episode_messages(&ctx.pool, episode_id).await?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].message_role, "user");
+        assert_eq!(messages[1].message_role, "assistant");
+        assert_eq!(
+            messages[1].text_body.as_deref(),
+            Some(failure_notice.text.as_str())
+        );
+        assert_eq!(messages[1].external_message_id.as_deref(), Some("1"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_closes_planned_ingress_batch_on_terminal_failure() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let now = Utc::now();
+        let first = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(2),
+            "first planned message",
+        )
+        .await?;
+        let second = insert_pending_ingress(
+            &ctx.pool,
+            "telegram-primary",
+            "primary-user",
+            now - Duration::minutes(1),
+            "second planned message",
+        )
+        .await?;
+        let trace_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        execution::insert(
+            &ctx.pool,
+            &execution::NewExecutionRecord {
+                execution_id,
+                trace_id,
+                trigger_kind: "planned_terminal_failure_test".to_string(),
+                synthetic_trigger: None,
+                status: "started".to_string(),
+                request_payload: serde_json::json!({
+                    "kind": "planned_terminal_failure_test"
+                }),
+            },
+        )
+        .await?;
+        let plan = foreground::plan_pending_foreground_execution(
+            &ctx.pool,
+            &config,
+            trace_id,
+            execution_id,
+            "telegram-primary",
+            foreground::PendingForegroundExecutionOptions {
+                force_recovery: true,
+            },
+        )
+        .await?
+        .expect("pending ingress plan should be created");
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_plan(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            foreground_orchestration::TelegramForegroundPlanExecution {
+                execution: foreground_orchestration::ForegroundExecutionIds {
+                    trace_id,
+                    execution_id,
+                },
+                trigger_kind_override: None,
+                plan,
+            },
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("missing self-model config should fail orchestration");
+        assert!(
+            error
+                .to_string()
+                .contains("missing foreground self-model seed configuration")
+        );
+
+        for ingress_id in [first.ingress_id, second.ingress_id] {
+            let stored = foreground::get_ingress_event(&ctx.pool, ingress_id).await?;
+            assert_eq!(stored.foreground_status, "processed");
+            assert_eq!(stored.execution_id, Some(execution_id));
+        }
+        assert_eq!(delivery.sent_messages().len(), 1);
         Ok(())
     })
     .await

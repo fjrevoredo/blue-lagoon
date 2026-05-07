@@ -350,7 +350,10 @@ mod tests {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(
+            versions,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
         assert_eq!(migrations[0].name, "runtime_foundation");
         assert_eq!(migrations[1].name, "foreground_loop");
         assert_eq!(migrations[3].name, "canonical_continuity");
@@ -363,6 +366,7 @@ mod tests {
         assert_eq!(migrations[10].name, "model_call_records");
         assert_eq!(migrations[11].name, "causal_links");
         assert_eq!(migrations[12].name, "identity_self_model");
+        assert_eq!(migrations[13].name, "diagnostic_action_kind");
     }
 
     #[test]

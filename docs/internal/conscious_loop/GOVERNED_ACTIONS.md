@@ -31,8 +31,8 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1370), payload structs (line 1400), `GovernedActionPayload` (line 1606) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 841), `build_governed_action_proposals()` (line 944), `governed_action_kind_as_str()` (line 1285) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 841), `build_governed_action_proposals()` (line 945), `governed_action_kind_as_str()` (line 1286) |
 | `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_inspect_workspace_artifact()` (line 871), `execute_create_workspace_script()` (line 1188), `execute_request_background_job()` (line 1406), `validate_capability_scope()` (line 1663), `governed_action_kind_as_str()` (line 3159), `CanonicalGovernedActionPayload` (line 3283) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
@@ -41,7 +41,8 @@ created.
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
 | `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
 | `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
-| `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for new action-kind strings |
+| `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for the completed conscious-loop action-kind strings |
+| `migrations/0014__diagnostic_action_kind.sql` | forward constraint update for the later `run_diagnostic` action kind on existing operator databases |
 
 ### Model-Facing Action Kinds
 
@@ -102,6 +103,17 @@ the same foreground turn: the worker receives harness observations, may propose
 another action if one is still needed, and the harness then decides whether the
 next proposal is allowed, approval-gated, or denied under policy, remaining
 budgets, and the configured per-turn action cap.
+
+Read-only list and diagnostic payloads should include an explicit `limit`.
+For parser robustness, the contracts layer applies a bounded default of `10`
+when that field is omitted from list/search payloads or diagnostic list
+queries. Workspace artifact and script list payloads also default omitted
+`status` to `active`; recovery checkpoint diagnostics default omitted
+`open_only` to `false`; recovery lease diagnostics default omitted
+`soft_warning_threshold_percent` to `80`. This compatibility default is
+intentionally limited to read-only discovery actions; mutating payload fields,
+identifiers, and required diagnostic selectors still fail as malformed
+proposals when absent.
 
 ### Payload Families
 
@@ -223,6 +235,9 @@ The short version is:
 
 - Add contract enum and payload variants.
 - Add the migration for constrained `action_kind` columns.
+- When adding action kinds after an operator database may already have applied
+  earlier migrations, add a new forward migration rather than editing an
+  already-applied migration file.
 - Add shape validation, scope validation, risk classification, canonical
   fingerprinting, execution dispatch, observation formatting, and audit payloads.
 - Update worker schema text and every exhaustive action-kind match.
@@ -244,4 +259,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-06.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-07.*

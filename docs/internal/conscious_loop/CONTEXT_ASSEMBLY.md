@@ -22,7 +22,7 @@ pending actions - enters through this pipeline. Nothing else reaches the model.
 |---|---|
 | `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 206), assembly limit constants (lines 18-20) |
 | `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 168), `load_episode_context()` (line 568) |
-| `crates/workers/src/main.rs` | `build_model_input()` (line 514), `format_conversation_excerpt()` (line 665), `troubleshooting_guidance_message()` (line 749), `identity_kickstart_schema_message()` (line 773), `is_foreground_visible_context_text()` (line 1810), `retrieved_context_summary()` (line 1885), `retrieved_episode_message_summary()` (line 1918) |
+| `crates/workers/src/main.rs` | `build_model_input()` (line 514), `format_conversation_excerpt()` (line 665), `troubleshooting_guidance_message()` (line 749), `identity_kickstart_schema_message()` (line 773), `is_foreground_visible_context_text()` (line 1811), `retrieved_context_summary()` (line 1886), `retrieved_episode_message_summary()` (line 1919) |
 | `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105) |
 | `config/self_model_seed.toml` | Bootstrap self-model and seed identity values |
 | `config/default.toml` | `harness.default_foreground_token_budget` |
@@ -133,7 +133,7 @@ When governed action observations are present, `build_model_input()` appends a D
 
 Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:720`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:749` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2347` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2375`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2410` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2438`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 
@@ -141,7 +141,7 @@ Location: `config/self_model_seed.toml`. Loaded by
 `self_model::load_self_model_snapshot()`. Flat seed fields preserve the legacy
 bootstrap self-model, while `[identity]` seed fields provide initial rich
 identity context until a complete identity is selected. `SelfModelSnapshot` is
-defined in `crates/contracts/src/lib.rs:428`.
+defined in `crates/contracts/src/lib.rs:440`.
 
 | Field | Type | Semantic meaning |
 |---|---|---|
@@ -208,11 +208,22 @@ empty-response fallback.
 
 After Telegram chat metadata has been parsed, foreground failures are also
 reported back to the user through `record_and_deliver_foreground_failure()`
-(`crates/harness/src/foreground_orchestration.rs:1861`). The message generated
+(`crates/harness/src/foreground_orchestration.rs:1891`). The message generated
 by `foreground_failure_notice_text()`
-(`crates/harness/src/foreground_orchestration.rs:2143`) includes the trace id
-and failure kind, while the full error chain remains only in execution records,
-episode failure summaries, and audit events.
+(`crates/harness/src/foreground_orchestration.rs:2259`) includes the trace id
+and failure kind. The same bounded notice is persisted as an assistant episode
+message through `persist_foreground_failure_notice()`
+(`crates/harness/src/foreground_orchestration.rs:1948`) so later context
+assembly can show the assistant the failure notice and trace id through normal
+`recent_history` and retrieved episode excerpts. The full internal error chain
+remains only in execution records, episode failure summaries, and audit events.
+Terminal foreground failures that reach this path also close the selected
+ingress rows through `mark_terminal_failure_ingress_processed()`
+(`crates/harness/src/foreground_orchestration.rs:1988`). This prevents stale
+`processing` ingress from being recovered every poll interval after a failure
+notice has already been sent or persisted. Actual Telegram delivery failures for
+a completed assistant reply remain retryable because the user may not have
+received the reply.
 
 ---
 
@@ -262,4 +273,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-06.*
+*Last verified: branch `codex/identity-self-model`, session 2026-05-07.*
