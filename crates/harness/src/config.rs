@@ -238,6 +238,21 @@ pub struct OpenRouterProviderConfig {
     pub http_referer: Option<String>,
     #[serde(default)]
     pub app_title: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<OpenRouterReasoningEffort>,
+    #[serde(default)]
+    pub exclude_reasoning: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenRouterReasoningEffort {
+    XHigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +267,7 @@ pub struct ResolvedForegroundModelRouteConfig {
     pub api_base_url: String,
     pub api_key: String,
     pub provider_headers: Vec<ProviderHttpHeaderConfig>,
+    pub provider_reasoning: Option<ProviderReasoningConfig>,
     pub timeout_ms: u64,
 }
 
@@ -259,6 +275,12 @@ pub struct ResolvedForegroundModelRouteConfig {
 pub struct ProviderHttpHeaderConfig {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReasoningConfig {
+    pub effort: Option<String>,
+    pub exclude: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -457,6 +479,7 @@ impl RuntimeConfig {
                 api_base_url: require_foreground_api_base_url(model_gateway)?,
                 api_key: require_foreground_api_key(&model_gateway.foreground.api_key_env)?,
                 provider_headers: foreground_provider_headers(model_gateway)?,
+                provider_reasoning: foreground_provider_reasoning(model_gateway),
                 timeout_ms: model_gateway.foreground.timeout_ms,
             },
         })
@@ -1053,6 +1076,34 @@ fn foreground_provider_headers(
             }
             Ok(headers)
         }
+    }
+}
+
+fn foreground_provider_reasoning(config: &ModelGatewayConfig) -> Option<ProviderReasoningConfig> {
+    match config.foreground.provider {
+        ModelProviderKind::ZAi => None,
+        ModelProviderKind::OpenRouter => {
+            let openrouter = config.openrouter.as_ref();
+            let effort = openrouter
+                .and_then(|provider| provider.reasoning_effort)
+                .unwrap_or(OpenRouterReasoningEffort::None);
+            let exclude = openrouter.and_then(|provider| provider.exclude_reasoning);
+            Some(ProviderReasoningConfig {
+                effort: Some(openrouter_reasoning_effort_label(effort).to_string()),
+                exclude,
+            })
+        }
+    }
+}
+
+fn openrouter_reasoning_effort_label(effort: OpenRouterReasoningEffort) -> &'static str {
+    match effort {
+        OpenRouterReasoningEffort::XHigh => "xhigh",
+        OpenRouterReasoningEffort::High => "high",
+        OpenRouterReasoningEffort::Medium => "medium",
+        OpenRouterReasoningEffort::Low => "low",
+        OpenRouterReasoningEffort::Minimal => "minimal",
+        OpenRouterReasoningEffort::None => "none",
     }
 }
 
@@ -1938,6 +1989,8 @@ api_surface = "coding"
                 api_base_url: None,
                 http_referer: Some("https://blue-lagoon.local".to_string()),
                 app_title: Some("Blue Lagoon".to_string()),
+                reasoning_effort: None,
+                exclude_reasoning: None,
             }),
         });
 
@@ -1970,6 +2023,13 @@ api_surface = "coding"
                 },
             ]
         );
+        assert_eq!(
+            resolved.foreground.provider_reasoning,
+            Some(ProviderReasoningConfig {
+                effort: Some("none".to_string()),
+                exclude: None,
+            })
+        );
 
         match original_api_key {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
@@ -1978,6 +2038,50 @@ api_surface = "coding"
         match original_api_base_url {
             Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL", value) },
             None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_BASE_URL") },
+        }
+    }
+
+    #[test]
+    fn require_model_gateway_config_applies_openrouter_reasoning_overrides() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: None,
+                api_key_env: format!("BLUE_LAGOON_TEST_OPENROUTER_API_KEY_{}", Uuid::now_v7()),
+                timeout_ms: 30_000,
+            },
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: None,
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: Some(OpenRouterReasoningEffort::Minimal),
+                exclude_reasoning: Some(true),
+            }),
+        });
+
+        let original_api_key = env::var_os("BLUE_LAGOON_FOREGROUND_API_KEY");
+        unsafe {
+            env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", "openrouter-key");
+        }
+
+        let resolved = config
+            .require_model_gateway_config()
+            .expect("openrouter reasoning config should resolve");
+        assert_eq!(
+            resolved.foreground.provider_reasoning,
+            Some(ProviderReasoningConfig {
+                effort: Some("minimal".to_string()),
+                exclude: Some(true),
+            })
+        );
+
+        match original_api_key {
+            Some(value) => unsafe { env::set_var("BLUE_LAGOON_FOREGROUND_API_KEY", value) },
+            None => unsafe { env::remove_var("BLUE_LAGOON_FOREGROUND_API_KEY") },
         }
     }
 

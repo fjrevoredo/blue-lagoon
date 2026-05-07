@@ -36,9 +36,26 @@ pub enum ModelGatewayError {
     #[error("model gateway transport failed: {0}")]
     Transport(String),
     #[error("provider returned status {status}: {message}")]
-    ProviderRejected { status: u16, message: String },
-    #[error("provider response shape was invalid: {0}")]
-    InvalidResponse(String),
+    ProviderRejected {
+        status: u16,
+        message: String,
+        response_body: Option<Value>,
+    },
+    #[error("provider response shape was invalid: {detail}")]
+    InvalidResponse {
+        detail: String,
+        response_body: Option<Value>,
+    },
+}
+
+impl ModelGatewayError {
+    pub fn response_body(&self) -> Option<&Value> {
+        match self {
+            Self::ProviderRejected { response_body, .. }
+            | Self::InvalidResponse { response_body, .. } => response_body.as_ref(),
+            Self::Validation(_) | Self::Transport(_) => None,
+        }
+    }
 }
 
 pub trait ModelProviderTransport {
@@ -342,6 +359,7 @@ async fn execute_z_ai_call<T: ModelProviderTransport>(
         return Err(ModelGatewayError::ProviderRejected {
             status: response.status,
             message: provider_error_message(&response.body),
+            response_body: Some(response.body),
         });
     }
 
@@ -373,6 +391,7 @@ async fn execute_openrouter_call<T: ModelProviderTransport>(
         return Err(ModelGatewayError::ProviderRejected {
             status: response.status,
             message: provider_error_message(&response.body),
+            response_body: Some(response.body),
         });
     }
 
@@ -401,6 +420,18 @@ fn openai_compatible_request_body(
         "max_tokens": request.budget.max_output_tokens,
         "temperature": 0.2,
     });
+    if let Some(reasoning) = &route.provider_reasoning {
+        let mut reasoning_body = serde_json::Map::new();
+        if let Some(effort) = &reasoning.effort {
+            reasoning_body.insert("effort".to_string(), Value::String(effort.clone()));
+        }
+        if let Some(exclude) = reasoning.exclude {
+            reasoning_body.insert("exclude".to_string(), Value::Bool(exclude));
+        }
+        if !reasoning_body.is_empty() {
+            body["reasoning"] = Value::Object(reasoning_body);
+        }
+    }
     if request.output_mode == ModelOutputMode::JsonObject {
         body["response_format"] = json!({
             "type": "json_object"
@@ -418,16 +449,26 @@ fn parse_openai_compatible_response(
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
-        .ok_or_else(|| {
-            ModelGatewayError::InvalidResponse(
-                "missing choices[0] in provider response".to_string(),
-            )
+        .ok_or_else(|| ModelGatewayError::InvalidResponse {
+            detail: "missing choices[0] in provider response".to_string(),
+            response_body: Some(body.clone()),
         })?;
 
-    let text = extract_message_text(choice).ok_or_else(|| {
-        ModelGatewayError::InvalidResponse(
-            "missing choices[0].message.content in provider response".to_string(),
-        )
+    let text = extract_choice_text(choice).ok_or_else(|| {
+        let detail = choice
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(|message| format!("choice error: {message}"))
+            .or_else(|| invalid_choice_detail(choice))
+            .unwrap_or_else(|| {
+                "missing choices[0].message.content or choices[0].text in provider response"
+                    .to_string()
+            });
+        ModelGatewayError::InvalidResponse {
+            detail,
+            response_body: Some(body.clone()),
+        }
     })?;
 
     let finish_reason = choice
@@ -448,9 +489,12 @@ fn parse_openai_compatible_response(
         ModelOutputMode::PlainText => None,
         ModelOutputMode::JsonObject => {
             Some(serde_json::from_str::<Value>(&text).map_err(|error| {
-                ModelGatewayError::InvalidResponse(format!(
-                    "provider returned non-JSON content for json_object mode: {error}"
-                ))
+                ModelGatewayError::InvalidResponse {
+                    detail: format!(
+                        "provider returned non-JSON content for json_object mode: {error}"
+                    ),
+                    response_body: Some(body.clone()),
+                }
             })?)
         }
     };
@@ -474,7 +518,13 @@ fn parse_openai_compatible_response(
     })
 }
 
-fn extract_message_text(choice: &Value) -> Option<String> {
+fn extract_choice_text(choice: &Value) -> Option<String> {
+    if let Some(text) = choice.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
+    }
+
     let content = choice.get("message")?.get("content")?;
     match content {
         Value::String(text) => Some(text.clone()),
@@ -492,6 +542,29 @@ fn extract_message_text(choice: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn invalid_choice_detail(choice: &Value) -> Option<String> {
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let content_is_null = choice
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .is_some_and(Value::is_null);
+    let reasoning_present = choice
+        .get("message")
+        .and_then(|message| message.get("reasoning"))
+        .is_some_and(|value| !value.is_null());
+    if content_is_null {
+        let mut parts = vec!["choices[0].message.content was null".to_string()];
+        if let Some(reason) = finish_reason {
+            parts.push(format!("finish_reason={reason}"));
+        }
+        if reasoning_present {
+            parts.push("reasoning tokens were present".to_string());
+        }
+        return Some(parts.join("; "));
+    }
+    None
 }
 
 fn provider_error_message(body: &Value) -> String {
@@ -576,6 +649,10 @@ mod tests {
                         value: "Blue Lagoon".to_string(),
                     },
                 ],
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("none".to_string()),
+                    exclude: None,
+                }),
                 timeout_ms: 20_000,
             },
         };
@@ -622,6 +699,55 @@ mod tests {
             seen[0].body.get("model").and_then(Value::as_str),
             Some("openai/gpt-5.2")
         );
+        assert_eq!(
+            seen[0]
+                .body
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str),
+            Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_openrouter_non_chat_choice_text_fallback() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("none".to_string()),
+                    exclude: None,
+                }),
+                timeout_ms: 20_000,
+            },
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "text": "fallback non-chat response",
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 4
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway should accept documented non-chat fallback shape");
+
+        assert_eq!(response.output.text, "fallback non-chat response");
+        assert_eq!(response.usage.input_tokens, 9);
+        assert_eq!(response.usage.output_tokens, 4);
     }
 
     #[tokio::test]
@@ -657,6 +783,57 @@ mod tests {
             .expect_err("provider error should surface");
         assert!(error.to_string().contains("429"));
         assert!(error.to_string().contains("rate limit"));
+        assert_eq!(
+            error.response_body(),
+            Some(&json!({
+                "error": { "message": "rate limit" }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_null_content_with_reasoning_detail() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("minimal".to_string()),
+                    exclude: None,
+                }),
+                timeout_ms: 20_000,
+            },
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning": "thinking"
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 32
+                }
+            }),
+        }));
+
+        let error = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect_err("null content response should fail with diagnostic detail");
+        assert!(error
+            .to_string()
+            .contains("choices[0].message.content was null; finish_reason=length; reasoning tokens were present"));
+        assert!(error.response_body().is_some());
     }
 
     #[tokio::test]
@@ -726,6 +903,7 @@ mod tests {
                 api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                 api_key: "secret".to_string(),
                 provider_headers: Vec::new(),
+                provider_reasoning: None,
                 timeout_ms: 20_000,
             },
         }

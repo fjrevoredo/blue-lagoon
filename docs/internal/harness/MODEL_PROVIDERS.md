@@ -24,9 +24,9 @@ the same foreground and background gateway path.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `ModelProviderKind` (line 1821), `ModelCallRequest` (line 1883), `ModelCallResponse` (line 1900) |
-| `crates/harness/src/config.rs` | `ModelGatewayConfig` (line 200), `ForegroundModelRouteConfig` (line 209), `OpenRouterProviderConfig` (line 234), `parse_model_provider_override()` (line 574), `require_foreground_api_base_url()` (line 987), `foreground_provider_headers()` (line 1032) |
-| `crates/harness/src/model_gateway.rs` | `ProviderHttpRequest` (line 18), `ReqwestModelProviderTransport` (line 52), `execute_model_call_unchecked()` (line 196), `execute_z_ai_call()` (line 324), `execute_openrouter_call()` (line 351), `openai_compatible_request_body()` (line 382), `parse_openai_compatible_response()` (line 412) |
-| `crates/harness/src/model_calls.rs` | `insert_pending_model_call_record()` (line 41), `model_provider_label()` (line 345) |
+| `crates/harness/src/config.rs` | `ModelGatewayConfig` (line 200), `ForegroundModelRouteConfig` (line 209), `OpenRouterProviderConfig` (line 234), `parse_model_provider_override()` (line 597), `require_foreground_api_base_url()` (line 1010), `foreground_provider_headers()` (line 1055), `foreground_provider_reasoning()` (line 1082) |
+| `crates/harness/src/model_gateway.rs` | `ProviderHttpRequest` (line 18), `ReqwestModelProviderTransport` (line 69), `execute_model_call_unchecked()` (line 213), `execute_z_ai_call()` (line 341), `execute_openrouter_call()` (line 369), `openai_compatible_request_body()` (line 401), `parse_openai_compatible_response()` (line 443) |
+| `crates/harness/src/model_calls.rs` | `insert_pending_model_call_record()` (line 41), `model_provider_label()` (line 348) |
 | `config/default.toml` | committed default model gateway provider and provider-specific defaults |
 | `config/local.example.toml` | local OpenRouter override example |
 | `.env.example` | direct foreground route and API key override examples |
@@ -72,6 +72,12 @@ OpenRouter support follows the OpenRouter quickstart for direct API usage:
 base URL `https://openrouter.ai/api/v1`, bearer authorization, and optional
 `HTTP-Referer` and `X-OpenRouter-Title` attribution headers.
 
+For OpenRouter routes, the gateway also injects a provider-specific
+`reasoning` object when configured. The committed default is
+`{"effort":"none"}`. This follows OpenRouter's documented reasoning controls
+and avoids reasoning-capable models consuming the full completion budget on
+reasoning tokens and returning `choices[0].message.content = null`.
+
 ### Response Parsing
 
 `parse_openai_compatible_response()` reads:
@@ -79,6 +85,7 @@ base URL `https://openrouter.ai/api/v1`, bearer authorization, and optional
 | Response field | Runtime field |
 |---|---|
 | `choices[0].message.content` | `ModelOutput.text` |
+| `choices[0].text` | fallback `ModelOutput.text` when a provider returns the documented non-chat shape |
 | `choices[0].finish_reason` | `ModelOutput.finish_reason`, defaulting to `unknown` |
 | `usage.prompt_tokens` | `ModelUsage.input_tokens`, defaulting to `0` |
 | `usage.completion_tokens` | `ModelUsage.output_tokens`, defaulting to `0` |
@@ -86,6 +93,9 @@ base URL `https://openrouter.ai/api/v1`, bearer authorization, and optional
 For JSON-object calls, the returned message content must parse as JSON or the
 gateway returns `InvalidResponse`. Provider error responses are surfaced as
 `ProviderRejected` with the provider status and best available error message.
+For malformed or rejected provider responses, the raw response body is retained
+in `model_call_records.response_payload_json` so `admin trace explain --json`
+can show the failing payload.
 
 ---
 
@@ -105,6 +115,8 @@ gateway returns `InvalidResponse`. Provider error responses are surfaced as
 | `model_gateway.openrouter.api_base_url` | `https://openrouter.ai/api/v1` | optional non-empty URL | `config.rs:234`, `config.rs:1016` |
 | `model_gateway.openrouter.http_referer` | unset | optional non-empty string | `config.rs:238`, `config.rs:1042` |
 | `model_gateway.openrouter.app_title` | unset | optional non-empty string | `config.rs:240`, `config.rs:1048` |
+| `model_gateway.openrouter.reasoning_effort` | `none` | `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `config.rs:242`, `config.rs:1088` |
+| `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `config.rs:244`, `config.rs:1094` |
 
 ### Environment Overrides
 
@@ -131,6 +143,8 @@ timeout_ms = 60000
 api_base_url = "https://openrouter.ai/api/v1"
 http_referer = "https://example.invalid"
 app_title = "Blue Lagoon"
+reasoning_effort = "none"
+exclude_reasoning = true
 ```
 
 Equivalent emergency route override:
@@ -163,9 +177,11 @@ BLUE_LAGOON_FOREGROUND_API_KEY=<secret>
   retained and inspected after provider invocation.
 - `docs/LOOP_ARCHITECTURE.md` describes the canonical loop boundary that keeps
   provider calls behind the harness.
-- `https://openrouter.ai/docs/quickstart/llms-full.txt` is the OpenRouter
-  quickstart reference used for endpoint, auth, and optional attribution header
+- [OpenRouter quickstart](https://openrouter.ai/docs/quickstart/llms-full.txt)
+  is the reference used for endpoint, auth, and optional attribution header
   behavior.
+- [OpenRouter reasoning tokens](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+  is the reference used for `reasoning.effort` and `reasoning.exclude`.
 
 ---
 

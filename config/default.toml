@@ -113,6 +113,9 @@ api_surface = "coding"
 # "openrouter/<provider-model-id>". The default endpoint follows the
 # OpenRouter OpenAI-compatible chat completions API.
 api_base_url = "https://openrouter.ai/api/v1"
+# Default to no explicit reasoning budget so reasoning models do not spend the
+# full completion budget on hidden thought and return `content = null`.
+reasoning_effort = "none"
 
 [self_model]
 seed_path = "config/self_model_seed.toml"

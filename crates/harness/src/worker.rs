@@ -239,6 +239,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
                         &pool,
                         model_call_id,
                         &error.to_string(),
+                        error.response_body(),
                         Utc::now(),
                     )
                     .await
@@ -447,6 +448,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
                         &pool,
                         model_call_id,
                         &error.to_string(),
+                        error.response_body(),
                         Utc::now(),
                     )
                     .await

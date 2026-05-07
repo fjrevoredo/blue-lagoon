@@ -165,6 +165,7 @@ pub async fn mark_model_call_failed(
     pool: &PgPool,
     model_call_id: Uuid,
     error_summary: &str,
+    response_payload_json: Option<&Value>,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
     sqlx::query(
@@ -173,13 +174,15 @@ pub async fn mark_model_call_failed(
         SET
             status = 'failed',
             error_summary = $2,
-            completed_at = $3,
+            response_payload_json = $3,
+            completed_at = $4,
             updated_at = NOW()
         WHERE model_call_id = $1
         "#,
     )
     .bind(model_call_id)
     .bind(error_summary)
+    .bind(response_payload_json)
     .bind(completed_at)
     .execute(pool)
     .await
