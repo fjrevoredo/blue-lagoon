@@ -1752,6 +1752,10 @@ fn format_trace_failure_class(class: harness::management::TraceFailureClass) -> 
         harness::management::TraceFailureClass::MalformedActionProposal => {
             "malformed_action_proposal"
         }
+        harness::management::TraceFailureClass::WorkerProtocolFailure => "worker_protocol_failure",
+        harness::management::TraceFailureClass::ScheduledForegroundValidationFailure => {
+            "scheduled_foreground_validation_failure"
+        }
         harness::management::TraceFailureClass::ApprovalPending => "approval_pending",
         harness::management::TraceFailureClass::ApprovalRejected => "approval_rejected",
         harness::management::TraceFailureClass::ApprovalExpired => "approval_expired",

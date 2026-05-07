@@ -28,11 +28,11 @@ they need causal-graph inspection.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/management.rs` | `TraceReport` (line 398), `TraceDiagnosisSummary` (line 542), `TraceExplanationReport` (line 584), `load_trace_report()` (line 2165), `explain_trace_report()` (line 2190), `diagnose_trace_report()` (line 2199), `inspect_trace_report_focus()` (line 2278), `list_recent_traces()` (line 2307) |
+| `crates/harness/src/management.rs` | `TraceReport` (line 398), `TraceFailureClass` (line 482), `TraceDiagnosisSummary` (line 542), `TraceExplanationReport` (line 584), `load_trace_report()` (line 2165), `diagnose_trace_report()` (line 2201), `classify_failure_text()` (line 3719), `derive_next_steps()` (line 3913), `trace_failure_class_label()` (line 4049) |
 | `crates/harness/src/model_calls.rs` | `ModelCallRecord` (line 16), `insert_pending_model_call_record()` (line 41), `clear_expired_model_call_payloads()` (line 258), `background_job_run_for_execution()` (line 312) |
 | `crates/harness/src/causal_links.rs` | `NewCausalLink` (line 8), `insert()` (line 31), `list_for_trace()` (line 69) |
-| `crates/harness/src/worker.rs` | foreground model-call persistence (line 195), background model-call persistence (line 375) |
-| `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 85), `TraceExplainCommand` (line 119), `TraceShowCommand` (line 129), `render_trace_explanation_text()` (line 1431), `render_trace_report_text()` (line 1518), `render_trace_mermaid()` (line 1680) |
+| `crates/harness/src/worker.rs` | `launch_conscious_worker_with_timeout()` (line 136), `launch_unconscious_worker_with_timeout()` (line 344), `collect_worker_protocol_failure_context()` (line 620), `stderr_excerpt()` (line 645) |
+| `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 85), `TraceExplainCommand` (line 119), `TraceShowCommand` (line 129), `render_trace_explanation_text()` (line 1431), `render_trace_report_text()` (line 1518), `render_trace_mermaid()` (line 1680), `format_trace_failure_class()` (line 1739) |
 | `migrations/0011__model_call_records.sql` | durable model-call records |
 | `migrations/0012__causal_links.sql` | durable causal graph edges |
 
@@ -64,8 +64,8 @@ The diagnosis layer derives a second, operator-facing view from `TraceReport`:
 - `TraceDiagnosisSummary`: verdict, failure class, first failing step, last
   successful step, side-effect status, user-reply status, retry safety, likely
   cause, next-step hints, and notes. Failure classes include transport,
-  persistence, approval, governed-action blocking, and malformed governed-action
-  proposal cases when the assistant fails to emit a valid tagged action block.
+  persistence, approval, governed-action blocking, malformed governed-action
+  proposal, worker protocol, and scheduled foreground validation cases.
 - `TraceFocusReport`: read-only inspection of the focused node payload,
   including retained-payload availability and retention/missing-data notes.
 
@@ -84,6 +84,16 @@ available, status, timing, and retention metadata.
 If a test or one-shot worker path is intentionally running against an unmigrated
 clean schema, the worker protocol continues and skips model-call persistence.
 Normal migrated runtime databases are expected to have the table.
+
+Worker protocol errors are annotated before they reach trace classification.
+The launchers attach a `worker_protocol_phase` marker for spawn, request write,
+model-call read, model-call persistence, provider call, model response write,
+final response read, child wait, and stderr cleanup phases. When the child exits
+early or closes its pipe, the harness closes stdin, waits for the child with a
+bounded cleanup timeout, and appends the child exit status plus a short stderr
+excerpt when available. `trace explain` classifies those errors as
+`worker_protocol_failure` and tells the operator to inspect the worker
+binary/configuration before retrying.
 
 Retention-managed fields are:
 
@@ -203,4 +213,4 @@ To extend diagnosis:
 - `crates/runtime/src/admin.rs` contains the operator command parser and trace
   text/Mermaid renderers.
 
-Verified: 2026-05-06.
+Verified: 2026-05-07.

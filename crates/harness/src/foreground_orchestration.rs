@@ -2262,6 +2262,14 @@ fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailur
             "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the trace with `admin trace explain --trace-id {trace_id}`.",
             failure_kind.as_str()
         ),
+        ForegroundFailureKind::WorkerProtocolFailure => format!(
+            "I couldn't complete that because the worker protocol failed while processing the request. Trace: {trace_id}. Failure kind: {}. Inspect the trace with `admin trace explain --trace-id {trace_id}` before retrying.",
+            failure_kind.as_str()
+        ),
+        ForegroundFailureKind::ScheduledForegroundValidationFailure => format!(
+            "I couldn't complete that because the scheduled foreground action was invalid. Trace: {trace_id}. Failure kind: {}. Inspect the trace with `admin trace explain --trace-id {trace_id}` before retrying.",
+            failure_kind.as_str()
+        ),
         _ => format!(
             "I hit an internal runtime error while processing that message. Trace: {trace_id}. Failure kind: {}. Send another message to continue.",
             failure_kind.as_str()
@@ -2275,6 +2283,7 @@ enum ForegroundFailureKind {
     ContextAssemblyFailure,
     MalformedActionProposal,
     WorkerProtocolFailure,
+    ScheduledForegroundValidationFailure,
     ModelGatewayTransportFailure,
     ProviderRejected,
     TelegramDeliveryFailure,
@@ -2288,6 +2297,7 @@ impl ForegroundFailureKind {
             Self::ContextAssemblyFailure => "context_assembly_failure",
             Self::MalformedActionProposal => "malformed_action_proposal",
             Self::WorkerProtocolFailure => "worker_protocol_failure",
+            Self::ScheduledForegroundValidationFailure => "scheduled_foreground_validation_failure",
             Self::ModelGatewayTransportFailure => "model_gateway_transport_failure",
             Self::ProviderRejected => "provider_rejected",
             Self::TelegramDeliveryFailure => "telegram_delivery_failure",
@@ -2300,6 +2310,19 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     let message = format_error_chain(error);
     if message.contains("provider returned status") {
         return ForegroundFailureKind::ProviderRejected;
+    }
+    if message.contains("scheduled foreground cadence_seconds")
+        || message.contains("scheduled foreground task key")
+        || message.contains("scheduled foreground message_text")
+    {
+        return ForegroundFailureKind::ScheduledForegroundValidationFailure;
+    }
+    if message.contains("violates check constraint")
+        || message.contains("failed to insert governed action execution")
+        || message.contains("failed to insert scheduled foreground task")
+        || message.contains("failed to update scheduled foreground task")
+    {
+        return ForegroundFailureKind::PersistenceFailure;
     }
     if message.contains("model gateway transport failed")
         || message.contains("error sending request for url")
@@ -3135,6 +3158,34 @@ mod tests {
     }
 
     #[test]
+    fn foreground_failure_notice_explains_worker_protocol_failure() {
+        let trace_id = Uuid::now_v7();
+        let notice =
+            foreground_failure_notice_text(trace_id, ForegroundFailureKind::WorkerProtocolFailure);
+
+        assert!(notice.contains("worker protocol failed"));
+        assert!(notice.contains("worker_protocol_failure"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("before retrying"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
+    fn foreground_failure_notice_explains_scheduled_validation_failure() {
+        let trace_id = Uuid::now_v7();
+        let notice = foreground_failure_notice_text(
+            trace_id,
+            ForegroundFailureKind::ScheduledForegroundValidationFailure,
+        );
+
+        assert!(notice.contains("scheduled foreground action was invalid"));
+        assert!(notice.contains("scheduled_foreground_validation_failure"));
+        assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("before retrying"));
+        assert!(notice.contains(&trace_id.to_string()));
+    }
+
+    #[test]
     fn classify_conscious_worker_failure_detects_malformed_action_proposal() {
         let error = anyhow::anyhow!(
             "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
@@ -3143,6 +3194,30 @@ mod tests {
         assert_eq!(
             classify_conscious_worker_failure(&error),
             ForegroundFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_worker_protocol_failure() {
+        let error = anyhow::anyhow!(
+            "conscious worker protocol failure: worker_protocol_phase=write_model_response failed to write worker protocol line: Broken pipe (os error 32)"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::WorkerProtocolFailure
+        );
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_detects_scheduled_validation_failure() {
+        let error = anyhow::anyhow!(
+            "conscious worker returned an error response: scheduled foreground cadence_seconds must be greater than zero unless task_key uses the one-shot prefix"
+        );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::ScheduledForegroundValidationFailure
         );
     }
 

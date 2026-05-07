@@ -2042,8 +2042,10 @@ fn validate_upsert_scheduled_foreground_task_action(
     if action.user_facing_prompt.trim().is_empty() {
         bail!("scheduled foreground prompt must not be empty");
     }
-    if action.cadence_seconds == 0 {
-        bail!("scheduled foreground cadence_seconds must be greater than zero");
+    if action.cadence_seconds == 0 && !is_one_shot_scheduled_task_key(&action.task_key) {
+        bail!(
+            "scheduled foreground cadence_seconds must be greater than zero unless task_key uses one-shot prefix"
+        );
     }
     if action.internal_principal_ref.trim().is_empty()
         || action.internal_conversation_ref.trim().is_empty()
@@ -2051,6 +2053,11 @@ fn validate_upsert_scheduled_foreground_task_action(
         bail!("scheduled foreground conversation binding fields must not be empty");
     }
     Ok(())
+}
+
+fn is_one_shot_scheduled_task_key(task_key: &str) -> bool {
+    let task_key = task_key.trim().to_ascii_lowercase();
+    task_key.starts_with("oneoff_") || task_key.starts_with("one_shot_")
 }
 
 fn validate_request_background_job_action(action: &RequestBackgroundJobAction) -> Result<()> {

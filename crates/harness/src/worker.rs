@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use chrono::Utc;
 use contracts::{
     ConsciousWorkerInboundMessage, ConsciousWorkerOutboundMessage, WorkerRequest, WorkerResponse,
@@ -159,7 +159,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         .stdout
         .take()
         .context("failed to take conscious worker stdout")?;
-    let stderr_task = child.stderr.take().map(|stderr| {
+    let mut stderr_task = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             let mut bytes = Vec::new();
             let mut stderr = stderr;
@@ -170,15 +170,19 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
     let pool = db::connect(config).await?;
 
     let operation = async {
-        write_json_line(&mut stdin, request).await?;
+        write_json_line(&mut stdin, request)
+            .await
+            .context("worker_protocol_phase=write_initial_request")?;
 
         let first_line = stdout_lines
             .next_line()
             .await
-            .context("failed to read conscious worker model-request line")?
-            .context("conscious worker exited before sending a protocol message")?;
+            .context("worker_protocol_phase=read_model_request")?
+            .with_context(|| {
+                "worker_protocol_phase=read_model_request conscious worker exited before sending a protocol message"
+            })?;
         let first_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&first_line)
-            .context("failed to decode first worker protocol message")?;
+            .context("worker_protocol_phase=read_model_request failed to decode first worker protocol message")?;
 
         let model_request = match first_message {
             ConsciousWorkerOutboundMessage::ModelCallRequest(model_request) => model_request,
@@ -186,7 +190,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
                 let status = child
                     .wait()
                     .await
-                    .context("conscious worker failed while waiting for exit status")?;
+                    .context("worker_protocol_phase=wait_child conscious worker failed while waiting for exit status")?;
                 return Ok((response, status));
             }
         };
@@ -203,56 +207,70 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         {
             Ok(model_call_id) => Some(model_call_id),
             Err(error) if model_calls::is_missing_model_call_schema(&error) => None,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error).context(
+                    "worker_protocol_phase=record_model_call failed to persist pending model call",
+                );
+            }
         };
-        let model_response =
-            match model_gateway::execute_foreground_model_call(gateway, &model_request, transport)
-                .await
-            {
-                Ok(model_response) => {
-                    if let Some(model_call_id) = model_call_id {
-                        model_calls::mark_model_call_succeeded(
+        let model_response = match model_gateway::execute_foreground_model_call(
+            gateway,
+            &model_request,
+            transport,
+        )
+        .await
+        {
+            Ok(model_response) => {
+                if let Some(model_call_id) = model_call_id {
+                    model_calls::mark_model_call_succeeded(
                             &pool,
                             model_call_id,
                             &model_response,
                             Utc::now(),
                         )
-                        .await?;
-                    }
-                    model_response
+                        .await
+                        .context("worker_protocol_phase=record_model_call failed to mark model call succeeded")?;
                 }
-                Err(error) => {
-                    if let Some(model_call_id) = model_call_id {
-                        model_calls::mark_model_call_failed(
-                            &pool,
-                            model_call_id,
-                            &error.to_string(),
-                            Utc::now(),
-                        )
-                        .await?;
-                    }
-                    return Err(error)
-                        .context("conscious worker model-call execution failed in the harness");
+                model_response
+            }
+            Err(error) => {
+                if let Some(model_call_id) = model_call_id {
+                    model_calls::mark_model_call_failed(
+                        &pool,
+                        model_call_id,
+                        &error.to_string(),
+                        Utc::now(),
+                    )
+                    .await
+                    .context(
+                        "worker_protocol_phase=record_model_call failed to mark model call failed",
+                    )?;
                 }
-            };
+                return Err(error)
+                        .context("worker_protocol_phase=execute_model_call conscious worker model-call execution failed in the harness");
+            }
+        };
         write_json_line(
             &mut stdin,
             &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),
         )
-        .await?;
+        .await
+        .context("worker_protocol_phase=write_model_response")?;
         drop(stdin);
 
         let final_line = stdout_lines
             .next_line()
             .await
-            .context("failed to read conscious worker final-response line")?
-            .context("conscious worker exited before sending a final response")?;
+            .context("worker_protocol_phase=read_final_response")?
+            .with_context(|| {
+                "worker_protocol_phase=read_final_response conscious worker exited before sending a final response"
+            })?;
         let final_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&final_line)
-            .context("failed to decode final worker protocol message")?;
+            .context("worker_protocol_phase=read_final_response failed to decode final worker protocol message")?;
         let response = match final_message {
             ConsciousWorkerOutboundMessage::ModelCallRequest(_) => {
                 bail!(
-                    "conscious worker emitted more than one model-call request; foreground execution supports only one"
+                    "worker_protocol_phase=read_final_response conscious worker emitted more than one model-call request; foreground execution supports only one"
                 )
             }
             ConsciousWorkerOutboundMessage::FinalResponse(response) => response,
@@ -261,18 +279,27 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         let status = child
             .wait()
             .await
-            .context("conscious worker failed while waiting for exit status")?;
+            .context("worker_protocol_phase=wait_child conscious worker failed while waiting for exit status")?;
         Ok((response, status))
     };
 
     let (response, status) = match timeout(Duration::from_millis(timeout_ms), operation).await {
-        Ok(result) => result?,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return Err(collect_worker_protocol_failure_context(
+                &mut child,
+                stderr_task.take(),
+                "conscious",
+                error,
+            )
+            .await);
+        }
         Err(_) => {
             child
                 .start_kill()
                 .context("failed to terminate timed-out conscious worker subprocess")?;
             let _ = child.wait().await;
-            let _ = read_child_stream(stderr_task, "stderr").await;
+            let _ = read_child_stream(stderr_task.take(), "stderr").await;
             bail!(
                 "conscious worker subprocess timed out after {} ms and was terminated",
                 timeout_ms
@@ -280,7 +307,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         }
     };
 
-    let stderr = read_child_stream(stderr_task, "stderr").await?;
+    let stderr = read_child_stream(stderr_task.take(), "stderr").await?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         bail!("conscious worker subprocess failed: {stderr}");
@@ -340,7 +367,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         .stdout
         .take()
         .context("failed to take unconscious worker stdout")?;
-    let stderr_task = child.stderr.take().map(|stderr| {
+    let mut stderr_task = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             let mut bytes = Vec::new();
             let mut stderr = stderr;
@@ -351,15 +378,19 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
     let pool = db::connect(config).await?;
 
     let operation = async {
-        write_json_line(&mut stdin, request).await?;
+        write_json_line(&mut stdin, request)
+            .await
+            .context("worker_protocol_phase=write_initial_request")?;
 
         let first_line = stdout_lines
             .next_line()
             .await
-            .context("failed to read unconscious worker model-request line")?
-            .context("unconscious worker exited before sending a protocol message")?;
+            .context("worker_protocol_phase=read_model_request")?
+            .with_context(|| {
+                "worker_protocol_phase=read_model_request unconscious worker exited before sending a protocol message"
+            })?;
         let first_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&first_line)
-            .context("failed to decode first worker protocol message")?;
+            .context("worker_protocol_phase=read_model_request failed to decode first worker protocol message")?;
 
         let model_request = match first_message {
             ConsciousWorkerOutboundMessage::ModelCallRequest(model_request) => model_request,
@@ -367,7 +398,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
                 let status = child
                     .wait()
                     .await
-                    .context("unconscious worker failed while waiting for exit status")?;
+                    .context("worker_protocol_phase=wait_child unconscious worker failed while waiting for exit status")?;
                 return Ok((response, status));
             }
         };
@@ -384,56 +415,70 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         {
             Ok(model_call_id) => Some(model_call_id),
             Err(error) if model_calls::is_missing_model_call_schema(&error) => None,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error).context(
+                    "worker_protocol_phase=record_model_call failed to persist pending model call",
+                );
+            }
         };
-        let model_response =
-            match model_gateway::execute_background_model_call(gateway, &model_request, transport)
-                .await
-            {
-                Ok(model_response) => {
-                    if let Some(model_call_id) = model_call_id {
-                        model_calls::mark_model_call_succeeded(
+        let model_response = match model_gateway::execute_background_model_call(
+            gateway,
+            &model_request,
+            transport,
+        )
+        .await
+        {
+            Ok(model_response) => {
+                if let Some(model_call_id) = model_call_id {
+                    model_calls::mark_model_call_succeeded(
                             &pool,
                             model_call_id,
                             &model_response,
                             Utc::now(),
                         )
-                        .await?;
-                    }
-                    model_response
+                        .await
+                        .context("worker_protocol_phase=record_model_call failed to mark model call succeeded")?;
                 }
-                Err(error) => {
-                    if let Some(model_call_id) = model_call_id {
-                        model_calls::mark_model_call_failed(
-                            &pool,
-                            model_call_id,
-                            &error.to_string(),
-                            Utc::now(),
-                        )
-                        .await?;
-                    }
-                    return Err(error)
-                        .context("unconscious worker model-call execution failed in the harness");
+                model_response
+            }
+            Err(error) => {
+                if let Some(model_call_id) = model_call_id {
+                    model_calls::mark_model_call_failed(
+                        &pool,
+                        model_call_id,
+                        &error.to_string(),
+                        Utc::now(),
+                    )
+                    .await
+                    .context(
+                        "worker_protocol_phase=record_model_call failed to mark model call failed",
+                    )?;
                 }
-            };
+                return Err(error)
+                        .context("worker_protocol_phase=execute_model_call unconscious worker model-call execution failed in the harness");
+            }
+        };
         write_json_line(
             &mut stdin,
             &ConsciousWorkerInboundMessage::ModelCallResponse(model_response),
         )
-        .await?;
+        .await
+        .context("worker_protocol_phase=write_model_response")?;
         drop(stdin);
 
         let final_line = stdout_lines
             .next_line()
             .await
-            .context("failed to read unconscious worker final-response line")?
-            .context("unconscious worker exited before sending a final response")?;
+            .context("worker_protocol_phase=read_final_response")?
+            .with_context(|| {
+                "worker_protocol_phase=read_final_response unconscious worker exited before sending a final response"
+            })?;
         let final_message: ConsciousWorkerOutboundMessage = serde_json::from_str(&final_line)
-            .context("failed to decode final worker protocol message")?;
+            .context("worker_protocol_phase=read_final_response failed to decode final worker protocol message")?;
         let response = match final_message {
             ConsciousWorkerOutboundMessage::ModelCallRequest(_) => {
                 bail!(
-                    "unconscious worker emitted more than one model-call request; background execution supports only one"
+                    "worker_protocol_phase=read_final_response unconscious worker emitted more than one model-call request; background execution supports only one"
                 )
             }
             ConsciousWorkerOutboundMessage::FinalResponse(response) => response,
@@ -442,18 +487,27 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         let status = child
             .wait()
             .await
-            .context("unconscious worker failed while waiting for exit status")?;
+            .context("worker_protocol_phase=wait_child unconscious worker failed while waiting for exit status")?;
         Ok((response, status))
     };
 
     let (response, status) = match timeout(Duration::from_millis(timeout_ms), operation).await {
-        Ok(result) => result?,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return Err(collect_worker_protocol_failure_context(
+                &mut child,
+                stderr_task.take(),
+                "unconscious",
+                error,
+            )
+            .await);
+        }
         Err(_) => {
             child
                 .start_kill()
                 .context("failed to terminate timed-out unconscious worker subprocess")?;
             let _ = child.wait().await;
-            let _ = read_child_stream(stderr_task, "stderr").await;
+            let _ = read_child_stream(stderr_task.take(), "stderr").await;
             bail!(
                 "unconscious worker subprocess timed out after {} ms and was terminated",
                 timeout_ms
@@ -461,7 +515,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         }
     };
 
-    let stderr = read_child_stream(stderr_task, "stderr").await?;
+    let stderr = read_child_stream(stderr_task.take(), "stderr").await?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         bail!("unconscious worker subprocess failed: {stderr}");
@@ -561,6 +615,43 @@ async fn read_child_stream(
             .with_context(|| format!("failed to read worker {stream_name}")),
         None => Ok(Vec::new()),
     }
+}
+
+async fn collect_worker_protocol_failure_context(
+    child: &mut tokio::process::Child,
+    stderr_task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    worker_kind: &str,
+    error: Error,
+) -> Error {
+    let exit_summary = match timeout(Duration::from_millis(1_000), child.wait()).await {
+        Ok(Ok(status)) => format!("worker_exit_status={status}"),
+        Ok(Err(wait_error)) => format!("worker_exit_status=unavailable({wait_error})"),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            "worker_exit_status=cleanup_timeout_killed".to_string()
+        }
+    };
+    let stderr_summary = match read_child_stream(stderr_task, "stderr").await {
+        Ok(stderr) => format!(
+            "worker_stderr_excerpt={}",
+            stderr_excerpt(&String::from_utf8_lossy(&stderr))
+        ),
+        Err(read_error) => format!("worker_stderr_excerpt=unavailable({read_error})"),
+    };
+    anyhow!("{worker_kind} worker protocol failure: {error}; {exit_summary}; {stderr_summary}")
+}
+
+fn stderr_excerpt(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut excerpt = trimmed.chars().take(500).collect::<String>();
+    if trimmed.chars().count() > 500 {
+        excerpt.push_str("...");
+    }
+    excerpt.replace(['\r', '\n'], " ")
 }
 
 async fn write_json_line<T: serde::Serialize>(

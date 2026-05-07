@@ -32,8 +32,8 @@ created.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 841), `build_governed_action_proposals()` (line 945), `governed_action_kind_as_str()` (line 1286) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_inspect_workspace_artifact()` (line 871), `execute_create_workspace_script()` (line 1188), `execute_request_background_job()` (line 1406), `validate_capability_scope()` (line 1663), `governed_action_kind_as_str()` (line 3159), `CanonicalGovernedActionPayload` (line 3283) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 888), `build_governed_action_proposals()` (line 993), `governed_action_kind_as_str()` (line 1334) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
@@ -141,10 +141,20 @@ Schedule, background, subprocess, and fetch payloads:
 
 ```json
 { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
+{ "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "oneoff_check_in_20260429", "title": "One-time check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 0, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
 { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
 { "kind": "run_subprocess", "value": { "command": "<executable>", "args": [], "working_directory": "<absolute path or null>" } }
 { "kind": "web_fetch", "value": { "url": "https://example.com", "timeout_ms": 10000, "max_response_bytes": 524288 } }
 ```
+
+Scheduled foreground tasks are recurring by default. Recurring tasks must use a
+positive `cadence_seconds` that passes `scheduled_foreground` validation.
+One-shot tasks are represented without a schema migration by using a task key
+with the `oneoff_` or `one_shot_` prefix and `cadence_seconds: 0`. The harness
+stores a bounded placeholder cadence internally because the database column is
+non-null, but terminal outcomes disable prefixed one-shot tasks after success,
+suppression, or failure. This prevents reminders from turning into retry loops
+unless a future action explicitly creates or reactivates a recurring task.
 
 ### Observation Feedback
 
@@ -259,4 +269,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/identity-self-model`, session 2026-05-07.*
+*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-07.*

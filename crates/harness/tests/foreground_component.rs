@@ -1867,6 +1867,50 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
 }
 
 #[tokio::test]
+async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> Result<()> {
+    support::with_clean_database(|_ctx| async move {
+        let mut config = _ctx.config.clone();
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["exit-after-model-request-worker".to_string()];
+
+        let gateway = sample_model_gateway_config();
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply from fake provider" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 13,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+
+        let request = contracts::WorkerRequest::conscious(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            sample_conscious_context(),
+        );
+
+        let error = worker::launch_conscious_worker(&config, &gateway, &request, &transport)
+            .await
+            .expect_err("early worker exit should fail the protocol boundary");
+        let message = error.to_string();
+        assert!(message.contains("conscious worker protocol failure"));
+        assert!(message.contains("worker_protocol_phase=write_model_response"));
+        assert!(message.contains("worker_exit_status="));
+        assert!(message.contains("worker_stderr_excerpt="));
+        assert!(message.contains("intentionally exiting before final response"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 #[serial]
 async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
@@ -2930,6 +2974,107 @@ async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> R
 
 #[tokio::test]
 #[serial]
+async fn scheduled_foreground_runtime_executes_one_shot_task_and_disables_after_success()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "oneoff_success_20260507".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "One-shot scheduled check-in".to_string(),
+                cadence_seconds: 0,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "one-shot proactive reply" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let handled = runtime::run_scheduled_foreground_iteration_with(
+            &ctx.pool,
+            &config,
+            &sample_model_gateway_config(),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let task = scheduled_foreground::get_task_by_key(&ctx.pool, "oneoff_success_20260507")
+            .await?
+            .expect("one-shot scheduled task should still be traceable");
+        assert_eq!(handled, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(delivery.sent_messages()[0].text, "one-shot proactive reply");
+        assert_eq!(
+            task.status,
+            contracts::ScheduledForegroundTaskStatus::Disabled
+        );
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Completed)
+        );
+        assert!(task.last_execution_id.is_some());
+
+        let due_tasks = scheduled_foreground::list_tasks(
+            &ctx.pool,
+            scheduled_foreground::ScheduledForegroundTaskListFilter {
+                status: Some(contracts::ScheduledForegroundTaskStatus::Active),
+                due_only: true,
+                limit: 10,
+            },
+        )
+        .await?;
+        assert!(due_tasks.is_empty());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn scheduled_foreground_runtime_suppresses_when_binding_disappears() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let binding = foreground::upsert_conversation_binding(
@@ -3034,6 +3179,85 @@ async fn scheduled_foreground_runtime_suppresses_when_binding_disappears() -> Re
         .fetch_one(&ctx.pool)
         .await?;
         assert_eq!(suppressed_audit_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduled_foreground_one_shot_failure_disables_task_and_stops_retry() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        foreground::upsert_conversation_binding(
+            &ctx.pool,
+            &foreground::NewConversationBinding {
+                conversation_binding_id: Uuid::now_v7(),
+                channel_kind: ChannelKind::Telegram,
+                external_user_id: "42".to_string(),
+                external_conversation_id: "42".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+            },
+        )
+        .await?;
+
+        scheduled_foreground::upsert_task(
+            &ctx.pool,
+            &ctx.config,
+            &scheduled_foreground::UpsertScheduledForegroundTask {
+                task_key: "oneoff_test_20260507".to_string(),
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                message_text: "One-shot scheduled message".to_string(),
+                cadence_seconds: 0,
+                cooldown_seconds: Some(120),
+                next_due_at: Some(Utc::now() - Duration::seconds(5)),
+                status: contracts::ScheduledForegroundTaskStatus::Active,
+                actor_ref: "test-harness".to_string(),
+            },
+        )
+        .await?;
+
+        let execution_id = Uuid::now_v7();
+        let claimed = scheduled_foreground::claim_next_due_task(
+            &ctx.pool,
+            execution_id,
+            Uuid::now_v7(),
+            Utc::now(),
+        )
+        .await?
+        .expect("one-shot task should be claimable");
+        let completed_at = Utc::now();
+        let task = scheduled_foreground::mark_task_failed(
+            &ctx.pool,
+            &claimed.task,
+            execution_id,
+            completed_at,
+            "execution_failed",
+            "worker protocol failure",
+        )
+        .await?;
+
+        assert_eq!(
+            task.status,
+            contracts::ScheduledForegroundTaskStatus::Disabled
+        );
+        assert_eq!(task.current_execution_id, None);
+        assert_eq!(
+            task.last_outcome,
+            Some(contracts::ScheduledForegroundLastOutcome::Failed)
+        );
+
+        let due_tasks = scheduled_foreground::list_tasks(
+            &ctx.pool,
+            scheduled_foreground::ScheduledForegroundTaskListFilter {
+                status: Some(contracts::ScheduledForegroundTaskStatus::Active),
+                due_only: true,
+                limit: 10,
+            },
+        )
+        .await?;
+        assert!(due_tasks.is_empty());
         Ok(())
     })
     .await

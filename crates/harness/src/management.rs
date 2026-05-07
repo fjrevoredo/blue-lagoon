@@ -486,6 +486,8 @@ pub enum TraceFailureClass {
     PersistenceFailure,
     ContextAssemblyFailure,
     MalformedActionProposal,
+    WorkerProtocolFailure,
+    ScheduledForegroundValidationFailure,
     ApprovalPending,
     ApprovalRejected,
     ApprovalExpired,
@@ -3691,6 +3693,9 @@ fn classify_failure_from_related_audit(
 
 fn classify_audit_failure(node: &TraceNode) -> Option<TraceFailureClass> {
     let payload = node.payload.get("payload")?;
+    if let Some(class) = classify_failure_text(&format!("{} {}", node.summary, payload)) {
+        return Some(class);
+    }
     let failure_kind = payload
         .get("failure_kind")
         .and_then(JsonValue::as_str)
@@ -3702,9 +3707,37 @@ fn classify_audit_failure(node: &TraceNode) -> Option<TraceFailureClass> {
         "persistence_failure" => Some(TraceFailureClass::PersistenceFailure),
         "context_assembly_failure" => Some(TraceFailureClass::ContextAssemblyFailure),
         "malformed_action_proposal" => Some(TraceFailureClass::MalformedActionProposal),
+        "worker_protocol_failure" => Some(TraceFailureClass::WorkerProtocolFailure),
+        "scheduled_foreground_validation_failure" => {
+            Some(TraceFailureClass::ScheduledForegroundValidationFailure)
+        }
         "recovery_interrupted" => Some(TraceFailureClass::RecoveryInterrupted),
         _ => Some(TraceFailureClass::UnknownFailure),
     }
+}
+
+fn classify_failure_text(text: &str) -> Option<TraceFailureClass> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("violates check constraint")
+        || text.contains("failed to insert governed action execution")
+        || text.contains("failed to insert scheduled foreground task")
+        || text.contains("failed to update scheduled foreground task")
+    {
+        return Some(TraceFailureClass::PersistenceFailure);
+    }
+    if text.contains("scheduled foreground cadence_seconds")
+        || text.contains("scheduled foreground task key")
+        || text.contains("scheduled foreground message_text")
+    {
+        return Some(TraceFailureClass::ScheduledForegroundValidationFailure);
+    }
+    if text.contains("worker_protocol_phase=")
+        || text.contains("failed to write worker protocol line")
+        || text.contains("broken pipe")
+    {
+        return Some(TraceFailureClass::WorkerProtocolFailure);
+    }
+    None
 }
 
 fn derive_side_effect_status(report: &TraceReport) -> TraceSideEffectStatus {
@@ -3914,6 +3947,25 @@ fn derive_next_steps(
                     .to_string(),
             );
         }
+        Some(TraceFailureClass::WorkerProtocolFailure) => {
+            steps.push(
+                "Inspect the worker protocol phase, child exit status, and stderr excerpt."
+                    .to_string(),
+            );
+            steps.push(
+                "Restart or rebuild the worker/runtime if the child exited unexpectedly."
+                    .to_string(),
+            );
+        }
+        Some(TraceFailureClass::ScheduledForegroundValidationFailure) => {
+            steps.push(
+                "Inspect the scheduled foreground task payload and one-shot versus recurring schedule shape."
+                    .to_string(),
+            );
+            steps.push(
+                "Correct or disable the scheduled foreground task before retrying.".to_string(),
+            );
+        }
         Some(TraceFailureClass::GovernedActionBlocked) => {
             steps.push(
                 "Inspect the blocked reason and capability scope on the governed action."
@@ -4013,6 +4065,14 @@ fn trace_failure_class_label(class: TraceFailureClass) -> String {
         }
         TraceFailureClass::MalformedActionProposal => {
             "The assistant attempted a governed action but returned an invalid action proposal shape."
+                .to_string()
+        }
+        TraceFailureClass::WorkerProtocolFailure => {
+            "The worker subprocess protocol failed before a valid final response returned."
+                .to_string()
+        }
+        TraceFailureClass::ScheduledForegroundValidationFailure => {
+            "A scheduled foreground action failed validation before execution could complete."
                 .to_string()
         }
         TraceFailureClass::ApprovalPending => {

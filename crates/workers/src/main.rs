@@ -42,6 +42,8 @@ enum WorkerCommand {
     Unconscious,
     #[command(name = "wrong-result-worker", hide = true)]
     WrongResult,
+    #[command(name = "exit-after-model-request-worker", hide = true)]
+    ExitAfterModelRequest,
     #[command(name = "stall-worker", hide = true)]
     Stall {
         #[arg(long)]
@@ -58,6 +60,7 @@ fn main() -> Result<()> {
         WorkerCommand::Conscious => run_conscious_worker(),
         WorkerCommand::Unconscious => run_unconscious_worker(),
         WorkerCommand::WrongResult => run_wrong_result_worker(),
+        WorkerCommand::ExitAfterModelRequest => run_exit_after_model_request_worker(),
         WorkerCommand::Stall { sleep_ms, pid_file } => run_stall_worker(sleep_ms, pid_file),
     }
 }
@@ -142,6 +145,50 @@ fn run_wrong_result_worker() -> Result<()> {
             }),
         }),
     )?;
+    Ok(())
+}
+
+fn run_exit_after_model_request_worker() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
+    let Some(request_line) = lines.next() else {
+        eprintln!("exit-after-model-request-worker missing request");
+        return Ok(());
+    };
+
+    let request = match serde_json::from_str::<WorkerRequest>(
+        &request_line.context("failed to read exit-after-model-request worker request line")?,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("exit-after-model-request-worker invalid request: {error}");
+            return Ok(());
+        }
+    };
+
+    if let Err(error) = request.validate() {
+        eprintln!("exit-after-model-request-worker invalid request: {error}");
+        return Ok(());
+    }
+
+    let model_request = match &request.payload {
+        WorkerPayload::Conscious(payload) => build_model_call_request(&request, payload.as_ref()),
+        WorkerPayload::Unconscious(payload) => {
+            build_unconscious_model_call_request(&request, payload.as_ref())
+        }
+        WorkerPayload::Smoke(_) => {
+            eprintln!("exit-after-model-request-worker unsupported smoke request");
+            return Ok(());
+        }
+    };
+    write_json_line(
+        &mut handle,
+        &ConsciousWorkerOutboundMessage::ModelCallRequest(model_request),
+    )?;
+    eprintln!("exit-after-model-request-worker intentionally exiting before final response");
     Ok(())
 }
 
@@ -894,6 +941,7 @@ Harness-native payload examples:
 - "payload": { "kind": "create_workspace_artifact", "value": { "artifact_kind": "scratchpad", "title": "...", "content_text": "...", "provenance": "conversation" } }
 - "payload": { "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
 - "payload": { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
+- One-shot scheduled foreground tasks must use task_key prefix "oneoff_" or "one_shot_" and cadence_seconds: 0. The harness stores a bounded placeholder cadence and disables the task after its terminal run outcome so it cannot repeat unless the user asks for recurrence.
 - "payload": { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
 - "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "trace_show", "params": { "trace_id": "<uuid>", "execution_id": null } } } }
 - "payload": { "kind": "run_diagnostic", "value": { "query": { "query": "internal_doc", "params": { "document": "context_assembly" } } } }
