@@ -1879,6 +1879,21 @@ pub struct ModelInputMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PromptCompositionMetrics {
+    pub system_prompt_chars: u32,
+    pub developer_message_chars: u32,
+    pub user_message_chars: u32,
+    pub assistant_message_chars: u32,
+    pub total_message_chars: u32,
+    pub total_chars: u32,
+    pub estimated_input_tokens: u32,
+    pub message_count: u32,
+    pub trimmed_message_count: u32,
+    pub trimmed_char_count: u32,
+    pub trim_events: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCallRequest {
     pub request_id: Uuid,
@@ -1889,6 +1904,7 @@ pub struct ModelCallRequest {
     pub task_class: String,
     pub budget: ModelBudget,
     pub input: ModelInput,
+    pub prompt_metrics: Option<PromptCompositionMetrics>,
     pub output_mode: ModelOutputMode,
     pub schema_name: Option<String>,
     pub schema_json: Option<Value>,
@@ -2578,6 +2594,19 @@ mod tests {
                     },
                 ],
             },
+            prompt_metrics: Some(PromptCompositionMetrics {
+                system_prompt_chars: 21,
+                developer_message_chars: 13,
+                user_message_chars: 5,
+                assistant_message_chars: 0,
+                total_message_chars: 18,
+                total_chars: 39,
+                estimated_input_tokens: 10,
+                message_count: 2,
+                trimmed_message_count: 0,
+                trimmed_char_count: 0,
+                trim_events: Vec::new(),
+            }),
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,

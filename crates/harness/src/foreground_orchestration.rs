@@ -2503,20 +2503,20 @@ fn approval_follow_up_episode_text(
             .join(" | ");
         format!("Harness governed-action observations: {joined}")
     };
-    let trimmed_model_text = model_text.trim();
-    if trimmed_model_text.is_empty() {
+    let normalized_model_text = normalize_assistant_history_text(model_text);
+    if normalized_model_text.is_empty() {
         observation_text
     } else {
-        format!("{trimmed_model_text}\n\n{observation_text}")
+        format!("{normalized_model_text}\n\n{observation_text}")
     }
 }
 
 fn approval_follow_up_delivery_text(model_text: &str) -> String {
-    let trimmed = model_text.trim();
-    if trimmed.is_empty() {
+    let normalized = normalize_assistant_history_text(model_text);
+    if normalized.is_empty() {
         "Approved action completed.".to_string()
     } else {
-        trimmed.to_string()
+        normalized
     }
 }
 
@@ -2540,9 +2540,9 @@ fn foreground_assistant_delivery_text(
     candidate_proposals: &[contracts::CanonicalProposal],
     context: &contracts::ConsciousContext,
 ) -> String {
-    let trimmed = model_text.trim();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
+    let normalized = normalize_assistant_history_text(model_text);
+    if !normalized.is_empty() {
+        return normalized;
     }
 
     if governed_action_summary.pending_approval_count > 0 {
@@ -2572,6 +2572,33 @@ fn foreground_assistant_delivery_text(
     }
 
     "No assistant response was generated.".to_string()
+}
+
+fn normalize_assistant_history_text(model_text: &str) -> String {
+    let mut current = model_text.trim();
+    loop {
+        if let Some(rest) = strip_history_prefix_once(current, "Assistant") {
+            current = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = current.strip_prefix("Assistant:") {
+            current = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    current.trim().to_string()
+}
+
+fn strip_history_prefix_once<'a>(text: &'a str, author: &str) -> Option<&'a str> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let closing = text.find(']')?;
+    let remainder = text.get(closing + 1..)?.trim_start();
+    let remainder = remainder.strip_prefix(author)?;
+    let remainder = remainder.strip_prefix(':')?;
+    Some(remainder.trim_start())
 }
 
 fn identity_kickstart_delivery_fallback(
@@ -2880,8 +2907,18 @@ fn is_ambiguous_identity_answer(normalized: &str) -> bool {
     trimmed.is_empty()
         || matches!(
             trimmed,
-            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no"
+            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no" | "sure" | "fine"
         )
+        || trimmed.contains("what are the options")
+        || trimmed.contains("what are my options")
+        || trimmed.contains("what's the next step")
+        || trimmed.contains("what is the next step")
+        || trimmed.contains("what's the next question")
+        || trimmed.contains("what is the next question")
+        || trimmed.contains("are you finished")
+        || trimmed.contains("are we finished")
+        || trimmed.contains("next question")
+        || trimmed.contains("next step")
 }
 
 async fn emit_typing_chat_action<D>(
@@ -3006,6 +3043,22 @@ mod tests {
             foreground_assistant_delivery_text("  Waiting on approval.  ", &summary, &[], &context),
             "Waiting on approval."
         );
+    }
+
+    #[test]
+    fn foreground_assistant_delivery_normalizes_prefixed_history_text() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
+        let normalized = foreground_assistant_delivery_text(
+            "[2026-05-07 12:00 UTC] Assistant: [2026-05-07 11:59 UTC] Assistant: Ready.",
+            &GovernedActionProcessingSummary::default(),
+            &[],
+            &context,
+        );
+        assert_eq!(normalized, "Ready.");
     }
 
     #[test]

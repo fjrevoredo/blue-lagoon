@@ -810,6 +810,7 @@ async fn model_call_records_are_persisted_and_visible_in_trace_report() -> Resul
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,
+            prompt_metrics: None,
             tool_policy: ToolPolicy::ProposalOnly,
             provider_hint: None,
         };
@@ -947,6 +948,7 @@ async fn model_call_payload_retention_clears_bulky_fields_but_keeps_metadata() -
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,
+            prompt_metrics: None,
             tool_policy: ToolPolicy::ProposalOnly,
             provider_hint: None,
         };

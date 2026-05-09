@@ -207,6 +207,24 @@ const CUSTOM_IDENTITY_STEPS: &[&str] = &[
     "relationship_to_user",
 ];
 
+const CUSTOM_IDENTITY_INTERVIEW_META_PHRASES: &[&str] = &[
+    "what are the options",
+    "what are my options",
+    "what are the choices",
+    "what is the next step",
+    "what's the next step",
+    "what is the next question",
+    "what's the next question",
+    "are you finished",
+    "are we finished",
+    "is that it",
+    "is this done",
+    "ok are you finished",
+    "continue",
+    "next question",
+    "next step",
+];
+
 pub async fn record_lifecycle_transition(
     pool: &PgPool,
     lifecycle: &NewIdentityLifecycle,
@@ -1258,9 +1276,49 @@ async fn apply_identity_interview_action_merge(
                 .as_object()
                 .cloned()
                 .unwrap_or_default();
+            let normalized_answer_text = match validate_custom_identity_interview_answer(
+                &answer.step_key,
+                &answer.answer_text,
+            ) {
+                Ok(normalized) => normalized,
+                Err(reason) => {
+                    continuity::update_merge_decision_outcome(
+                        pool,
+                        proposal.proposal_id,
+                        "rejected",
+                        &reason,
+                    )
+                    .await?;
+                    insert_identity_diagnostic(
+                        pool,
+                        &NewIdentityDiagnostic {
+                            identity_diagnostic_id: Uuid::now_v7(),
+                            diagnostic_kind: identity_interview_rejection_diagnostic_kind(
+                                &answer.step_key,
+                            )
+                            .to_string(),
+                            severity: "warning".to_string(),
+                            status: "open".to_string(),
+                            identity_item_id: None,
+                            proposal_id: Some(proposal.proposal_id),
+                            trace_id: Some(context.trace_id),
+                            message: reason.clone(),
+                            evidence_refs: json!([]),
+                            payload: json!({
+                                "proposal_id": proposal.proposal_id,
+                                "step_key": answer.step_key,
+                                "answer_text": answer.answer_text,
+                                "reason": reason,
+                            }),
+                        },
+                    )
+                    .await?;
+                    return Ok(reject(proposal.proposal_id, reason));
+                }
+            };
             answered_fields.insert(
                 answer.step_key.clone(),
-                Value::String(answer.answer_text.trim().to_string()),
+                Value::String(normalized_answer_text),
             );
             let answered_value = Value::Object(answered_fields.clone());
             let next_step = next_missing_step(&answered_fields);
@@ -1914,6 +1972,89 @@ fn custom_identity_step_prompt(step: &str) -> String {
     custom_identity_step_user_prompt(step).to_string()
 }
 
+fn validate_custom_identity_interview_answer(
+    step_key: &str,
+    answer_text: &str,
+) -> Result<String, String> {
+    let normalized = normalize_custom_identity_answer(answer_text);
+    if normalized.is_empty() {
+        return Err(format!(
+            "identity interview answer for step '{step_key}' was empty"
+        ));
+    }
+    if normalized.len() > 160 {
+        return Err(format!(
+            "identity interview answer for step '{step_key}' was too long"
+        ));
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    if is_meta_identity_interview_answer(&lowered) {
+        return Err(format!(
+            "identity interview answer for step '{step_key}' looked like process chatter instead of identity content"
+        ));
+    }
+
+    if normalized.contains('?') || starts_with_question_phrase(&lowered) {
+        return Err(format!(
+            "identity interview answer for step '{step_key}' looked like a question instead of an identity answer"
+        ));
+    }
+
+    if step_key == "name" {
+        let word_count = normalized.split_whitespace().count();
+        if normalized.len() < 2 || word_count > 5 {
+            return Err(
+                "identity interview answer for step 'name' was not a plausible assistant name"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_custom_identity_answer(answer_text: &str) -> String {
+    answer_text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_meta_identity_interview_answer(lowered: &str) -> bool {
+    matches!(
+        lowered,
+        "ok" | "okay" | "yes" | "no" | "sure" | "fine" | "done" | "hello" | "hi" | "hey" | "hmm"
+    ) || CUSTOM_IDENTITY_INTERVIEW_META_PHRASES
+        .iter()
+        .any(|phrase| lowered.contains(phrase))
+}
+
+fn starts_with_question_phrase(lowered: &str) -> bool {
+    [
+        "what ", "how ", "why ", "when ", "where ", "which ", "who ", "can ", "could ", "should ",
+        "do ", "does ", "did ", "is ", "are ", "will ", "would ",
+    ]
+    .iter()
+    .any(|prefix| lowered.starts_with(prefix))
+}
+
+fn identity_interview_rejection_diagnostic_kind(step_key: &str) -> &'static str {
+    if matches!(
+        step_key,
+        "name"
+            | "identity_form"
+            | "archetype_role"
+            | "temperament"
+            | "communication_style"
+            | "backstory"
+            | "age_framing"
+            | "values"
+            | "boundaries"
+    ) {
+        "identity_interview_suspicious_stable_field_answer"
+    } else {
+        "identity_interview_invalid_answer"
+    }
+}
+
 fn custom_identity_deltas_from_answers(
     answered_fields: &serde_json::Map<String, Value>,
     proposal: &CanonicalProposal,
@@ -2312,5 +2453,40 @@ fn reject(proposal_id: Uuid, reason: impl Into<String>) -> ProposalEvaluation {
         outcome: ProposalEvaluationOutcome::Rejected,
         reason: reason.into(),
         target: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_identity_answer_validation_rejects_process_chatter() {
+        let error =
+            validate_custom_identity_interview_answer("identity_form", "What are the options?")
+                .expect_err("process chatter should be rejected");
+        assert!(error.contains("process chatter"));
+    }
+
+    #[test]
+    fn custom_identity_answer_validation_normalizes_whitespace() {
+        let normalized = validate_custom_identity_interview_answer(
+            "communication_style",
+            "  direct   and   concise  ",
+        )
+        .expect("valid answer should be accepted");
+        assert_eq!(normalized, "direct and concise");
+    }
+
+    #[test]
+    fn identity_interview_rejection_diagnostic_kind_marks_stable_steps_as_suspicious() {
+        assert_eq!(
+            identity_interview_rejection_diagnostic_kind("name"),
+            "identity_interview_suspicious_stable_field_answer"
+        );
+        assert_eq!(
+            identity_interview_rejection_diagnostic_kind("likes"),
+            "identity_interview_invalid_answer"
+        );
     }
 }

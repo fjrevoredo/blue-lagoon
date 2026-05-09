@@ -158,6 +158,12 @@ timeline, edges, scheduling projection, and trace notes. `trace show --json`
 continues to emit the normalized `TraceReport`. `trace explain --json` emits a
 `TraceExplanationReport` with `diagnosis` and optional `focus`.
 
+When a trace includes retained foreground or background model-call payloads,
+`trace show --json` also exposes `ModelCallRequest.prompt_metrics`. For
+foreground calls this includes post-trim character totals for the system prompt,
+developer messages, user messages, assistant-history messages, estimated input
+tokens, and any trim events recorded during final prompt assembly.
+
 Focused inspection is conservative:
 
 - if the focused node exists, the payload is emitted together with an

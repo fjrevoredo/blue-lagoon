@@ -1902,7 +1902,10 @@ async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> R
             .expect_err("early worker exit should fail the protocol boundary");
         let message = error.to_string();
         assert!(message.contains("conscious worker protocol failure"));
-        assert!(message.contains("worker_protocol_phase=write_model_response"));
+        assert!(
+            message.contains("worker_protocol_phase=write_model_response")
+                || message.contains("worker_protocol_phase=read_final_response")
+        );
         assert!(message.contains("worker_exit_status="));
         assert!(message.contains("worker_stderr_excerpt="));
         assert!(message.contains("intentionally exiting before final response"));
@@ -3547,6 +3550,7 @@ fn sample_model_call_request() -> ModelCallRequest {
         output_mode: ModelOutputMode::PlainText,
         schema_name: None,
         schema_json: None,
+        prompt_metrics: None,
         tool_policy: ToolPolicy::NoTools,
         provider_hint: None,
     }

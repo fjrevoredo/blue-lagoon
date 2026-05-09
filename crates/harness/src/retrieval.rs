@@ -18,6 +18,23 @@ use crate::{
 };
 
 const RETRIEVAL_REFRESH_SCAN_MULTIPLIER: i64 = 4;
+const RETRIEVAL_NOISE_FRAGMENTS: &[&str] = &[
+    "do not propose multiple actions in a single response",
+    "approval requested. use the approval prompt above to continue",
+    "harness governed-action observation",
+    "harness governed-action observations",
+    "governed action system",
+    "if a governed action is needed, add at most one fenced",
+    "foreground response completed for",
+    "proposals evaluated=",
+    "canonical_writes=",
+    "governed_actions proposed=",
+    "worker protocol failed",
+    "internal runtime error while processing",
+    "unrecognized governed action kind",
+    "admin trace explain --trace-id",
+    "failure kind:",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RetrievalSourceKind {
@@ -247,6 +264,7 @@ async fn ensure_episode_retrieval_artifacts(
             e.episode_id,
             e.internal_conversation_ref,
             e.started_at,
+            COALESCE(e.outcome, e.status, '') AS outcome,
             COALESCE(e.summary, '') AS summary,
             COALESCE(
                 (
@@ -271,6 +289,8 @@ async fn ensure_episode_retrieval_artifacts(
         FROM episodes e
         WHERE e.internal_conversation_ref = $1
           AND e.started_at < $2
+          AND LOWER(COALESCE(e.outcome, e.status, '')) NOT LIKE '%fail%'
+          AND LOWER(COALESCE(e.outcome, e.status, '')) NOT LIKE '%error%'
         ORDER BY e.started_at DESC
         LIMIT $3
         "#,
@@ -291,11 +311,15 @@ async fn ensure_episode_retrieval_artifacts(
         let summary: String = row.get("summary");
         let user_message: String = row.get("user_message");
         let assistant_message: String = row.get("assistant_message");
-        let lexical_document = [summary, user_message, assistant_message]
-            .into_iter()
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let lexical_document = [
+            sanitize_retrieval_text(&summary, false),
+            sanitize_retrieval_text(&user_message, false),
+            sanitize_retrieval_text(&assistant_message, true),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
         if lexical_document.trim().is_empty() {
             continue;
         }
@@ -439,11 +463,18 @@ async fn fetch_retrieval_candidates(
             ra.internal_conversation_ref
         FROM retrieval_artifacts ra
         LEFT JOIN memory_artifacts ma ON ma.memory_artifact_id = ra.source_memory_artifact_id
+        LEFT JOIN episodes e ON e.episode_id = ra.source_episode_id
         WHERE ra.status = 'active'
           AND ra.internal_conversation_ref = $1
           AND ra.relevance_timestamp < $2
           AND (
-                (ra.source_kind = 'episode' AND ra.source_episode_id IS NOT NULL)
+                (
+                    ra.source_kind = 'episode'
+                    AND ra.source_episode_id IS NOT NULL
+                    AND e.episode_id IS NOT NULL
+                    AND LOWER(COALESCE(e.outcome, e.status, '')) NOT LIKE '%fail%'
+                    AND LOWER(COALESCE(e.outcome, e.status, '')) NOT LIKE '%error%'
+                )
                 OR (ra.source_kind = 'memory_artifact' AND ma.status = 'active')
           )
         ORDER BY ra.relevance_timestamp DESC, ra.retrieval_artifact_id DESC
@@ -489,6 +520,8 @@ fn score_candidates(
 ) -> Vec<ScoredCandidate> {
     let trigger_tokens = tokenize(trigger_text);
     let trigger_semantic_tokens = semantic_tokens(trigger_text);
+    let sparse_small_talk = is_sparse_small_talk_trigger(trigger_text, &trigger_tokens);
+    let sparse_follow_up = is_sparse_follow_up_trigger(trigger_text, &trigger_tokens);
 
     let mut scored = candidates
         .into_iter()
@@ -501,19 +534,41 @@ fn score_candidates(
                 .count();
             let same_conversation =
                 candidate.internal_conversation_ref.as_deref() == Some(internal_conversation_ref);
-            let score = lexical_match_count as i64 * 100
+            let lexical_score = if sparse_small_talk
+                && candidate.source_kind == RetrievalSourceKind::Episode
+                && !same_conversation
+            {
+                0
+            } else {
+                lexical_match_count as i64 * 100
+            };
+            let sparse_trigger_penalty = if sparse_small_talk
+                && candidate.source_kind == RetrievalSourceKind::Episode
+                && !same_conversation
+            {
+                120
+            } else if sparse_follow_up && candidate.source_kind == RetrievalSourceKind::Episode {
+                160
+            } else {
+                0
+            };
+            let score = lexical_score
                 + semantic_match_count as i64 * 40
                 + if same_conversation { 50 } else { 0 }
-                + recency_bonus(candidate.relevance_timestamp);
-            let relevance_reason = if lexical_match_count > 0 {
-                format!("lexical_match:{lexical_match_count}")
-            } else if semantic_match_count > 0 {
-                format!("semantic_match:{semantic_match_count}")
-            } else if same_conversation {
-                "same_conversation_recent".to_string()
-            } else {
-                "recency_only".to_string()
-            };
+                + recency_bonus(candidate.relevance_timestamp)
+                - sparse_trigger_penalty;
+            let relevance_reason =
+                if sparse_small_talk && same_conversation && lexical_match_count == 0 {
+                    "same_conversation_sparse_trigger".to_string()
+                } else if lexical_match_count > 0 {
+                    format!("lexical_match:{lexical_match_count}")
+                } else if semantic_match_count > 0 {
+                    format!("semantic_match:{semantic_match_count}")
+                } else if same_conversation {
+                    "same_conversation_recent".to_string()
+                } else {
+                    "recency_only".to_string()
+                };
 
             ScoredCandidate {
                 retrieval_artifact_id: candidate.retrieval_artifact_id,
@@ -611,12 +666,63 @@ async fn load_episode_context(
         episode_id: row.get("episode_id"),
         internal_conversation_ref: row.get("internal_conversation_ref"),
         started_at: row.get("started_at"),
-        summary: row.get("summary"),
+        summary: sanitize_retrieval_text(&row.get::<String, _>("summary"), false)
+            .unwrap_or_default(),
         latest_user_message: row.get("latest_user_message"),
-        latest_assistant_message: row.get("latest_assistant_message"),
+        latest_assistant_message: row
+            .get::<Option<String>, _>("latest_assistant_message")
+            .and_then(|value| sanitize_retrieval_text(&value, true)),
         outcome: row.get("outcome"),
         relevance_reason,
     })
+}
+
+fn sanitize_retrieval_text(value: &str, assistant_role: bool) -> Option<String> {
+    let normalized = if assistant_role {
+        normalize_assistant_history_text(value)
+    } else {
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || is_retrieval_noise_text(trimmed) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalize_assistant_history_text(value: &str) -> String {
+    let mut current = value.trim();
+    loop {
+        if let Some(rest) = strip_history_prefix_once(current, "Assistant") {
+            current = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = current.strip_prefix("Assistant:") {
+            current = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    current.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_history_prefix_once<'a>(text: &'a str, author: &str) -> Option<&'a str> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let closing = text.find(']')?;
+    let remainder = text.get(closing + 1..)?.trim_start();
+    let remainder = remainder.strip_prefix(author)?;
+    let remainder = remainder.strip_prefix(':')?;
+    Some(remainder.trim_start())
+}
+
+fn is_retrieval_noise_text(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    RETRIEVAL_NOISE_FRAGMENTS
+        .iter()
+        .any(|fragment| lowered.contains(fragment))
 }
 
 async fn load_memory_context(
@@ -744,6 +850,66 @@ fn recency_bonus(relevance_timestamp: DateTime<Utc>) -> i64 {
     20 - age_minutes.min(20)
 }
 
+fn is_sparse_small_talk_trigger(trigger_text: &str, trigger_tokens: &BTreeSet<String>) -> bool {
+    let compact = normalize_sparse_trigger_text(trigger_text);
+    trigger_tokens.len() <= 3
+        && matches!(
+            compact.as_str(),
+            "hi" | "hello"
+                | "hey"
+                | "hello again"
+                | "hi again"
+                | "hey again"
+                | "good morning"
+                | "good afternoon"
+                | "good evening"
+                | "thanks"
+                | "thank you"
+                | "ok"
+                | "okay"
+        )
+}
+
+fn is_sparse_follow_up_trigger(trigger_text: &str, trigger_tokens: &BTreeSet<String>) -> bool {
+    let compact = normalize_sparse_trigger_text(trigger_text);
+    (trigger_tokens.len() <= 3 || trigger_text.trim() == "?")
+        && matches!(
+            if trigger_text.trim() == "?" {
+                "?"
+            } else {
+                compact.as_str()
+            },
+            "yes"
+                | "yeah"
+                | "yep"
+                | "ok"
+                | "okay"
+                | "sure"
+                | "go ahead"
+                | "please do"
+                | "do it"
+                | "proceed"
+                | "?"
+        )
+}
+
+fn normalize_sparse_trigger_text(trigger_text: &str) -> String {
+    trigger_text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
@@ -823,6 +989,82 @@ mod tests {
     }
 
     #[test]
+    fn score_candidates_sparse_small_talk_prefers_recent_same_conversation_context() {
+        let now = Utc::now();
+        let distant_id = Uuid::now_v7();
+        let recent_id = Uuid::now_v7();
+        let scored = score_candidates(
+            vec![
+                RetrievalCandidate {
+                    retrieval_artifact_id: distant_id,
+                    source_kind: RetrievalSourceKind::Episode,
+                    source_episode_id: Some(Uuid::now_v7()),
+                    source_memory_artifact_id: None,
+                    lexical_document: "hello again old follow-up".to_string(),
+                    semantic_document: build_semantic_document(&["hello again old follow-up"]),
+                    relevance_timestamp: now - Duration::days(10),
+                    internal_conversation_ref: Some("telegram-archive".to_string()),
+                },
+                RetrievalCandidate {
+                    retrieval_artifact_id: recent_id,
+                    source_kind: RetrievalSourceKind::Episode,
+                    source_episode_id: Some(Uuid::now_v7()),
+                    source_memory_artifact_id: None,
+                    lexical_document: "recent local context".to_string(),
+                    semantic_document: build_semantic_document(&["recent local context"]),
+                    relevance_timestamp: now,
+                    internal_conversation_ref: Some("telegram-primary".to_string()),
+                },
+            ],
+            "hello again",
+            "telegram-primary",
+        );
+
+        assert_eq!(scored[0].retrieval_artifact_id, recent_id);
+        assert_eq!(
+            scored[0].relevance_reason,
+            "same_conversation_sparse_trigger"
+        );
+        assert_eq!(scored[1].retrieval_artifact_id, distant_id);
+    }
+
+    #[test]
+    fn score_candidates_sparse_confirmation_penalizes_episode_retrieval() {
+        let now = Utc::now();
+        let memory_id = Uuid::now_v7();
+        let episode_id = Uuid::now_v7();
+        let scored = score_candidates(
+            vec![
+                RetrievalCandidate {
+                    retrieval_artifact_id: episode_id,
+                    source_kind: RetrievalSourceKind::Episode,
+                    source_episode_id: Some(Uuid::now_v7()),
+                    source_memory_artifact_id: None,
+                    lexical_document: "weather follow-up".to_string(),
+                    semantic_document: build_semantic_document(&["weather follow-up"]),
+                    relevance_timestamp: now,
+                    internal_conversation_ref: Some("telegram-primary".to_string()),
+                },
+                RetrievalCandidate {
+                    retrieval_artifact_id: memory_id,
+                    source_kind: RetrievalSourceKind::MemoryArtifact,
+                    source_episode_id: None,
+                    source_memory_artifact_id: Some(Uuid::now_v7()),
+                    lexical_document: "user prefers concise replies".to_string(),
+                    semantic_document: build_semantic_document(&["user prefers concise replies"]),
+                    relevance_timestamp: now - Duration::minutes(1),
+                    internal_conversation_ref: Some("telegram-primary".to_string()),
+                },
+            ],
+            "yes",
+            "telegram-primary",
+        );
+
+        assert_eq!(scored[0].retrieval_artifact_id, memory_id);
+        assert_eq!(scored[1].retrieval_artifact_id, episode_id);
+    }
+
+    #[test]
     fn validate_retrieval_update_accepts_conversation_scoped_upsert() {
         let update = RetrievalUpdateProposal {
             update_id: Uuid::now_v7(),
@@ -855,6 +1097,34 @@ mod tests {
                 .to_string()
                 .contains("requires an internal_conversation_ref")
         );
+    }
+
+    #[test]
+    fn sanitize_retrieval_text_strips_prefixed_assistant_history() {
+        let sanitized = sanitize_retrieval_text(
+            "[2026-05-07 12:00 UTC] Assistant: [2026-05-07 11:59 UTC] Assistant: I found the page.",
+            true,
+        )
+        .expect("assistant text should be sanitized");
+        assert_eq!(sanitized, "I found the page.");
+    }
+
+    #[test]
+    fn sanitize_retrieval_text_drops_instruction_bleed() {
+        let sanitized = sanitize_retrieval_text(
+            "Do not propose multiple actions in a single response. Keep the reply outside the block.",
+            true,
+        );
+        assert!(sanitized.is_none());
+    }
+
+    #[test]
+    fn sanitize_retrieval_text_drops_operational_episode_summaries() {
+        let sanitized = sanitize_retrieval_text(
+            "foreground response completed for 234687044 | proposals evaluated=0, accepted=0, rejected=0, canonical_writes=0 | governed_actions proposed=0",
+            false,
+        );
+        assert!(sanitized.is_none());
     }
 
     fn sample_scored_candidate(source_kind: RetrievalSourceKind, score: i64) -> ScoredCandidate {

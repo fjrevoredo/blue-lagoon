@@ -13,17 +13,45 @@ use contracts::{
     IdentityDeltaProposal, IdentityInterviewAnswer, IdentityKickstartAction,
     IdentityKickstartActionKind, IdentityLifecycleState, IdentityReflectionOutput, LoopKind,
     MemoryArtifactProposal, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelCallResponse,
-    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, ProposalConflictPosture,
-    ProposalProvenance, ProposalProvenanceKind, RetrievalUpdateOperation, RetrievalUpdateProposal,
-    SelfModelObservationProposal, SmokeWorkerResult, ToolPolicy, UnconsciousContext,
-    UnconsciousJobKind, UnconsciousMaintenanceOutputs, UnconsciousWorkerRequest,
-    UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal, WorkerErrorCode, WorkerFailure,
-    WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult, predefined_identity_delta,
+    ModelInput, ModelInputMessage, ModelMessageRole, ModelOutputMode, PromptCompositionMetrics,
+    ProposalConflictPosture, ProposalProvenance, ProposalProvenanceKind, RetrievalUpdateOperation,
+    RetrievalUpdateProposal, SelfModelObservationProposal, SmokeWorkerResult, ToolPolicy,
+    UnconsciousContext, UnconsciousJobKind, UnconsciousMaintenanceOutputs,
+    UnconsciousWorkerRequest, UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal,
+    WorkerErrorCode, WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult,
+    predefined_identity_delta,
 };
 use serde::Serialize;
 
 const GOVERNED_ACTIONS_BLOCK_TAG: &str = "blue-lagoon-governed-actions";
 const IDENTITY_KICKSTART_BLOCK_TAG: &str = "blue-lagoon-identity-kickstart";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundMessageKind {
+    RecentHistoryUser,
+    RecentHistoryAssistant,
+    TriggerUser,
+    RecoveryNotice,
+    RetrievedContext,
+    ConfirmationBridge,
+    GovernedActionObservations,
+    GovernedActionInstructions,
+    TroubleshootingGuidance,
+    IdentityKickstartGuidance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForegroundMessageCandidate {
+    role: ModelMessageRole,
+    content: String,
+    kind: ForegroundMessageKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SparseConfirmationContext {
+    normalized_trigger: String,
+    antecedent_assistant_message: String,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "workers", about = "Blue Lagoon worker runtime")]
@@ -472,6 +500,7 @@ fn build_model_call_request(
     let token_budget = payload.context.trigger.budget.token_budget;
     let max_output_tokens = min(token_budget, 800);
     let max_input_tokens = max(1, token_budget.saturating_sub(max_output_tokens));
+    let (input, prompt_metrics) = build_model_input(&payload.context, max_input_tokens);
 
     ModelCallRequest {
         request_id: uuid::Uuid::now_v7(),
@@ -485,7 +514,8 @@ fn build_model_call_request(
             max_output_tokens,
             timeout_ms: payload.context.trigger.budget.wall_clock_budget_ms,
         },
-        input: build_model_input(&payload.context),
+        input,
+        prompt_metrics: Some(prompt_metrics),
         output_mode: ModelOutputMode::PlainText,
         schema_name: None,
         schema_json: None,
@@ -504,6 +534,8 @@ fn build_unconscious_model_call_request(
 
     let identity_reflection_output =
         payload.context.job_kind == UnconsciousJobKind::SelfModelReflection;
+    let input = build_unconscious_model_input(&payload.context);
+    let prompt_metrics = summarize_prompt_metrics(&input, Vec::new());
 
     ModelCallRequest {
         request_id: uuid::Uuid::now_v7(),
@@ -517,7 +549,8 @@ fn build_unconscious_model_call_request(
             max_output_tokens,
             timeout_ms: payload.context.budget.wall_clock_budget_ms,
         },
-        input: build_unconscious_model_input(&payload.context),
+        input,
+        prompt_metrics: Some(prompt_metrics),
         output_mode: if identity_reflection_output {
             ModelOutputMode::JsonObject
         } else {
@@ -558,42 +591,49 @@ fn identity_reflection_output_schema() -> serde_json::Value {
     })
 }
 
-fn build_model_input(context: &ConsciousContext) -> ModelInput {
+fn build_model_input(
+    context: &ConsciousContext,
+    max_input_tokens: u32,
+) -> (ModelInput, PromptCompositionMetrics) {
+    let sparse_confirmation = sparse_confirmation_context(context);
     let mut messages = Vec::new();
     for episode in context.recent_history.iter().rev() {
         if let Some(user_message) = &episode.user_message {
-            messages.push(ModelInputMessage {
+            messages.push(ForegroundMessageCandidate {
                 role: ModelMessageRole::User,
                 content: format_conversation_excerpt("User", episode.started_at, user_message),
+                kind: ForegroundMessageKind::RecentHistoryUser,
             });
         }
         if let Some(assistant_message) = &episode.assistant_message {
-            messages.push(ModelInputMessage {
-                role: ModelMessageRole::Assistant,
-                content: format_conversation_excerpt(
-                    "Assistant",
-                    episode.started_at,
-                    assistant_message,
-                ),
-            });
+            if let Some(content) =
+                format_assistant_conversation_excerpt(episode.started_at, assistant_message)
+            {
+                messages.push(ForegroundMessageCandidate {
+                    role: ModelMessageRole::Assistant,
+                    content,
+                    kind: ForegroundMessageKind::RecentHistoryAssistant,
+                });
+            }
         }
     }
 
     if let Some(trigger_text) = &context.trigger.ingress.text_body {
-        messages.push(ModelInputMessage {
+        messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::User,
             content: format_conversation_excerpt(
                 "User",
                 context.trigger.ingress.occurred_at,
                 trigger_text,
             ),
+            kind: ForegroundMessageKind::TriggerUser,
         });
     }
 
     if context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery
         && !context.recovery_context.ordered_ingress.is_empty()
     {
-        messages.push(ModelInputMessage {
+        messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
             content: format!(
                 "Recovery mode is backlog_recovery. Ordered delayed ingress batch: {}.",
@@ -611,16 +651,18 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
                         .collect::<Vec<_>>()
                 )
             ),
+            kind: ForegroundMessageKind::RecoveryNotice,
         });
     }
 
-    if !context.retrieved_context.items.is_empty() {
-        messages.push(ModelInputMessage {
+    if !context.retrieved_context.items.is_empty() && sparse_confirmation.is_none() {
+        messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
             content: format!(
                 "Retrieved canonical context: {}.",
                 retrieved_context_summary(&context.retrieved_context.items)
             ),
+            kind: ForegroundMessageKind::RetrievedContext,
         });
     }
 
@@ -635,29 +677,44 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
                 )
             })
             .unwrap_or_default();
-        messages.push(ModelInputMessage {
+        messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
             content: format!(
                 "Harness governed-action observations: {}.{} Continue the foreground turn using these outcomes. If another governed action is still needed, propose it in the same turn and let the harness decide whether it is allowed, approval-gated, or denied based on policy, the configured per-turn action limit, and the remaining loop budget. Do not claim that any follow-up action already happened unless it appears in the harness observations.",
                 governed_action_observation_summary(&context.governed_action_observations),
                 loop_state_fragment,
             ),
+            kind: ForegroundMessageKind::GovernedActionObservations,
         });
     } else {
-        messages.push(ModelInputMessage {
+        if let Some(confirmation) = &sparse_confirmation {
+            messages.push(ForegroundMessageCandidate {
+                role: ModelMessageRole::Developer,
+                content: sparse_confirmation_bridge_message(confirmation),
+                kind: ForegroundMessageKind::ConfirmationBridge,
+            });
+        }
+        messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
-            content: governed_action_schema_message(),
+            content: if should_include_full_governed_action_schema(context) {
+                governed_action_schema_message()
+            } else {
+                governed_action_reminder_message()
+            },
+            kind: ForegroundMessageKind::GovernedActionInstructions,
         });
         if should_include_troubleshooting_guidance(context) {
-            messages.push(ModelInputMessage {
+            messages.push(ForegroundMessageCandidate {
                 role: ModelMessageRole::Developer,
                 content: troubleshooting_guidance_message(),
+                kind: ForegroundMessageKind::TroubleshootingGuidance,
             });
         }
         if let Some(message) = identity_kickstart_schema_message(context) {
-            messages.push(ModelInputMessage {
+            messages.push(ForegroundMessageCandidate {
                 role: ModelMessageRole::Developer,
                 content: message,
+                kind: ForegroundMessageKind::IdentityKickstartGuidance,
             });
         }
     }
@@ -686,27 +743,38 @@ fn build_model_input(context: &ConsciousContext) -> ModelInput {
 
     let identity_fragment = identity_system_prompt_fragment(context);
 
-    ModelInput {
-        system_prompt: format!(
-            "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nOperational estimates from harness counters: load_estimate={load}%, health_estimate={health}%, confidence_estimate={confidence}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. When an action is required, never output only an action or payload name; emit the full tagged governed-action JSON block.",
-            name = foreground_label_or_default(&context.self_model.stable_identity, "blue-lagoon"),
-            role = foreground_label_or_default(&context.self_model.role, "personal_assistant"),
-            style = foreground_label_or_default(&context.self_model.communication_style, "direct"),
-            preferences = join_or_none_foreground(&context.self_model.preferences),
-            identity = identity_fragment,
-            capabilities = join_or_none_foreground(&context.self_model.capabilities),
-            constraints = join_or_none_foreground(&context.self_model.constraints),
-            goals = join_or_none_foreground(&context.self_model.current_goals),
-            subgoals = subgoals_fragment,
-            conditions = active_conditions_fragment,
-            current_time = current_time,
-            load = context.internal_state.load_pct,
-            health = context.internal_state.health_pct,
-            confidence = context.internal_state.confidence_pct,
-            mode = foreground_execution_mode_as_str(context.recovery_context.mode),
-        ),
-        messages,
-    }
+    let system_prompt = format!(
+        "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nOperational estimates from harness counters: load_estimate={load}%, health_estimate={health}%, confidence_estimate={confidence}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. When an action is required, never output only an action or payload name; emit the full tagged governed-action JSON block.",
+        name = foreground_label_or_default(&context.self_model.stable_identity, "blue-lagoon"),
+        role = foreground_label_or_default(&context.self_model.role, "personal_assistant"),
+        style = foreground_label_or_default(&context.self_model.communication_style, "direct"),
+        preferences = join_or_none_foreground(&context.self_model.preferences),
+        identity = identity_fragment,
+        capabilities = join_or_none_foreground(&context.self_model.capabilities),
+        constraints = join_or_none_foreground(&context.self_model.constraints),
+        goals = join_or_none_foreground(&context.self_model.current_goals),
+        subgoals = subgoals_fragment,
+        conditions = active_conditions_fragment,
+        current_time = current_time,
+        load = context.internal_state.load_pct,
+        health = context.internal_state.health_pct,
+        confidence = context.internal_state.confidence_pct,
+        mode = foreground_execution_mode_as_str(context.recovery_context.mode),
+    );
+    let trim_events =
+        enforce_foreground_input_budget(&system_prompt, &mut messages, max_input_tokens);
+    let input = ModelInput {
+        system_prompt,
+        messages: messages
+            .into_iter()
+            .map(|message| ModelInputMessage {
+                role: message.role,
+                content: message.content,
+            })
+            .collect(),
+    };
+    let prompt_metrics = summarize_prompt_metrics(&input, trim_events);
+    (input, prompt_metrics)
 }
 
 fn format_conversation_excerpt(
@@ -714,12 +782,177 @@ fn format_conversation_excerpt(
     occurred_at: chrono::DateTime<chrono::Utc>,
     text: &str,
 ) -> String {
+    let normalized_text = text.trim().to_string();
     format!(
         "[{}] {}: {}",
         occurred_at.format("%Y-%m-%d %H:%M UTC"),
         author,
-        text
+        normalized_text
     )
+}
+
+fn format_assistant_conversation_excerpt(
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    text: &str,
+) -> Option<String> {
+    let normalized_text = sanitize_assistant_history_excerpt_text(text)?;
+    Some(format!(
+        "[{}] Assistant: {}",
+        occurred_at.format("%Y-%m-%d %H:%M UTC"),
+        normalized_text
+    ))
+}
+
+fn enforce_foreground_input_budget(
+    system_prompt: &str,
+    messages: &mut Vec<ForegroundMessageCandidate>,
+    max_input_tokens: u32,
+) -> Vec<String> {
+    let mut trim_events = Vec::new();
+    loop {
+        let estimated_tokens = estimate_input_tokens(
+            system_prompt,
+            &messages
+                .iter()
+                .map(|message| ModelInputMessage {
+                    role: message.role,
+                    content: message.content.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        if estimated_tokens <= max_input_tokens {
+            break;
+        }
+
+        let Some((index, event)) = next_foreground_trim_candidate(messages) else {
+            break;
+        };
+        let removed = messages.remove(index);
+        trim_events.push(format!("{event}:{}chars", removed.content.chars().count()));
+    }
+    trim_events
+}
+
+fn next_foreground_trim_candidate(
+    messages: &[ForegroundMessageCandidate],
+) -> Option<(usize, String)> {
+    let priorities = [
+        ForegroundMessageKind::RetrievedContext,
+        ForegroundMessageKind::RecoveryNotice,
+        ForegroundMessageKind::TroubleshootingGuidance,
+        ForegroundMessageKind::RecentHistoryAssistant,
+        ForegroundMessageKind::RecentHistoryUser,
+    ];
+
+    for kind in priorities {
+        if let Some(index) = messages.iter().position(|message| message.kind == kind) {
+            return Some((
+                index,
+                format!("drop:{}", foreground_message_kind_label(kind)),
+            ));
+        }
+    }
+    None
+}
+
+fn foreground_message_kind_label(kind: ForegroundMessageKind) -> &'static str {
+    match kind {
+        ForegroundMessageKind::RecentHistoryUser => "recent_history_user",
+        ForegroundMessageKind::RecentHistoryAssistant => "recent_history_assistant",
+        ForegroundMessageKind::TriggerUser => "trigger_user",
+        ForegroundMessageKind::RecoveryNotice => "recovery_notice",
+        ForegroundMessageKind::RetrievedContext => "retrieved_context",
+        ForegroundMessageKind::ConfirmationBridge => "confirmation_bridge",
+        ForegroundMessageKind::GovernedActionObservations => "governed_action_observations",
+        ForegroundMessageKind::GovernedActionInstructions => "governed_action_instructions",
+        ForegroundMessageKind::TroubleshootingGuidance => "troubleshooting_guidance",
+        ForegroundMessageKind::IdentityKickstartGuidance => "identity_kickstart_guidance",
+    }
+}
+
+fn summarize_prompt_metrics(
+    input: &ModelInput,
+    trim_events: Vec<String>,
+) -> PromptCompositionMetrics {
+    let system_prompt_chars = input.system_prompt.chars().count() as u32;
+    let mut developer_message_chars = 0u32;
+    let mut user_message_chars = 0u32;
+    let mut assistant_message_chars = 0u32;
+
+    for message in &input.messages {
+        let char_count = message.content.chars().count() as u32;
+        match message.role {
+            ModelMessageRole::Developer => developer_message_chars += char_count,
+            ModelMessageRole::User => user_message_chars += char_count,
+            ModelMessageRole::Assistant => assistant_message_chars += char_count,
+            ModelMessageRole::System => {}
+        }
+    }
+
+    let total_message_chars =
+        developer_message_chars + user_message_chars + assistant_message_chars;
+    let trimmed_char_count = trim_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .rsplit_once(':')
+                .and_then(|(_, suffix)| suffix.strip_suffix("chars"))
+                .and_then(|digits| digits.parse::<u32>().ok())
+        })
+        .sum();
+    PromptCompositionMetrics {
+        system_prompt_chars,
+        developer_message_chars,
+        user_message_chars,
+        assistant_message_chars,
+        total_message_chars,
+        total_chars: system_prompt_chars + total_message_chars,
+        estimated_input_tokens: estimate_input_tokens(&input.system_prompt, &input.messages),
+        message_count: input.messages.len() as u32,
+        trimmed_message_count: trim_events.len() as u32,
+        trimmed_char_count,
+        trim_events,
+    }
+}
+
+fn estimate_input_tokens(system_prompt: &str, messages: &[ModelInputMessage]) -> u32 {
+    estimate_text_tokens(system_prompt)
+        + messages
+            .iter()
+            .map(|message| estimate_text_tokens(&message.content))
+            .sum::<u32>()
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
+    let chars = text.chars().count() as u32;
+    max(1, (chars.saturating_add(3)) / 4)
+}
+
+fn normalize_assistant_history_text(text: &str) -> String {
+    let mut current = text.trim();
+    loop {
+        if let Some(rest) = strip_history_prefix_once(current, "Assistant") {
+            current = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = current.strip_prefix("Assistant:") {
+            current = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    current.trim().to_string()
+}
+
+fn strip_history_prefix_once<'a>(text: &'a str, author: &str) -> Option<&'a str> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let closing = text.find(']')?;
+    let remainder = text.get(closing + 1..)?.trim_start();
+    let remainder = remainder.strip_prefix(author)?;
+    let remainder = remainder.strip_prefix(':')?;
+    Some(remainder.trim_start())
 }
 
 fn identity_system_prompt_fragment(context: &ConsciousContext) -> String {
@@ -791,6 +1024,120 @@ fn should_include_troubleshooting_guidance(context: &ConsciousContext) -> bool {
     troubleshooting_terms
         .iter()
         .any(|term| trigger_text.contains(term))
+}
+
+fn sparse_confirmation_context(context: &ConsciousContext) -> Option<SparseConfirmationContext> {
+    let trigger_text = context.trigger.ingress.text_body.as_deref()?;
+    let normalized_trigger = normalize_sparse_follow_up_trigger(trigger_text);
+    if !is_sparse_confirmation_trigger(&normalized_trigger)
+        && !is_retry_follow_up_trigger(&normalized_trigger)
+    {
+        return None;
+    }
+
+    let antecedent = context
+        .recent_history
+        .iter()
+        .filter_map(|episode| episode.assistant_message.as_deref())
+        .filter_map(sanitize_assistant_history_excerpt_text)
+        .next()?;
+    if !assistant_message_invites_confirmation(&antecedent)
+        && !assistant_message_invites_retry(&antecedent)
+    {
+        return None;
+    }
+
+    Some(SparseConfirmationContext {
+        normalized_trigger,
+        antecedent_assistant_message: antecedent,
+    })
+}
+
+fn normalize_sparse_follow_up_trigger(text: &str) -> String {
+    let compact = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let filler_prefixes = [
+        "well ", "uh ", "um ", "hmm ", "mm ", "so ", "right ", "please ",
+    ];
+    filler_prefixes
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .unwrap_or(&compact)
+        .to_string()
+}
+
+fn is_sparse_confirmation_trigger(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "yes"
+            | "yeah"
+            | "yep"
+            | "ok"
+            | "okay"
+            | "sure"
+            | "go ahead"
+            | "please do"
+            | "do it"
+            | "proceed"
+            | "why not"
+    )
+}
+
+fn is_retry_follow_up_trigger(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "try again"
+            | "try it again"
+            | "try it again properly"
+            | "try again properly"
+            | "do it properly"
+            | "send it properly"
+            | "do that properly"
+    )
+}
+
+fn assistant_message_invites_confirmation(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    [
+        "want me to",
+        "want me go ahead",
+        "do you want me to",
+        "should i",
+        "if you want me to",
+        "i'll need you to approve",
+        "approve a network-enabled action",
+        "approve a network enabled action",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn assistant_message_invites_retry(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("failed to produce a valid governed-action proposal")
+        || lowered.contains("failure kind: malformed_action_proposal")
+        || lowered.contains("couldn't complete that because the assistant failed")
+}
+
+fn sparse_confirmation_bridge_message(context: &SparseConfirmationContext) -> String {
+    format!(
+        "The current user message is a terse confirmation (`{}`) replying to the immediately preceding assistant prompt. Treat it as consent to continue the specific pending action implied by that prompt, not as a new standalone topic. Anchor on the latest assistant message: \"{}\". If continuing requires a governed action, respond normally to the user and append the governed-action JSON block for that specific action.",
+        context.normalized_trigger, context.antecedent_assistant_message
+    )
 }
 
 fn troubleshooting_guidance_message() -> String {
@@ -959,6 +1306,52 @@ Scope rules: filesystem.read_roots must be non-empty for subprocess/script actio
     template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
+fn governed_action_reminder_message() -> String {
+    format!(
+        "If a governed action is needed, add at most one fenced `{}` JSON block after the user-visible reply. Omit the block entirely when no action is needed.",
+        GOVERNED_ACTIONS_BLOCK_TAG
+    )
+}
+
+fn should_include_full_governed_action_schema(context: &ConsciousContext) -> bool {
+    if sparse_confirmation_context(context).is_some() {
+        return true;
+    }
+    if should_include_troubleshooting_guidance(context) {
+        return true;
+    }
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    let lowered = trigger_text.to_ascii_lowercase();
+    [
+        "http://",
+        "https://",
+        "fetch",
+        "search",
+        "look up",
+        "inspect",
+        "check",
+        "show",
+        "list",
+        "read",
+        "open",
+        "create",
+        "update",
+        "write",
+        "run ",
+        "execute",
+        "script",
+        "artifact",
+        "diagnostic",
+        "schedule",
+        "remind",
+        "later",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
     observations
         .iter()
@@ -991,9 +1384,12 @@ fn governed_action_loop_state_summary(
 }
 
 fn build_governed_action_proposals(
+    context: &ConsciousContext,
     model_text: &str,
 ) -> std::result::Result<Vec<GovernedActionProposal>, String> {
-    let Some(block_json) = extract_governed_action_block(model_text) else {
+    let Some(block_json) = extract_governed_action_block(model_text)
+        .or_else(|| extract_standalone_governed_action_payload(model_text))
+    else {
         return Ok(Vec::new());
     };
 
@@ -1002,9 +1398,11 @@ fn build_governed_action_proposals(
         actions: Vec<GovernedActionProposal>,
     }
 
-    let envelope: GovernedActionEnvelope = serde_json::from_str(block_json)
-        .map_err(|error| format!("invalid governed-action proposal block: {error}"))?;
-    Ok(envelope.actions)
+    match serde_json::from_str::<GovernedActionEnvelope>(block_json) {
+        Ok(envelope) => Ok(envelope.actions),
+        Err(primary_error) => build_legacy_governed_action_proposals(context, block_json)
+            .map_err(|_| format!("invalid governed-action proposal block: {primary_error}")),
+    }
 }
 
 fn validate_governed_action_response_shape(
@@ -1162,6 +1560,10 @@ fn infer_identity_interview_answer_from_trigger(
     if answer_text.is_empty() {
         return None;
     }
+    let normalized = normalize_identity_answer_intent(answer_text);
+    if is_ambiguous_identity_answer(&normalized) {
+        return None;
+    }
     Some(IdentityInterviewAnswer {
         step_key,
         answer_text: answer_text.to_string(),
@@ -1216,7 +1618,12 @@ fn identity_interview_action_proposal(
 
 fn strip_worker_control_blocks(model_text: &str) -> String {
     let without_identity = strip_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG);
-    strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG)
+    let without_governed = strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG);
+    if extract_standalone_governed_action_payload(&without_governed).is_some() {
+        String::new()
+    } else {
+        without_governed
+    }
 }
 
 fn detect_bare_governed_action_invocation(text: &str) -> Option<&str> {
@@ -1300,6 +1707,168 @@ fn strip_json_language_prefix(text: &str) -> &str {
         return rest.trim_start();
     }
     trimmed
+}
+
+fn extract_standalone_governed_action_payload(model_text: &str) -> Option<&str> {
+    let trimmed = strip_json_language_prefix(model_text).trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+
+    let looks_like_payload = trimmed.contains("\"governed-actions\"")
+        || (trimmed.contains("\"actions\"")
+            && (trimmed.contains("\"action_kind\"")
+                || trimmed.contains("\"payload\"")
+                || trimmed.contains("\"action\"")));
+    looks_like_payload.then_some(trimmed)
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyGovernedActionEnvelope {
+    #[serde(rename = "governed-actions")]
+    governed_actions: Option<LegacyGovernedActionWrapper>,
+    actions: Option<Vec<LegacyGovernedAction>>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyGovernedActionWrapper {
+    actions: Vec<LegacyGovernedAction>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyGovernedAction {
+    action: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyScheduleTaskParams {
+    task: Option<String>,
+    trigger: Option<String>,
+    delay_seconds: Option<u64>,
+    payload: Option<LegacyReminderPayload>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyReminderPayload {
+    message: Option<String>,
+}
+
+fn build_legacy_governed_action_proposals(
+    context: &ConsciousContext,
+    block_json: &str,
+) -> std::result::Result<Vec<GovernedActionProposal>, String> {
+    let envelope: LegacyGovernedActionEnvelope = serde_json::from_str(block_json)
+        .map_err(|error| format!("legacy governed-action parse failed: {error}"))?;
+    let actions = envelope
+        .governed_actions
+        .map(|wrapper| wrapper.actions)
+        .or(envelope.actions)
+        .ok_or_else(|| "legacy governed-action payload missing actions".to_string())?;
+
+    actions
+        .into_iter()
+        .map(|action| build_legacy_governed_action_proposal(context, action))
+        .collect()
+}
+
+fn build_legacy_governed_action_proposal(
+    context: &ConsciousContext,
+    action: LegacyGovernedAction,
+) -> std::result::Result<GovernedActionProposal, String> {
+    match action.action.as_str() {
+        "schedule_task" => {
+            let params: LegacyScheduleTaskParams = serde_json::from_value(action.params)
+                .map_err(|error| format!("legacy schedule_task params invalid: {error}"))?;
+            let trigger = params.trigger.unwrap_or_else(|| "relative".to_string());
+            if trigger != "relative" {
+                return Err(format!(
+                    "legacy schedule_task trigger '{trigger}' is unsupported"
+                ));
+            }
+
+            let delay_seconds = params.delay_seconds.unwrap_or(0);
+            if delay_seconds == 0 {
+                return Err(
+                    "legacy schedule_task delay_seconds must be greater than zero".to_string(),
+                );
+            }
+
+            let reminder_message = params
+                .payload
+                .and_then(|payload| payload.message)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| "Reminder".to_string());
+            let task_slug = params
+                .task
+                .unwrap_or_else(|| "reminder".to_string())
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('_')
+                .to_string();
+            let next_due_at = context.trigger.ingress.occurred_at
+                + chrono::Duration::seconds(delay_seconds as i64);
+
+            Ok(GovernedActionProposal {
+                proposal_id: uuid::Uuid::now_v7(),
+                title: "Schedule reminder".to_string(),
+                rationale: Some(
+                    "Converted legacy schedule_task reminder proposal into canonical scheduled foreground work."
+                        .to_string(),
+                ),
+                action_kind: contracts::GovernedActionKind::UpsertScheduledForegroundTask,
+                requested_risk_tier: None,
+                capability_scope: harness_native_governed_action_scope(),
+                payload: contracts::GovernedActionPayload::UpsertScheduledForegroundTask(
+                    contracts::UpsertScheduledForegroundTaskAction {
+                        task_key: format!(
+                            "oneoff_{}_{}",
+                            if task_slug.is_empty() { "reminder" } else { &task_slug },
+                            uuid::Uuid::now_v7().simple()
+                        ),
+                        title: "Reminder".to_string(),
+                        user_facing_prompt: reminder_message,
+                        next_due_at_utc: Some(next_due_at),
+                        cadence_seconds: 0,
+                        cooldown_seconds: Some(3600),
+                        internal_principal_ref: context
+                            .trigger
+                            .ingress
+                            .internal_principal_ref
+                            .clone(),
+                        internal_conversation_ref: context
+                            .trigger
+                            .ingress
+                            .internal_conversation_ref
+                            .clone(),
+                        active: true,
+                    },
+                ),
+            })
+        }
+        other => Err(format!("unsupported legacy governed action '{other}'")),
+    }
+}
+
+fn harness_native_governed_action_scope() -> contracts::CapabilityScope {
+    contracts::CapabilityScope {
+        filesystem: contracts::FilesystemCapabilityScope::default(),
+        network: contracts::NetworkAccessPosture::Disabled,
+        environment: contracts::EnvironmentCapabilityScope::default(),
+        execution: contracts::ExecutionCapabilityBudget {
+            timeout_ms: 0,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: 0,
+        },
+    }
 }
 
 fn strip_tagged_block(model_text: &str, tag: &str) -> String {
@@ -1432,8 +2001,10 @@ fn build_conscious_worker_response(
         &payload.context,
         &model_response.output.text,
     )?);
-    let governed_action_proposals = build_governed_action_proposals(&model_response.output.text)?;
-    let assistant_text = strip_worker_control_blocks(&model_response.output.text);
+    let governed_action_proposals =
+        build_governed_action_proposals(&payload.context, &model_response.output.text)?;
+    let assistant_text =
+        normalize_assistant_history_text(&strip_worker_control_blocks(&model_response.output.text));
     validate_governed_action_response_shape(
         &model_response.output.text,
         &assistant_text,
@@ -1937,14 +2508,15 @@ fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> Strin
         .enumerate()
         .map(|(index, item)| match item {
             contracts::RetrievedContextItem::Episode(episode) => {
-                let latest_messages = retrieved_episode_message_summary(episode);
+                let summary = compact_retrieved_context_text(&episode.summary, 160)
+                    .unwrap_or_else(|| "prior episode context".to_string());
+                let latest_messages = retrieved_episode_message_summary(episode, &summary);
                 format!(
-                    "{}. episode at {} ({}, relevance={}): {}{}",
+                    "{}. episode at {} (relevance={}): {}{}",
                     index + 1,
                     episode.started_at.format("%Y-%m-%d %H:%M UTC"),
-                    episode.outcome,
                     episode.relevance_reason,
-                    episode.summary,
+                    summary,
                     latest_messages
                 )
             }
@@ -1956,7 +2528,8 @@ fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> Strin
                     artifact.subject_ref,
                     artifact.validity_status,
                     artifact.relevance_reason,
-                    artifact.content_text
+                    compact_retrieved_context_text(&artifact.content_text, 160)
+                        .unwrap_or_else(|| "retained memory".to_string())
                 )
             }
         })
@@ -1964,13 +2537,20 @@ fn retrieved_context_summary(items: &[contracts::RetrievedContextItem]) -> Strin
         .join("\n")
 }
 
-fn retrieved_episode_message_summary(episode: &contracts::RetrievedEpisodeContext) -> String {
+fn retrieved_episode_message_summary(
+    episode: &contracts::RetrievedEpisodeContext,
+    summary: &str,
+) -> String {
     let mut parts = Vec::new();
-    if let Some(user_message) = non_empty_context_excerpt(&episode.latest_user_message) {
-        parts.push(format!("latest user: {user_message}"));
+    if let Some(user_message) = compact_optional_context_excerpt(&episode.latest_user_message, 72) {
+        parts.push(format!("user cue: {user_message}"));
     }
-    if let Some(assistant_message) = non_empty_context_excerpt(&episode.latest_assistant_message) {
-        parts.push(format!("latest assistant: {assistant_message}"));
+    if summary.len() < 48 {
+        if let Some(assistant_message) =
+            compact_optional_context_excerpt(&episode.latest_assistant_message, 56)
+        {
+            parts.push(format!("assistant cue: {assistant_message}"));
+        }
     }
     if parts.is_empty() {
         String::new()
@@ -1984,6 +2564,87 @@ fn non_empty_context_excerpt(value: &Option<String>) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn compact_optional_context_excerpt(value: &Option<String>, max_chars: usize) -> Option<String> {
+    non_empty_context_excerpt(value)
+        .and_then(|text| compact_retrieved_context_text(text, max_chars))
+}
+
+fn compact_retrieved_context_text(text: &str, max_chars: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let compact = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut shortened = compact.chars().take(max_chars).collect::<String>();
+    if compact.chars().count() > max_chars {
+        shortened.push_str("...");
+    }
+    Some(shortened)
+}
+
+fn sanitize_assistant_history_excerpt_text(text: &str) -> Option<String> {
+    let normalized = normalize_assistant_history_text(text);
+    if normalized.is_empty() || is_assistant_history_noise_text(&normalized) {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn is_assistant_history_noise_text(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    let noise_fragments = [
+        "do not propose multiple actions in a single response",
+        "if a governed action is needed, add at most one fenced",
+        "governed action system",
+        "approval requested. use the approval prompt above to continue",
+        "harness governed-action observation",
+        "harness governed-action observations",
+        "foreground response completed for",
+        "proposals evaluated=",
+        "canonical_writes=",
+        "governed_actions proposed=",
+        "worker protocol failed",
+        "internal runtime error while processing",
+    ];
+
+    noise_fragments
+        .iter()
+        .any(|fragment| lowered.contains(fragment))
+}
+
+fn normalize_identity_answer_intent(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn is_ambiguous_identity_answer(normalized: &str) -> bool {
+    let trimmed = normalized.trim();
+    trimmed.is_empty()
+        || matches!(
+            trimmed,
+            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no" | "sure" | "fine"
+        )
+        || trimmed.contains("what are the options")
+        || trimmed.contains("what are my options")
+        || trimmed.contains("what is the next step")
+        || trimmed.contains("what s the next step")
+        || trimmed.contains("what is the next question")
+        || trimmed.contains("what s the next question")
+        || trimmed.contains("are you finished")
+        || trimmed.contains("are we finished")
+        || trimmed.contains("next question")
+        || trimmed.contains("next step")
 }
 
 fn build_candidate_proposals(
@@ -2558,15 +3219,11 @@ mod tests {
                 .contains("Open task: fix context assembly.")
         );
         assert!(retrieved.content.contains("User asked for open tasks."));
+        assert!(retrieved.content.contains("user cue: what tasks are open?"));
         assert!(
             retrieved
                 .content
-                .contains("latest user: what tasks are open?")
-        );
-        assert!(
-            retrieved
-                .content
-                .contains("latest assistant: I will check the task list.")
+                .contains("assistant cue: I will check the task list.")
         );
         assert!(!retrieved.content.contains(&memory_id.to_string()));
         assert!(!retrieved.content.contains(&episode_id.to_string()));
@@ -3101,6 +3758,350 @@ mod tests {
             ))
         );
         assert_eq!(result.assistant_output.text, "Got it.");
+    }
+
+    #[test]
+    fn conscious_model_request_uses_short_governed_action_reminder_for_plain_chat() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("hello again".to_string());
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let developer_messages = model_request
+            .input
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelMessageRole::Developer)
+            .collect::<Vec<_>>();
+        assert!(
+            developer_messages
+                .iter()
+                .any(|message| { message.content.contains("add at most one fenced") })
+        );
+        assert!(
+            !developer_messages
+                .iter()
+                .any(|message| { message.content.contains("GOVERNED ACTION SYSTEM") })
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_keeps_full_governed_action_schema_for_action_requests() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("check the workspace artifacts".to_string());
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("GOVERNED ACTION SYSTEM"))
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_treats_sparse_confirmation_as_action_follow_up() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("yes".to_string());
+        context.recent_history = vec![contracts::EpisodeExcerpt {
+            episode_id: uuid::Uuid::now_v7(),
+            trace_id: uuid::Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            user_message: Some("get the current weather".to_string()),
+            assistant_message: Some(
+                "I can't access real-time weather data without approval. Want me to go ahead and ask for that?"
+                    .to_string(),
+            ),
+            outcome: "completed".to_string(),
+        }];
+        context.retrieved_context.items = vec![contracts::RetrievedContextItem::Episode(
+            contracts::RetrievedEpisodeContext {
+                episode_id: uuid::Uuid::now_v7(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                started_at: chrono::Utc::now(),
+                summary: "old weather discussion".to_string(),
+                latest_user_message: Some("yes".to_string()),
+                latest_assistant_message: Some("stale assistant cue".to_string()),
+                outcome: "completed".to_string(),
+                relevance_reason: "same_conversation_recent".to_string(),
+            },
+        )];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("terse confirmation (`yes`)"))
+        );
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("GOVERNED ACTION SYSTEM"))
+        );
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Retrieved canonical context"))
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_treats_well_yes_as_action_follow_up() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("well yes".to_string());
+        context.recent_history = vec![contracts::EpisodeExcerpt {
+            episode_id: uuid::Uuid::now_v7(),
+            trace_id: uuid::Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            user_message: Some("send me a reminder in 3 minutes".to_string()),
+            assistant_message: Some(
+                "I can create a scheduled foreground task. Want me to set that up?".to_string(),
+            ),
+            outcome: "completed".to_string(),
+        }];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("terse confirmation (`yes`)"))
+        );
+        assert!(
+            model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("GOVERNED ACTION SYSTEM"))
+        );
+    }
+
+    #[test]
+    fn conscious_model_request_includes_prompt_metrics() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let metrics = model_request
+            .prompt_metrics
+            .as_ref()
+            .expect("prompt metrics should be present");
+        assert!(metrics.system_prompt_chars > 0);
+        assert!(metrics.user_message_chars > 0);
+        assert_eq!(
+            metrics.message_count,
+            model_request.input.messages.len() as u32
+        );
+        assert!(metrics.estimated_input_tokens > 0);
+    }
+
+    #[test]
+    fn conscious_model_request_trims_retrieved_context_before_history() {
+        let mut context = sample_context();
+        context.trigger.budget.token_budget = 900;
+        context.retrieved_context.items = vec![contracts::RetrievedContextItem::Episode(
+            contracts::RetrievedEpisodeContext {
+                episode_id: uuid::Uuid::now_v7(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                started_at: chrono::Utc::now(),
+                summary: "Open task: ".to_string() + &"fix context assembly ".repeat(80),
+                latest_user_message: Some("what tasks are open?".to_string()),
+                latest_assistant_message: Some("I will check the task list.".to_string()),
+                outcome: "completed".to_string(),
+                relevance_reason: "same_conversation_recent".to_string(),
+            },
+        )];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Retrieved canonical context"))
+        );
+        let metrics = model_request
+            .prompt_metrics
+            .as_ref()
+            .expect("prompt metrics should be present");
+        assert!(
+            metrics
+                .trim_events
+                .iter()
+                .any(|event| event.contains("drop:retrieved_context"))
+        );
+    }
+
+    #[test]
+    fn retrieved_context_summary_compacts_long_episode_and_memory_text() {
+        let summary = retrieved_context_summary(&[
+            contracts::RetrievedContextItem::MemoryArtifact(
+                contracts::RetrievedMemoryArtifactContext {
+                    memory_artifact_id: uuid::Uuid::now_v7(),
+                    artifact_kind: "preference".to_string(),
+                    subject_ref: "user".to_string(),
+                    content_text: "Prefer concise summaries ".repeat(20),
+                    validity_status: "active".to_string(),
+                    relevance_reason: "semantic_match:2".to_string(),
+                },
+            ),
+            contracts::RetrievedContextItem::Episode(contracts::RetrievedEpisodeContext {
+                episode_id: uuid::Uuid::now_v7(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                started_at: chrono::Utc::now(),
+                summary: "Follow-up on open tasks ".repeat(20),
+                latest_user_message: Some("what tasks are open right now?".to_string()),
+                latest_assistant_message: Some(
+                    "I will check the task list and summarize the active items.".to_string(),
+                ),
+                outcome: "completed".to_string(),
+                relevance_reason: "same_conversation_recent".to_string(),
+            }),
+        ]);
+
+        assert!(summary.contains("Prefer concise summaries"));
+        assert!(summary.contains("user cue: what tasks are open right now?"));
+        assert!(summary.contains("..."));
+        assert!(!summary.contains("assistant cue:"));
+    }
+
+    #[test]
+    fn conscious_model_request_filters_instruction_bleed_from_assistant_history() {
+        let mut context = sample_context();
+        context.recent_history = vec![contracts::EpisodeExcerpt {
+            episode_id: uuid::Uuid::now_v7(),
+            trace_id: uuid::Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            user_message: Some("yes".to_string()),
+            assistant_message: Some(
+                "[2026-05-07 12:00 UTC] Assistant: Do not propose multiple actions in a single response."
+                    .to_string(),
+            ),
+            outcome: "completed".to_string(),
+        }];
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Do not propose multiple actions"))
+        );
+    }
+
+    #[test]
+    fn build_governed_action_proposals_converts_legacy_schedule_task_payload() {
+        let context = sample_context();
+        let model_text = r#"json
+{
+  "governed-actions": {
+    "version": "0.1.0",
+    "actions": [
+      {
+        "action": "schedule_task",
+        "params": {
+          "task": "remind_user",
+          "trigger": "relative",
+          "delay_seconds": 180,
+          "payload": {
+            "message": "3-minute reminder from Richard"
+          }
+        }
+      }
+    ]
+  }
+}"#;
+
+        let proposals = build_governed_action_proposals(&context, model_text)
+            .expect("legacy payload should convert");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].action_kind,
+            contracts::GovernedActionKind::UpsertScheduledForegroundTask
+        );
+        let contracts::GovernedActionPayload::UpsertScheduledForegroundTask(action) =
+            &proposals[0].payload
+        else {
+            panic!("expected scheduled foreground payload");
+        };
+        assert!(action.task_key.starts_with("oneoff_"));
+        assert_eq!(action.cadence_seconds, 0);
+        assert_eq!(action.user_facing_prompt, "3-minute reminder from Richard");
+    }
+
+    #[test]
+    fn strip_worker_control_blocks_removes_standalone_legacy_governed_action_payload() {
+        let model_text = r#"json
+{
+  "governed-actions": {
+    "version": "0.1.0",
+    "actions": [
+      {
+        "action": "schedule_task",
+        "params": {
+          "task": "remind_user",
+          "trigger": "relative",
+          "delay_seconds": 180
+        }
+      }
+    ]
+  }
+}"#;
+
+        assert!(strip_worker_control_blocks(model_text).is_empty());
+    }
+
+    #[test]
+    fn infer_identity_interview_answer_skips_ambiguous_trigger_text() {
+        let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("What are the options?".to_string());
+        context.self_model.identity_lifecycle = IdentityLifecycleContext {
+            state: IdentityLifecycleState::IdentityKickstartInProgress,
+            kickstart_available: true,
+            kickstart: Some(IdentityKickstartContext {
+                available_actions: vec![IdentityKickstartActionKind::AnswerCustomInterview],
+                next_step: Some("identity_form".to_string()),
+                resume_summary: Some("custom identity interview is in progress".to_string()),
+                predefined_templates: Vec::new(),
+            }),
+        };
+
+        assert!(infer_identity_interview_answer_from_trigger(&context).is_none());
     }
 
     #[test]

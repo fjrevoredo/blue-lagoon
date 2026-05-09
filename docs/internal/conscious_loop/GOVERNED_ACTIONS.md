@@ -32,7 +32,7 @@ created.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 888), `build_governed_action_proposals()` (line 993), `governed_action_kind_as_str()` (line 1334) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `governed_action_schema_message()` (line 1235), `governed_action_reminder_message()` (line 1309), `should_include_full_governed_action_schema()` (line 1316), `build_governed_action_proposals()` (line 1386), `extract_standalone_governed_action_payload()` (line 1712), `build_legacy_governed_action_proposals()` (line 1758), `governed_action_kind_as_str()` (line 1903) |
 | `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
@@ -68,8 +68,12 @@ The live governed-action enum contains these model-usable kinds:
 
 ### Proposal Format
 
-The worker injects the schema as a Developer message. The model may append one
-block tagged `blue-lagoon-governed-actions`:
+The worker injects governed-action instructions as a Developer message. For
+likely action-taking turns, troubleshooting turns, terse confirmation follow-ups
+such as `yes` or `well yes`, and retry-on-last-task follow-ups after a malformed
+action proposal, it sends the full schema; routine chat turns receive only the short reminder from
+`governed_action_reminder_message()`. When an action is needed, the model may
+append one block tagged `blue-lagoon-governed-actions`:
 
 ````json
 ```blue-lagoon-governed-actions
@@ -97,12 +101,21 @@ block tagged `blue-lagoon-governed-actions`:
 ```
 ````
 
-`build_governed_action_proposals()` extracts the last matching block. The
+`build_governed_action_proposals()` extracts the last matching tagged block. If
+no tagged block is present, it also recognizes a standalone JSON payload that
+is clearly intended as a governed-action proposal. The
 foreground orchestrator may continue through multiple governed-action rounds in
 the same foreground turn: the worker receives harness observations, may propose
 another action if one is still needed, and the harness then decides whether the
 next proposal is allowed, approval-gated, or denied under policy, remaining
 budgets, and the configured per-turn action cap.
+
+For compatibility hardening, the worker also translates one known legacy shape:
+a standalone or tagged `schedule_task` reminder payload under the old
+`"governed-actions"` wrapper is converted into the canonical
+`upsert_scheduled_foreground_task` proposal before harness validation. This is
+deliberately narrow and exists to recover from observed model regressions, not
+to preserve a second public schema.
 
 Read-only list and diagnostic payloads should include an explicit `limit`.
 For parser robustness, the contracts layer applies a bounded default of `10`
@@ -269,4 +282,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-07.*
+*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-09.*

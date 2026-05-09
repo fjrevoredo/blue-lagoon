@@ -981,6 +981,7 @@ mod tests {
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,
+            prompt_metrics: None,
             tool_policy: ToolPolicy::NoTools,
             provider_hint: None,
         }
