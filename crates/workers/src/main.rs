@@ -53,6 +53,91 @@ struct SparseConfirmationContext {
     antecedent_assistant_message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundContextScenario {
+    RoutineGreeting,
+    PlainFactualQuestion,
+    ExplicitActionRequest,
+    ContinuityPreferenceFollowUp,
+    ApprovalFollowUp,
+    TerseConfirmation,
+    NaturalLanguageConfirmation,
+    RetryAfterMalformedAction,
+    PostExecutionFollowUp,
+    ReminderScheduling,
+    Troubleshooting,
+    BacklogRecovery,
+}
+
+impl ForegroundContextScenario {
+    fn label(self) -> &'static str {
+        match self {
+            ForegroundContextScenario::RoutineGreeting => "routine_greeting",
+            ForegroundContextScenario::PlainFactualQuestion => "plain_factual_question",
+            ForegroundContextScenario::ExplicitActionRequest => "explicit_action_request",
+            ForegroundContextScenario::ContinuityPreferenceFollowUp => {
+                "continuity_preference_follow_up"
+            }
+            ForegroundContextScenario::ApprovalFollowUp => "approval_follow_up",
+            ForegroundContextScenario::TerseConfirmation => "terse_confirmation",
+            ForegroundContextScenario::NaturalLanguageConfirmation => {
+                "natural_language_confirmation"
+            }
+            ForegroundContextScenario::RetryAfterMalformedAction => "retry_after_malformed_action",
+            ForegroundContextScenario::PostExecutionFollowUp => "post_execution_follow_up",
+            ForegroundContextScenario::ReminderScheduling => "reminder_scheduling",
+            ForegroundContextScenario::Troubleshooting => "troubleshooting",
+            ForegroundContextScenario::BacklogRecovery => "backlog_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaDisclosureMode {
+    ShortReminder,
+    FullSchema,
+    GovernedActionObservations,
+}
+
+impl SchemaDisclosureMode {
+    fn label(self) -> &'static str {
+        match self {
+            SchemaDisclosureMode::ShortReminder => "short_reminder",
+            SchemaDisclosureMode::FullSchema => "full_schema",
+            SchemaDisclosureMode::GovernedActionObservations => "governed_action_observations",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForegroundContextPolicy {
+    scenario: ForegroundContextScenario,
+    retrieval_eligible: bool,
+    include_recovery_notice: bool,
+    include_troubleshooting_guidance: bool,
+    schema_disclosure: SchemaDisclosureMode,
+    inclusion_decisions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PromptCompositionDiagnostics {
+    context_scenario: Option<String>,
+    schema_disclosure: Option<String>,
+    retrieval_eligible: Option<bool>,
+    inclusion_decisions: Vec<String>,
+}
+
+impl ForegroundContextPolicy {
+    fn diagnostics(&self) -> PromptCompositionDiagnostics {
+        PromptCompositionDiagnostics {
+            context_scenario: Some(self.scenario.label().to_string()),
+            schema_disclosure: Some(self.schema_disclosure.label().to_string()),
+            retrieval_eligible: Some(self.retrieval_eligible),
+            inclusion_decisions: self.inclusion_decisions.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "workers", about = "Blue Lagoon worker runtime")]
 struct Cli {
@@ -535,7 +620,8 @@ fn build_unconscious_model_call_request(
     let identity_reflection_output =
         payload.context.job_kind == UnconsciousJobKind::SelfModelReflection;
     let input = build_unconscious_model_input(&payload.context);
-    let prompt_metrics = summarize_prompt_metrics(&input, Vec::new());
+    let prompt_metrics =
+        summarize_prompt_metrics(&input, Vec::new(), PromptCompositionDiagnostics::default());
 
     ModelCallRequest {
         request_id: uuid::Uuid::now_v7(),
@@ -591,11 +677,156 @@ fn identity_reflection_output_schema() -> serde_json::Value {
     })
 }
 
+fn foreground_context_policy(
+    context: &ConsciousContext,
+    sparse_confirmation: Option<&SparseConfirmationContext>,
+) -> ForegroundContextPolicy {
+    let scenario = classify_foreground_context(context, sparse_confirmation);
+    let include_recovery_notice =
+        context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery;
+    let include_troubleshooting_guidance = scenario == ForegroundContextScenario::Troubleshooting;
+    let retrieval_eligible = retrieval_eligible_for_scenario(context, scenario);
+    let schema_disclosure = schema_disclosure_for_scenario(context, scenario);
+    let mut inclusion_decisions = vec![
+        format!("scenario:{}", scenario.label()),
+        format!(
+            "retrieval:{}:{}",
+            if retrieval_eligible {
+                "included_if_available"
+            } else {
+                "excluded"
+            },
+            scenario.label()
+        ),
+        format!("schema:{}", schema_disclosure.label()),
+    ];
+    if include_recovery_notice {
+        inclusion_decisions.push("recovery_notice:included".to_string());
+    }
+    if include_troubleshooting_guidance {
+        inclusion_decisions.push("troubleshooting_guidance:included".to_string());
+    }
+    if context.governed_action_observations.is_empty() {
+        inclusion_decisions.push("governed_action_observations:absent".to_string());
+    } else {
+        inclusion_decisions.push("governed_action_observations:included".to_string());
+    }
+
+    ForegroundContextPolicy {
+        scenario,
+        retrieval_eligible,
+        include_recovery_notice,
+        include_troubleshooting_guidance,
+        schema_disclosure,
+        inclusion_decisions,
+    }
+}
+
+fn classify_foreground_context(
+    context: &ConsciousContext,
+    sparse_confirmation: Option<&SparseConfirmationContext>,
+) -> ForegroundContextScenario {
+    if !context.governed_action_observations.is_empty() {
+        return ForegroundContextScenario::PostExecutionFollowUp;
+    }
+    if context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery {
+        return ForegroundContextScenario::BacklogRecovery;
+    }
+    if let Some(confirmation) = sparse_confirmation {
+        if is_retry_follow_up_trigger(&confirmation.normalized_trigger) {
+            return ForegroundContextScenario::RetryAfterMalformedAction;
+        }
+        if is_natural_language_confirmation_trigger(context, &confirmation.normalized_trigger) {
+            return ForegroundContextScenario::NaturalLanguageConfirmation;
+        }
+        return ForegroundContextScenario::TerseConfirmation;
+    }
+    if context.trigger.ingress.approval_payload.is_some() {
+        return ForegroundContextScenario::ApprovalFollowUp;
+    }
+    if should_include_troubleshooting_guidance(context) {
+        return ForegroundContextScenario::Troubleshooting;
+    }
+    if is_continuity_preference_trigger(context) {
+        return ForegroundContextScenario::ContinuityPreferenceFollowUp;
+    }
+    if is_reminder_scheduling_trigger(context) {
+        return ForegroundContextScenario::ReminderScheduling;
+    }
+    if is_explicit_action_request_trigger(context) {
+        return ForegroundContextScenario::ExplicitActionRequest;
+    }
+    if is_routine_greeting_trigger(context) {
+        return ForegroundContextScenario::RoutineGreeting;
+    }
+    ForegroundContextScenario::PlainFactualQuestion
+}
+
+fn retrieval_eligible_for_scenario(
+    context: &ConsciousContext,
+    scenario: ForegroundContextScenario,
+) -> bool {
+    match scenario {
+        ForegroundContextScenario::ExplicitActionRequest
+        | ForegroundContextScenario::ContinuityPreferenceFollowUp
+        | ForegroundContextScenario::ReminderScheduling
+        | ForegroundContextScenario::Troubleshooting => true,
+        ForegroundContextScenario::BacklogRecovery => {
+            should_include_troubleshooting_guidance(context)
+                || is_continuity_preference_trigger(context)
+                || is_reminder_scheduling_trigger(context)
+                || is_explicit_action_request_trigger(context)
+        }
+        ForegroundContextScenario::RoutineGreeting
+        | ForegroundContextScenario::PlainFactualQuestion
+        | ForegroundContextScenario::ApprovalFollowUp
+        | ForegroundContextScenario::TerseConfirmation
+        | ForegroundContextScenario::NaturalLanguageConfirmation
+        | ForegroundContextScenario::RetryAfterMalformedAction
+        | ForegroundContextScenario::PostExecutionFollowUp => false,
+    }
+}
+
+fn schema_disclosure_for_scenario(
+    context: &ConsciousContext,
+    scenario: ForegroundContextScenario,
+) -> SchemaDisclosureMode {
+    if !context.governed_action_observations.is_empty() {
+        return SchemaDisclosureMode::GovernedActionObservations;
+    }
+    match scenario {
+        ForegroundContextScenario::ExplicitActionRequest
+        | ForegroundContextScenario::ApprovalFollowUp
+        | ForegroundContextScenario::TerseConfirmation
+        | ForegroundContextScenario::NaturalLanguageConfirmation
+        | ForegroundContextScenario::RetryAfterMalformedAction
+        | ForegroundContextScenario::ReminderScheduling
+        | ForegroundContextScenario::Troubleshooting => SchemaDisclosureMode::FullSchema,
+        ForegroundContextScenario::ContinuityPreferenceFollowUp => {
+            SchemaDisclosureMode::ShortReminder
+        }
+        ForegroundContextScenario::BacklogRecovery => {
+            if should_include_troubleshooting_guidance(context)
+                || is_reminder_scheduling_trigger(context)
+                || is_explicit_action_request_trigger(context)
+            {
+                SchemaDisclosureMode::FullSchema
+            } else {
+                SchemaDisclosureMode::ShortReminder
+            }
+        }
+        ForegroundContextScenario::RoutineGreeting
+        | ForegroundContextScenario::PlainFactualQuestion
+        | ForegroundContextScenario::PostExecutionFollowUp => SchemaDisclosureMode::ShortReminder,
+    }
+}
+
 fn build_model_input(
     context: &ConsciousContext,
     max_input_tokens: u32,
 ) -> (ModelInput, PromptCompositionMetrics) {
     let sparse_confirmation = sparse_confirmation_context(context);
+    let policy = foreground_context_policy(context, sparse_confirmation.as_ref());
     let mut messages = Vec::new();
     for episode in context.recent_history.iter().rev() {
         if let Some(user_message) = &episode.user_message {
@@ -606,9 +837,11 @@ fn build_model_input(
             });
         }
         if let Some(assistant_message) = &episode.assistant_message {
-            if let Some(content) =
-                format_assistant_conversation_excerpt(episode.started_at, assistant_message)
-            {
+            if let Some(content) = format_assistant_conversation_excerpt(
+                episode.started_at,
+                assistant_message,
+                &policy,
+            ) {
                 messages.push(ForegroundMessageCandidate {
                     role: ModelMessageRole::Assistant,
                     content,
@@ -630,9 +863,7 @@ fn build_model_input(
         });
     }
 
-    if context.recovery_context.mode == ForegroundExecutionMode::BacklogRecovery
-        && !context.recovery_context.ordered_ingress.is_empty()
-    {
+    if policy.include_recovery_notice && !context.recovery_context.ordered_ingress.is_empty() {
         messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
             content: format!(
@@ -655,7 +886,7 @@ fn build_model_input(
         });
     }
 
-    if !context.retrieved_context.items.is_empty() && sparse_confirmation.is_none() {
+    if policy.retrieval_eligible && !context.retrieved_context.items.is_empty() {
         messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
             content: format!(
@@ -666,7 +897,7 @@ fn build_model_input(
         });
     }
 
-    if !context.governed_action_observations.is_empty() {
+    if policy.schema_disclosure == SchemaDisclosureMode::GovernedActionObservations {
         let loop_state_fragment = context
             .governed_action_loop_state
             .as_ref()
@@ -696,14 +927,14 @@ fn build_model_input(
         }
         messages.push(ForegroundMessageCandidate {
             role: ModelMessageRole::Developer,
-            content: if should_include_full_governed_action_schema(context) {
+            content: if policy.schema_disclosure == SchemaDisclosureMode::FullSchema {
                 governed_action_schema_message()
             } else {
                 governed_action_reminder_message()
             },
             kind: ForegroundMessageKind::GovernedActionInstructions,
         });
-        if should_include_troubleshooting_guidance(context) {
+        if policy.include_troubleshooting_guidance {
             messages.push(ForegroundMessageCandidate {
                 role: ModelMessageRole::Developer,
                 content: troubleshooting_guidance_message(),
@@ -773,7 +1004,7 @@ fn build_model_input(
             })
             .collect(),
     };
-    let prompt_metrics = summarize_prompt_metrics(&input, trim_events);
+    let prompt_metrics = summarize_prompt_metrics(&input, trim_events, policy.diagnostics());
     (input, prompt_metrics)
 }
 
@@ -794,13 +1025,47 @@ fn format_conversation_excerpt(
 fn format_assistant_conversation_excerpt(
     occurred_at: chrono::DateTime<chrono::Utc>,
     text: &str,
+    policy: &ForegroundContextPolicy,
 ) -> Option<String> {
     let normalized_text = sanitize_assistant_history_excerpt_text(text)?;
+    if !should_replay_assistant_history(policy, &normalized_text) {
+        return None;
+    }
     Some(format!(
         "[{}] Assistant: {}",
         occurred_at.format("%Y-%m-%d %H:%M UTC"),
         normalized_text
     ))
+}
+
+fn should_replay_assistant_history(
+    policy: &ForegroundContextPolicy,
+    normalized_text: &str,
+) -> bool {
+    match policy.scenario {
+        ForegroundContextScenario::RoutineGreeting
+        | ForegroundContextScenario::PlainFactualQuestion => {
+            !is_stale_approval_or_failure_history(normalized_text)
+        }
+        _ => true,
+    }
+}
+
+fn is_stale_approval_or_failure_history(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    [
+        "approval requested",
+        "pending approval",
+        "approve a network-enabled action",
+        "approve a network enabled action",
+        "want me to go ahead",
+        "want me go ahead",
+        "failed to produce a valid governed-action proposal",
+        "failure kind: malformed_action_proposal",
+        "couldn't complete that because the assistant failed",
+    ]
+    .iter()
+    .any(|fragment| lowered.contains(fragment))
 }
 
 fn enforce_foreground_input_budget(
@@ -873,6 +1138,7 @@ fn foreground_message_kind_label(kind: ForegroundMessageKind) -> &'static str {
 fn summarize_prompt_metrics(
     input: &ModelInput,
     trim_events: Vec<String>,
+    diagnostics: PromptCompositionDiagnostics,
 ) -> PromptCompositionMetrics {
     let system_prompt_chars = input.system_prompt.chars().count() as u32;
     let mut developer_message_chars = 0u32;
@@ -912,6 +1178,10 @@ fn summarize_prompt_metrics(
         trimmed_message_count: trim_events.len() as u32,
         trimmed_char_count,
         trim_events,
+        context_scenario: diagnostics.context_scenario,
+        schema_disclosure: diagnostics.schema_disclosure,
+        retrieval_eligible: diagnostics.retrieval_eligible,
+        inclusion_decisions: diagnostics.inclusion_decisions,
     }
 }
 
@@ -1026,6 +1296,89 @@ fn should_include_troubleshooting_guidance(context: &ConsciousContext) -> bool {
         .any(|term| trigger_text.contains(term))
 }
 
+fn is_explicit_action_request_trigger(context: &ConsciousContext) -> bool {
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    let lowered = trigger_text.to_ascii_lowercase();
+    [
+        "http://",
+        "https://",
+        "fetch",
+        "search",
+        "look up",
+        "inspect",
+        "check",
+        "show",
+        "list",
+        "read",
+        "open",
+        "create",
+        "update",
+        "write",
+        "run ",
+        "execute",
+        "script",
+        "artifact",
+        "diagnostic",
+        "weather",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn is_continuity_preference_trigger(context: &ConsciousContext) -> bool {
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    let lowered = trigger_text.to_ascii_lowercase();
+    [
+        "remember",
+        "prefer",
+        "preference",
+        "stay concise",
+        "be direct",
+        "call me",
+        "from now on",
+        "keep in mind",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn is_reminder_scheduling_trigger(context: &ConsciousContext) -> bool {
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    let lowered = trigger_text.to_ascii_lowercase();
+    ["schedule", "remind", "reminder", "later", "tomorrow"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+fn is_routine_greeting_trigger(context: &ConsciousContext) -> bool {
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    let normalized = compact_sparse_trigger_text(trigger_text);
+    matches!(
+        normalized.as_str(),
+        "hello"
+            | "hi"
+            | "hey"
+            | "hello again"
+            | "hi again"
+            | "hey again"
+            | "hello richard"
+            | "hi richard"
+            | "hey richard"
+            | "hello again richard"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+    )
+}
+
 fn sparse_confirmation_context(context: &ConsciousContext) -> Option<SparseConfirmationContext> {
     let trigger_text = context.trigger.ingress.text_body.as_deref()?;
     let normalized_trigger = normalize_sparse_follow_up_trigger(trigger_text);
@@ -1054,8 +1407,21 @@ fn sparse_confirmation_context(context: &ConsciousContext) -> Option<SparseConfi
 }
 
 fn normalize_sparse_follow_up_trigger(text: &str) -> String {
-    let compact = text
-        .to_ascii_lowercase()
+    let compact = compact_sparse_trigger_text(text);
+    let filler_prefixes = [
+        "well ", "uh ", "um ", "hmm ", "mm ", "so ", "right ", "please ",
+    ];
+    filler_prefixes
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .unwrap_or(&compact)
+        .to_string()
+}
+
+fn compact_sparse_trigger_text(text: &str) -> String {
+    text.to_ascii_lowercase()
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
@@ -1067,17 +1433,17 @@ fn normalize_sparse_follow_up_trigger(text: &str) -> String {
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
-    let filler_prefixes = [
-        "well ", "uh ", "um ", "hmm ", "mm ", "so ", "right ", "please ",
-    ];
-    filler_prefixes
-        .iter()
-        .find_map(|prefix| compact.strip_prefix(prefix))
-        .map(str::trim)
-        .filter(|trimmed| !trimmed.is_empty())
-        .unwrap_or(&compact)
-        .to_string()
+        .join(" ")
+}
+
+fn is_natural_language_confirmation_trigger(
+    context: &ConsciousContext,
+    normalized_trigger: &str,
+) -> bool {
+    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
+        return false;
+    };
+    compact_sparse_trigger_text(trigger_text) != normalized_trigger
 }
 
 fn is_sparse_confirmation_trigger(normalized: &str) -> bool {
@@ -1311,45 +1677,6 @@ fn governed_action_reminder_message() -> String {
         "If a governed action is needed, add at most one fenced `{}` JSON block after the user-visible reply. Omit the block entirely when no action is needed.",
         GOVERNED_ACTIONS_BLOCK_TAG
     )
-}
-
-fn should_include_full_governed_action_schema(context: &ConsciousContext) -> bool {
-    if sparse_confirmation_context(context).is_some() {
-        return true;
-    }
-    if should_include_troubleshooting_guidance(context) {
-        return true;
-    }
-    let Some(trigger_text) = context.trigger.ingress.text_body.as_deref() else {
-        return false;
-    };
-    let lowered = trigger_text.to_ascii_lowercase();
-    [
-        "http://",
-        "https://",
-        "fetch",
-        "search",
-        "look up",
-        "inspect",
-        "check",
-        "show",
-        "list",
-        "read",
-        "open",
-        "create",
-        "update",
-        "write",
-        "run ",
-        "execute",
-        "script",
-        "artifact",
-        "diagnostic",
-        "schedule",
-        "remind",
-        "later",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
 }
 
 fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
@@ -2595,10 +2922,18 @@ fn sanitize_assistant_history_excerpt_text(text: &str) -> Option<String> {
 
 fn is_assistant_history_noise_text(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
+    let trimmed = value.trim();
+    let looks_like_control_payload = ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with("```") && trimmed.ends_with("```")))
+        && (lowered.contains("governed-action")
+            || lowered.contains("governed_actions")
+            || lowered.contains("blue-lagoon-governed-actions")
+            || lowered.contains("\"actions\""));
     let noise_fragments = [
         "do not propose multiple actions in a single response",
         "if a governed action is needed, add at most one fenced",
         "governed action system",
+        "blue-lagoon-governed-actions",
         "approval requested. use the approval prompt above to continue",
         "harness governed-action observation",
         "harness governed-action observations",
@@ -2610,9 +2945,10 @@ fn is_assistant_history_noise_text(value: &str) -> bool {
         "internal runtime error while processing",
     ];
 
-    noise_fragments
-        .iter()
-        .any(|fragment| lowered.contains(fragment))
+    looks_like_control_payload
+        || noise_fragments
+            .iter()
+            .any(|fragment| lowered.contains(fragment))
 }
 
 fn normalize_identity_answer_intent(text: &str) -> String {
@@ -3176,6 +3512,7 @@ mod tests {
     #[test]
     fn conscious_model_request_surfaces_retrieved_context_content_first() {
         let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("check what tasks are open".to_string());
         let memory_id = uuid::Uuid::now_v7();
         let episode_id = uuid::Uuid::now_v7();
         context.retrieved_context.items = vec![
@@ -3762,14 +4099,11 @@ mod tests {
 
     #[test]
     fn conscious_model_request_uses_short_governed_action_reminder_for_plain_chat() {
-        let mut context = sample_context();
-        context.trigger.ingress.text_body = Some("hello again".to_string());
-        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
-        let WorkerPayload::Conscious(payload) = &request.payload else {
-            panic!("expected conscious payload");
-        };
-
-        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("hello again")
+                .build(),
+        );
         let developer_messages = model_request
             .input
             .messages
@@ -3789,15 +4123,79 @@ mod tests {
     }
 
     #[test]
-    fn conscious_model_request_keeps_full_governed_action_schema_for_action_requests() {
-        let mut context = sample_context();
-        context.trigger.ingress.text_body = Some("check the workspace artifacts".to_string());
-        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
-        let WorkerPayload::Conscious(payload) = &request.payload else {
-            panic!("expected conscious payload");
-        };
+    fn routine_chat_golden_suppresses_polluted_retrieval_and_stale_approval_residue() {
+        let context = ConsciousContextFixture::new()
+            .with_trigger_text("hello again richard")
+            .with_recent_episode(
+                Some("get the current weather"),
+                Some(
+                    "I can fetch the weather if you approve a network-enabled action. Want me to go ahead?",
+                ),
+            )
+            .with_retrieved_episode("old weather discussion that should not return")
+            .build();
 
-        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_request = conscious_model_request_for_context(context);
+
+        assert_eq!(
+            golden_context_shape(&model_request),
+            "scenario=routine_greeting\nschema=short_reminder\nretrieval_eligible=Some(false)\nmessages=user,user,governed_action_short_reminder"
+        );
+        assert_no_message_kind(&model_request.input, "retrieved_context");
+        assert_no_message_kind(&model_request.input, "governed_action_full_schema");
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Want me to go ahead"))
+        );
+    }
+
+    #[test]
+    fn plain_factual_question_golden_uses_short_reminder_without_retrieval() {
+        let context = ConsciousContextFixture::new()
+            .with_trigger_text("what does continuity mean here?")
+            .with_retrieved_episode("unrelated old continuity episode")
+            .build();
+
+        let model_request = conscious_model_request_for_context(context);
+
+        assert_eq!(
+            golden_context_shape(&model_request),
+            "scenario=plain_factual_question\nschema=short_reminder\nretrieval_eligible=Some(false)\nmessages=user,assistant_history,user,governed_action_short_reminder"
+        );
+        assert_no_message_kind(&model_request.input, "retrieved_context");
+    }
+
+    #[test]
+    fn continuity_preference_follow_up_uses_retrieval_without_full_schema() {
+        let context = ConsciousContextFixture::new()
+            .with_trigger_text("can you stay concise in replies now?")
+            .with_retrieved_episode("remember that I prefer concise replies and be direct")
+            .build();
+
+        let model_request = conscious_model_request_for_context(context);
+
+        assert_eq!(
+            model_request
+                .prompt_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.context_scenario.as_deref()),
+            Some("continuity_preference_follow_up")
+        );
+        assert_has_message_kind(&model_request.input, "retrieved_context");
+        assert_has_message_kind(&model_request.input, "governed_action_short_reminder");
+        assert_no_message_kind(&model_request.input, "governed_action_full_schema");
+    }
+
+    #[test]
+    fn conscious_model_request_keeps_full_governed_action_schema_for_action_requests() {
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("check the workspace artifacts")
+                .build(),
+        );
         assert!(
             model_request
                 .input
@@ -3805,6 +4203,30 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("GOVERNED ACTION SYSTEM"))
         );
+    }
+
+    #[test]
+    fn action_request_golden_allows_retrieval_and_full_schema() {
+        for trigger in [
+            "get the current weather",
+            "check the workspace artifacts",
+            "send me a reminder in 3 minutes",
+        ] {
+            let model_request = conscious_model_request_for_context(
+                ConsciousContextFixture::new()
+                    .with_trigger_text(trigger)
+                    .with_retrieved_episode("directly relevant supporting context")
+                    .build(),
+            );
+            let metrics = model_request
+                .prompt_metrics
+                .as_ref()
+                .expect("prompt metrics should be present");
+            assert_eq!(metrics.schema_disclosure.as_deref(), Some("full_schema"));
+            assert_eq!(metrics.retrieval_eligible, Some(true));
+            assert_has_message_kind(&model_request.input, "retrieved_context");
+            assert_has_message_kind(&model_request.input, "governed_action_full_schema");
+        }
     }
 
     #[test]
@@ -3860,6 +4282,192 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("Retrieved canonical context"))
+        );
+    }
+
+    #[test]
+    fn confirmation_and_retry_golden_cases_anchor_on_antecedent_and_suppress_retrieval() {
+        for trigger in ["yes", "well yes", "go ahead"] {
+            let model_request = conscious_model_request_for_context(
+                ConsciousContextFixture::new()
+                    .with_trigger_text(trigger)
+                    .with_recent_episode(
+                        Some("get the current weather"),
+                        Some(
+                            "I can't access real-time weather data without approval. Want me to go ahead and ask for that?",
+                        ),
+                    )
+                    .with_retrieved_episode("stale weather retrieval")
+                    .build(),
+            );
+            assert_has_message_kind(&model_request.input, "confirmation_bridge");
+            assert_has_message_kind(&model_request.input, "governed_action_full_schema");
+            assert_no_message_kind(&model_request.input, "retrieved_context");
+        }
+
+        for trigger in ["try again", "try it again properly"] {
+            let model_request = conscious_model_request_for_context(
+                ConsciousContextFixture::new()
+                    .with_trigger_text(trigger)
+                    .with_recent_episode(
+                        Some("send me a reminder in 3 minutes"),
+                        Some(
+                            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal. Failure kind: malformed_action_proposal.",
+                        ),
+                    )
+                    .with_retrieved_episode("stale reminder retrieval")
+                    .build(),
+            );
+            assert_has_message_kind(&model_request.input, "confirmation_bridge");
+            assert_has_message_kind(&model_request.input, "governed_action_full_schema");
+            assert_no_message_kind(&model_request.input, "retrieved_context");
+        }
+    }
+
+    #[test]
+    fn post_execution_and_approval_golden_cases_have_distinct_context_shapes() {
+        let post_execution_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("continue")
+                .with_governed_observation()
+                .with_retrieved_episode("unrelated retrieval")
+                .build(),
+        );
+        assert_eq!(
+            post_execution_request
+                .prompt_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.context_scenario.as_deref()),
+            Some("post_execution_follow_up")
+        );
+        assert_has_message_kind(
+            &post_execution_request.input,
+            "governed_action_observations",
+        );
+        assert_no_message_kind(&post_execution_request.input, "governed_action_full_schema");
+        assert_no_message_kind(
+            &post_execution_request.input,
+            "governed_action_short_reminder",
+        );
+        assert_no_message_kind(&post_execution_request.input, "retrieved_context");
+
+        let approval_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("approved")
+                .with_approval_payload()
+                .with_retrieved_episode("stale approval retrieval")
+                .build(),
+        );
+        assert_eq!(
+            approval_request
+                .prompt_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.context_scenario.as_deref()),
+            Some("approval_follow_up")
+        );
+        assert_has_message_kind(&approval_request.input, "governed_action_full_schema");
+        assert_no_message_kind(&approval_request.input, "retrieved_context");
+    }
+
+    #[test]
+    fn backlog_recovery_golden_includes_recovery_notice() {
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("hello")
+                .with_backlog_recovery()
+                .build(),
+        );
+
+        assert_eq!(
+            model_request
+                .prompt_metrics
+                .as_ref()
+                .and_then(|metrics| metrics.context_scenario.as_deref()),
+            Some("backlog_recovery")
+        );
+        assert_has_message_kind(&model_request.input, "recovery_notice");
+        assert_no_message_kind(&model_request.input, "retrieved_context");
+    }
+
+    #[test]
+    fn foreground_classifier_assigns_expected_scenarios() {
+        let cases = [
+            ("hello", "routine_greeting"),
+            ("what does continuity mean here?", "plain_factual_question"),
+            (
+                "can you stay concise in replies now?",
+                "continuity_preference_follow_up",
+            ),
+            ("check the workspace artifacts", "explicit_action_request"),
+            ("send me a reminder tomorrow", "reminder_scheduling"),
+            ("show me the latest trace error", "troubleshooting"),
+        ];
+        for (trigger, expected) in cases {
+            let context = ConsciousContextFixture::new()
+                .with_trigger_text(trigger)
+                .build();
+            let sparse = sparse_confirmation_context(&context);
+            let policy = foreground_context_policy(&context, sparse.as_ref());
+            assert_eq!(policy.scenario.label(), expected, "trigger={trigger}");
+        }
+    }
+
+    #[test]
+    fn foreground_policy_records_inclusion_decisions_for_trace_metrics() {
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("show me the latest trace error")
+                .with_retrieved_episode("trace diagnostic context")
+                .build(),
+        );
+        let metrics = model_request
+            .prompt_metrics
+            .as_ref()
+            .expect("prompt metrics should be present");
+
+        assert_eq!(metrics.context_scenario.as_deref(), Some("troubleshooting"));
+        assert_eq!(metrics.schema_disclosure.as_deref(), Some("full_schema"));
+        assert_eq!(metrics.retrieval_eligible, Some(true));
+        assert!(
+            metrics
+                .inclusion_decisions
+                .contains(&"troubleshooting_guidance:included".to_string())
+        );
+        assert!(
+            metrics
+                .inclusion_decisions
+                .contains(&"retrieval:included_if_available:troubleshooting".to_string())
+        );
+    }
+
+    #[test]
+    fn rendering_suppresses_json_payloads_and_approval_boilerplate_when_unrelated() {
+        assert!(
+            sanitize_assistant_history_excerpt_text(
+                r#"```blue-lagoon-governed-actions
+{"actions":[]}
+```"#
+            )
+            .is_none()
+        );
+
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("hello")
+                .with_recent_episode(
+                    Some("please fetch this"),
+                    Some("Approval requested. Use the approval prompt above to continue."),
+                )
+                .build(),
+        );
+
+        assert_no_message_kind(&model_request.input, "assistant_history");
+        assert!(
+            !model_request
+                .input
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Approval requested"))
         );
     }
 
@@ -3924,6 +4532,7 @@ mod tests {
     #[test]
     fn conscious_model_request_trims_retrieved_context_before_history() {
         let mut context = sample_context();
+        context.trigger.ingress.text_body = Some("check what tasks are open".to_string());
         context.trigger.budget.token_budget = 900;
         context.retrieved_context.items = vec![contracts::RetrievedContextItem::Episode(
             contracts::RetrievedEpisodeContext {
@@ -4062,6 +4671,29 @@ mod tests {
         assert!(action.task_key.starts_with("oneoff_"));
         assert_eq!(action.cadence_seconds, 0);
         assert_eq!(action.user_facing_prompt, "3-minute reminder from Richard");
+    }
+
+    #[test]
+    fn build_governed_action_proposals_rejects_unsupported_legacy_payload() {
+        let context = sample_context();
+        let model_text = r#"json
+{
+  "governed-actions": {
+    "version": "0.1.0",
+    "actions": [
+      {
+        "action": "send_email",
+        "params": {
+          "to": "user@example.com"
+        }
+      }
+    ]
+  }
+}"#;
+
+        let error = build_governed_action_proposals(&context, model_text)
+            .expect_err("unsupported legacy action should fail closed");
+        assert!(error.contains("invalid governed-action proposal block"));
     }
 
     #[test]
@@ -4501,10 +5133,109 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct ConsciousContextFixture {
+        context: ConsciousContext,
+    }
+
+    impl ConsciousContextFixture {
+        fn new() -> Self {
+            Self {
+                context: sample_context_base(),
+            }
+        }
+
+        fn with_trigger_text(mut self, text: &str) -> Self {
+            self.context.trigger.ingress.text_body = Some(text.to_string());
+            self
+        }
+
+        fn with_recent_episode(
+            mut self,
+            user_message: Option<&str>,
+            assistant_message: Option<&str>,
+        ) -> Self {
+            self.context.recent_history = vec![contracts::EpisodeExcerpt {
+                episode_id: uuid::Uuid::now_v7(),
+                trace_id: uuid::Uuid::now_v7(),
+                started_at: fixed_test_time() - chrono::Duration::minutes(5),
+                user_message: user_message.map(str::to_string),
+                assistant_message: assistant_message.map(str::to_string),
+                outcome: "completed".to_string(),
+            }];
+            self
+        }
+
+        fn with_retrieved_episode(mut self, summary: &str) -> Self {
+            self.context.retrieved_context.items = vec![contracts::RetrievedContextItem::Episode(
+                contracts::RetrievedEpisodeContext {
+                    episode_id: uuid::Uuid::now_v7(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                    started_at: fixed_test_time() - chrono::Duration::days(1),
+                    summary: summary.to_string(),
+                    latest_user_message: Some("earlier user cue".to_string()),
+                    latest_assistant_message: Some("earlier assistant cue".to_string()),
+                    outcome: "completed".to_string(),
+                    relevance_reason: "same_conversation_recent".to_string(),
+                },
+            )];
+            self
+        }
+
+        fn with_governed_observation(mut self) -> Self {
+            self.context.governed_action_observations =
+                vec![contracts::GovernedActionObservation {
+                    observation_id: uuid::Uuid::now_v7(),
+                    action_kind: contracts::GovernedActionKind::WebFetch,
+                    outcome: contracts::GovernedActionExecutionOutcome {
+                        status: contracts::GovernedActionStatus::Executed,
+                        summary: "web fetch completed for https://example.com/".to_string(),
+                        fingerprint: None,
+                        output_ref: Some("execution_record:test".to_string()),
+                    },
+                }];
+            self
+        }
+
+        fn with_approval_payload(mut self) -> Self {
+            self.context.trigger.ingress.approval_payload = Some(contracts::ApprovalPayload {
+                token: "approval-token".to_string(),
+                callback_data: Some("approve:123".to_string()),
+            });
+            self
+        }
+
+        fn with_backlog_recovery(mut self) -> Self {
+            self.context.recovery_context.mode = ForegroundExecutionMode::BacklogRecovery;
+            self.context.recovery_context.ordered_ingress =
+                vec![contracts::OrderedIngressReference {
+                    ingress_id: self.context.trigger.ingress.ingress_id,
+                    external_message_id: self.context.trigger.ingress.external_message_id.clone(),
+                    occurred_at: self.context.trigger.ingress.occurred_at,
+                    text_body: self.context.trigger.ingress.text_body.clone(),
+                }];
+            self
+        }
+
+        fn build(self) -> ConsciousContext {
+            self.context
+        }
+    }
+
+    fn fixed_test_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-09T12:00:00Z")
+            .expect("fixed test timestamp should parse")
+            .with_timezone(&chrono::Utc)
+    }
+
     fn sample_context() -> ConsciousContext {
+        ConsciousContextFixture::new().build()
+    }
+
+    fn sample_context_base() -> ConsciousContext {
         ConsciousContext {
             context_id: uuid::Uuid::now_v7(),
-            assembled_at: chrono::Utc::now(),
+            assembled_at: fixed_test_time(),
             trigger: ForegroundTrigger {
                 trigger_id: uuid::Uuid::now_v7(),
                 trace_id: uuid::Uuid::now_v7(),
@@ -4520,7 +5251,7 @@ mod tests {
                     internal_principal_ref: "primary-user".to_string(),
                     internal_conversation_ref: "telegram-primary".to_string(),
                     event_kind: IngressEventKind::MessageCreated,
-                    occurred_at: chrono::Utc::now(),
+                    occurred_at: fixed_test_time(),
                     text_body: Some(
                         "remember that I prefer concise replies and be direct".to_string(),
                     ),
@@ -4530,7 +5261,7 @@ mod tests {
                     approval_payload: None,
                     raw_payload_ref: None,
                 },
-                received_at: chrono::Utc::now(),
+                received_at: fixed_test_time(),
                 deduplication_key: "telegram:update-42".to_string(),
                 budget: ForegroundBudget {
                     iteration_budget: 1,
@@ -4562,7 +5293,7 @@ mod tests {
             recent_history: vec![contracts::EpisodeExcerpt {
                 episode_id: uuid::Uuid::now_v7(),
                 trace_id: uuid::Uuid::now_v7(),
-                started_at: chrono::Utc::now(),
+                started_at: fixed_test_time() - chrono::Duration::minutes(10),
                 user_message: Some("older user".to_string()),
                 assistant_message: Some("older assistant".to_string()),
                 outcome: "completed".to_string(),
@@ -4577,6 +5308,81 @@ mod tests {
             }),
             recovery_context: contracts::ForegroundRecoveryContext::default(),
         }
+    }
+
+    fn conscious_model_request_for_context(context: ConsciousContext) -> ModelCallRequest {
+        let request = WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), context);
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        build_model_call_request(&request, payload.as_ref())
+    }
+
+    fn message_kind_label(message: &ModelInputMessage) -> &'static str {
+        match message.role {
+            ModelMessageRole::User => "user",
+            ModelMessageRole::Assistant => "assistant_history",
+            ModelMessageRole::Developer => {
+                if message.content.contains("Retrieved canonical context") {
+                    "retrieved_context"
+                } else if message
+                    .content
+                    .contains("Recovery mode is backlog_recovery")
+                {
+                    "recovery_notice"
+                } else if message.content.contains("terse confirmation") {
+                    "confirmation_bridge"
+                } else if message
+                    .content
+                    .contains("Harness governed-action observations")
+                {
+                    "governed_action_observations"
+                } else if message.content.contains("GOVERNED ACTION SYSTEM") {
+                    "governed_action_full_schema"
+                } else if message.content.contains("TROUBLESHOOTING CAPABILITY") {
+                    "troubleshooting_guidance"
+                } else if message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG) {
+                    "identity_kickstart_guidance"
+                } else {
+                    "governed_action_short_reminder"
+                }
+            }
+            ModelMessageRole::System => "system",
+        }
+    }
+
+    fn message_kind_labels(input: &ModelInput) -> Vec<&'static str> {
+        input.messages.iter().map(message_kind_label).collect()
+    }
+
+    fn assert_has_message_kind(input: &ModelInput, label: &str) {
+        assert!(
+            message_kind_labels(input).contains(&label),
+            "expected message kind {label}; got {:?}",
+            message_kind_labels(input)
+        );
+    }
+
+    fn assert_no_message_kind(input: &ModelInput, label: &str) {
+        assert!(
+            !message_kind_labels(input).contains(&label),
+            "unexpected message kind {label}; got {:?}",
+            message_kind_labels(input)
+        );
+    }
+
+    fn golden_context_shape(model_request: &ModelCallRequest) -> String {
+        let metrics = model_request
+            .prompt_metrics
+            .as_ref()
+            .expect("prompt metrics should be present");
+        format!(
+            "scenario={}\nschema={}\nretrieval_eligible={:?}\nmessages={}",
+            metrics.context_scenario.as_deref().unwrap_or("none"),
+            metrics.schema_disclosure.as_deref().unwrap_or("none"),
+            metrics.retrieval_eligible,
+            message_kind_labels(&model_request.input).join(",")
+        )
     }
 
     fn conscious_model_response(

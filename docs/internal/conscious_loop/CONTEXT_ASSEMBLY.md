@@ -22,8 +22,8 @@ pending actions - enters through this pipeline. Nothing else reaches the model.
 |---|---|
 | `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 206), assembly limit constants (lines 18-20) |
 | `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 185), `ensure_episode_retrieval_artifacts()` (line 255), `fetch_retrieval_candidates()` (line 448), `score_candidates()` (line 516), `load_episode_context()` (line 623), `sanitize_retrieval_text()` (line 680), `is_sparse_follow_up_trigger()` (line 873) |
-| `crates/workers/src/main.rs` | `build_model_input()` (line 594), `enforce_foreground_input_budget()` (line 806), `summarize_prompt_metrics()` (line 873), `format_conversation_excerpt()` (line 780), `sparse_confirmation_context()` (line 1029), `troubleshooting_guidance_message()` (line 1143), `identity_kickstart_schema_message()` (line 1167), `governed_action_schema_message()` (line 1235), `governed_action_reminder_message()` (line 1309), `should_include_full_governed_action_schema()` (line 1316), `is_foreground_visible_context_text()` (line 2430), `retrieved_context_summary()` (line 2505), `retrieved_episode_message_summary()` (line 2540), `sanitize_assistant_history_excerpt_text()` (line 2587) |
-| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105), `PromptCompositionMetrics` (line 1883), `ModelCallRequest.prompt_metrics` (line 1907) |
+| `crates/workers/src/main.rs` | `foreground_context_policy()` (line 680), `classify_foreground_context()` (line 725), `retrieval_eligible_for_scenario()` (line 765), `schema_disclosure_for_scenario()` (line 790), `build_model_input()` (line 824), `format_assistant_conversation_excerpt()` (line 1025), `enforce_foreground_input_budget()` (line 1071), `summarize_prompt_metrics()` (line 1138), `sparse_confirmation_context()` (line 1382), `troubleshooting_guidance_message()` (line 1509), `identity_kickstart_schema_message()` (line 1533), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1675), `is_foreground_visible_context_text()` (line 2757), `retrieved_context_summary()` (line 2832), `retrieved_episode_message_summary()` (line 2867), `sanitize_assistant_history_excerpt_text()` (line 2914) |
+| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105), `PromptCompositionMetrics` (line 1883), `ModelCallRequest.prompt_metrics` (line 1906) |
 | `config/self_model_seed.toml` | Bootstrap self-model and seed identity values |
 | `config/default.toml` | `harness.default_foreground_token_budget` |
 
@@ -41,6 +41,10 @@ Steps execute in order inside `assemble_foreground_context()`:
 5. Recent episode history fetched - up to `recent_history_limit` episodes before the trigger timestamp; each message truncated to `history_message_char_limit` characters, then labeled with author and UTC timestamp before model submission.
 6. Retrieved context assembled via `retrieval::assemble_retrieved_context()`.
    Episode retrieval refresh now skips failure/error outcomes, strips prefixed assistant-history wrappers, drops instruction-heavy or runtime-only text before lexical artifacts are created or reloaded into foreground context, and downranks sparse follow-up triggers such as `yes` or `go ahead` so they do not pull unrelated episode summaries into the foreground turn by default.
+7. Worker-side foreground scenario policy decides whether supplied retrieval is
+   eligible to be rendered. Routine greetings, plain factual questions,
+   confirmations, retries, approval callbacks, and post-execution continuation
+   calls suppress retrieved context even if the harness supplied candidates.
 
 ### `ModelInput` Structure
 
@@ -125,14 +129,32 @@ Foreground self-model text is passed through `is_foreground_visible_context_text
 
 ### Message Array Ordering
 
+Before rendering messages, `foreground_context_policy()` classifies the turn
+into one of these scenario labels:
+
+| Scenario label | Context posture |
+|---|---|
+| `routine_greeting` | Current greeting/check-in, compact sanitized history, no retrieval, short governed-action reminder |
+| `plain_factual_question` | Non-action question, compact sanitized history, no retrieval, short reminder |
+| `continuity_preference_follow_up` | User asks about or reinforces preferences, memory, naming, or interaction style; retrieval eligible, short reminder |
+| `explicit_action_request` | Direct governed-capability request, retrieval eligible, full action schema |
+| `approval_follow_up` | Approval callback/follow-up, no retrieval, full action schema if another proposal is needed |
+| `terse_confirmation` | Short confirmation anchored to the immediately preceding assistant prompt, no retrieval, full schema |
+| `natural_language_confirmation` | Filler-prefixed confirmation such as `well yes`, no retrieval, full schema |
+| `retry_after_malformed_action` | Short retry after malformed-action failure, no retrieval, full schema |
+| `post_execution_follow_up` | Same-turn continuation with governed-action observations, observation guidance replaces normal schema/reminder |
+| `reminder_scheduling` | Scheduling/reminder request, retrieval eligible, full action schema |
+| `troubleshooting` | Error/trace/log/diagnostic request, retrieval eligible, full schema plus troubleshooting guidance |
+| `backlog_recovery` | Ordered delayed ingress batch, recovery notice included; retrieval/schema posture follows explicit action or troubleshooting intent |
+
 Messages are appended in this order by `build_model_input()`:
 
 | # | Role | Content | Condition |
 |---|---|---|---|
-| 1..N | User / Assistant | Recent episode excerpts, oldest first (reversed from DB fetch), formatted as `[YYYY-MM-DD HH:MM UTC] Author: text` | Always, but assistant excerpts that normalize into instruction bleed or operational runtime summaries are dropped at prompt assembly time |
+| 1..N | User / Assistant | Recent episode excerpts, oldest first (reversed from DB fetch), formatted as `[YYYY-MM-DD HH:MM UTC] Author: text` | Always for user history; assistant excerpts that normalize into instruction bleed, operational runtime summaries, standalone control payloads, or stale approval/failure residue for independent routine turns are dropped at prompt assembly time |
 | N+1 | User | Current trigger `text_body`, formatted as `[YYYY-MM-DD HH:MM UTC] User: text` | Only if `text_body` is `Some` |
 | N+2 | Developer | Backlog recovery notice with ordered ingress batch | Only in `BacklogRecovery` mode with non-empty `ordered_ingress` |
-| N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with compact memory artifact text, concise episode summaries, timestamps, relevance reason, and short user/assistant cues only when useful; durable IDs are not included in the model-facing summary. Retrieval refresh and reload suppress failed/error episodes, instruction bleed, and normalized assistant-history prefixes before this text is surfaced. | Only if `retrieved_context.items` is non-empty and the current turn is not a sparse confirmation follow-up |
+| N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with compact memory artifact text, concise episode summaries, timestamps, relevance reason, and short user/assistant cues only when useful; durable IDs are not included in the model-facing summary. Retrieval refresh and reload suppress failed/error episodes, instruction bleed, and normalized assistant-history prefixes before this text is surfaced. | Only if `retrieved_context.items` is non-empty and scenario policy marks retrieval eligible |
 | N+4 | Developer | Governed action observations plus, when available, foreground action-loop state | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Sparse-confirmation bridge note that binds a terse trigger such as `yes` to the immediately preceding assistant prompt | If governed action observations are empty and `sparse_confirmation_context()` detects a recent assistant confirmation prompt |
 | N+5 (alt) | Developer | Full governed action schema or short governed-action reminder | If governed action observations are empty |
@@ -143,15 +165,15 @@ Messages are appended in this order by `build_model_input()`:
 
 When governed action observations are present, `build_model_input()` appends a Developer message that summarizes the observations, includes the current `ForegroundGovernedActionLoopState` when the harness supplied it, and explicitly tells the worker to continue the same foreground turn. The worker may propose another governed action in that same turn if it is still needed, but the harness remains the authority for whether the proposal is allowed, approval-gated, or denied under policy, the configured per-turn action cap, and the remaining loop budget.
 
-When governed action observations are absent, the worker no longer receives the full governed-action schema on every turn. `should_include_full_governed_action_schema()` now injects the full schema for likely action-taking turns, troubleshooting turns, and sparse confirmation follow-ups whose latest assistant antecedent was asking to proceed with a pending action. Routine chat turns receive the short reminder from `governed_action_reminder_message()` instead.
+When governed action observations are absent, the worker no longer receives the full governed-action schema on every turn. `schema_disclosure_for_scenario()` injects the full schema for explicit action requests, reminder scheduling, troubleshooting turns, approval follow-ups, sparse confirmations, natural-language confirmation variants, and malformed-action retries. Routine chat and plain factual turns receive the short reminder from `governed_action_reminder_message()` instead.
 
-`sparse_confirmation_context()` in `crates/workers/src/main.rs:1029` is the foreground guard for replies such as `yes`, `well yes`, `ok`, `sure`, `go ahead`, `please do`, or short retry utterances after a malformed action proposal. When the trigger is a terse confirmation or retry and the most recent assistant history message looks like a request to proceed, approve an action, or retry the previous task, prompt assembly adds a Developer bridge note and suppresses retrieved canonical context for that turn. This keeps the model anchored on the immediately preceding assistant question instead of replaying unrelated retrieval summaries.
+`sparse_confirmation_context()` in `crates/workers/src/main.rs:1382` is the foreground guard for replies such as `yes`, `well yes`, `ok`, `sure`, `go ahead`, `please do`, or short retry utterances after a malformed action proposal. When the trigger is a terse confirmation or retry and the most recent assistant history message looks like a request to proceed, approve an action, or retry the previous task, prompt assembly adds a Developer bridge note and suppresses retrieved canonical context for that turn. This keeps the model anchored on the immediately preceding assistant question instead of replaying unrelated retrieval summaries.
 
-Assistant history now has a prompt-time sanitation pass separate from persistence normalization. `sanitize_assistant_history_excerpt_text()` in `crates/workers/src/main.rs:2587` removes already-persisted instruction bleed and operational runtime summaries such as `foreground response completed for ...` before those lines can be replayed into later model calls through `recent_history`.
+Assistant history now has a prompt-time sanitation pass separate from persistence normalization. `sanitize_assistant_history_excerpt_text()` in `crates/workers/src/main.rs:2914` removes already-persisted instruction bleed, standalone governed-action control payloads, and operational runtime summaries such as `foreground response completed for ...` before those lines can be replayed into later model calls through `recent_history`. Scenario policy also suppresses stale approval and malformed-action residue for independent routine and factual turns.
 
-The worker now records prompt-composition metrics directly on each `ModelCallRequest` through `prompt_metrics`. These metrics include post-trim character counts for system prompt, developer messages, user messages, assistant-history messages, total estimated input tokens, and any trim events applied during final assembly. Because the full `ModelCallRequest` is already retained at the worker gateway boundary, these metrics become visible in retained trace payloads without a second prompt-analysis pass.
+The worker now records prompt-composition metrics directly on each `ModelCallRequest` through `prompt_metrics`. These metrics include post-trim character counts for system prompt, developer messages, user messages, assistant-history messages, total estimated input tokens, any trim events applied during final assembly, the scenario label, schema disclosure mode, retrieval eligibility, and high-level inclusion/exclusion decisions. Because the full `ModelCallRequest` is already retained at the worker gateway boundary, these metrics become visible in retained trace payloads without a second prompt-analysis pass.
 
-Troubleshooting is progressively disclosed by `should_include_troubleshooting_guidance()` in `crates/workers/src/main.rs:1000`. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:1143` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+Troubleshooting is progressively disclosed by scenario policy. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:1509` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
 
 Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2486` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2514`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. Both durable persistence and user delivery now normalize repeated `[... UTC] Assistant:` wrappers before storage so contaminated assistant-history prefixes do not recursively accumulate across turns. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
@@ -283,6 +305,20 @@ To feed a new data source into the model input:
 3. Consume it in `build_model_input()` (`main.rs`) — append a `Developer`-role message.
 4. Add a test in the foreground component suite.
 
+### Semantic Classification Boundary
+
+The current foreground assembly path is fully deterministic. No semantic
+classifier or unconscious-evaluation fallback is invoked in the hot path. If a
+future scenario cannot be classified from structured state, recent-turn topology,
+governed-action state, approval payloads, recovery mode, and bounded capability
+intent terms, the extension point is an optional bounded result consumed by
+`foreground_context_policy()`. Such a fallback must be opt-in for a named
+scenario boundary, must not directly render arbitrary model output into the
+prompt, and must record whether it was considered, invoked, skipped, or timed
+out in prompt or trace metadata. The default failure posture is to keep the
+deterministic scenario and ask the user for clarification rather than widening
+retrieval or schema disclosure by guesswork.
+
 ---
 
 ## 4. Further Reading
@@ -295,4 +331,4 @@ To feed a new data source into the model input:
 
 ---
 
-*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-09.*
+*Last verified: branch `further-optimizations`, session 2026-05-09.*

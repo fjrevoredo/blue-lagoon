@@ -352,6 +352,7 @@ fn configure_management_execution(config: &mut harness::config::RuntimeConfig) {
             provider: contracts::ModelProviderKind::ZAi,
             model: "z-ai-background".to_string(),
             api_base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
             api_key_env,
             timeout_ms: 20_000,
         },

@@ -32,7 +32,7 @@ created.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `governed_action_schema_message()` (line 1235), `governed_action_reminder_message()` (line 1309), `should_include_full_governed_action_schema()` (line 1316), `build_governed_action_proposals()` (line 1386), `extract_standalone_governed_action_payload()` (line 1712), `build_legacy_governed_action_proposals()` (line 1758), `governed_action_kind_as_str()` (line 1903) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1675), `build_governed_action_proposals()` (line 1713), `extract_standalone_governed_action_payload()` (line 2039), `build_legacy_governed_action_proposals()` (line 2085), `governed_action_kind_as_str()` (line 2230) |
 | `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
@@ -69,10 +69,11 @@ The live governed-action enum contains these model-usable kinds:
 ### Proposal Format
 
 The worker injects governed-action instructions as a Developer message. For
-likely action-taking turns, troubleshooting turns, terse confirmation follow-ups
-such as `yes` or `well yes`, and retry-on-last-task follow-ups after a malformed
-action proposal, it sends the full schema; routine chat turns receive only the short reminder from
-`governed_action_reminder_message()`. When an action is needed, the model may
+explicit action requests, reminder scheduling, troubleshooting turns, approval
+follow-ups, terse confirmation follow-ups such as `yes` or `well yes`, and
+retry-on-last-task follow-ups after a malformed action proposal, scenario policy
+sends the full schema; routine chat and plain factual turns receive only the
+short reminder from `governed_action_reminder_message()`. When an action is needed, the model may
 append one block tagged `blue-lagoon-governed-actions`:
 
 ````json
@@ -282,4 +283,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-09.*
+*Last verified: branch `further-optimizations`, session 2026-05-09.*

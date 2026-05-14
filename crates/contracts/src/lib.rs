@@ -1892,6 +1892,14 @@ pub struct PromptCompositionMetrics {
     pub trimmed_message_count: u32,
     pub trimmed_char_count: u32,
     pub trim_events: Vec<String>,
+    #[serde(default)]
+    pub context_scenario: Option<String>,
+    #[serde(default)]
+    pub schema_disclosure: Option<String>,
+    #[serde(default)]
+    pub retrieval_eligible: Option<bool>,
+    #[serde(default)]
+    pub inclusion_decisions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2606,6 +2614,10 @@ mod tests {
                 trimmed_message_count: 0,
                 trimmed_char_count: 0,
                 trim_events: Vec::new(),
+                context_scenario: Some("routine_greeting".to_string()),
+                schema_disclosure: Some("short_reminder".to_string()),
+                retrieval_eligible: Some(false),
+                inclusion_decisions: vec!["schema:short_reminder".to_string()],
             }),
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
