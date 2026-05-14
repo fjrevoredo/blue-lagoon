@@ -263,7 +263,7 @@ The next useful diagrams after this first set are:
 
 ## Related Documents
 
-- [docs/diagram-strategy.md](docs/diagram-strategy.md)
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)
-- [docs/LOOP_ARCHITECTURE.md](docs/LOOP_ARCHITECTURE.md)
-- [docs/IMPLEMENTATION_DESIGN.md](docs/IMPLEMENTATION_DESIGN.md)
+- [diagram-strategy.md](diagram-strategy.md)
+- [REQUIREMENTS.md](REQUIREMENTS.md)
+- [LOOP_ARCHITECTURE.md](LOOP_ARCHITECTURE.md)
+- [IMPLEMENTATION_DESIGN.md](IMPLEMENTATION_DESIGN.md)

@@ -144,34 +144,34 @@ consumed the budget on reasoning instead of emitting final assistant content.
 
 | Config key | Default | Valid range | Read by |
 |---|---|---|---|
-| `model_gateway.foreground.provider` | `z_ai` | `z_ai` or `openrouter` | `config.rs:209`, `config.rs:520` |
-| `model_gateway.foreground.model` | `z-ai-foreground` | non-empty exact provider model ID | `config.rs:209`, `config.rs:520` |
-| `model_gateway.foreground.reasoning_mode` | `off` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `config.rs:215`, `config.rs:1155` |
-| `model_gateway.foreground.api_base_url` | provider-specific | optional non-empty URL override | `config.rs:213`, `config.rs:1083` |
-| `model_gateway.foreground.api_key_env` | `BLUE_LAGOON_FOREGROUND_API_KEY` | non-empty environment variable name | `config.rs:216`, `config.rs:1069` |
-| `model_gateway.foreground.timeout_ms` | `60000` | integer greater than zero | `config.rs:217`, `model_gateway.rs:353`, `model_gateway.rs:385` |
-| `model_gateway.z_ai.api_surface` | `coding` | `general` or `coding` | `config.rs:245`, `config.rs:1099` |
-| `model_gateway.z_ai.api_base_url` | unset | optional non-empty URL | `config.rs:247`, `config.rs:1094` |
-| `model_gateway.openrouter.api_base_url` | `https://openrouter.ai/api/v1` | optional non-empty URL | `config.rs:260`, `config.rs:1106` |
-| `model_gateway.openrouter.http_referer` | unset | optional non-empty string | `config.rs:262`, `config.rs:1135` |
-| `model_gateway.openrouter.app_title` | unset | optional non-empty string | `config.rs:264`, `config.rs:1141` |
-| `model_gateway.openrouter.reasoning_effort` | unset | compatibility alias: `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `config.rs:266`, `config.rs:1163` |
-| `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `config.rs:268`, `config.rs:1211` |
+| `model_gateway.foreground.provider` | `z_ai` | `z_ai` or `openrouter` | `crates/harness/src/config.rs:209`, `crates/harness/src/config.rs:520` |
+| `model_gateway.foreground.model` | `z-ai-foreground` | non-empty exact provider model ID | `crates/harness/src/config.rs:209`, `crates/harness/src/config.rs:520` |
+| `model_gateway.foreground.reasoning_mode` | `off` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `crates/harness/src/config.rs:215`, `crates/harness/src/config.rs:1155` |
+| `model_gateway.foreground.api_base_url` | provider-specific | optional non-empty URL override | `crates/harness/src/config.rs:213`, `crates/harness/src/config.rs:1083` |
+| `model_gateway.foreground.api_key_env` | `BLUE_LAGOON_FOREGROUND_API_KEY` | non-empty environment variable name | `crates/harness/src/config.rs:216`, `crates/harness/src/config.rs:1069` |
+| `model_gateway.foreground.timeout_ms` | `60000` | integer greater than zero | `crates/harness/src/config.rs:217`, `crates/harness/src/model_gateway.rs:353`, `crates/harness/src/model_gateway.rs:385` |
+| `model_gateway.z_ai.api_surface` | `coding` | `general` or `coding` | `crates/harness/src/config.rs:245`, `crates/harness/src/config.rs:1099` |
+| `model_gateway.z_ai.api_base_url` | unset | optional non-empty URL | `crates/harness/src/config.rs:247`, `crates/harness/src/config.rs:1094` |
+| `model_gateway.openrouter.api_base_url` | `https://openrouter.ai/api/v1` | optional non-empty URL | `crates/harness/src/config.rs:260`, `crates/harness/src/config.rs:1106` |
+| `model_gateway.openrouter.http_referer` | unset | optional non-empty string | `crates/harness/src/config.rs:262`, `crates/harness/src/config.rs:1135` |
+| `model_gateway.openrouter.app_title` | unset | optional non-empty string | `crates/harness/src/config.rs:264`, `crates/harness/src/config.rs:1141` |
+| `model_gateway.openrouter.reasoning_effort` | unset | compatibility alias: `xhigh`, `high`, `medium`, `low`, `minimal`, `none` | `crates/harness/src/config.rs:266`, `crates/harness/src/config.rs:1163` |
+| `model_gateway.openrouter.exclude_reasoning` | unset | `true` or `false` | `crates/harness/src/config.rs:268`, `crates/harness/src/config.rs:1211` |
 
 > **NOT IMPLEMENTED:** There is no separate unconscious/background model route
 > today. `model_gateway.foreground.*` is the only configured route, and
 > `execute_background_model_call()` reuses that same resolved provider/model
-> after validating the request shape (`model_gateway.rs:204`,
-> `model_gateway.rs:219`).
+> after validating the request shape (`crates/harness/src/model_gateway.rs:204`,
+> `crates/harness/src/model_gateway.rs:219`).
 
 ### Environment Overrides
 
 | Environment variable | Default | Valid range | Read by |
 |---|---|---|---|
-| `BLUE_LAGOON_FOREGROUND_ROUTE` | unset | `<provider>/<exact-model>` | `config.rs:399`, `config.rs:651` |
-| `BLUE_LAGOON_FOREGROUND_REASONING_MODE` | unset | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `config.rs:404`, `config.rs:676` |
-| `BLUE_LAGOON_FOREGROUND_API_KEY` | unset | non-empty secret | `config.rs:1069` |
-| `BLUE_LAGOON_FOREGROUND_API_BASE_URL` | unset | non-empty URL | `config.rs:1083` |
+| `BLUE_LAGOON_FOREGROUND_ROUTE` | unset | `<provider>/<exact-model>` | `crates/harness/src/config.rs:399`, `crates/harness/src/config.rs:651` |
+| `BLUE_LAGOON_FOREGROUND_REASONING_MODE` | unset | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `provider_default` | `crates/harness/src/config.rs:404`, `crates/harness/src/config.rs:676` |
+| `BLUE_LAGOON_FOREGROUND_API_KEY` | unset | non-empty secret | `crates/harness/src/config.rs:1069` |
+| `BLUE_LAGOON_FOREGROUND_API_BASE_URL` | unset | non-empty URL | `crates/harness/src/config.rs:1083` |
 
 Direct `BLUE_LAGOON_FOREGROUND_API_KEY` takes precedence over the configured
 `api_key_env`. Direct `BLUE_LAGOON_FOREGROUND_API_BASE_URL` takes precedence
@@ -237,4 +237,4 @@ BLUE_LAGOON_FOREGROUND_API_KEY=<secret>
 
 ---
 
-Verified: 2026-05-07.
+Verified: 2026-05-14.

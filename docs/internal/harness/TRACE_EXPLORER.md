@@ -187,7 +187,7 @@ metadata required for trace correlation and conservative diagnosis.
 
 | Config key | Default | Valid range | Read by |
 |---|---:|---|---|
-| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `config.rs:130`, `worker.rs:200`, `worker.rs:380` |
+| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `crates/harness/src/config.rs:130`, `crates/harness/src/worker.rs:200`, `crates/harness/src/worker.rs:380` |
 
 To add a new traceable relationship:
 
@@ -229,4 +229,4 @@ To extend diagnosis:
 - `crates/runtime/src/admin.rs` contains the operator command parser and trace
   text/Mermaid renderers.
 
-Verified: 2026-05-07.
+Verified: 2026-05-14.

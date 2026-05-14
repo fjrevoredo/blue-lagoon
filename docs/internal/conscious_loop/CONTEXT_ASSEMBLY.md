@@ -62,15 +62,15 @@ details.
 
 ### Token Budget
 
-Computed in `build_model_call_request()` (`main.rs:489`):
+Computed in `build_model_call_request()` (`crates/workers/src/main.rs:489`):
 
 | Field | Value | Source |
 |---|---|---|
 | `token_budget` | `4_000` (default) | `config/default.toml: harness.default_foreground_token_budget` |
-| `max_output_tokens` | `min(token_budget, 800)` | `main.rs:494` |
-| `max_input_tokens` | `max(1, token_budget - max_output_tokens)` | `main.rs:495` |
+| `max_output_tokens` | `min(token_budget, 800)` | `crates/workers/src/main.rs:494` |
+| `max_input_tokens` | `max(1, token_budget - max_output_tokens)` | `crates/workers/src/main.rs:495` |
 
-The unconscious loop uses the same pattern but caps `max_output_tokens` at `1_200` (`main.rs:525`).
+The unconscious loop uses the same pattern but caps `max_output_tokens` at `1_200` (`crates/workers/src/main.rs:525`).
 
 Foreground prompt assembly now performs a final budget pass inside `build_model_input()`. The worker estimates input size with a coarse character-based token heuristic and trims low-priority context until the estimated foreground request fits `max_input_tokens` or no further safe trims remain. The trim order is deterministic:
 
@@ -84,7 +84,7 @@ The current trigger message, governed-action instructions, identity-kickstart gu
 
 ### System Prompt Template
 
-Constructed in `build_model_input()` at `main.rs:587`. Exact format:
+Constructed in `build_model_input()` at `crates/workers/src/main.rs:587`. Exact format:
 
 ```
 You are {stable_identity}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.
@@ -285,7 +285,7 @@ All three assembly limits live as constants in `crates/harness/src/context.rs:18
 
 ### Token Budget
 
-Change `harness.default_foreground_token_budget` in `config/local.toml` to override the default of `4_000`. The `max_output_tokens` cap of `800` is hardcoded in `main.rs:494` - raise it there if longer responses are needed (re-run the component test suite afterwards).
+Change `harness.default_foreground_token_budget` in `config/local.toml` to override the default of `4_000`. The `max_output_tokens` cap of `800` is hardcoded in `crates/workers/src/main.rs:494` - raise it there if longer responses are needed (re-run the component test suite afterwards).
 
 ### Self-Model Seed
 
@@ -331,4 +331,4 @@ retrieval or schema disclosure by guesswork.
 
 ---
 
-*Last verified: branch `further-optimizations`, session 2026-05-09.*
+*Last verified: 2026-05-14.*
