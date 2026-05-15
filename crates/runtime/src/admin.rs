@@ -8,18 +8,19 @@ use harness::{
     management::{
         self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
         BackgroundJobSummary, BackgroundRunNextOutcome, CalendarIntegrationRunSummary,
-        EnqueueBackgroundJobRequest, GovernedActionSummary, IdentityDiagnosticSummary,
-        IdentityEditProposalReport, IdentityEditProposalRequest, IdentityEditProposalSummary,
-        IdentityEditResolutionReport, IdentityEditResolutionRequest, IdentityHistorySummary,
-        IdentityResetReport, IdentityResetRequest, IdentityShowReport, IdentityStatusReport,
-        OperationalDiagnosticSummary, OperationalHealthSummary,
+        EmailIntegrationRunSummary, EnqueueBackgroundJobRequest, GovernedActionSummary,
+        IdentityDiagnosticSummary, IdentityEditProposalReport, IdentityEditProposalRequest,
+        IdentityEditProposalSummary, IdentityEditResolutionReport, IdentityEditResolutionRequest,
+        IdentityHistorySummary, IdentityResetReport, IdentityResetRequest, IdentityShowReport,
+        IdentityStatusReport, OperationalDiagnosticSummary, OperationalHealthSummary,
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
         ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
-        SuperviseWorkerLeasesRequest, TraceDiagnosisSummary, TraceExplanationReport,
-        TraceFocusPayloadAvailability, TraceFocusReport, TraceFocusSelector, TraceLookupRequest,
-        TraceReport, TraceSummary, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
-        WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
+        SuperviseWorkerLeasesRequest, TaskSyncRunSummary, TraceDiagnosisSummary,
+        TraceExplanationReport, TraceFocusPayloadAvailability, TraceFocusReport,
+        TraceFocusSelector, TraceLookupRequest, TraceReport, TraceSummary,
+        UpsertScheduledForegroundTaskRequest, WakeSignalSummary, WorkerLeaseInspectionSummary,
+        WorkspaceScriptRunSummary,
     },
 };
 
@@ -531,6 +532,9 @@ pub struct IntegrationsCommand {
 #[derive(Debug, Subcommand)]
 pub enum IntegrationsSubcommand {
     Calendar(CalendarIntegrationsCommand),
+    Email(EmailIntegrationsCommand),
+    #[command(name = "task-sync")]
+    TaskSync(TaskSyncIntegrationsCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -546,6 +550,48 @@ pub enum CalendarIntegrationsSubcommand {
 
 #[derive(Debug, Args)]
 pub struct CalendarIntegrationListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct EmailIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: EmailIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EmailIntegrationsSubcommand {
+    List(EmailIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct EmailIntegrationListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct TaskSyncIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: TaskSyncIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskSyncIntegrationsSubcommand {
+    List(TaskSyncIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskSyncIntegrationListCommand {
     #[arg(long, value_enum)]
     pub status: Option<GovernedActionStatusArg>,
     #[arg(long, default_value_t = management::default_list_limit())]
@@ -1009,6 +1055,28 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                     print_calendar_integration_runs(runs, command.json)?;
                 }
             },
+            IntegrationsSubcommand::Email(command) => match command.command {
+                EmailIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_email_integration_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_email_integration_runs(runs, command.json)?;
+                }
+            },
+            IntegrationsSubcommand::TaskSync(command) => match command.command {
+                TaskSyncIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_task_sync_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_task_sync_runs(runs, command.json)?;
+                }
+            },
         },
         AdminSubcommand::Workspace(command) => match command.command {
             WorkspaceSubcommand::Artifacts(command) => match command.command {
@@ -1411,6 +1479,26 @@ fn print_calendar_integration_runs(
     }
 
     println!("{}", render_calendar_integration_runs_text(&runs));
+    Ok(())
+}
+
+fn print_email_integration_runs(runs: Vec<EmailIntegrationRunSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_email_integration_runs_text(&runs));
+    Ok(())
+}
+
+fn print_task_sync_runs(runs: Vec<TaskSyncRunSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_task_sync_runs_text(&runs));
     Ok(())
 }
 
@@ -2097,6 +2185,80 @@ fn render_governed_actions_text(actions: &[GovernedActionSummary]) -> String {
 fn render_calendar_integration_runs_text(runs: &[CalendarIntegrationRunSummary]) -> String {
     if runs.is_empty() {
         return "No calendar integration runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_email_integration_runs_text(runs: &[EmailIntegrationRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No email integration runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_task_sync_runs_text(runs: &[TaskSyncRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No task sync runs.".to_string();
     }
 
     let mut output = String::new();
@@ -3399,6 +3561,46 @@ mod tests {
         .expect("sample calendar integration run should deserialize")
     }
 
+    fn sample_email_integration_run_summary() -> EmailIntegrationRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000121",
+            "trace_id": "00000000-0000-0000-0000-000000000122",
+            "execution_id": "00000000-0000-0000-0000-000000000123",
+            "approval_request_id": null,
+            "action_kind": "list_email_messages",
+            "risk_tier": "tier_1",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "mailbox=inbox query=subject:milestone max_results=10",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000123",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample email integration run should deserialize")
+    }
+
+    fn sample_task_sync_run_summary() -> TaskSyncRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000131",
+            "trace_id": "00000000-0000-0000-0000-000000000132",
+            "execution_id": "00000000-0000-0000-0000-000000000133",
+            "approval_request_id": null,
+            "action_kind": "sync_task_list",
+            "risk_tier": "tier_2",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "title=Milestone Tasks items=2 external_list_id=new workspace_artifact_id=none",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000133",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample task sync run should deserialize")
+    }
+
     fn sample_workspace_run_summary() -> WorkspaceScriptRunSummary {
         serde_json::from_value(json!({
             "workspace_script_run_id": "00000000-0000-0000-0000-000000000021",
@@ -3707,6 +3909,68 @@ mod tests {
     }
 
     #[test]
+    fn phase_five_admin_parser_accepts_email_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "email",
+            "list",
+            "--status",
+            "failed",
+            "--limit",
+            "3",
+        ])
+        .expect("email integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::Email(EmailIntegrationsCommand {
+                        command: EmailIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 3);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Failed)
+                ));
+            }
+            other => panic!("expected email integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_task_sync_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "task-sync",
+            "list",
+            "--status",
+            "executed",
+            "--limit",
+            "4",
+        ])
+        .expect("task sync integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::TaskSync(TaskSyncIntegrationsCommand {
+                        command: TaskSyncIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 4);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Executed)
+                ));
+            }
+            other => panic!("expected task sync integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn phase_six_admin_parser_accepts_recovery_checkpoint_filters() {
         let command = AdminCommand::try_parse_from([
             "runtime",
@@ -3942,6 +4206,18 @@ mod tests {
         assert!(rendered.contains("principal=primary-user"));
         assert!(rendered.contains("conversation=telegram-primary"));
         assert!(rendered.contains("request: window=2026-05-20"));
+    }
+
+    #[test]
+    fn render_email_and_task_sync_runs_text_include_request_and_scope() {
+        let email_rendered =
+            render_email_integration_runs_text(&[sample_email_integration_run_summary()]);
+        assert!(email_rendered.contains("kind=list_email_messages"));
+        assert!(email_rendered.contains("request: mailbox=inbox"));
+
+        let task_rendered = render_task_sync_runs_text(&[sample_task_sync_run_summary()]);
+        assert!(task_rendered.contains("kind=sync_task_list"));
+        assert!(task_rendered.contains("request: title=Milestone Tasks"));
     }
 
     #[test]

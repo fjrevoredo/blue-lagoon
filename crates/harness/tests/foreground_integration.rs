@@ -3,14 +3,14 @@ mod support;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
-    ApprovalRequestStatus, CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload,
-    CanonicalTargetKind, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
-    ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
-    GovernedActionKind, GovernedActionPayload, GovernedActionProposal, GovernedActionRiskTier,
-    IdentityDeltaProposal, IdentityInterviewAnswer, IdentityKickstartAction,
-    IdentityLifecycleState, IngressAttachmentProcessingStatus, ModelProviderKind,
-    NetworkAccessPosture, ProcessIngressAttachmentAction, ProposalConflictPosture,
-    ProposalProvenance, ProposalProvenanceKind, SubprocessAction,
+    ApprovalRequestStatus, ApprovalResolutionDecision, CanonicalProposal, CanonicalProposalKind,
+    CanonicalProposalPayload, CanonicalTargetKind, CapabilityScope, ChannelKind,
+    EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
+    GovernedActionFingerprint, GovernedActionKind, GovernedActionPayload, GovernedActionProposal,
+    GovernedActionRiskTier, IdentityDeltaProposal, IdentityInterviewAnswer,
+    IdentityKickstartAction, IdentityLifecycleState, IngressAttachmentProcessingStatus,
+    ModelProviderKind, NetworkAccessPosture, ProcessIngressAttachmentAction,
+    ProposalConflictPosture, ProposalProvenance, ProposalProvenanceKind, SubprocessAction,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
@@ -427,13 +427,22 @@ async fn telegram_callback_fixture_runtime_run_resolves_pending_approval() -> Re
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Runtime callback approval"
+            "Approval approved: Runtime callback approval\nState: approved\nNext: running the approved action now."
         );
 
         let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
             .await?
             .expect("approval request should still be queryable");
         assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Approved)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
         Ok(())
     })
     .await
@@ -486,13 +495,158 @@ async fn telegram_command_fixture_runtime_run_resolves_pending_approval() -> Res
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Runtime command approval"
+            "Approval approved: Runtime command approval\nState: approved\nNext: running the approved action now."
         );
 
         let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
             .await?
             .expect("approval request should still be queryable");
         assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Approved)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_callback_fixture_runtime_run_rejects_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-callback-reject".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime callback rejection".to_string(),
+                consequence_summary: "Used to verify runtime callback reject routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_callback_reject.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approval rejected: Runtime callback rejection\nState: rejected\nNext: no action was executed."
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Rejected);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Rejected)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_command_fixture_runtime_run_rejects_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-command-reject".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime command rejection".to_string(),
+                consequence_summary: "Used to verify runtime command reject routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_command_reject.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approval rejected: Runtime command rejection\nState: rejected\nNext: no action was executed."
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Rejected);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Rejected)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
         Ok(())
     })
     .await
@@ -1460,6 +1614,13 @@ fn sample_telegram_config() -> ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
         poll_limit: 10,
     }
 }

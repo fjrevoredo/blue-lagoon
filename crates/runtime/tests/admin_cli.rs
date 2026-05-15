@@ -220,6 +220,42 @@ fn admin_integrations_calendar_list_help_lists_filter_arguments() -> Result<()> 
 }
 
 #[test]
+fn admin_integrations_email_list_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("integrations")
+        .arg("email")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_integrations_task_sync_list_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("integrations")
+        .arg("task-sync")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
 fn admin_recovery_checkpoints_help_lists_operator_arguments() -> Result<()> {
     let mut command = Command::cargo_bin("runtime")?;
     command
@@ -429,6 +465,16 @@ async fn phase_six_admin_json_commands_run_against_a_real_database() -> Result<(
     assert_admin_json_command(
         &database_url,
         &["admin", "integrations", "calendar", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "integrations", "email", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "integrations", "task-sync", "list", "--json"],
         "[]",
     )?;
 

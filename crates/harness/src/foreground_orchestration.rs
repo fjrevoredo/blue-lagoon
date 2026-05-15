@@ -8,7 +8,10 @@ use crate::{
     approval,
     audit::{self, NewAuditEvent},
     causal_links::{self, NewCausalLink},
-    config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
+    config::{
+        ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig,
+        TelegramApprovalResolutionPolicy,
+    },
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
     governed_actions, identity,
@@ -223,6 +226,7 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            Some(telegram_config),
             model_gateway_config,
             trigger,
             parsed_resolution,
@@ -264,6 +268,7 @@ where
 pub async fn orchestrate_telegram_foreground_plan<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    telegram_config: Option<&ResolvedTelegramConfig>,
     model_gateway_config: &ResolvedModelGatewayConfig,
     execution: TelegramForegroundPlanExecution,
     transport: &T,
@@ -295,6 +300,7 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            telegram_config,
             model_gateway_config,
             trigger,
             parsed_resolution,
@@ -339,9 +345,11 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn orchestrate_telegram_approval_resolution_trigger<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    telegram_config: Option<&ResolvedTelegramConfig>,
     model_gateway_config: &ResolvedModelGatewayConfig,
     trigger: contracts::ForegroundTrigger,
     parsed_resolution: ParsedApprovalResolutionIngress,
@@ -359,71 +367,6 @@ where
         approval_token = %parsed_resolution.approval_token,
         "resolving telegram approval trigger"
     );
-    let approval_request = match approval::get_approval_request_by_token(
-        pool,
-        &parsed_resolution.approval_token,
-    )
-    .await
-    {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::ApprovalResolutionFailure,
-                anyhow::anyhow!(
-                    "approval callback referenced unknown approval token '{}'",
-                    parsed_resolution.approval_token
-                ),
-            )
-            .await;
-        }
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::PersistenceFailure,
-                error,
-            )
-            .await;
-        }
-    };
-
-    let resolution = match approval::resolve_approval_request(
-        pool,
-        &approval::ApprovalResolutionAttempt {
-            token: parsed_resolution.approval_token.clone(),
-            actor_ref: format!("telegram:{}", trigger.ingress.internal_principal_ref),
-            expected_action_fingerprint: parsed_resolution
-                .expected_action_fingerprint
-                .clone()
-                .unwrap_or_else(|| approval_request.action_fingerprint.clone()),
-            decision: parsed_resolution.decision,
-            reason: Some(parsed_resolution.resolution_source.clone()),
-            resolved_at: trigger.received_at,
-        },
-    )
-    .await
-    {
-        Ok(resolution) => resolution,
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::ApprovalResolutionFailure,
-                error,
-            )
-            .await;
-        }
-    };
-    info!(
-        trace_id = %trigger.trace_id,
-        execution_id = %trigger.execution_id,
-        approval_request_id = %resolution.request.approval_request_id,
-        decision = ?resolution.event.decision,
-        "approval request resolved"
-    );
-
     let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
         Ok(chat_id) => chat_id,
         Err(error) => {
@@ -448,6 +391,163 @@ where
             .await;
         }
     };
+
+    let approval_request = match approval::get_approval_request_by_token(
+        pool,
+        &parsed_resolution.approval_token,
+    )
+    .await
+    {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            record_approval_resolution_diagnostic(
+                pool,
+                Some(trigger.trace_id),
+                Some(trigger.execution_id),
+                "approval_resolution_unknown_token",
+                "approval resolution attempt referenced an unknown token",
+                json!({
+                    "approval_token": parsed_resolution.approval_token,
+                    "source": parsed_resolution.resolution_source,
+                }),
+            )
+            .await;
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::ApprovalResolutionFailure,
+                anyhow::anyhow!(
+                    "approval callback referenced unknown approval token '{}'",
+                    parsed_resolution.approval_token
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::PersistenceFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    if approval_request.status != contracts::ApprovalRequestStatus::Pending {
+        let decision = approval_terminal_decision(&approval_request);
+        if let Some(decision) = decision {
+            record_approval_resolution_diagnostic(
+                pool,
+                Some(trigger.trace_id),
+                Some(trigger.execution_id),
+                "approval_resolution_stale_token",
+                "approval resolution attempt targeted a non-pending request",
+                json!({
+                    "approval_request_id": approval_request.approval_request_id,
+                    "status": approval_request_status_label(approval_request.status),
+                    "decision": approval_resolution_decision_label(decision),
+                    "source": parsed_resolution.resolution_source,
+                }),
+            )
+            .await;
+
+            let delivery_receipt = match delivery
+                .send_message(&TelegramOutboundMessage {
+                    chat_id,
+                    text: approval_terminal_message(&approval_request, decision),
+                    reply_to_message_id,
+                    reply_markup: None,
+                })
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return record_and_return_approval_resolution_failure(
+                        pool,
+                        &trigger,
+                        ForegroundFailureKind::TelegramDeliveryFailure,
+                        error,
+                    )
+                    .await;
+                }
+            };
+            return Ok(TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                TelegramApprovalResolutionCompletion {
+                    trace_id: trigger.trace_id,
+                    execution_id: trigger.execution_id,
+                    ingress_id: trigger.ingress.ingress_id,
+                    approval_request_id: approval_request.approval_request_id,
+                    decision,
+                    outbound_message_id: delivery_receipt.message_id,
+                },
+            ));
+        }
+    }
+
+    let resolved_telegram_config = match telegram_config {
+        Some(telegram_config) => telegram_config.clone(),
+        None => match config.require_telegram_config() {
+            Ok(telegram_config) => telegram_config,
+            Err(error) => {
+                return record_and_return_approval_resolution_failure(
+                    pool,
+                    &trigger,
+                    ForegroundFailureKind::ApprovalResolutionFailure,
+                    error,
+                )
+                .await;
+            }
+        },
+    };
+
+    let actor_policy = approval::ApprovalResolutionActorPolicy {
+        mode: match resolved_telegram_config.approval_resolution_policy {
+            TelegramApprovalResolutionPolicy::DelegateAllowed => {
+                approval::ApprovalResolutionActorPolicyMode::DelegateAllowed
+            }
+            TelegramApprovalResolutionPolicy::OwnerOnly => {
+                approval::ApprovalResolutionActorPolicyMode::OwnerOnly
+            }
+        },
+        owner_principal_ref: resolved_telegram_config.internal_principal_ref.clone(),
+        allowlisted_principal_refs: resolved_telegram_config.allowlisted_principal_refs(),
+    };
+
+    let resolution = match approval::resolve_approval_request_with_actor_policy(
+        pool,
+        &approval::ApprovalResolutionAttempt {
+            token: parsed_resolution.approval_token.clone(),
+            actor_ref: format!("telegram:{}", trigger.ingress.internal_principal_ref),
+            expected_action_fingerprint: parsed_resolution
+                .expected_action_fingerprint
+                .clone()
+                .unwrap_or_else(|| approval_request.action_fingerprint.clone()),
+            decision: parsed_resolution.decision,
+            reason: Some(parsed_resolution.resolution_source.clone()),
+            resolved_at: trigger.received_at,
+        },
+        Some(&actor_policy),
+    )
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::ApprovalResolutionFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        approval_request_id = %resolution.request.approval_request_id,
+        decision = ?resolution.event.decision,
+        "approval request resolved"
+    );
     emit_typing_chat_action(
         delivery,
         chat_id,
@@ -2466,19 +2566,116 @@ fn parse_approval_callback_decision(
     }
 }
 
+async fn record_approval_resolution_diagnostic(
+    pool: &sqlx::PgPool,
+    trace_id: Option<Uuid>,
+    execution_id: Option<Uuid>,
+    reason_code: &str,
+    summary: &str,
+    diagnostic_payload: serde_json::Value,
+) {
+    let _ = recovery::insert_operational_diagnostic(
+        pool,
+        &recovery::NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id,
+            execution_id,
+            subsystem: "foreground_orchestration".to_string(),
+            severity: recovery::OperationalDiagnosticSeverity::Info,
+            reason_code: reason_code.to_string(),
+            summary: summary.to_string(),
+            diagnostic_payload,
+        },
+    )
+    .await;
+}
+
+fn approval_terminal_decision(
+    request: &approval::ApprovalRequestRecord,
+) -> Option<contracts::ApprovalResolutionDecision> {
+    request.resolution_kind.or(match request.status {
+        contracts::ApprovalRequestStatus::Approved => {
+            Some(contracts::ApprovalResolutionDecision::Approved)
+        }
+        contracts::ApprovalRequestStatus::Rejected => {
+            Some(contracts::ApprovalResolutionDecision::Rejected)
+        }
+        contracts::ApprovalRequestStatus::Expired => {
+            Some(contracts::ApprovalResolutionDecision::Expired)
+        }
+        contracts::ApprovalRequestStatus::Invalidated => {
+            Some(contracts::ApprovalResolutionDecision::Invalidated)
+        }
+        contracts::ApprovalRequestStatus::Pending => None,
+    })
+}
+
+fn approval_request_status_label(status: contracts::ApprovalRequestStatus) -> &'static str {
+    match status {
+        contracts::ApprovalRequestStatus::Pending => "pending",
+        contracts::ApprovalRequestStatus::Approved => "approved",
+        contracts::ApprovalRequestStatus::Rejected => "rejected",
+        contracts::ApprovalRequestStatus::Expired => "expired",
+        contracts::ApprovalRequestStatus::Invalidated => "invalidated",
+    }
+}
+
+fn approval_resolution_decision_label(
+    decision: contracts::ApprovalResolutionDecision,
+) -> &'static str {
+    match decision {
+        contracts::ApprovalResolutionDecision::Approved => "approved",
+        contracts::ApprovalResolutionDecision::Rejected => "rejected",
+        contracts::ApprovalResolutionDecision::Expired => "expired",
+        contracts::ApprovalResolutionDecision::Invalidated => "invalidated",
+    }
+}
+
+fn approval_terminal_message(
+    request: &approval::ApprovalRequestRecord,
+    decision: contracts::ApprovalResolutionDecision,
+) -> String {
+    match decision {
+        contracts::ApprovalResolutionDecision::Approved => format!(
+            "Approval already approved: {}\nState: approved\nNext: no additional action is needed.",
+            request.title
+        ),
+        contracts::ApprovalResolutionDecision::Rejected => format!(
+            "Approval already rejected: {}\nState: rejected\nNext: no action will be executed.",
+            request.title
+        ),
+        contracts::ApprovalResolutionDecision::Expired => {
+            "Approval request already expired.\nState: expired\nNext: request the action again to create a new approval."
+                .to_string()
+        }
+        contracts::ApprovalResolutionDecision::Invalidated => {
+            "Approval request already invalidated because the requested action changed.\nState: invalidated\nNext: request the action again."
+                .to_string()
+        }
+    }
+}
+
 fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) -> String {
     match resolution.event.decision {
         contracts::ApprovalResolutionDecision::Approved => {
-            format!("Approved: {}", resolution.request.title)
+            format!(
+                "Approval approved: {}\nState: approved\nNext: running the approved action now.",
+                resolution.request.title
+            )
         }
         contracts::ApprovalResolutionDecision::Rejected => {
-            format!("Rejected: {}", resolution.request.title)
+            format!(
+                "Approval rejected: {}\nState: rejected\nNext: no action was executed.",
+                resolution.request.title
+            )
         }
         contracts::ApprovalResolutionDecision::Expired => {
-            "Approval request expired before it could be applied.".to_string()
+            "Approval request expired.\nState: expired\nNext: request the action again to create a new approval."
+                .to_string()
         }
         contracts::ApprovalResolutionDecision::Invalidated => {
-            "Approval request is no longer valid because the requested action changed.".to_string()
+            "Approval request invalidated because the requested action changed.\nState: invalidated\nNext: request the action again."
+                .to_string()
         }
     }
 }
@@ -2547,10 +2744,10 @@ fn foreground_assistant_delivery_text(
 
     if governed_action_summary.pending_approval_count > 0 {
         return if governed_action_summary.pending_approval_count == 1 {
-            "Approval requested. Use the approval prompt above to continue.".to_string()
+            "Approval pending. Use the approval prompt above to approve or reject.".to_string()
         } else {
             format!(
-                "{} approvals requested. Use the approval prompts above to continue.",
+                "{} approvals pending. Use the approval prompts above to approve or reject.",
                 governed_action_summary.pending_approval_count
             )
         };
@@ -2973,6 +3170,9 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
         contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
         contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        contracts::GovernedActionKind::ListEmailMessages => "list_email_messages",
+        contracts::GovernedActionKind::SendEmailMessage => "send_email_message",
+        contracts::GovernedActionKind::SyncTaskList => "sync_task_list",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -3079,7 +3279,7 @@ mod tests {
 
         assert_eq!(
             foreground_assistant_delivery_text("", &summary, &[], &context),
-            "Approval requested. Use the approval prompt above to continue."
+            "Approval pending. Use the approval prompt above to approve or reject."
         );
     }
 
@@ -3097,7 +3297,7 @@ mod tests {
 
         assert_eq!(
             foreground_assistant_delivery_text(" \n", &summary, &[], &context),
-            "2 approvals requested. Use the approval prompts above to continue."
+            "2 approvals pending. Use the approval prompts above to approve or reject."
         );
     }
 

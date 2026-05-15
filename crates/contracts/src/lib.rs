@@ -1397,6 +1397,9 @@ pub enum GovernedActionKind {
     ProcessIngressAttachment,
     ListCalendarEvents,
     UpsertCalendarEvent,
+    ListEmailMessages,
+    SendEmailMessage,
+    SyncTaskList,
     UpsertScheduledForegroundTask,
     RequestBackgroundJob,
     RunDiagnostic,
@@ -1570,6 +1573,37 @@ pub struct UpsertCalendarEventAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListEmailMessagesAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub mailbox: Option<String>,
+    pub query: Option<String>,
+    #[serde(default = "default_governed_action_list_limit")]
+    pub max_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendEmailMessageAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub reply_to_external_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTaskListAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub task_list_title: String,
+    pub items: Vec<String>,
+    pub external_list_id: Option<String>,
+    pub workspace_artifact_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpsertScheduledForegroundTaskAction {
     pub task_key: String,
     pub title: String,
@@ -1728,6 +1762,9 @@ pub enum GovernedActionPayload {
     ProcessIngressAttachment(ProcessIngressAttachmentAction),
     ListCalendarEvents(ListCalendarEventsAction),
     UpsertCalendarEvent(UpsertCalendarEventAction),
+    ListEmailMessages(ListEmailMessagesAction),
+    SendEmailMessage(SendEmailMessageAction),
+    SyncTaskList(SyncTaskListAction),
     UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
     RequestBackgroundJob(RequestBackgroundJobAction),
     RunDiagnostic(RunDiagnosticAction),
@@ -2345,6 +2382,65 @@ mod tests {
         let error = serde_json::from_value::<GovernedActionProposal>(value)
             .expect_err("missing title should fail calendar upsert payload parse");
         assert!(error.to_string().contains("title"));
+    }
+
+    #[test]
+    fn governed_action_email_list_payload_defaults_bounded_max_results() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("list_email_messages");
+        value["payload"] = serde_json::json!({
+            "kind": "list_email_messages",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "mailbox": "inbox",
+                "query": "subject:milestone"
+            }
+        });
+
+        let decoded: GovernedActionProposal =
+            serde_json::from_value(value).expect("missing email max_results should default");
+        let GovernedActionPayload::ListEmailMessages(payload) = decoded.payload else {
+            panic!("expected list email messages payload");
+        };
+        assert_eq!(payload.max_results, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn governed_action_email_and_task_sync_payloads_reject_missing_required_fields() {
+        let mut email_value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        email_value["action_kind"] = serde_json::json!("send_email_message");
+        email_value["payload"] = serde_json::json!({
+            "kind": "send_email_message",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "to": ["one@example.com"],
+                "cc": [],
+                "body_text": "hello"
+            }
+        });
+        let email_error = serde_json::from_value::<GovernedActionProposal>(email_value)
+            .expect_err("missing subject should fail email send payload parse");
+        assert!(email_error.to_string().contains("subject"));
+
+        let mut task_value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        task_value["action_kind"] = serde_json::json!("sync_task_list");
+        task_value["payload"] = serde_json::json!({
+            "kind": "sync_task_list",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "external_list_id": null,
+                "workspace_artifact_id": null
+            }
+        });
+        let task_error = serde_json::from_value::<GovernedActionProposal>(task_value)
+            .expect_err("missing task_list_title should fail task sync payload parse");
+        assert!(task_error.to_string().contains("task_list_title"));
     }
 
     #[test]

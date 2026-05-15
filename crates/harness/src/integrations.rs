@@ -6,7 +6,10 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 
-use crate::config::ResolvedCalendarIntegrationConfig;
+use crate::config::{
+    ResolvedCalendarIntegrationConfig, ResolvedEmailIntegrationConfig,
+    ResolvedTaskSyncIntegrationConfig,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarListEventsRequest {
@@ -36,6 +39,52 @@ pub struct CalendarEventSummary {
     pub starts_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub location: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailListMessagesRequest {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub mailbox: Option<String>,
+    pub query: Option<String>,
+    pub max_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendEmailMessageRequest {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub reply_to_external_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailMessageSummary {
+    pub external_message_id: String,
+    pub mailbox: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub subject: String,
+    pub sent_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSyncRequest {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub task_list_title: String,
+    pub items: Vec<String>,
+    pub external_list_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSyncResult {
+    pub external_list_id: String,
+    pub task_list_title: String,
+    pub items: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +137,116 @@ pub trait CalendarIntegrationAdapter {
     ) -> std::result::Result<CalendarEventSummary, CalendarIntegrationError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailIntegrationErrorKind {
+    Misconfigured,
+    TemporaryFailure,
+    PermanentFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct EmailIntegrationError {
+    pub kind: EmailIntegrationErrorKind,
+    pub message: String,
+}
+
+impl EmailIntegrationError {
+    pub fn misconfigured(message: impl Into<String>) -> Self {
+        Self {
+            kind: EmailIntegrationErrorKind::Misconfigured,
+            message: message.into(),
+        }
+    }
+
+    pub fn temporary_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: EmailIntegrationErrorKind::TemporaryFailure,
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: EmailIntegrationErrorKind::PermanentFailure,
+            message: message.into(),
+        }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait EmailIntegrationAdapter {
+    async fn list_messages(
+        &self,
+        request: &EmailListMessagesRequest,
+    ) -> std::result::Result<Vec<EmailMessageSummary>, EmailIntegrationError>;
+
+    async fn send_message(
+        &self,
+        request: &SendEmailMessageRequest,
+    ) -> std::result::Result<EmailMessageSummary, EmailIntegrationError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSyncIntegrationErrorKind {
+    Misconfigured,
+    TemporaryFailure,
+    PermanentFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub struct TaskSyncIntegrationError {
+    pub kind: TaskSyncIntegrationErrorKind,
+    pub message: String,
+}
+
+impl TaskSyncIntegrationError {
+    pub fn misconfigured(message: impl Into<String>) -> Self {
+        Self {
+            kind: TaskSyncIntegrationErrorKind::Misconfigured,
+            message: message.into(),
+        }
+    }
+
+    pub fn temporary_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: TaskSyncIntegrationErrorKind::TemporaryFailure,
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: TaskSyncIntegrationErrorKind::PermanentFailure,
+            message: message.into(),
+        }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait TaskSyncIntegrationAdapter {
+    async fn sync_task_list(
+        &self,
+        request: &TaskSyncRequest,
+    ) -> std::result::Result<TaskSyncResult, TaskSyncIntegrationError>;
+}
+
 pub fn is_supported_calendar_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "deterministic_fake" | "fake"
+    )
+}
+
+pub fn is_supported_email_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "deterministic_fake" | "fake"
+    )
+}
+
+pub fn is_supported_task_sync_provider(provider: &str) -> bool {
     matches!(
         provider.trim().to_ascii_lowercase().as_str(),
         "deterministic_fake" | "fake"
@@ -343,6 +501,281 @@ fn validate_calendar_upsert_event_request(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct DeterministicEmailIntegrationAdapter {
+    _provider: String,
+    _api_base_url: Option<String>,
+    _credential: String,
+}
+
+impl DeterministicEmailIntegrationAdapter {
+    pub fn from_resolved_config(config: &ResolvedEmailIntegrationConfig) -> Self {
+        Self {
+            _provider: config.provider.clone(),
+            _api_base_url: config.api_base_url.clone(),
+            _credential: config.credential.clone(),
+        }
+    }
+}
+
+impl EmailIntegrationAdapter for DeterministicEmailIntegrationAdapter {
+    async fn list_messages(
+        &self,
+        request: &EmailListMessagesRequest,
+    ) -> std::result::Result<Vec<EmailMessageSummary>, EmailIntegrationError> {
+        validate_email_list_messages_request(request)?;
+        let message = EmailMessageSummary {
+            external_message_id: format!(
+                "deterministic-email:{}:{}:{}",
+                request.internal_principal_ref.trim(),
+                request.internal_conversation_ref.trim(),
+                request.max_results
+            ),
+            mailbox: request
+                .mailbox
+                .clone()
+                .unwrap_or_else(|| "inbox".to_string())
+                .trim()
+                .to_string(),
+            from: "sender@example.com".to_string(),
+            to: vec!["primary@example.com".to_string()],
+            subject: request
+                .query
+                .clone()
+                .unwrap_or_else(|| "Deterministic inbox message".to_string()),
+            sent_at: Utc::now(),
+        };
+        Ok(vec![message])
+    }
+
+    async fn send_message(
+        &self,
+        request: &SendEmailMessageRequest,
+    ) -> std::result::Result<EmailMessageSummary, EmailIntegrationError> {
+        validate_send_email_message_request(request)?;
+        Ok(EmailMessageSummary {
+            external_message_id: format!(
+                "deterministic-email:{}:{}:{}",
+                request.internal_principal_ref.trim(),
+                request.internal_conversation_ref.trim(),
+                request.subject.trim().len()
+            ),
+            mailbox: "sent".to_string(),
+            from: "primary@example.com".to_string(),
+            to: request
+                .to
+                .iter()
+                .map(|value| value.trim().to_string())
+                .collect(),
+            subject: request.subject.trim().to_string(),
+            sent_at: Utc::now(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnconfiguredEmailIntegrationAdapter;
+
+impl EmailIntegrationAdapter for UnconfiguredEmailIntegrationAdapter {
+    async fn list_messages(
+        &self,
+        _request: &EmailListMessagesRequest,
+    ) -> std::result::Result<Vec<EmailMessageSummary>, EmailIntegrationError> {
+        Err(EmailIntegrationError::misconfigured(
+            "email integration adapter is not configured",
+        ))
+    }
+
+    async fn send_message(
+        &self,
+        _request: &SendEmailMessageRequest,
+    ) -> std::result::Result<EmailMessageSummary, EmailIntegrationError> {
+        Err(EmailIntegrationError::misconfigured(
+            "email integration adapter is not configured",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FakeEmailIntegrationAdapter;
+
+impl EmailIntegrationAdapter for FakeEmailIntegrationAdapter {
+    async fn list_messages(
+        &self,
+        request: &EmailListMessagesRequest,
+    ) -> std::result::Result<Vec<EmailMessageSummary>, EmailIntegrationError> {
+        validate_email_list_messages_request(request)?;
+        Err(EmailIntegrationError::temporary_failure(
+            "no fake email list response queued",
+        ))
+    }
+
+    async fn send_message(
+        &self,
+        request: &SendEmailMessageRequest,
+    ) -> std::result::Result<EmailMessageSummary, EmailIntegrationError> {
+        validate_send_email_message_request(request)?;
+        Err(EmailIntegrationError::temporary_failure(
+            "no fake email send response queued",
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeterministicTaskSyncIntegrationAdapter {
+    _provider: String,
+    _api_base_url: Option<String>,
+    _credential: String,
+}
+
+impl DeterministicTaskSyncIntegrationAdapter {
+    pub fn from_resolved_config(config: &ResolvedTaskSyncIntegrationConfig) -> Self {
+        Self {
+            _provider: config.provider.clone(),
+            _api_base_url: config.api_base_url.clone(),
+            _credential: config.credential.clone(),
+        }
+    }
+}
+
+impl TaskSyncIntegrationAdapter for DeterministicTaskSyncIntegrationAdapter {
+    async fn sync_task_list(
+        &self,
+        request: &TaskSyncRequest,
+    ) -> std::result::Result<TaskSyncResult, TaskSyncIntegrationError> {
+        validate_task_sync_request(request)?;
+        let items = request
+            .items
+            .iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        Ok(TaskSyncResult {
+            external_list_id: request.external_list_id.clone().unwrap_or_else(|| {
+                format!(
+                    "deterministic-task-list:{}:{}",
+                    request.internal_principal_ref.trim(),
+                    request.internal_conversation_ref.trim()
+                )
+            }),
+            task_list_title: request.task_list_title.trim().to_string(),
+            items,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnconfiguredTaskSyncIntegrationAdapter;
+
+impl TaskSyncIntegrationAdapter for UnconfiguredTaskSyncIntegrationAdapter {
+    async fn sync_task_list(
+        &self,
+        _request: &TaskSyncRequest,
+    ) -> std::result::Result<TaskSyncResult, TaskSyncIntegrationError> {
+        Err(TaskSyncIntegrationError::misconfigured(
+            "task sync integration adapter is not configured",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FakeTaskSyncIntegrationAdapter;
+
+impl TaskSyncIntegrationAdapter for FakeTaskSyncIntegrationAdapter {
+    async fn sync_task_list(
+        &self,
+        request: &TaskSyncRequest,
+    ) -> std::result::Result<TaskSyncResult, TaskSyncIntegrationError> {
+        validate_task_sync_request(request)?;
+        Err(TaskSyncIntegrationError::temporary_failure(
+            "no fake task sync response queued",
+        ))
+    }
+}
+
+fn validate_email_list_messages_request(
+    request: &EmailListMessagesRequest,
+) -> std::result::Result<(), EmailIntegrationError> {
+    if request.internal_principal_ref.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email list_messages request requires internal_principal_ref",
+        ));
+    }
+    if request.internal_conversation_ref.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email list_messages request requires internal_conversation_ref",
+        ));
+    }
+    if request.max_results == 0 {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email list_messages request requires max_results greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_send_email_message_request(
+    request: &SendEmailMessageRequest,
+) -> std::result::Result<(), EmailIntegrationError> {
+    if request.internal_principal_ref.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email send_message request requires internal_principal_ref",
+        ));
+    }
+    if request.internal_conversation_ref.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email send_message request requires internal_conversation_ref",
+        ));
+    }
+    if request.to.iter().all(|value| value.trim().is_empty()) {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email send_message request requires at least one recipient",
+        ));
+    }
+    if request.subject.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email send_message request requires subject",
+        ));
+    }
+    if request.body_text.trim().is_empty() {
+        return Err(EmailIntegrationError::permanent_failure(
+            "email send_message request requires body_text",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_task_sync_request(
+    request: &TaskSyncRequest,
+) -> std::result::Result<(), TaskSyncIntegrationError> {
+    if request.internal_principal_ref.trim().is_empty() {
+        return Err(TaskSyncIntegrationError::permanent_failure(
+            "task sync request requires internal_principal_ref",
+        ));
+    }
+    if request.internal_conversation_ref.trim().is_empty() {
+        return Err(TaskSyncIntegrationError::permanent_failure(
+            "task sync request requires internal_conversation_ref",
+        ));
+    }
+    if request.task_list_title.trim().is_empty() {
+        return Err(TaskSyncIntegrationError::permanent_failure(
+            "task sync request requires task_list_title",
+        ));
+    }
+    if request.items.is_empty() {
+        return Err(TaskSyncIntegrationError::permanent_failure(
+            "task sync request requires at least one task item",
+        ));
+    }
+    if request.items.iter().all(|value| value.trim().is_empty()) {
+        return Err(TaskSyncIntegrationError::permanent_failure(
+            "task sync request requires at least one non-empty task item",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
@@ -369,6 +802,41 @@ mod tests {
             location: Some("remote".to_string()),
             details: Some("integration alignment".to_string()),
             external_event_id: None,
+        }
+    }
+
+    fn sample_email_list_request() -> EmailListMessagesRequest {
+        EmailListMessagesRequest {
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            mailbox: Some("inbox".to_string()),
+            query: Some("subject:milestone".to_string()),
+            max_results: 5,
+        }
+    }
+
+    fn sample_email_send_request() -> SendEmailMessageRequest {
+        SendEmailMessageRequest {
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            to: vec!["owner@example.com".to_string()],
+            cc: vec![],
+            subject: "Milestone update".to_string(),
+            body_text: "We shipped milestone 3.".to_string(),
+            reply_to_external_message_id: None,
+        }
+    }
+
+    fn sample_task_sync_request() -> TaskSyncRequest {
+        TaskSyncRequest {
+            internal_principal_ref: "primary-user".to_string(),
+            internal_conversation_ref: "telegram-primary".to_string(),
+            task_list_title: "Milestone Tasks".to_string(),
+            items: vec![
+                "Review PR #123".to_string(),
+                "Write release notes".to_string(),
+            ],
+            external_list_id: None,
         }
     }
 
@@ -432,5 +900,78 @@ mod tests {
         assert!(is_supported_calendar_provider("deterministic_fake"));
         assert!(is_supported_calendar_provider(" fake "));
         assert!(!is_supported_calendar_provider("google_calendar"));
+        assert!(is_supported_email_provider("deterministic_fake"));
+        assert!(is_supported_task_sync_provider("fake"));
+        assert!(!is_supported_email_provider("gmail"));
+        assert!(!is_supported_task_sync_provider("todoist"));
+    }
+
+    #[tokio::test]
+    async fn email_adapters_validate_and_fail_closed_or_succeed_deterministically() {
+        let unconfigured = UnconfiguredEmailIntegrationAdapter;
+        let error = unconfigured
+            .list_messages(&sample_email_list_request())
+            .await
+            .expect_err("unconfigured email adapter should fail closed");
+        assert_eq!(error.kind, EmailIntegrationErrorKind::Misconfigured);
+
+        let fake = FakeEmailIntegrationAdapter;
+        let fake_error = fake
+            .send_message(&sample_email_send_request())
+            .await
+            .expect_err("fake adapter should emit deterministic failure");
+        assert_eq!(fake_error.kind, EmailIntegrationErrorKind::TemporaryFailure);
+
+        let deterministic = DeterministicEmailIntegrationAdapter::from_resolved_config(
+            &ResolvedEmailIntegrationConfig {
+                provider: "deterministic_fake".to_string(),
+                credential: "secret".to_string(),
+                api_base_url: None,
+            },
+        );
+        let listed = deterministic
+            .list_messages(&sample_email_list_request())
+            .await
+            .expect("deterministic email list should succeed");
+        assert_eq!(listed.len(), 1);
+        let sent = deterministic
+            .send_message(&sample_email_send_request())
+            .await
+            .expect("deterministic email send should succeed");
+        assert_eq!(sent.mailbox, "sent");
+    }
+
+    #[tokio::test]
+    async fn task_sync_adapters_validate_and_fail_closed_or_succeed_deterministically() {
+        let unconfigured = UnconfiguredTaskSyncIntegrationAdapter;
+        let error = unconfigured
+            .sync_task_list(&sample_task_sync_request())
+            .await
+            .expect_err("unconfigured task sync adapter should fail closed");
+        assert_eq!(error.kind, TaskSyncIntegrationErrorKind::Misconfigured);
+
+        let fake = FakeTaskSyncIntegrationAdapter;
+        let fake_error = fake
+            .sync_task_list(&sample_task_sync_request())
+            .await
+            .expect_err("fake task sync adapter should emit deterministic failure");
+        assert_eq!(
+            fake_error.kind,
+            TaskSyncIntegrationErrorKind::TemporaryFailure
+        );
+
+        let deterministic = DeterministicTaskSyncIntegrationAdapter::from_resolved_config(
+            &ResolvedTaskSyncIntegrationConfig {
+                provider: "deterministic_fake".to_string(),
+                credential: "secret".to_string(),
+                api_base_url: None,
+            },
+        );
+        let synced = deterministic
+            .sync_task_list(&sample_task_sync_request())
+            .await
+            .expect("deterministic task sync should succeed");
+        assert_eq!(synced.task_list_title, "Milestone Tasks");
+        assert_eq!(synced.items.len(), 2);
     }
 }

@@ -853,6 +853,9 @@ mod tests {
                     allowed_chat_id: 42,
                     internal_principal_ref: "primary-user".to_string(),
                     internal_conversation_ref: "telegram-primary".to_string(),
+                    delegates: Vec::new(),
+                    approval_resolution_policy:
+                        crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
                 }),
             }),
             model_gateway: None,

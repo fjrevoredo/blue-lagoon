@@ -106,12 +106,17 @@ pub fn evaluate_telegram_foreground_trigger(
     config: &ResolvedTelegramConfig,
     ingress: &NormalizedIngress,
 ) -> PolicyDecision {
-    if ingress.external_user_id != config.allowed_user_id.to_string() {
+    let principal_binding = match ingress.external_user_id.parse::<i64>() {
+        Ok(user_id) => config.principal_binding_for_user_id(user_id),
+        Err(_) => None,
+    };
+    let Some(principal_binding) = principal_binding else {
         return PolicyDecision::Denied {
-            reason: "Telegram ingress actor does not match the configured single-user boundary"
-                .to_string(),
+            reason:
+                "Telegram ingress actor is not allowlisted for the configured principal bindings"
+                    .to_string(),
         };
-    }
+    };
 
     if ingress.external_conversation_id != config.allowed_chat_id.to_string() {
         return PolicyDecision::Denied {
@@ -121,7 +126,7 @@ pub fn evaluate_telegram_foreground_trigger(
         };
     }
 
-    if ingress.internal_principal_ref != config.internal_principal_ref {
+    if ingress.internal_principal_ref != principal_binding.internal_principal_ref {
         return PolicyDecision::Denied {
             reason: "Telegram ingress principal binding does not match configured policy"
                 .to_string(),
@@ -189,10 +194,13 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         | GovernedActionKind::UpdateWorkspaceArtifact
         | GovernedActionKind::ProcessIngressAttachment
         | GovernedActionKind::ListCalendarEvents
+        | GovernedActionKind::ListEmailMessages
         | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,
         GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
         | GovernedActionKind::UpsertCalendarEvent
+        | GovernedActionKind::SendEmailMessage
+        | GovernedActionKind::SyncTaskList
         | GovernedActionKind::UpsertScheduledForegroundTask => GovernedActionRiskTier::Tier2,
         GovernedActionKind::WebFetch => GovernedActionRiskTier::Tier2,
         GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
@@ -236,6 +244,9 @@ pub fn evaluate_governed_action_identity_boundaries(
                     GovernedActionKind::WebFetch
                         | GovernedActionKind::ListCalendarEvents
                         | GovernedActionKind::UpsertCalendarEvent
+                        | GovernedActionKind::ListEmailMessages
+                        | GovernedActionKind::SendEmailMessage
+                        | GovernedActionKind::SyncTaskList
                 ))
         {
             return PolicyDecision::Denied {
@@ -723,7 +734,7 @@ mod tests {
         match evaluate_telegram_foreground_trigger(&telegram_config(), &ingress) {
             PolicyDecision::Allowed => panic!("unauthorized actor should be rejected"),
             PolicyDecision::Denied { reason } => {
-                assert!(reason.contains("single-user boundary"));
+                assert!(reason.contains("not allowlisted"));
             }
         }
     }
@@ -736,6 +747,13 @@ mod tests {
             allowed_chat_id: 24,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         }
     }

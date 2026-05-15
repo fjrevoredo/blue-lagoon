@@ -21,6 +21,7 @@ const RETRIEVAL_REFRESH_SCAN_MULTIPLIER: i64 = 4;
 const RETRIEVAL_NOISE_FRAGMENTS: &[&str] = &[
     "do not propose multiple actions in a single response",
     "approval requested. use the approval prompt above to continue",
+    "approval pending. use the approval prompt above to approve or reject",
     "harness governed-action observation",
     "harness governed-action observations",
     "governed action system",

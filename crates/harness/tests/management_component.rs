@@ -1500,6 +1500,37 @@ async fn calendar_integration_run_listing_filters_and_surfaces_request_context()
         let non_calendar_payload = serde_json::to_value(
             contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("not-calendar")),
         )?;
+        let email_list_payload =
+            serde_json::to_value(contracts::GovernedActionPayload::ListEmailMessages(
+                contracts::ListEmailMessagesAction {
+                    internal_principal_ref: "primary-user".to_string(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                    mailbox: Some("inbox".to_string()),
+                    query: Some("subject:milestone".to_string()),
+                    max_results: 5,
+                },
+            ))?;
+        let email_send_payload = serde_json::to_value(
+            contracts::GovernedActionPayload::SendEmailMessage(contracts::SendEmailMessageAction {
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                to: vec!["owner@example.com".to_string()],
+                cc: vec!["observer@example.com".to_string()],
+                subject: "Milestone update".to_string(),
+                body_text: "Daily status".to_string(),
+                reply_to_external_message_id: None,
+            }),
+        )?;
+        let task_sync_payload = serde_json::to_value(
+            contracts::GovernedActionPayload::SyncTaskList(contracts::SyncTaskListAction {
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                task_list_title: "Milestone Tasks".to_string(),
+                items: vec!["Review PR".to_string(), "Write notes".to_string()],
+                external_list_id: Some("list_123".to_string()),
+                workspace_artifact_id: None,
+            }),
+        )?;
 
         sqlx::query(
             r#"
@@ -1624,6 +1655,129 @@ async fn calendar_integration_run_listing_filters_and_surfaces_request_context()
         .execute(&ctx.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:email-list")
+        .bind("list_email_messages")
+        .bind("tier_1")
+        .bind("executed")
+        .bind(&capability_scope_json)
+        .bind(&email_list_payload)
+        .bind(Option::<String>::None)
+        .bind(Some("execution_record:email-list".to_string()))
+        .bind(Some(now - Duration::minutes(7)))
+        .bind(Some(now - Duration::minutes(6)))
+        .execute(&ctx.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:email-send")
+        .bind("send_email_message")
+        .bind("tier_2")
+        .bind("failed")
+        .bind(&capability_scope_json)
+        .bind(&email_send_payload)
+        .bind(Some("provider rejected send".to_string()))
+        .bind(Some("execution_record:email-send".to_string()))
+        .bind(Some(now - Duration::minutes(6)))
+        .bind(Some(now - Duration::minutes(5)))
+        .execute(&ctx.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:task-sync")
+        .bind("sync_task_list")
+        .bind("tier_2")
+        .bind("executed")
+        .bind(&capability_scope_json)
+        .bind(&task_sync_payload)
+        .bind(Option::<String>::None)
+        .bind(Some("execution_record:task-sync".to_string()))
+        .bind(Some(now - Duration::minutes(8)))
+        .bind(Some(now - Duration::minutes(7)))
+        .execute(&ctx.pool)
+        .await?;
+
         let runs = management::list_calendar_integration_runs(&ctx.config, None, 10).await?;
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|run| {
@@ -1651,6 +1805,34 @@ async fn calendar_integration_run_listing_filters_and_surfaces_request_context()
         .await?;
         assert_eq!(failed_runs.len(), 1);
         assert_eq!(failed_runs[0].action_kind, "upsert_calendar_event");
+
+        let email_runs = management::list_email_integration_runs(&ctx.config, None, 10).await?;
+        assert_eq!(email_runs.len(), 2);
+        assert!(email_runs.iter().any(|run| {
+            run.action_kind == "list_email_messages"
+                && run.request_summary.contains("max_results=5")
+        }));
+        assert!(email_runs.iter().any(|run| {
+            run.action_kind == "send_email_message"
+                && run
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("provider rejected send"))
+        }));
+
+        let failed_email_runs = management::list_email_integration_runs(
+            &ctx.config,
+            Some(contracts::GovernedActionStatus::Failed),
+            10,
+        )
+        .await?;
+        assert_eq!(failed_email_runs.len(), 1);
+        assert_eq!(failed_email_runs[0].action_kind, "send_email_message");
+
+        let task_runs = management::list_task_sync_runs(&ctx.config, None, 10).await?;
+        assert_eq!(task_runs.len(), 1);
+        assert_eq!(task_runs[0].action_kind, "sync_task_list");
+        assert!(task_runs[0].request_summary.contains("items=2"));
         Ok(())
     })
     .await

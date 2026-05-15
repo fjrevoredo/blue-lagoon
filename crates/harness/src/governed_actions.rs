@@ -8,12 +8,12 @@ use contracts::{
     GovernedActionKind, GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
     GovernedActionRiskTier, GovernedActionStatus, InspectIngressAttachmentsAction,
     InspectWorkspaceArtifactAction, InspectWorkspaceScriptAction, ListCalendarEventsAction,
-    ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction, ListWorkspaceScriptsAction,
-    NetworkAccessPosture, ProcessIngressAttachmentAction, RequestBackgroundJobAction,
-    RunDiagnosticAction, SubprocessAction, UpdateWorkspaceArtifactAction,
-    UpsertCalendarEventAction, UpsertScheduledForegroundTaskAction, WebFetchAction,
-    WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
-    WorkspaceScriptRunStatus,
+    ListEmailMessagesAction, ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction,
+    ListWorkspaceScriptsAction, NetworkAccessPosture, ProcessIngressAttachmentAction,
+    RequestBackgroundJobAction, RunDiagnosticAction, SendEmailMessageAction, SubprocessAction,
+    SyncTaskListAction, UpdateWorkspaceArtifactAction, UpsertCalendarEventAction,
+    UpsertScheduledForegroundTaskAction, WebFetchAction, WorkspaceArtifactKind,
+    WorkspaceArtifactStatusFilter, WorkspaceScriptAction, WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -36,7 +36,12 @@ use crate::{
     integrations::{
         self, CalendarEventSummary, CalendarIntegrationAdapter, CalendarIntegrationError,
         CalendarIntegrationErrorKind, DeterministicCalendarIntegrationAdapter,
-        FakeCalendarIntegrationAdapter,
+        DeterministicEmailIntegrationAdapter, DeterministicTaskSyncIntegrationAdapter,
+        EmailIntegrationAdapter, EmailIntegrationError, EmailIntegrationErrorKind,
+        EmailMessageSummary, FakeCalendarIntegrationAdapter, FakeEmailIntegrationAdapter,
+        FakeTaskSyncIntegrationAdapter, SendEmailMessageRequest, TaskSyncIntegrationAdapter,
+        TaskSyncIntegrationError, TaskSyncIntegrationErrorKind, TaskSyncRequest, TaskSyncResult,
+        UnconfiguredEmailIntegrationAdapter, UnconfiguredTaskSyncIntegrationAdapter,
     },
     management, policy, recovery, scheduled_foreground, tool_execution,
     workspace::{
@@ -639,6 +644,9 @@ pub async fn execute_governed_action(
         | GovernedActionPayload::ProcessIngressAttachment(_)
         | GovernedActionPayload::ListCalendarEvents(_)
         | GovernedActionPayload::UpsertCalendarEvent(_)
+        | GovernedActionPayload::ListEmailMessages(_)
+        | GovernedActionPayload::SendEmailMessage(_)
+        | GovernedActionPayload::SyncTaskList(_)
         | GovernedActionPayload::UpsertScheduledForegroundTask(_)
         | GovernedActionPayload::RequestBackgroundJob(_)
         | GovernedActionPayload::RunDiagnostic(_) => {
@@ -702,6 +710,15 @@ pub async fn execute_governed_action(
         GovernedActionPayload::UpsertCalendarEvent(action) => {
             execute_upsert_calendar_event(config, pool, &started_record, action).await
         }
+        GovernedActionPayload::ListEmailMessages(action) => {
+            execute_list_email_messages(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::SendEmailMessage(action) => {
+            execute_send_email_message(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::SyncTaskList(action) => {
+            execute_sync_task_list(config, pool, &started_record, action).await
+        }
         GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
             execute_upsert_scheduled_foreground_task(config, pool, &started_record, action).await
         }
@@ -755,11 +772,17 @@ async fn validate_governed_action_policy(
     proposal: &GovernedActionProposal,
 ) -> Result<()> {
     validate_capability_scope(config, proposal)?;
-    if matches!(
-        proposal.action_kind,
-        GovernedActionKind::ListCalendarEvents | GovernedActionKind::UpsertCalendarEvent
-    ) {
-        validate_calendar_integration_is_ready(config)?;
+    match proposal.action_kind {
+        GovernedActionKind::ListCalendarEvents | GovernedActionKind::UpsertCalendarEvent => {
+            validate_calendar_integration_is_ready(config)?;
+        }
+        GovernedActionKind::ListEmailMessages | GovernedActionKind::SendEmailMessage => {
+            validate_email_integration_is_ready(config)?;
+        }
+        GovernedActionKind::SyncTaskList => {
+            validate_task_sync_integration_is_ready(config)?;
+        }
+        _ => {}
     }
     let identity = identity::reconstruct_compact_identity_snapshot(pool, 32).await?;
     match policy::evaluate_governed_action_identity_boundaries(proposal, &identity.boundaries) {
@@ -776,6 +799,34 @@ fn validate_calendar_integration_is_ready(config: &RuntimeConfig) -> Result<()> 
     if !integrations::is_supported_calendar_provider(&resolved.provider) {
         bail!(
             "calendar integration provider '{}' is not supported",
+            resolved.provider
+        );
+    }
+    Ok(())
+}
+
+fn validate_email_integration_is_ready(config: &RuntimeConfig) -> Result<()> {
+    let resolved = config.resolve_email_integration_config()?;
+    let Some(resolved) = resolved else {
+        bail!("email integration is disabled");
+    };
+    if !integrations::is_supported_email_provider(&resolved.provider) {
+        bail!(
+            "email integration provider '{}' is not supported",
+            resolved.provider
+        );
+    }
+    Ok(())
+}
+
+fn validate_task_sync_integration_is_ready(config: &RuntimeConfig) -> Result<()> {
+    let resolved = config.resolve_task_sync_integration_config()?;
+    let Some(resolved) = resolved else {
+        bail!("task sync integration is disabled");
+    };
+    if !integrations::is_supported_task_sync_provider(&resolved.provider) {
+        bail!(
+            "task sync integration provider '{}' is not supported",
             resolved.provider
         );
     }
@@ -1738,6 +1789,425 @@ fn calendar_integration_error_kind_label(kind: CalendarIntegrationErrorKind) -> 
     }
 }
 
+async fn execute_list_email_messages(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ListEmailMessagesAction,
+) -> Result<GovernedActionExecutionResult> {
+    let request = integrations::EmailListMessagesRequest {
+        internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+        internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+        mailbox: action
+            .mailbox
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        query: action.query.as_ref().map(|value| value.trim().to_string()),
+        max_results: action.max_results,
+    };
+    match execute_email_list_messages_via_adapter(config, &request).await {
+        Ok(messages) => {
+            let items = messages
+                .iter()
+                .map(email_message_summary_payload)
+                .collect::<Vec<_>>();
+            let summary = format!("listed {} email message(s)", items.len());
+            complete_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "email",
+                    "operation": "list_messages",
+                    "request": {
+                        "internal_principal_ref": request.internal_principal_ref,
+                        "internal_conversation_ref": request.internal_conversation_ref,
+                        "mailbox": request.mailbox,
+                        "query": request.query,
+                        "max_results": request.max_results,
+                    },
+                    "items": items,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            let summary = format!("email list_messages failed: {}", error.message);
+            fail_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "email",
+                    "operation": "list_messages",
+                    "error_kind": email_integration_error_kind_label(error.kind),
+                    "error_message": error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_send_email_message(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &SendEmailMessageAction,
+) -> Result<GovernedActionExecutionResult> {
+    let request = SendEmailMessageRequest {
+        internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+        internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+        to: action
+            .to
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect(),
+        cc: action
+            .cc
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect(),
+        subject: action.subject.trim().to_string(),
+        body_text: action.body_text.clone(),
+        reply_to_external_message_id: action
+            .reply_to_external_message_id
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+    };
+    match execute_send_email_message_via_adapter(config, &request).await {
+        Ok(message) => {
+            let summary = format!(
+                "sent email '{}' ({})",
+                message.subject, message.external_message_id
+            );
+            complete_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "email",
+                    "operation": "send_message",
+                    "request": {
+                        "internal_principal_ref": request.internal_principal_ref,
+                        "internal_conversation_ref": request.internal_conversation_ref,
+                        "to": request.to,
+                        "cc": request.cc,
+                        "subject": request.subject,
+                        "body_text": request.body_text,
+                        "reply_to_external_message_id": request.reply_to_external_message_id,
+                    },
+                    "message": email_message_summary_payload(&message),
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            let summary = format!("email send_message failed: {}", error.message);
+            fail_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "email",
+                    "operation": "send_message",
+                    "error_kind": email_integration_error_kind_label(error.kind),
+                    "error_message": error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_sync_task_list(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &SyncTaskListAction,
+) -> Result<GovernedActionExecutionResult> {
+    let request = TaskSyncRequest {
+        internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+        internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+        task_list_title: action.task_list_title.trim().to_string(),
+        items: action
+            .items
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect(),
+        external_list_id: action
+            .external_list_id
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+    };
+    match execute_sync_task_list_via_adapter(config, &request).await {
+        Ok(result) => {
+            let task_content = format_task_list_content(&result.items);
+            let metadata = json!({
+                "integration": "task_sync",
+                "internal_principal_ref": request.internal_principal_ref,
+                "internal_conversation_ref": request.internal_conversation_ref,
+                "external_list_id": result.external_list_id,
+                "synced_at": Utc::now(),
+            });
+            let target = resolve_task_sync_target_artifact(
+                pool,
+                action.workspace_artifact_id,
+                &result.task_list_title,
+            )
+            .await?;
+            let (artifact, artifact_action) = match target {
+                Some(existing) => {
+                    let updated = workspace::update_workspace_artifact(
+                        config,
+                        pool,
+                        &workspace::UpdateWorkspaceArtifact {
+                            workspace_artifact_id: existing.workspace_artifact_id,
+                            title: result.task_list_title.clone(),
+                            content_text: Some(task_content.clone()),
+                            status: workspace::WorkspaceArtifactStatus::Active,
+                            metadata,
+                        },
+                    )
+                    .await?;
+                    (updated, "updated")
+                }
+                None => {
+                    let created = workspace::create_workspace_artifact(
+                        config,
+                        pool,
+                        &workspace::NewWorkspaceArtifact {
+                            workspace_artifact_id: Uuid::now_v7(),
+                            trace_id: Some(record.trace_id),
+                            execution_id: record.execution_id,
+                            artifact_kind: WorkspaceArtifactKind::TaskList,
+                            title: result.task_list_title.clone(),
+                            content_text: Some(task_content.clone()),
+                            metadata,
+                        },
+                    )
+                    .await?;
+                    (created, "created")
+                }
+            };
+            let summary = format!(
+                "{artifact_action} synced task list '{}' with {} item(s)",
+                artifact.title,
+                result.items.len()
+            );
+            complete_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "task_sync",
+                    "operation": "sync_task_list",
+                    "artifact_action": artifact_action,
+                    "workspace_artifact_id": artifact.workspace_artifact_id,
+                    "request": {
+                        "internal_principal_ref": request.internal_principal_ref,
+                        "internal_conversation_ref": request.internal_conversation_ref,
+                        "task_list_title": request.task_list_title,
+                        "external_list_id": request.external_list_id,
+                    },
+                    "result": {
+                        "external_list_id": result.external_list_id,
+                        "task_list_title": result.task_list_title,
+                        "item_count": result.items.len(),
+                        "items": result.items,
+                    },
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            let summary = format!("task sync sync_task_list failed: {}", error.message);
+            fail_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "task_sync",
+                    "operation": "sync_task_list",
+                    "error_kind": task_sync_integration_error_kind_label(error.kind),
+                    "error_message": error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_email_list_messages_via_adapter(
+    config: &RuntimeConfig,
+    request: &integrations::EmailListMessagesRequest,
+) -> std::result::Result<Vec<EmailMessageSummary>, EmailIntegrationError> {
+    let resolved = match config.resolve_email_integration_config() {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return UnconfiguredEmailIntegrationAdapter
+                .list_messages(request)
+                .await;
+        }
+        Err(error) => {
+            return Err(EmailIntegrationError::misconfigured(error.to_string()));
+        }
+    };
+    let provider = resolved.provider.trim().to_ascii_lowercase();
+    if !integrations::is_supported_email_provider(&provider) {
+        return Err(EmailIntegrationError::misconfigured(format!(
+            "email integration provider '{provider}' is not supported"
+        )));
+    }
+    match provider.as_str() {
+        "deterministic_fake" => {
+            let adapter = DeterministicEmailIntegrationAdapter::from_resolved_config(&resolved);
+            adapter.list_messages(request).await
+        }
+        "fake" => {
+            let adapter = FakeEmailIntegrationAdapter;
+            adapter.list_messages(request).await
+        }
+        _ => Err(EmailIntegrationError::misconfigured(format!(
+            "email integration provider '{provider}' is not supported"
+        ))),
+    }
+}
+
+async fn execute_send_email_message_via_adapter(
+    config: &RuntimeConfig,
+    request: &SendEmailMessageRequest,
+) -> std::result::Result<EmailMessageSummary, EmailIntegrationError> {
+    let resolved = match config.resolve_email_integration_config() {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return UnconfiguredEmailIntegrationAdapter
+                .send_message(request)
+                .await;
+        }
+        Err(error) => {
+            return Err(EmailIntegrationError::misconfigured(error.to_string()));
+        }
+    };
+    let provider = resolved.provider.trim().to_ascii_lowercase();
+    if !integrations::is_supported_email_provider(&provider) {
+        return Err(EmailIntegrationError::misconfigured(format!(
+            "email integration provider '{provider}' is not supported"
+        )));
+    }
+    match provider.as_str() {
+        "deterministic_fake" => {
+            let adapter = DeterministicEmailIntegrationAdapter::from_resolved_config(&resolved);
+            adapter.send_message(request).await
+        }
+        "fake" => {
+            let adapter = FakeEmailIntegrationAdapter;
+            adapter.send_message(request).await
+        }
+        _ => Err(EmailIntegrationError::misconfigured(format!(
+            "email integration provider '{provider}' is not supported"
+        ))),
+    }
+}
+
+async fn execute_sync_task_list_via_adapter(
+    config: &RuntimeConfig,
+    request: &TaskSyncRequest,
+) -> std::result::Result<TaskSyncResult, TaskSyncIntegrationError> {
+    let resolved = match config.resolve_task_sync_integration_config() {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return UnconfiguredTaskSyncIntegrationAdapter
+                .sync_task_list(request)
+                .await;
+        }
+        Err(error) => {
+            return Err(TaskSyncIntegrationError::misconfigured(error.to_string()));
+        }
+    };
+    let provider = resolved.provider.trim().to_ascii_lowercase();
+    if !integrations::is_supported_task_sync_provider(&provider) {
+        return Err(TaskSyncIntegrationError::misconfigured(format!(
+            "task sync integration provider '{provider}' is not supported"
+        )));
+    }
+    match provider.as_str() {
+        "deterministic_fake" => {
+            let adapter = DeterministicTaskSyncIntegrationAdapter::from_resolved_config(&resolved);
+            adapter.sync_task_list(request).await
+        }
+        "fake" => {
+            let adapter = FakeTaskSyncIntegrationAdapter;
+            adapter.sync_task_list(request).await
+        }
+        _ => Err(TaskSyncIntegrationError::misconfigured(format!(
+            "task sync integration provider '{provider}' is not supported"
+        ))),
+    }
+}
+
+async fn resolve_task_sync_target_artifact(
+    pool: &PgPool,
+    explicit_workspace_artifact_id: Option<Uuid>,
+    task_list_title: &str,
+) -> Result<Option<workspace::WorkspaceArtifactRecord>> {
+    if let Some(workspace_artifact_id) = explicit_workspace_artifact_id {
+        let artifact = workspace::get_workspace_artifact(pool, workspace_artifact_id).await?;
+        if artifact.artifact_kind != WorkspaceArtifactKind::TaskList {
+            bail!("task sync workspace_artifact_id must reference a task_list artifact");
+        }
+        if artifact.status == workspace::WorkspaceArtifactStatus::Archived {
+            bail!("task sync cannot update archived task_list artifacts");
+        }
+        return Ok(Some(artifact));
+    }
+
+    let normalized_title = task_list_title.trim();
+    let artifacts = workspace::list_workspace_artifacts(pool, 250).await?;
+    Ok(artifacts.into_iter().find(|artifact| {
+        artifact.artifact_kind == WorkspaceArtifactKind::TaskList
+            && artifact.status == workspace::WorkspaceArtifactStatus::Active
+            && artifact.title.trim() == normalized_title
+    }))
+}
+
+fn format_task_list_content(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| format!("- [ ] {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn email_message_summary_payload(message: &EmailMessageSummary) -> serde_json::Value {
+    json!({
+        "external_message_id": message.external_message_id,
+        "mailbox": message.mailbox,
+        "from": message.from,
+        "to": message.to,
+        "subject": message.subject,
+        "sent_at": message.sent_at,
+    })
+}
+
+fn email_integration_error_kind_label(kind: EmailIntegrationErrorKind) -> &'static str {
+    match kind {
+        EmailIntegrationErrorKind::Misconfigured => "misconfigured",
+        EmailIntegrationErrorKind::TemporaryFailure => "temporary_failure",
+        EmailIntegrationErrorKind::PermanentFailure => "permanent_failure",
+    }
+}
+
+fn task_sync_integration_error_kind_label(kind: TaskSyncIntegrationErrorKind) -> &'static str {
+    match kind {
+        TaskSyncIntegrationErrorKind::Misconfigured => "misconfigured",
+        TaskSyncIntegrationErrorKind::TemporaryFailure => "temporary_failure",
+        TaskSyncIntegrationErrorKind::PermanentFailure => "permanent_failure",
+    }
+}
+
 async fn execute_upsert_scheduled_foreground_task(
     config: &RuntimeConfig,
     pool: &PgPool,
@@ -2088,6 +2558,9 @@ pub fn validate_capability_scope(
             | GovernedActionKind::ProcessIngressAttachment
             | GovernedActionKind::ListCalendarEvents
             | GovernedActionKind::UpsertCalendarEvent
+            | GovernedActionKind::ListEmailMessages
+            | GovernedActionKind::SendEmailMessage
+            | GovernedActionKind::SyncTaskList
             | GovernedActionKind::UpsertScheduledForegroundTask
             | GovernedActionKind::RequestBackgroundJob
             | GovernedActionKind::RunDiagnostic
@@ -2245,6 +2718,21 @@ pub fn validate_capability_scope(
             validate_upsert_calendar_event_action(action)?;
         }
         (
+            GovernedActionKind::ListEmailMessages,
+            GovernedActionPayload::ListEmailMessages(action),
+        ) => {
+            validate_harness_native_scope(scope, "email message listing")?;
+            validate_list_email_messages_action(action)?;
+        }
+        (GovernedActionKind::SendEmailMessage, GovernedActionPayload::SendEmailMessage(action)) => {
+            validate_harness_native_scope(scope, "email send")?;
+            validate_send_email_message_action(action)?;
+        }
+        (GovernedActionKind::SyncTaskList, GovernedActionPayload::SyncTaskList(action)) => {
+            validate_harness_native_scope(scope, "task list sync")?;
+            validate_sync_task_list_action(action)?;
+        }
+        (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(_),
         ) => {
@@ -2337,6 +2825,16 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::UpsertCalendarEvent,
             GovernedActionPayload::UpsertCalendarEvent(action),
         ) => validate_upsert_calendar_event_action(action),
+        (
+            GovernedActionKind::ListEmailMessages,
+            GovernedActionPayload::ListEmailMessages(action),
+        ) => validate_list_email_messages_action(action),
+        (GovernedActionKind::SendEmailMessage, GovernedActionPayload::SendEmailMessage(action)) => {
+            validate_send_email_message_action(action)
+        }
+        (GovernedActionKind::SyncTaskList, GovernedActionPayload::SyncTaskList(action)) => {
+            validate_sync_task_list_action(action)
+        }
         (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(action),
@@ -2536,6 +3034,61 @@ fn validate_upsert_calendar_event_action(action: &UpsertCalendarEventAction) -> 
     }
     if action.starts_at >= action.ends_at {
         bail!("calendar event upsert starts_at must be before ends_at");
+    }
+    Ok(())
+}
+
+fn validate_list_email_messages_action(action: &ListEmailMessagesAction) -> Result<()> {
+    if action.internal_principal_ref.trim().is_empty() {
+        bail!("email message listing internal_principal_ref must not be empty");
+    }
+    if action.internal_conversation_ref.trim().is_empty() {
+        bail!("email message listing internal_conversation_ref must not be empty");
+    }
+    if action.max_results == 0 || action.max_results > GOVERNED_ACTION_LIST_LIMIT_MAX {
+        bail!(
+            "email message listing max_results must be between 1 and {}",
+            GOVERNED_ACTION_LIST_LIMIT_MAX
+        );
+    }
+    Ok(())
+}
+
+fn validate_send_email_message_action(action: &SendEmailMessageAction) -> Result<()> {
+    if action.internal_principal_ref.trim().is_empty() {
+        bail!("email send internal_principal_ref must not be empty");
+    }
+    if action.internal_conversation_ref.trim().is_empty() {
+        bail!("email send internal_conversation_ref must not be empty");
+    }
+    if action.subject.trim().is_empty() {
+        bail!("email send subject must not be empty");
+    }
+    if action.body_text.trim().is_empty() {
+        bail!("email send body_text must not be empty");
+    }
+    if action
+        .to
+        .iter()
+        .all(|recipient| recipient.trim().is_empty())
+    {
+        bail!("email send requires at least one non-empty recipient");
+    }
+    Ok(())
+}
+
+fn validate_sync_task_list_action(action: &SyncTaskListAction) -> Result<()> {
+    if action.internal_principal_ref.trim().is_empty() {
+        bail!("task list sync internal_principal_ref must not be empty");
+    }
+    if action.internal_conversation_ref.trim().is_empty() {
+        bail!("task list sync internal_conversation_ref must not be empty");
+    }
+    if action.task_list_title.trim().is_empty() {
+        bail!("task list sync task_list_title must not be empty");
+    }
+    if action.items.is_empty() || action.items.iter().all(|item| item.trim().is_empty()) {
+        bail!("task list sync requires at least one non-empty item");
     }
     Ok(())
 }
@@ -3688,6 +4241,9 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         GovernedActionKind::ListCalendarEvents => "list_calendar_events",
         GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        GovernedActionKind::ListEmailMessages => "list_email_messages",
+        GovernedActionKind::SendEmailMessage => "send_email_message",
+        GovernedActionKind::SyncTaskList => "sync_task_list",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -3712,6 +4268,9 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "process_ingress_attachment" => Ok(GovernedActionKind::ProcessIngressAttachment),
         "list_calendar_events" => Ok(GovernedActionKind::ListCalendarEvents),
         "upsert_calendar_event" => Ok(GovernedActionKind::UpsertCalendarEvent),
+        "list_email_messages" => Ok(GovernedActionKind::ListEmailMessages),
+        "send_email_message" => Ok(GovernedActionKind::SendEmailMessage),
+        "sync_task_list" => Ok(GovernedActionKind::SyncTaskList),
         "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
         "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_diagnostic" => Ok(GovernedActionKind::RunDiagnostic),
@@ -3883,6 +4442,30 @@ enum CanonicalGovernedActionPayload {
         details: Option<String>,
         external_event_id: Option<String>,
     },
+    ListEmailMessages {
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        mailbox: Option<String>,
+        query: Option<String>,
+        max_results: u32,
+    },
+    SendEmailMessage {
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        to: Vec<String>,
+        cc: Vec<String>,
+        subject: String,
+        body_text: String,
+        reply_to_external_message_id: Option<String>,
+    },
+    SyncTaskList {
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        task_list_title: String,
+        items: Vec<String>,
+        external_list_id: Option<String>,
+        workspace_artifact_id: Option<Uuid>,
+    },
     UpsertScheduledForegroundTask {
         task_key: String,
         title: String,
@@ -4036,6 +4619,51 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                     .external_event_id
                     .as_ref()
                     .map(|value| value.trim().to_string()),
+            },
+            GovernedActionPayload::ListEmailMessages(action) => Self::ListEmailMessages {
+                internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                mailbox: action
+                    .mailbox
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                query: action.query.as_ref().map(|value| value.trim().to_string()),
+                max_results: action.max_results,
+            },
+            GovernedActionPayload::SendEmailMessage(action) => Self::SendEmailMessage {
+                internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                to: action
+                    .to
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .collect(),
+                cc: action
+                    .cc
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .collect(),
+                subject: action.subject.trim().to_string(),
+                body_text: action.body_text.clone(),
+                reply_to_external_message_id: action
+                    .reply_to_external_message_id
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+            },
+            GovernedActionPayload::SyncTaskList(action) => Self::SyncTaskList {
+                internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                task_list_title: action.task_list_title.trim().to_string(),
+                items: action
+                    .items
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .collect(),
+                external_list_id: action
+                    .external_list_id
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                workspace_artifact_id: action.workspace_artifact_id,
             },
             GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
                 Self::UpsertScheduledForegroundTask {

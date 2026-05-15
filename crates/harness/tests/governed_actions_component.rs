@@ -44,6 +44,9 @@ fn kind_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         GovernedActionKind::ListCalendarEvents => "list_calendar_events",
         GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        GovernedActionKind::ListEmailMessages => "list_email_messages",
+        GovernedActionKind::SendEmailMessage => "send_email_message",
+        GovernedActionKind::SyncTaskList => "sync_task_list",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -1289,6 +1292,39 @@ fn sample_upsert_calendar_event_action() -> contracts::UpsertCalendarEventAction
     }
 }
 
+fn sample_list_email_messages_action() -> contracts::ListEmailMessagesAction {
+    contracts::ListEmailMessagesAction {
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        mailbox: Some("inbox".to_string()),
+        query: Some("subject:milestone".to_string()),
+        max_results: 10,
+    }
+}
+
+fn sample_send_email_message_action() -> contracts::SendEmailMessageAction {
+    contracts::SendEmailMessageAction {
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        to: vec!["owner@example.com".to_string()],
+        cc: vec!["observer@example.com".to_string()],
+        subject: "Milestone update".to_string(),
+        body_text: "Daily status".to_string(),
+        reply_to_external_message_id: None,
+    }
+}
+
+fn sample_sync_task_list_action() -> contracts::SyncTaskListAction {
+    contracts::SyncTaskListAction {
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        task_list_title: "Milestone Tasks".to_string(),
+        items: vec!["Review PR #123".to_string(), "Write notes".to_string()],
+        external_list_id: None,
+        workspace_artifact_id: None,
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn calendar_actions_fail_closed_when_integration_is_disabled() -> Result<()> {
@@ -1576,6 +1612,265 @@ async fn calendar_list_action_records_adapter_failure_and_failed_audit_event() -
 
 #[tokio::test]
 #[serial]
+async fn email_actions_fail_closed_when_integration_is_disabled() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "List email messages".to_string(),
+                    rationale: Some("check recent inbox messages".to_string()),
+                    action_kind: GovernedActionKind::ListEmailMessages,
+                    requested_risk_tier: None,
+                    capability_scope: harness_native_capability_scope(),
+                    payload: contracts::GovernedActionPayload::ListEmailMessages(
+                        sample_list_email_messages_action(),
+                    ),
+                },
+            },
+        )
+        .await?;
+        let blocked = match outcome {
+            governed_actions::GovernedActionPlanningOutcome::Blocked(blocked) => blocked,
+            other => panic!("expected blocked email action while disabled, got {other:?}"),
+        };
+        assert!(
+            blocked
+                .record
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("disabled")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn email_list_action_records_adapter_failure_and_failed_audit_event() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.email.enabled = true;
+        config.integrations.email.provider = "fake".to_string();
+        config.integrations.email.credential_env = "BLUE_LAGOON_TEST_EMAIL_TOKEN".to_string();
+
+        let env_name = config.integrations.email.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let trace_id = Uuid::now_v7();
+        let run_result = async {
+            let planned_result = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id,
+                    execution_id: None,
+                    proposal: contracts::GovernedActionProposal {
+                        proposal_id: Uuid::now_v7(),
+                        title: "List email messages".to_string(),
+                        rationale: Some("verify adapter failure handling".to_string()),
+                        action_kind: GovernedActionKind::ListEmailMessages,
+                        requested_risk_tier: None,
+                        capability_scope: harness_native_capability_scope(),
+                        payload: contracts::GovernedActionPayload::ListEmailMessages(
+                            sample_list_email_messages_action(),
+                        ),
+                    },
+                },
+            )
+            .await?;
+            let planned = match planned_result {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected planned email list action, got {other:?}"),
+            };
+            assert!(!planned.requires_approval);
+
+            let execution =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &planned.record)
+                    .await?;
+            assert_eq!(
+                execution.outcome.status,
+                contracts::GovernedActionStatus::Failed
+            );
+            assert!(
+                execution
+                    .outcome
+                    .summary
+                    .contains("email list_messages failed")
+            );
+
+            let payload_row = sqlx::query(
+                r#"
+                SELECT payload
+                FROM audit_events
+                WHERE trace_id = $1
+                  AND event_kind = 'governed_action_execution_failed'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(trace_id)
+            .fetch_one(&ctx.pool)
+            .await?;
+            let payload: serde_json::Value = payload_row.get("payload");
+            assert_eq!(
+                payload["details"]["integration"],
+                serde_json::json!("email")
+            );
+            assert_eq!(
+                payload["details"]["operation"],
+                serde_json::json!("list_messages")
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn send_email_action_requires_approval_by_default_threshold() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.email.enabled = true;
+        config.integrations.email.provider = "deterministic_fake".to_string();
+        config.integrations.email.credential_env = "BLUE_LAGOON_TEST_EMAIL_TOKEN".to_string();
+
+        let env_name = config.integrations.email.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let outcome = governed_actions::plan_governed_action(
+            &config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Send email message".to_string(),
+                    rationale: Some("notify owner".to_string()),
+                    action_kind: GovernedActionKind::SendEmailMessage,
+                    requested_risk_tier: None,
+                    capability_scope: harness_native_capability_scope(),
+                    payload: contracts::GovernedActionPayload::SendEmailMessage(
+                        sample_send_email_message_action(),
+                    ),
+                },
+            },
+        )
+        .await?;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+
+        let planned = match outcome {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned send email action, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+        assert_eq!(planned.record.risk_tier, GovernedActionRiskTier::Tier2);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn task_sync_action_executes_and_persists_task_list_artifact() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.task_sync.enabled = true;
+        config.integrations.task_sync.provider = "deterministic_fake".to_string();
+        config.integrations.task_sync.credential_env =
+            "BLUE_LAGOON_TEST_TASK_SYNC_TOKEN".to_string();
+        config.governed_actions.approval_required_min_risk_tier = GovernedActionRiskTier::Tier3;
+
+        let env_name = config.integrations.task_sync.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let planned_result = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: contracts::GovernedActionProposal {
+                        proposal_id: Uuid::now_v7(),
+                        title: "Sync task list".to_string(),
+                        rationale: Some("align canonical tasks".to_string()),
+                        action_kind: GovernedActionKind::SyncTaskList,
+                        requested_risk_tier: None,
+                        capability_scope: harness_native_capability_scope(),
+                        payload: contracts::GovernedActionPayload::SyncTaskList(
+                            sample_sync_task_list_action(),
+                        ),
+                    },
+                },
+            )
+            .await?;
+            let planned = match planned_result {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected planned task sync action, got {other:?}"),
+            };
+            assert!(!planned.requires_approval);
+            assert_eq!(planned.record.risk_tier, GovernedActionRiskTier::Tier2);
+            let executed =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &planned.record)
+                    .await?;
+            assert_eq!(
+                executed.outcome.status,
+                contracts::GovernedActionStatus::Executed
+            );
+
+            let artifacts = workspace::list_workspace_artifacts(&ctx.pool, 25).await?;
+            assert!(artifacts.iter().any(|artifact| {
+                artifact.artifact_kind == WorkspaceArtifactKind::TaskList
+                    && artifact.title == "Milestone Tasks"
+                    && artifact
+                        .content_text
+                        .as_deref()
+                        .is_some_and(|content| content.contains("- [ ] Review PR #123"))
+            }));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn web_fetch_proposal_is_planned_with_tier2_and_requires_approval() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let planned = governed_actions::plan_governed_action(
@@ -1845,6 +2140,9 @@ async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
             GovernedActionKind::ProcessIngressAttachment,
             GovernedActionKind::ListCalendarEvents,
             GovernedActionKind::UpsertCalendarEvent,
+            GovernedActionKind::ListEmailMessages,
+            GovernedActionKind::SendEmailMessage,
+            GovernedActionKind::SyncTaskList,
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionKind::RequestBackgroundJob,
             GovernedActionKind::RunDiagnostic,

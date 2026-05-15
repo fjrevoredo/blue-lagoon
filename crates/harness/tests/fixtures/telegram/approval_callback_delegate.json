@@ -1,0 +1,22 @@
+{
+  "update_id": 1010,
+  "callback_query": {
+    "id": "callback-delegate-1010",
+    "from": {
+      "id": 43,
+      "is_bot": false,
+      "first_name": "Delegate",
+      "username": "delegate_user"
+    },
+    "data": "approve:42",
+    "message": {
+      "message_id": 55,
+      "date": 1712301040,
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "Approve this action?"
+    }
+  }
+}

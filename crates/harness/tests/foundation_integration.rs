@@ -628,6 +628,9 @@ fn sample_telegram_config() -> TelegramConfig {
             allowed_chat_id: 24,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            delegates: Vec::new(),
+            approval_resolution_policy:
+                harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
         }),
     }
 }

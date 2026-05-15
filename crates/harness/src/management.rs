@@ -389,6 +389,42 @@ pub struct CalendarIntegrationRunSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailIntegrationRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSyncRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceScriptRunSummary {
     pub workspace_script_run_id: Uuid,
     pub workspace_script_id: Uuid,
@@ -2219,6 +2255,86 @@ pub async fn list_calendar_integration_runs(
 
     rows.into_iter()
         .map(calendar_integration_run_summary_from_row)
+        .collect()
+}
+
+pub async fn list_email_integration_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<EmailIntegrationRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('list_email_messages', 'send_email_message')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list email integration runs for management")?;
+
+    rows.into_iter()
+        .map(email_integration_run_summary_from_row)
+        .collect()
+}
+
+pub async fn list_task_sync_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<TaskSyncRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('sync_task_list')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list task sync integration runs for management")?;
+
+    rows.into_iter()
+        .map(task_sync_run_summary_from_row)
         .collect()
 }
 
@@ -5335,6 +5451,118 @@ fn calendar_integration_run_summary_from_row(
     })
 }
 
+fn email_integration_run_summary_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<EmailIntegrationRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode email integration payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::ListEmailMessages(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "mailbox={} query={} max_results={}",
+                action.mailbox.as_deref().unwrap_or("inbox"),
+                action.query.as_deref().unwrap_or("none"),
+                action.max_results
+            ),
+        ),
+        contracts::GovernedActionPayload::SendEmailMessage(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "to={} cc={} subject={} reply_to={}",
+                action.to.len(),
+                action.cc.len(),
+                action.subject,
+                action
+                    .reply_to_external_message_id
+                    .as_deref()
+                    .unwrap_or("none")
+            ),
+        ),
+        _ => bail!(
+            "email integration query returned non-email payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(EmailIntegrationRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
+fn task_sync_run_summary_from_row(row: sqlx::postgres::PgRow) -> Result<TaskSyncRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode task sync payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::SyncTaskList(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "title={} items={} external_list_id={} workspace_artifact_id={}",
+                action.task_list_title,
+                action.items.len(),
+                action.external_list_id.as_deref().unwrap_or("new"),
+                action
+                    .workspace_artifact_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ),
+        _ => bail!(
+            "task sync query returned non-task-sync payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(TaskSyncRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
 fn workspace_script_run_summary(
     record: &workspace::WorkspaceScriptRunRecord,
 ) -> WorkspaceScriptRunSummary {
@@ -5403,6 +5631,9 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
         contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
         contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        contracts::GovernedActionKind::ListEmailMessages => "list_email_messages",
+        contracts::GovernedActionKind::SendEmailMessage => "send_email_message",
+        contracts::GovernedActionKind::SyncTaskList => "sync_task_list",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -5734,6 +5965,9 @@ mod tests {
                     allowed_chat_id: 2,
                     internal_principal_ref: "primary-user".to_string(),
                     internal_conversation_ref: "telegram-primary".to_string(),
+                    delegates: Vec::new(),
+                    approval_resolution_policy:
+                        crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
                 }),
             }),
             model_gateway: Some(ModelGatewayConfig {

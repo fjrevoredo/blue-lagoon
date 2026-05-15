@@ -2,7 +2,7 @@
 
 ## Metadata
 
-- Plan Status: IN PROGRESS
+- Plan Status: COMPLETED
 - Created: 2026-05-15
 - Last Updated: 2026-05-15
 - Owner: Coding agent
@@ -222,7 +222,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 3: Typed Workflow Integrations (R3)
 
-- Status: IN PROGRESS
+- Status: COMPLETED
 - Purpose: Add first-class harness-governed workflow integrations, beginning
   with calendar as the easiest vertical slice, then extending to email and task
   sync.
@@ -300,7 +300,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.6: Expand Integration Coverage To Email And Task Sync
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Extend the proven calendar integration pattern to email and task
   sync workflows.
 - Steps:
@@ -315,7 +315,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 4: Autonomous Background Origination (R4)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Add deterministic harness-side origination of background work from
   configured thresholds/schedules.
 - Exit Criteria: Scheduler can originate due jobs without manual enqueue and
@@ -323,7 +323,7 @@ Resolved on 2026-05-15:
 
 #### Task 4.1: Add Scheduler Planning Stage
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Introduce planner stage in runtime scheduler before due-job
   execution leasing.
 - Steps:
@@ -335,7 +335,7 @@ Resolved on 2026-05-15:
 
 #### Task 4.2: Implement Threshold/Schedule Trigger Producers
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Generate background planning requests from thresholds and periodic
   schedule criteria.
 - Steps:
@@ -347,7 +347,7 @@ Resolved on 2026-05-15:
 
 #### Task 4.3: Add Deduplication, Telemetry, And Audit Coverage
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Ensure autonomous planning remains bounded and diagnosable.
 - Steps:
   1. Add planner-level dedup checks and counters.
@@ -358,7 +358,7 @@ Resolved on 2026-05-15:
 
 #### Task 4.4: Add End-To-End Autonomous Origination Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove originate -> execute -> merge path from runtime scheduler.
 - Steps:
   1. Add integration tests where no manual enqueue occurs.
@@ -414,7 +414,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 6: Approval UX Hardening (R6)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Improve approval status clarity and follow-up messaging while keeping
   canonical approval semantics unchanged.
 - Exit Criteria: In-channel approval messages clearly represent lifecycle
@@ -422,7 +422,7 @@ Resolved on 2026-05-15:
 
 #### Task 6.1: Improve Approval Prompt And Follow-Up Messaging
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Provide clear user-facing status text for pending, approved,
   rejected, expired, and invalidated approvals.
 - Steps:
@@ -434,7 +434,7 @@ Resolved on 2026-05-15:
 
 #### Task 6.2: Add Multi-Approval Context And Idempotency Guards
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Improve handling and messaging when multiple approvals are pending
   or duplicate resolutions arrive.
 - Steps:
@@ -446,7 +446,7 @@ Resolved on 2026-05-15:
 
 #### Task 6.3: Add Approval UX Integration Coverage
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove approval lifecycle messaging and resolution paths end to end.
 - Steps:
   1. Add integration tests for callback-based approve/reject flows.
@@ -457,7 +457,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 7: Bounded Multi-Principal Collaboration (R7)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Extend single-user-first runtime to owner+delegate collaboration
   without introducing enterprise multi-tenant complexity.
 - Exit Criteria: Allowlisted delegate principals can participate through bounded
@@ -466,7 +466,7 @@ Resolved on 2026-05-15:
 
 #### Task 7.1: Add Principal/Binding Schema Extensions
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add durable structures for owner/delegate principal bindings.
 - Steps:
   1. Add migration(s) for principal allowlist and conversation binding metadata.
@@ -477,7 +477,7 @@ Resolved on 2026-05-15:
 
 #### Task 7.2: Extend Ingress Normalization For Allowlisted Principals
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Map ingress events to configured owner/delegate principals safely.
 - Steps:
   1. Extend Telegram binding config/resolution rules for bounded principal sets.
@@ -488,7 +488,7 @@ Resolved on 2026-05-15:
 
 #### Task 7.3: Extend Policy/Approval Attribution For Delegates
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Ensure approvals and governed actions retain clear actor identity
   under collaboration flows.
 - Steps:
@@ -503,7 +503,7 @@ Resolved on 2026-05-15:
 
 #### Task 7.4: Add Collaboration Integration Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove delegate-triggered and owner-approved flows under bounded
   policy rules.
 - Steps:
@@ -518,7 +518,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 8: Cleanup And Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Ensure only intended artifacts remain and the full change set is
   verified before marking completion.
 - Exit Criteria: Temporary artifacts are removed, targeted and broad
@@ -526,7 +526,7 @@ Resolved on 2026-05-15:
 
 #### Task 8.1: Cleanup Intermediate Artifacts
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Remove temporary files and scaffolding not part of final
   repository state.
 - Steps:
@@ -540,7 +540,7 @@ Resolved on 2026-05-15:
 
 #### Task 8.2: Final Verification
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Run final integrated verification after cleanup.
 - Steps:
   1. Run the final verification commands listed below.
@@ -644,3 +644,100 @@ Implementation must not start until the user approves this plan.
     - `cargo test -p harness --test governed_actions_integration -- --nocapture`.
     - `cargo check --workspace`.
     - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Task 3.6 completed.
+  - Added governed action kinds and payload support for email/task sync (`list_email_messages`, `send_email_message`, `sync_task_list`) in contracts, worker schema disclosure, harness validation/execution, policy/approval/recovery mappings, and management/admin inspection surfaces.
+  - Added forward migration `0017__workflow_integration_email_task_action_kinds.sql` and aligned migration discovery expectations to include version 17.
+  - Validation runs:
+    - `cargo test --workspace`.
+    - `cargo fmt --all --check`.
+    - `cargo check --workspace`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Milestone 4 started.
+  - Task 4.1 completed: added a dedicated scheduler planning stage (`run_scheduler_planning_pass`) before due-job leasing in `run_background_scheduler_iteration()`, while preserving existing execution behavior for already planned jobs.
+  - Added deterministic planner-input coverage via `run_scheduler_planning_pass_with_requests(...)`.
+  - Validation runs:
+    - `cargo test -p harness --lib background_planning -- --nocapture`.
+    - `cargo test -p harness --test unconscious_component -- --nocapture`.
+- 2026-05-15: Task 4.2 completed.
+  - Added autonomous threshold producers for memory consolidation and retrieval maintenance, plus a bounded periodic schedule producer for self-model reflection, all routed through `plan_background_job()`.
+  - Added planner producer coverage in unconscious component tests, including dedup/schedule due behavior across repeated scheduler passes.
+  - Updated `docs/internal/unconscious_loop/BACKGROUND_JOBS.md` to reflect the live producer behavior and restamped source references.
+  - Validation runs:
+    - `cargo test -p harness --lib background_planning -- --nocapture`.
+    - `cargo test -p harness --test unconscious_component -- --nocapture`.
+- 2026-05-15: Task 4.3 completed.
+  - Added scheduler-pass telemetry audit events (`background_scheduler_planning_pass_completed`) and rate-limited operational diagnostics for duplicate suppression/rejection pressure in the planner path.
+  - Added unconscious component assertions that planner telemetry is persisted and surfaced through operational diagnostics.
+  - Updated `docs/internal/unconscious_loop/BACKGROUND_JOBS.md` with telemetry/diagnostic behavior and refreshed source references.
+  - Validation runs:
+    - `cargo test -p harness --lib background_planning -- --nocapture`.
+    - `cargo test -p harness --test unconscious_component -- --nocapture`.
+- 2026-05-15: Task 4.4 completed.
+  - Added runtime scheduler integration entrypoint (`run_background_scheduler_once_with_transport`) and end-to-end integration coverage for autonomous schedule origination with no manual enqueue.
+  - New integration assertions verify persisted trigger kind (`time_schedule`), completed execution/run state, scheduler planning telemetry presence, and duplicate suppression across repeated scheduler iterations.
+  - Validation runs:
+    - `cargo test -p harness --test unconscious_integration -- --nocapture`.
+- 2026-05-15: Milestone 6 started.
+  - Task 6.1 completed: approval prompt and follow-up fallback text now explicitly communicate lifecycle state (`pending/approved/rejected/expired/invalidated`) and next-step guidance, with callback and `/approve`/`/reject` command paths aligned through shared resolution messaging.
+  - Validation runs:
+    - `cargo test -p harness --lib telegram -- --nocapture`.
+    - `cargo test -p harness --lib foreground_orchestration -- --nocapture`.
+- 2026-05-15: Task 6.2 completed.
+  - Added stale/unknown approval-token diagnostics in foreground orchestration, including explicit `approval_resolution_unknown_token` and `approval_resolution_stale_token` operational diagnostics with trace/execution linkage and source metadata.
+  - Added idempotent stale-resolution behavior for non-pending approvals so replayed callback/command submissions return terminal lifecycle messaging instead of attempting a second resolution transition.
+  - Extended component coverage for callback replay idempotency and unknown-token diagnostics.
+  - Validation runs:
+    - `cargo test -p harness --test foreground_component -- --nocapture`.
+- 2026-05-15: Task 6.3 completed.
+  - Expanded integration coverage to include callback and command reject flows (`approval_callback_reject.json`, `approval_command_reject.json`) in addition to existing approve flows.
+  - Added assertions that callback and command resolution channels persist the same canonical approval lifecycle fields (`status`, `resolution_kind`, `resolved_by`, `resolved_at`) for equivalent outcomes.
+  - Validation runs:
+    - `cargo test -p harness --test foreground_integration -- --nocapture`.
+- 2026-05-15: Milestone 7 started.
+  - Task 7.1 completed: added reviewed migration `0018__collaboration_principal_bindings.sql` to extend conversation binding schema for collaboration-safe principal mappings (owner/delegate metadata column, internal-conversation uniqueness relaxation, and principal-scoped lookup indexes).
+  - Validation runs:
+    - `cargo test -p harness --test migration_component -- --nocapture`.
+- 2026-05-15: Task 7.2 completed.
+  - Extended Telegram binding config with delegate allowlist entries and approval-resolution policy mode, resolved into explicit principal binding maps.
+  - Updated ingress normalization and foreground policy evaluation to resolve internal principal refs from allowlisted Telegram users instead of a single fixed actor binding.
+  - Added delegate component coverage (`delegate_ingress_binding_is_accepted_for_allowlisted_principal`) plus fixture coverage for delegate message ingress.
+  - Validation runs:
+    - `cargo test -p harness --test foreground_component -- --nocapture`.
+- 2026-05-15: Task 7.3 completed.
+  - Added approval-resolution actor policy support (`delegate_allowed` / `owner_only`) with allowlisted-principal enforcement and owner-only gating.
+  - Routed Telegram approval callback/command resolution through the resolved actor policy; approval audit payloads now include requested/resolved principal attribution fields.
+  - Updated local operator template config with collaboration policy/delegate examples and documented new knobs in `docs/internal/conscious_loop/GOVERNED_ACTIONS.md`.
+  - Validation runs:
+    - `cargo test -p harness --test governed_actions_component -- --nocapture`.
+    - `cargo test -p harness --lib -- --nocapture`.
+- 2026-05-15: Task 7.4 completed.
+  - Added delegate collaboration integration fixtures and tests:
+    - delegate approval callback succeeds under `delegate_allowed`,
+    - delegate approval callback is denied under `owner_only`,
+    - canonical approval state remains pending on denied delegate attempts.
+  - Validation runs:
+    - `cargo test -p harness --test governed_actions_integration -- --nocapture`.
+    - `cargo check --workspace`.
+    - `cargo fmt --all --check`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Milestone 8 completed.
+  - Task 8.1 completed: verified no temporary scaffolding remained in the worktree; retained all new fixtures/migrations/docs required for long-term collaboration and approval UX coverage.
+  - During cleanup verification, fixed one artifact-naming policy violation by renaming migration `0018__phase_7_collaboration_principal_bindings.sql` to `0018__collaboration_principal_bindings.sql`.
+  - Validation runs:
+    - `cargo test -p harness --test artifact_naming -- --nocapture`.
+- 2026-05-15: Task 8.2 completed.
+  - Final verification command set completed successfully after Milestone 8 cleanup.
+  - Validation runs:
+    - `cargo fmt --all --check`.
+    - `cargo check --workspace`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+    - `cargo test -p contracts --lib`.
+    - `cargo test -p harness --test migration_component -- --nocapture`.
+    - `cargo test -p harness --test foreground_component -- --nocapture`.
+    - `cargo test -p harness --test foreground_integration -- --nocapture`.
+    - `cargo test -p harness --test unconscious_component -- --nocapture`.
+    - `cargo test -p harness --test unconscious_integration -- --nocapture`.
+    - `cargo test -p harness --test governed_actions_component -- --nocapture`.
+    - `cargo test -p harness --test governed_actions_integration -- --nocapture`.
+    - `cargo test -p runtime --test admin_cli -- --nocapture`.
+    - `cargo test --workspace`.

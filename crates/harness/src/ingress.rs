@@ -88,13 +88,13 @@ pub fn normalize_telegram_update(
             ));
         }
 
-        if callback.from.id != config.allowed_user_id {
+        let Some(principal_binding) = config.principal_binding_for_user_id(callback.from.id) else {
             return Ok(reject(
                 update.update_id,
                 TelegramRejectionReason::UnauthorizedActor,
-                "Telegram callback actor does not match configured single-user identity",
+                "Telegram callback actor is not allowlisted for the configured foreground binding",
             ));
-        }
+        };
 
         if message.chat.id != config.allowed_chat_id {
             return Ok(reject(
@@ -112,7 +112,7 @@ pub fn normalize_telegram_update(
                 external_conversation_id: message.chat.id.to_string(),
                 external_event_id: update.update_id.to_string(),
                 external_message_id: Some(message.message_id.to_string()),
-                internal_principal_ref: config.internal_principal_ref.clone(),
+                internal_principal_ref: principal_binding.internal_principal_ref.clone(),
                 internal_conversation_ref: config.internal_conversation_ref.clone(),
                 event_kind: IngressEventKind::ApprovalCallback,
                 occurred_at: match timestamp_to_utc(message.date) {
@@ -176,13 +176,13 @@ fn normalize_message_update(
         );
     }
 
-    if actor.id != config.allowed_user_id {
+    let Some(principal_binding) = config.principal_binding_for_user_id(actor.id) else {
         return reject(
             update.update_id,
             TelegramRejectionReason::UnauthorizedActor,
-            "Telegram message actor does not match configured single-user identity",
+            "Telegram message actor is not allowlisted for the configured foreground binding",
         );
-    }
+    };
 
     if message.chat.id != config.allowed_chat_id {
         return reject(
@@ -207,7 +207,7 @@ fn normalize_message_update(
         external_conversation_id: message.chat.id.to_string(),
         external_event_id: update.update_id.to_string(),
         external_message_id: Some(message.message_id.to_string()),
-        internal_principal_ref: config.internal_principal_ref.clone(),
+        internal_principal_ref: principal_binding.internal_principal_ref.clone(),
         internal_conversation_ref: config.internal_conversation_ref.clone(),
         event_kind: message_event_kind(message),
         occurred_at,
@@ -325,6 +325,13 @@ mod tests {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         }
     }

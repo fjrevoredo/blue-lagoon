@@ -102,10 +102,38 @@ pub struct WakeSignalPolicyConfig {
 pub struct WorkflowIntegrationsConfig {
     #[serde(default)]
     pub calendar: CalendarIntegrationConfig,
+    #[serde(default)]
+    pub email: EmailIntegrationConfig,
+    #[serde(default)]
+    pub task_sync: TaskSyncIntegrationConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct CalendarIntegrationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub credential_env: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct EmailIntegrationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub credential_env: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct TaskSyncIntegrationConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -202,6 +230,45 @@ pub struct TelegramForegroundBindingConfig {
     pub allowed_chat_id: i64,
     pub internal_principal_ref: String,
     pub internal_conversation_ref: String,
+    #[serde(default)]
+    pub delegates: Vec<TelegramDelegateBindingConfig>,
+    #[serde(default = "default_telegram_approval_resolution_policy")]
+    pub approval_resolution_policy: TelegramApprovalResolutionPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TelegramDelegateBindingConfig {
+    pub allowed_user_id: i64,
+    pub internal_principal_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramApprovalResolutionPolicy {
+    DelegateAllowed,
+    OwnerOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramPrincipalRole {
+    Owner,
+    Delegate,
+}
+
+impl TelegramPrincipalRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Delegate => "delegate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTelegramPrincipalBinding {
+    pub allowed_user_id: i64,
+    pub internal_principal_ref: String,
+    pub role: TelegramPrincipalRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +279,36 @@ pub struct ResolvedTelegramConfig {
     pub allowed_chat_id: i64,
     pub internal_principal_ref: String,
     pub internal_conversation_ref: String,
+    pub approval_resolution_policy: TelegramApprovalResolutionPolicy,
+    pub principal_bindings: Vec<ResolvedTelegramPrincipalBinding>,
     pub poll_limit: u16,
+}
+
+impl ResolvedTelegramConfig {
+    pub fn principal_binding_for_user_id(
+        &self,
+        allowed_user_id: i64,
+    ) -> Option<&ResolvedTelegramPrincipalBinding> {
+        self.principal_bindings
+            .iter()
+            .find(|binding| binding.allowed_user_id == allowed_user_id)
+    }
+
+    pub fn principal_binding_for_principal_ref(
+        &self,
+        principal_ref: &str,
+    ) -> Option<&ResolvedTelegramPrincipalBinding> {
+        self.principal_bindings
+            .iter()
+            .find(|binding| binding.internal_principal_ref == principal_ref)
+    }
+
+    pub fn allowlisted_principal_refs(&self) -> Vec<String> {
+        self.principal_bindings
+            .iter()
+            .map(|binding| binding.internal_principal_ref.clone())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -360,6 +456,20 @@ pub struct ResolvedSelfModelConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCalendarIntegrationConfig {
+    pub provider: String,
+    pub credential: String,
+    pub api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEmailIntegrationConfig {
+    pub provider: String,
+    pub credential: String,
+    pub api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTaskSyncIntegrationConfig {
     pub provider: String,
     pub credential: String,
     pub api_base_url: Option<String>,
@@ -552,6 +662,19 @@ impl RuntimeConfig {
             "missing Telegram foreground binding configuration: configure [telegram.foreground_binding] in config/local.toml or an equivalent local override",
         )?;
         binding.validate()?;
+        let mut principal_bindings = Vec::with_capacity(1 + binding.delegates.len());
+        principal_bindings.push(ResolvedTelegramPrincipalBinding {
+            allowed_user_id: binding.allowed_user_id,
+            internal_principal_ref: binding.internal_principal_ref.clone(),
+            role: TelegramPrincipalRole::Owner,
+        });
+        principal_bindings.extend(binding.delegates.iter().map(|delegate| {
+            ResolvedTelegramPrincipalBinding {
+                allowed_user_id: delegate.allowed_user_id,
+                internal_principal_ref: delegate.internal_principal_ref.clone(),
+                role: TelegramPrincipalRole::Delegate,
+            }
+        }));
 
         Ok(ResolvedTelegramConfig {
             api_base_url: telegram.api_base_url.clone(),
@@ -563,6 +686,8 @@ impl RuntimeConfig {
             allowed_chat_id: binding.allowed_chat_id,
             internal_principal_ref: binding.internal_principal_ref.clone(),
             internal_conversation_ref: binding.internal_conversation_ref.clone(),
+            approval_resolution_policy: binding.approval_resolution_policy,
+            principal_bindings,
             poll_limit: telegram.poll_limit,
         })
     }
@@ -660,22 +785,18 @@ impl RuntimeConfig {
         &self,
     ) -> Result<Option<ResolvedCalendarIntegrationConfig>> {
         self.integrations.validate()?;
-        if !self.integrations.calendar.enabled {
-            return Ok(None);
-        }
-
         let calendar = &self.integrations.calendar;
-        let credential = require_secret_env(
-            &calendar.credential_env,
-            "calendar integration credential environment variable",
-        )?;
-        let provider = calendar.provider.trim().to_string();
-        let api_base_url = calendar
-            .api_base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        let Some((provider, credential, api_base_url)) =
+            resolve_workflow_integration_config_fields(
+                calendar.enabled,
+                &calendar.provider,
+                &calendar.credential_env,
+                calendar.api_base_url.as_deref(),
+                "calendar integration credential environment variable",
+            )?
+        else {
+            return Ok(None);
+        };
 
         Ok(Some(ResolvedCalendarIntegrationConfig {
             provider,
@@ -683,6 +804,73 @@ impl RuntimeConfig {
             api_base_url,
         }))
     }
+
+    pub fn resolve_email_integration_config(
+        &self,
+    ) -> Result<Option<ResolvedEmailIntegrationConfig>> {
+        self.integrations.validate()?;
+        let email = &self.integrations.email;
+        let Some((provider, credential, api_base_url)) =
+            resolve_workflow_integration_config_fields(
+                email.enabled,
+                &email.provider,
+                &email.credential_env,
+                email.api_base_url.as_deref(),
+                "email integration credential environment variable",
+            )?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(ResolvedEmailIntegrationConfig {
+            provider,
+            credential,
+            api_base_url,
+        }))
+    }
+
+    pub fn resolve_task_sync_integration_config(
+        &self,
+    ) -> Result<Option<ResolvedTaskSyncIntegrationConfig>> {
+        self.integrations.validate()?;
+        let task_sync = &self.integrations.task_sync;
+        let Some((provider, credential, api_base_url)) =
+            resolve_workflow_integration_config_fields(
+                task_sync.enabled,
+                &task_sync.provider,
+                &task_sync.credential_env,
+                task_sync.api_base_url.as_deref(),
+                "task sync integration credential environment variable",
+            )?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(ResolvedTaskSyncIntegrationConfig {
+            provider,
+            credential,
+            api_base_url,
+        }))
+    }
+}
+
+fn resolve_workflow_integration_config_fields(
+    enabled: bool,
+    provider: &str,
+    credential_env: &str,
+    api_base_url: Option<&str>,
+    credential_env_label: &str,
+) -> Result<Option<(String, String, Option<String>)>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let credential = require_secret_env(credential_env, credential_env_label)?;
+    let provider = provider.trim().to_string();
+    let api_base_url = api_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Ok(Some((provider, credential, api_base_url)))
 }
 
 fn discover_config_root() -> Result<PathBuf> {
@@ -923,6 +1111,10 @@ fn is_valid_env_var_name(value: &str) -> bool {
         })
 }
 
+fn default_telegram_approval_resolution_policy() -> TelegramApprovalResolutionPolicy {
+    TelegramApprovalResolutionPolicy::DelegateAllowed
+}
+
 impl TelegramConfig {
     fn validate(&self) -> Result<()> {
         self.validate_transport()?;
@@ -959,6 +1151,28 @@ impl TelegramForegroundBindingConfig {
         }
         if self.internal_conversation_ref.trim().is_empty() {
             bail!("telegram.foreground_binding.internal_conversation_ref must not be empty");
+        }
+        let mut seen_user_ids = std::collections::BTreeSet::new();
+        let mut seen_principals = std::collections::BTreeSet::new();
+        seen_user_ids.insert(self.allowed_user_id);
+        seen_principals.insert(self.internal_principal_ref.trim().to_string());
+        for delegate in &self.delegates {
+            if delegate.allowed_user_id == 0 {
+                bail!("telegram.foreground_binding.delegates[].allowed_user_id must not be zero");
+            }
+            if delegate.internal_principal_ref.trim().is_empty() {
+                bail!(
+                    "telegram.foreground_binding.delegates[].internal_principal_ref must not be empty"
+                );
+            }
+            if !seen_user_ids.insert(delegate.allowed_user_id) {
+                bail!("telegram.foreground_binding.delegates contains a duplicate allowed_user_id");
+            }
+            if !seen_principals.insert(delegate.internal_principal_ref.trim().to_string()) {
+                bail!(
+                    "telegram.foreground_binding.delegates contains a duplicate internal_principal_ref"
+                );
+            }
         }
         Ok(())
     }
@@ -1149,7 +1363,10 @@ impl WakeSignalPolicyConfig {
 
 impl WorkflowIntegrationsConfig {
     fn validate(&self) -> Result<()> {
-        self.calendar.validate()
+        self.calendar.validate()?;
+        self.email.validate()?;
+        self.task_sync.validate()?;
+        Ok(())
     }
 }
 
@@ -1174,6 +1391,60 @@ impl CalendarIntegrationConfig {
         {
             bail!(
                 "integrations.calendar.api_base_url must not be empty when integrations.calendar.enabled is true"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl EmailIntegrationConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.provider.trim().is_empty() {
+            bail!(
+                "integrations.email.provider must not be empty when integrations.email.enabled is true"
+            );
+        }
+        if self.credential_env.trim().is_empty() {
+            bail!(
+                "integrations.email.credential_env must not be empty when integrations.email.enabled is true"
+            );
+        }
+        if let Some(api_base_url) = self.api_base_url.as_deref()
+            && api_base_url.trim().is_empty()
+        {
+            bail!(
+                "integrations.email.api_base_url must not be empty when integrations.email.enabled is true"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl TaskSyncIntegrationConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.provider.trim().is_empty() {
+            bail!(
+                "integrations.task_sync.provider must not be empty when integrations.task_sync.enabled is true"
+            );
+        }
+        if self.credential_env.trim().is_empty() {
+            bail!(
+                "integrations.task_sync.credential_env must not be empty when integrations.task_sync.enabled is true"
+            );
+        }
+        if let Some(api_base_url) = self.api_base_url.as_deref()
+            && api_base_url.trim().is_empty()
+        {
+            bail!(
+                "integrations.task_sync.api_base_url must not be empty when integrations.task_sync.enabled is true"
             );
         }
         Ok(())
@@ -1971,6 +2242,32 @@ args = []
     }
 
     #[test]
+    fn validate_rejects_enabled_email_integration_without_provider() {
+        let mut config = sample_config();
+        config.integrations.email.enabled = true;
+        config.integrations.email.provider = "   ".to_string();
+        config.integrations.email.credential_env = "BLUE_LAGOON_TEST_EMAIL_TOKEN".to_string();
+
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("integrations.email.provider"));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_task_sync_integration_without_credential_env() {
+        let mut config = sample_config();
+        config.integrations.task_sync.enabled = true;
+        config.integrations.task_sync.provider = "todoist".to_string();
+        config.integrations.task_sync.credential_env = "   ".to_string();
+
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("integrations.task_sync.credential_env")
+        );
+    }
+
+    #[test]
     fn resolve_calendar_integration_config_returns_none_when_disabled() {
         let config = sample_config();
         let resolved = config
@@ -2046,6 +2343,65 @@ args = []
     }
 
     #[test]
+    fn resolve_email_and_task_sync_configs_resolve_enabled_secrets_and_endpoints() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.integrations.email.enabled = true;
+        config.integrations.email.provider = "gmail".to_string();
+        config.integrations.email.credential_env =
+            format!("BLUE_LAGOON_TEST_EMAIL_TOKEN_{}", Uuid::now_v7());
+        config.integrations.email.api_base_url =
+            Some("https://gmail.googleapis.com/gmail/v1".to_string());
+
+        config.integrations.task_sync.enabled = true;
+        config.integrations.task_sync.provider = "todoist".to_string();
+        config.integrations.task_sync.credential_env =
+            format!("BLUE_LAGOON_TEST_TASK_SYNC_TOKEN_{}", Uuid::now_v7());
+        config.integrations.task_sync.api_base_url =
+            Some("https://api.todoist.com/rest/v2".to_string());
+
+        let email_env = config.integrations.email.credential_env.clone();
+        let task_env = config.integrations.task_sync.credential_env.clone();
+        let original_email = env::var_os(&email_env);
+        let original_task = env::var_os(&task_env);
+        unsafe {
+            env::set_var(&email_env, "email-secret");
+            env::set_var(&task_env, "task-secret");
+        }
+
+        let email = config
+            .resolve_email_integration_config()
+            .expect("email integration should resolve")
+            .expect("email integration should be enabled");
+        assert_eq!(email.provider, "gmail");
+        assert_eq!(email.credential, "email-secret");
+        assert_eq!(
+            email.api_base_url.as_deref(),
+            Some("https://gmail.googleapis.com/gmail/v1")
+        );
+
+        let task_sync = config
+            .resolve_task_sync_integration_config()
+            .expect("task sync integration should resolve")
+            .expect("task sync integration should be enabled");
+        assert_eq!(task_sync.provider, "todoist");
+        assert_eq!(task_sync.credential, "task-secret");
+        assert_eq!(
+            task_sync.api_base_url.as_deref(),
+            Some("https://api.todoist.com/rest/v2")
+        );
+
+        match original_email {
+            Some(value) => unsafe { env::set_var(&email_env, value) },
+            None => unsafe { env::remove_var(&email_env) },
+        }
+        match original_task {
+            Some(value) => unsafe { env::set_var(&task_env, value) },
+            None => unsafe { env::remove_var(&task_env) },
+        }
+    }
+
+    #[test]
     fn validate_rejects_invalid_observability_settings() {
         let mut config = sample_config();
         config.observability.model_call_payload_retention_days = 0;
@@ -2073,6 +2429,8 @@ args = []
         assert_eq!(loaded.background.execution.default_token_budget, 6_000);
         assert!(loaded.background.wake_signals.allow_foreground_conversion);
         assert!(!loaded.integrations.calendar.enabled);
+        assert!(!loaded.integrations.email.enabled);
+        assert!(!loaded.integrations.task_sync.enabled);
         assert_eq!(loaded.observability.model_call_payload_retention_days, 30);
 
         match original_database_url {
@@ -2127,6 +2485,8 @@ args = []
                 allowed_chat_id: 42,
                 internal_principal_ref: "primary-user".to_string(),
                 internal_conversation_ref: "telegram-primary".to_string(),
+                delegates: Vec::new(),
+                approval_resolution_policy: TelegramApprovalResolutionPolicy::DelegateAllowed,
             }),
         });
 

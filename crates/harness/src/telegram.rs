@@ -505,14 +505,16 @@ pub fn build_approval_prompt_message(
 
     let mut lines = vec![
         "Approval required".to_string(),
+        "State: pending".to_string(),
         format!("Action: {}", prompt.title),
         format!(
             "Risk: {}",
             governed_action_risk_tier_label(prompt.risk_tier)
         ),
+        format!("Impact: {}", prompt.consequence_summary),
         format!("Fingerprint: {}", prompt.action_fingerprint),
         format!("Expires: {}", prompt.expires_at.to_rfc3339()),
-        format!("Impact: {}", prompt.consequence_summary),
+        "Next: approve or reject this request.".to_string(),
     ];
     if prompt_mode == ApprovalPromptMode::InlineKeyboardWithFallback {
         lines.push(format!(
@@ -658,6 +660,13 @@ mod tests {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         }
     }
@@ -752,8 +761,14 @@ mod tests {
         .expect("approval prompt should build");
 
         assert!(message.text.contains("Approval required"));
+        assert!(message.text.contains("State: pending"));
         assert!(message.text.contains("Action: Run scoped subprocess"));
         assert!(message.text.contains("Fingerprint: sha256:abc123"));
+        assert!(
+            message
+                .text
+                .contains("Next: approve or reject this request.")
+        );
         assert!(message.text.contains("/approve approval-token-42"));
         let Some(TelegramReplyMarkup::InlineKeyboard(markup)) = message.reply_markup else {
             panic!("approval prompt should include inline keyboard markup");
@@ -841,6 +856,13 @@ mod tests {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         });
 
@@ -874,6 +896,13 @@ mod tests {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         });
 
@@ -922,6 +951,13 @@ mod tests {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         });
 

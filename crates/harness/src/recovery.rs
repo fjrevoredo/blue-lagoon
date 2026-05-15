@@ -1370,6 +1370,9 @@ fn governed_action_recovery_action_classification(
         | GovernedActionKind::ProcessIngressAttachment
         | GovernedActionKind::ListCalendarEvents
         | GovernedActionKind::UpsertCalendarEvent
+        | GovernedActionKind::ListEmailMessages
+        | GovernedActionKind::SendEmailMessage
+        | GovernedActionKind::SyncTaskList
         | GovernedActionKind::UpsertScheduledForegroundTask
         | GovernedActionKind::RequestBackgroundJob
         | GovernedActionKind::RunSubprocess

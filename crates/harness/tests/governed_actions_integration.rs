@@ -583,13 +583,236 @@ async fn approval_resolution_executes_linked_governed_action_after_approval() ->
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Approval-gated subprocess"
+            "Approval approved: Approval-gated subprocess\nState: approved\nNext: running the approved action now."
         );
         assert!(
             delivery
                 .sent_chat_actions()
                 .contains(&(42, telegram::TelegramChatAction::Typing))
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn delegate_approval_resolution_succeeds_under_delegate_allowed_policy() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Delegate approval-gated subprocess".to_string(),
+            rationale: Some("Used to verify delegate approval resolution.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: approval_required_scope(),
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("ok")),
+        };
+        let planned = governed_actions::plan_governed_action(
+            &config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: proposal.clone(),
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected approval-gated governed action, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+
+        let approval_request = approval::create_approval_request(
+            &config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: proposal.title,
+                consequence_summary: "Used to verify delegate approval-linked execution."
+                    .to_string(),
+                capability_scope: proposal.capability_scope,
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+
+        let delegate_config = sample_telegram_config_with_delegate(
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        );
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("approval_callback_delegate.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &delegate_config,
+            &update,
+            Some("fixtures/approval_callback_delegate.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &delegate_config,
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                _,
+            ) => {}
+            other => panic!("expected approval-resolution outcome, got {other:?}"),
+        }
+
+        let resolved_request =
+            approval::get_approval_request(&ctx.pool, approval_request.approval_request_id).await?;
+        assert_eq!(resolved_request.status, ApprovalRequestStatus::Approved);
+        assert_eq!(
+            resolved_request.resolved_by.as_deref(),
+            Some("telegram:delegate-user")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn delegate_approval_resolution_is_denied_under_owner_only_policy() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+
+        let proposal = contracts::GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Owner-only approval-gated subprocess".to_string(),
+            rationale: Some("Used to verify owner-only approval resolution.".to_string()),
+            action_kind: GovernedActionKind::RunSubprocess,
+            requested_risk_tier: None,
+            capability_scope: approval_required_scope(),
+            payload: contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("ok")),
+        };
+        let planned = governed_actions::plan_governed_action(
+            &config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: proposal.clone(),
+            },
+        )
+        .await?;
+        let planned = match planned {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected approval-gated governed action, got {other:?}"),
+        };
+
+        let approval_request = approval::create_approval_request(
+            &config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: planned.record.trace_id,
+                execution_id: None,
+                action_proposal_id: planned.record.action_proposal_id,
+                action_fingerprint: planned.record.action_fingerprint.clone(),
+                action_kind: planned.record.action_kind,
+                risk_tier: planned.record.risk_tier,
+                title: proposal.title,
+                consequence_summary: "Used to verify owner-only policy denial.".to_string(),
+                capability_scope: proposal.capability_scope,
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+        governed_actions::attach_approval_request(
+            &ctx.pool,
+            planned.record.governed_action_execution_id,
+            approval_request.approval_request_id,
+        )
+        .await?;
+
+        let owner_only_config = sample_telegram_config_with_delegate(
+            harness::config::TelegramApprovalResolutionPolicy::OwnerOnly,
+        );
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("approval_callback_delegate.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &owner_only_config,
+            &update,
+            Some("fixtures/approval_callback_delegate.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &owner_only_config,
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("delegate approval should be denied under owner-only policy");
+        assert!(error.to_string().contains("owner-only policy"));
+
+        let unresolved_request =
+            approval::get_approval_request(&ctx.pool, approval_request.approval_request_id).await?;
+        assert_eq!(unresolved_request.status, ApprovalRequestStatus::Pending);
+        assert!(delivery.sent_messages().is_empty());
         Ok(())
     })
     .await
@@ -1086,6 +1309,310 @@ async fn calendar_upsert_action_executes_after_approval_with_audit_visibility() 
 
 #[tokio::test]
 #[serial]
+async fn send_email_action_executes_after_approval_with_audit_visibility() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.email.enabled = true;
+        config.integrations.email.provider = "deterministic_fake".to_string();
+        config.integrations.email.credential_env = "BLUE_LAGOON_TEST_EMAIL_TOKEN".to_string();
+
+        let env_name = config.integrations.email.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let proposal = contracts::GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: "Send milestone email".to_string(),
+                rationale: Some("Integration test for approval-gated email send.".to_string()),
+                action_kind: GovernedActionKind::SendEmailMessage,
+                requested_risk_tier: None,
+                capability_scope: calendar_integration_scope(),
+                payload: contracts::GovernedActionPayload::SendEmailMessage(
+                    contracts::SendEmailMessageAction {
+                        internal_principal_ref: "primary-user".to_string(),
+                        internal_conversation_ref: "telegram-primary".to_string(),
+                        to: vec!["owner@example.com".to_string()],
+                        cc: vec![],
+                        subject: "Milestone update".to_string(),
+                        body_text: "Status green.".to_string(),
+                        reply_to_external_message_id: None,
+                    },
+                ),
+            };
+
+            let planned = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: proposal.clone(),
+                },
+            )
+            .await?;
+            let planned = match planned {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected approval-gated email send, got {other:?}"),
+            };
+            assert!(planned.requires_approval);
+            assert_eq!(
+                planned.record.risk_tier,
+                contracts::GovernedActionRiskTier::Tier2
+            );
+
+            let approval_request = approval::create_approval_request(
+                &config,
+                &ctx.pool,
+                &NewApprovalRequestRecord {
+                    approval_request_id: Uuid::now_v7(),
+                    trace_id: planned.record.trace_id,
+                    execution_id: None,
+                    action_proposal_id: planned.record.action_proposal_id,
+                    action_fingerprint: planned.record.action_fingerprint.clone(),
+                    action_kind: planned.record.action_kind,
+                    risk_tier: planned.record.risk_tier,
+                    title: proposal.title.clone(),
+                    consequence_summary: "Send milestone email for integration test.".to_string(),
+                    capability_scope: proposal.capability_scope,
+                    requested_by: "telegram:primary-user".to_string(),
+                    token: "email-send-approval-token".to_string(),
+                    requested_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::minutes(15),
+                },
+            )
+            .await?;
+            governed_actions::attach_approval_request(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                approval_request.approval_request_id,
+            )
+            .await?;
+
+            approval::resolve_approval_request(
+                &ctx.pool,
+                &approval::ApprovalResolutionAttempt {
+                    token: approval_request.token.clone(),
+                    actor_ref: "telegram:primary-user".to_string(),
+                    expected_action_fingerprint: planned.record.action_fingerprint.clone(),
+                    decision: contracts::ApprovalResolutionDecision::Approved,
+                    reason: Some("integration approval".to_string()),
+                    resolved_at: Utc::now(),
+                },
+            )
+            .await?;
+
+            let synced = governed_actions::sync_status_from_approval_resolution(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                contracts::ApprovalResolutionDecision::Approved,
+                None,
+                Some("integration approval"),
+            )
+            .await?;
+            let outcome =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &synced).await?;
+
+            assert_eq!(
+                outcome.record.status,
+                contracts::GovernedActionStatus::Executed
+            );
+            assert!(outcome.outcome.summary.contains("sent email"));
+
+            let completed_payload = sqlx::query(
+                r#"
+                SELECT payload
+                FROM audit_events
+                WHERE trace_id = $1
+                  AND event_kind = 'governed_action_execution_completed'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(planned.record.trace_id)
+            .fetch_one(&ctx.pool)
+            .await?
+            .get::<serde_json::Value, _>("payload");
+            assert_eq!(
+                completed_payload["details"]["integration"],
+                serde_json::json!("email")
+            );
+            assert_eq!(
+                completed_payload["details"]["operation"],
+                serde_json::json!("send_message")
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn task_sync_action_executes_after_approval_and_updates_workspace_artifacts() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.task_sync.enabled = true;
+        config.integrations.task_sync.provider = "deterministic_fake".to_string();
+        config.integrations.task_sync.credential_env =
+            "BLUE_LAGOON_TEST_TASK_SYNC_TOKEN".to_string();
+
+        let env_name = config.integrations.task_sync.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let proposal = contracts::GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: "Sync milestone tasks".to_string(),
+                rationale: Some("Integration test for approval-gated task sync.".to_string()),
+                action_kind: GovernedActionKind::SyncTaskList,
+                requested_risk_tier: None,
+                capability_scope: calendar_integration_scope(),
+                payload: contracts::GovernedActionPayload::SyncTaskList(
+                    contracts::SyncTaskListAction {
+                        internal_principal_ref: "primary-user".to_string(),
+                        internal_conversation_ref: "telegram-primary".to_string(),
+                        task_list_title: "Milestone Tasks".to_string(),
+                        items: vec![
+                            "Review PR #123".to_string(),
+                            "Write release notes".to_string(),
+                        ],
+                        external_list_id: None,
+                        workspace_artifact_id: None,
+                    },
+                ),
+            };
+
+            let planned = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: proposal.clone(),
+                },
+            )
+            .await?;
+            let planned = match planned {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected approval-gated task sync, got {other:?}"),
+            };
+            assert!(planned.requires_approval);
+
+            let approval_request = approval::create_approval_request(
+                &config,
+                &ctx.pool,
+                &NewApprovalRequestRecord {
+                    approval_request_id: Uuid::now_v7(),
+                    trace_id: planned.record.trace_id,
+                    execution_id: None,
+                    action_proposal_id: planned.record.action_proposal_id,
+                    action_fingerprint: planned.record.action_fingerprint.clone(),
+                    action_kind: planned.record.action_kind,
+                    risk_tier: planned.record.risk_tier,
+                    title: proposal.title.clone(),
+                    consequence_summary: "Sync canonical task list for integration test."
+                        .to_string(),
+                    capability_scope: proposal.capability_scope,
+                    requested_by: "telegram:primary-user".to_string(),
+                    token: "task-sync-approval-token".to_string(),
+                    requested_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::minutes(15),
+                },
+            )
+            .await?;
+            governed_actions::attach_approval_request(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                approval_request.approval_request_id,
+            )
+            .await?;
+
+            approval::resolve_approval_request(
+                &ctx.pool,
+                &approval::ApprovalResolutionAttempt {
+                    token: approval_request.token.clone(),
+                    actor_ref: "telegram:primary-user".to_string(),
+                    expected_action_fingerprint: planned.record.action_fingerprint.clone(),
+                    decision: contracts::ApprovalResolutionDecision::Approved,
+                    reason: Some("integration approval".to_string()),
+                    resolved_at: Utc::now(),
+                },
+            )
+            .await?;
+
+            let synced = governed_actions::sync_status_from_approval_resolution(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                contracts::ApprovalResolutionDecision::Approved,
+                None,
+                Some("integration approval"),
+            )
+            .await?;
+            let outcome =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &synced).await?;
+
+            assert_eq!(
+                outcome.record.status,
+                contracts::GovernedActionStatus::Executed
+            );
+            assert!(outcome.outcome.summary.contains("synced task list"));
+
+            let artifacts = harness::workspace::list_workspace_artifacts(&ctx.pool, 20).await?;
+            assert!(artifacts.iter().any(|artifact| {
+                artifact.artifact_kind == contracts::WorkspaceArtifactKind::TaskList
+                    && artifact.title == "Milestone Tasks"
+            }));
+
+            let completed_payload = sqlx::query(
+                r#"
+                SELECT payload
+                FROM audit_events
+                WHERE trace_id = $1
+                  AND event_kind = 'governed_action_execution_completed'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(planned.record.trace_id)
+            .fetch_one(&ctx.pool)
+            .await?
+            .get::<serde_json::Value, _>("payload");
+            assert_eq!(
+                completed_payload["details"]["integration"],
+                serde_json::json!("task_sync")
+            );
+            assert_eq!(
+                completed_payload["details"]["operation"],
+                serde_json::json!("sync_task_list")
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn calendar_policy_recheck_failure_emits_recovery_diagnostic() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut planning_config = ctx.config.clone();
@@ -1344,6 +1871,40 @@ fn sample_telegram_config() -> harness::config::ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
+        poll_limit: 10,
+    }
+}
+
+fn sample_telegram_config_with_delegate(
+    approval_resolution_policy: harness::config::TelegramApprovalResolutionPolicy,
+) -> harness::config::ResolvedTelegramConfig {
+    harness::config::ResolvedTelegramConfig {
+        api_base_url: "https://api.telegram.org".to_string(),
+        bot_token: "secret".to_string(),
+        allowed_user_id: 42,
+        allowed_chat_id: 42,
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy,
+        principal_bindings: vec![
+            harness::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: harness::config::TelegramPrincipalRole::Owner,
+            },
+            harness::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 43,
+                internal_principal_ref: "delegate-user".to_string(),
+                role: harness::config::TelegramPrincipalRole::Delegate,
+            },
+        ],
         poll_limit: 10,
     }
 }
