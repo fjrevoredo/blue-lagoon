@@ -2969,6 +2969,8 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
             "append_workspace_script_version"
         }
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }

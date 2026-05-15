@@ -5283,6 +5283,8 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
             "append_workspace_script_version"
         }
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -5617,6 +5619,14 @@ mod tests {
                 foreground: crate::config::ForegroundModelRouteConfig {
                     provider: contracts::ModelProviderKind::ZAi,
                     model: "foreground".to_string(),
+                    api_base_url: None,
+                    reasoning_mode: None,
+                    api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
+                    timeout_ms: 60_000,
+                },
+                unconscious: crate::config::ForegroundModelRouteConfig {
+                    provider: contracts::ModelProviderKind::ZAi,
+                    model: "unconscious".to_string(),
                     api_base_url: None,
                     reasoning_mode: None,
                     api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),

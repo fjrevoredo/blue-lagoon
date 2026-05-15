@@ -15,9 +15,9 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 2. The first message in the model request contains the self-model seed's `communication_style` ("be direct").
 3. One `execution_records` row with `status = 'completed'` exists after the run.
 
-**Current Status**: Partial
+**Current Status**: Working
 
-**Gap**: No assertion that the self-model seed appears in the model prompt. The system assembles context, but this is untested at the scenario level.
+**Gap**: None. Covered by `use_case_scenarios::uc1_basic_conversation_delivers_reply_with_self_model_in_prompt`.
 
 **Test**: `uc1_basic_conversation_delivers_reply_with_self_model_in_prompt`
 
@@ -34,9 +34,9 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 2. The second request's messages array contains the first session's user message text ("hello from telegram").
 3. Two Telegram messages are delivered (`delivery.sent_messages().len() == 2`).
 
-**Current Status**: Partial
+**Current Status**: Working
 
-**Gap**: No integration test asserting that prior episode text appears in the second model request. Recent history retrieval is implemented, but the scenario-level assertion is missing.
+**Gap**: None. Covered by `use_case_scenarios::uc2_second_message_receives_prior_episode_in_context`.
 
 **Test**: `uc2_second_message_receives_prior_episode_in_context`
 
@@ -72,9 +72,9 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 2. After manual approval resolution: one `governed_action_executions` row with `status IN ('executed', 'failed')`.
 3. The `approval_requests` row is resolved.
 
-**Current Status**: Partial
+**Current Status**: Working
 
-**Gap**: No two-run test covering the full flow: model output → approval prompt → user approves → execution. The approval resolution and execution paths are tested in isolation in `governed_actions_integration.rs`.
+**Gap**: None for the core approval-required execution flow. Covered by `use_case_scenarios::uc4_governed_action_requires_approval_then_executes_after_user_approves`.
 
 **Test**: `uc4_governed_action_requires_approval_then_executes_after_user_approves`
 
@@ -111,9 +111,9 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 1. After Phase 1 (background): one `wake_signals` row with `status = 'accepted'`; one `ingress_events` row with `external_event_id LIKE 'wake-signal:%'` and `foreground_status = 'pending'`.
 2. After Phase 2 (foreground pickup): one Telegram message delivered; the `ingress_events` row has `foreground_status = 'processed'`.
 
-**Current Status**: Partial
+**Current Status**: Working
 
-**Gap**: The background→staging path is tested in `unconscious_integration`. The staging→Telegram delivery path is not tested end-to-end in a single test.
+**Gap**: None. Covered by `use_case_scenarios::uc6_background_wake_signal_stages_then_delivers_notification`.
 
 **Test**: `uc6_background_wake_signal_stages_then_delivers_notification`
 
@@ -150,9 +150,9 @@ This catalog defines the 8 most important use cases for the Blue Lagoon assistan
 3. One `recovery_checkpoints` row with `recovery_decision IN ('retry', 'abandon')` exists for the execution.
 4. (Extended) After re-upserting the task as due, `run_scheduled_foreground_iteration_with` returns `handled == 1`.
 
-**Current Status**: Partial
+**Current Status**: Working
 
-**Gap**: Each mechanism (claim, recovery, re-execution) is tested in isolation. No single test covers the full acquire→crash→recover→re-execute lifecycle.
+**Gap**: None. Covered by `use_case_scenarios::uc8_worker_crash_creates_checkpoint_and_task_is_clean_after_recovery`.
 
 **Test**: `uc8_worker_crash_creates_checkpoint_and_task_is_clean_after_recovery`
 

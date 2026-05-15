@@ -9,6 +9,7 @@ use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{
+    attachments,
     audit::{self, NewAuditEvent},
     background,
     causal_links::{self, NewCausalLink},
@@ -1584,6 +1585,18 @@ pub async fn intake_telegram_foreground_trigger(
         return Err(error);
     }
     mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
+    attachments::register_ingress_attachments(
+        &mut tx,
+        ingress.ingress_id,
+        trace.trace_id,
+        Some(execution_id),
+        &ingress.internal_principal_ref,
+        &ingress.internal_conversation_ref,
+        channel_kind_as_str(ingress.channel_kind),
+        ingress.raw_payload_ref.as_deref(),
+        &ingress.attachments,
+    )
+    .await?;
 
     audit::insert(
         &mut *tx,
@@ -1717,6 +1730,18 @@ pub async fn stage_telegram_foreground_ingress(
             status: "accepted".to_string(),
             rejection_reason: None,
         },
+    )
+    .await?;
+    attachments::register_ingress_attachments(
+        &mut tx,
+        ingress.ingress_id,
+        trace.trace_id,
+        None,
+        &ingress.internal_principal_ref,
+        &ingress.internal_conversation_ref,
+        channel_kind_as_str(ingress.channel_kind),
+        ingress.raw_payload_ref.as_deref(),
+        &ingress.attachments,
     )
     .await?;
 

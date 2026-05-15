@@ -2,7 +2,7 @@
 
 ## Metadata
 
-- Plan Status: APPROVED
+- Plan Status: IN PROGRESS
 - Created: 2026-05-15
 - Last Updated: 2026-05-15
 - Owner: Coding agent
@@ -87,7 +87,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 1: Canonical Contract Alignment (R1)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Align canonical docs with implemented behavior and explicit
   gap-closure scope before code expansion.
 - Exit Criteria: Canonical docs clearly define archived immutability and post-v1
@@ -95,7 +95,7 @@ Resolved on 2026-05-15:
 
 #### Task 1.1: Promote Archived Immutability To Canonical Requirements
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add explicit normative requirements that archived workspace
   artifacts/scripts are immutable unless restored by an explicit controlled path.
 - Steps:
@@ -109,7 +109,7 @@ Resolved on 2026-05-15:
 
 #### Task 1.2: Update Implementation Design And User Manual For Approval/Archive Reality
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Ensure design and user docs reflect current approval-callback
   behavior and archived mutability posture accurately.
 - Steps:
@@ -124,7 +124,7 @@ Resolved on 2026-05-15:
 
 #### Task 1.3: Reconcile Planning/Use-Case Documentation Drift
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Correct stale status statements in planning-oriented docs that no
   longer match implemented tests.
 - Steps:
@@ -137,7 +137,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 2: Attachment Processing Pipeline (R2)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Make user attachments first-class governed inputs with bounded
   parsing and context projection.
 - Exit Criteria: Attachments can be ingested, processed through harness-owned
@@ -145,7 +145,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.1: Add Attachment Persistence Schema
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Introduce reviewed schema for attachment processing state and
   extracted content references.
 - Steps:
@@ -158,7 +158,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.2: Extend Contracts For Attachment Actions And Summaries
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add cross-process types for attachment inspection and processing
   requests/results.
 - Steps:
@@ -171,7 +171,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.3: Implement Harness Attachment Services
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add harness-side storage/services for attachment processing
   lifecycle and extracted-content storage.
 - Steps:
@@ -183,7 +183,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.4: Add Governed Attachment Actions
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Expose attachment inspection and processing through governed
   actions with proper risk/policy checks.
 - Steps:
@@ -195,7 +195,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.5: Add Attachment Context Projection
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Inject bounded extracted attachment summaries/excerpts into
   conscious context assembly.
 - Steps:
@@ -207,7 +207,7 @@ Resolved on 2026-05-15:
 
 #### Task 2.6: Add End-To-End Attachment Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove attachment flow from Telegram ingress through governed
   processing to context-visible assistant behavior.
 - Steps:
@@ -369,7 +369,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 5: Foreground/Unconscious Model Route Split (R5)
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Purpose: Separate user-facing and background model routing, policy, and cost
   posture.
 - Exit Criteria: `model_gateway.unconscious.*` exists, is validated, and is
@@ -378,7 +378,7 @@ Resolved on 2026-05-15:
 
 #### Task 5.1: Extend Model Gateway Config For Unconscious Route
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Add unconscious route config, defaults, and validation.
 - Steps:
   1. Extend config structs and loader logic with
@@ -390,7 +390,7 @@ Resolved on 2026-05-15:
 
 #### Task 5.2: Route Background Calls Through Unconscious Route
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Ensure `execute_background_model_call()` uses unconscious route
   resolution, not foreground route reuse.
 - Steps:
@@ -402,7 +402,7 @@ Resolved on 2026-05-15:
 
 #### Task 5.3: Update Internal Provider/Background Docs
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Update internal docs to remove stale "not implemented" callouts
   once route split is live.
 - Steps:
@@ -588,3 +588,19 @@ Implementation must not start until the user approves this plan.
 - Update milestone and task status before starting and after validation.
 - Update each task to COMPLETED immediately after its validation passes.
 - Mark tasks or milestones BLOCKED with a short reason when progress cannot continue.
+- 2026-05-15: Milestone 1 completed. Validation run: `cargo test -p harness --test use_case_scenarios -- --nocapture`.
+- 2026-05-15: Milestone 5 completed.
+  - Route split implementation validation: `cargo test -p harness --lib config -- --nocapture`.
+  - Route split gateway validation: `cargo test -p harness --lib model_gateway -- --nocapture`.
+  - Internal docs updated: `docs/internal/harness/MODEL_PROVIDERS.md`,
+    `docs/internal/unconscious_loop/BACKGROUND_JOBS.md` (stale route-split callouts removed; verified dates restamped).
+- 2026-05-15: Milestone 2 completed.
+  - Added attachment schema migration and governed attachment processing/context projection flow.
+  - Added fixture-driven foreground integration coverage for processed and unsupported attachment paths.
+  - Validation runs:
+    - `cargo test -p harness --test migration_component -- --nocapture`.
+    - `cargo test -p contracts --lib`.
+    - `cargo test -p harness --test foundation_component -- --nocapture`.
+    - `cargo test -p harness --test governed_actions_component -- --nocapture`.
+    - `cargo test -p harness --test foreground_component -- --nocapture`.
+    - `cargo test -p harness --test foreground_integration -- --nocapture`.

@@ -3421,6 +3421,14 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
                 timeout_ms: 30_000,
             },
+            unconscious: ForegroundModelRouteConfig {
+                provider: contracts::ModelProviderKind::ZAi,
+                model: "glm-unconscious".to_string(),
+                api_base_url: None,
+                reasoning_mode: None,
+                api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
             z_ai: Some(harness::config::ZAiProviderConfig {
                 api_surface: Some(harness::config::ZAiApiSurface::Coding),
                 api_base_url: None,
@@ -3511,6 +3519,16 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
         foreground: ResolvedForegroundModelRouteConfig {
             provider: contracts::ModelProviderKind::ZAi,
             model: "z-ai-foreground".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 20_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "secret".to_string(),
             provider_headers: Vec::new(),

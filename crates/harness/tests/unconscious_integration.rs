@@ -834,6 +834,14 @@ fn sample_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             api_key_env: api_key_env.to_string(),
             timeout_ms: 20_000,
         },
+        unconscious: ForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
+            api_key_env: api_key_env.to_string(),
+            timeout_ms: 20_000,
+        },
         z_ai: Some(ZAiProviderConfig {
             api_surface: None,
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),

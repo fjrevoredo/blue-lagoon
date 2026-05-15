@@ -1319,12 +1319,14 @@ Approval requests remain canonical harness objects first and Telegram renderings
 The v1 approval flow should be:
 
 1. The harness creates an approval request with TTL, action fingerprint, risk tier, and concise consequence summary.
-2. Telegram renders the request primarily with inline approval controls.
-3. Typed approval or rejection may exist as a controlled fallback using the same approval token model.
+2. Telegram renders the request primarily with inline approval controls when callback payload size allows.
+3. Typed approval or rejection exists as a controlled fallback (`/approve <token>` and `/reject <token>`) using the same approval token model.
 4. The response becomes an approval-resolution event.
 5. The harness validates actor identity, TTL, one-shot use, and unchanged action fingerprint.
 6. The harness re-checks policy before executing on approval.
 7. Rejection or expiry returns control through the normal approval-resolution path for replanning, cancellation, or abandonment.
+
+Inline callback and fallback command resolution are transport aliases, not separate approval systems. Both paths must resolve through the same harness-owned approval transition logic and preserve idempotent one-shot semantics.
 
 #### Notifications and local chat scope
 
@@ -1338,6 +1340,13 @@ The v1 approval flow should be:
 - Attachments are accepted in v1 as normalized references with basic metadata.
 - Deeper attachment processing remains harness-mediated and policy-controlled.
 - Attachment handling should not force Telegram-specific semantics upward into core business logic.
+
+#### Workspace archive lifecycle
+
+- Governed workspace artifacts and workspace scripts use explicit lifecycle state.
+- Archived workspace artifacts and scripts are immutable through normal mutation and execution paths.
+- Returning an archived artifact or script to active use requires an explicit, harness-mediated restore or unarchive transition.
+- Restore or unarchive transitions remain policy-evaluated and auditable before any subsequent mutation or execution is allowed.
 
 #### Minimal operator surface
 

@@ -6,12 +6,13 @@ use contracts::{
     AppendWorkspaceScriptVersionAction, CapabilityScope, CreateWorkspaceArtifactAction,
     CreateWorkspaceScriptAction, GovernedActionExecutionOutcome, GovernedActionFingerprint,
     GovernedActionKind, GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
-    GovernedActionRiskTier, GovernedActionStatus, InspectWorkspaceArtifactAction,
-    InspectWorkspaceScriptAction, ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction,
-    ListWorkspaceScriptsAction, NetworkAccessPosture, RequestBackgroundJobAction,
-    RunDiagnosticAction, SubprocessAction, UpdateWorkspaceArtifactAction,
-    UpsertScheduledForegroundTaskAction, WebFetchAction, WorkspaceArtifactKind,
-    WorkspaceArtifactStatusFilter, WorkspaceScriptAction, WorkspaceScriptRunStatus,
+    GovernedActionRiskTier, GovernedActionStatus, InspectIngressAttachmentsAction,
+    InspectWorkspaceArtifactAction, InspectWorkspaceScriptAction, ListWorkspaceArtifactsAction,
+    ListWorkspaceScriptRunsAction, ListWorkspaceScriptsAction, NetworkAccessPosture,
+    ProcessIngressAttachmentAction, RequestBackgroundJobAction, RunDiagnosticAction,
+    SubprocessAction, UpdateWorkspaceArtifactAction, UpsertScheduledForegroundTaskAction,
+    WebFetchAction, WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
+    WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -21,6 +22,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
+    attachments::{self, AttachmentProcessStatus, ProcessIngressAttachmentRequest},
     audit::{self, NewAuditEvent},
     background_planning::{self, BackgroundPlanningDecision, BackgroundPlanningRequest},
     causal_links::{self, NewCausalLink},
@@ -626,6 +628,8 @@ pub async fn execute_governed_action(
         | GovernedActionPayload::CreateWorkspaceScript(_)
         | GovernedActionPayload::AppendWorkspaceScriptVersion(_)
         | GovernedActionPayload::ListWorkspaceScriptRuns(_)
+        | GovernedActionPayload::InspectIngressAttachments(_)
+        | GovernedActionPayload::ProcessIngressAttachment(_)
         | GovernedActionPayload::UpsertScheduledForegroundTask(_)
         | GovernedActionPayload::RequestBackgroundJob(_)
         | GovernedActionPayload::RunDiagnostic(_) => {
@@ -676,6 +680,12 @@ pub async fn execute_governed_action(
         }
         GovernedActionPayload::ListWorkspaceScriptRuns(action) => {
             execute_list_workspace_script_runs(pool, &started_record, action).await
+        }
+        GovernedActionPayload::InspectIngressAttachments(action) => {
+            execute_inspect_ingress_attachments(pool, &started_record, action).await
+        }
+        GovernedActionPayload::ProcessIngressAttachment(action) => {
+            execute_process_ingress_attachment(pool, &started_record, action).await
         }
         GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
             execute_upsert_scheduled_foreground_task(config, pool, &started_record, action).await
@@ -1332,6 +1342,92 @@ async fn execute_list_workspace_script_runs(
     .await
 }
 
+async fn execute_inspect_ingress_attachments(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &InspectIngressAttachmentsAction,
+) -> Result<GovernedActionExecutionResult> {
+    let summaries = attachments::list_ingress_attachment_summaries(pool, action.ingress_id).await?;
+    let summary = format!(
+        "listed {} attachment(s) for ingress {}",
+        summaries.len(),
+        action.ingress_id
+    );
+    complete_harness_native_action(
+        pool,
+        record,
+        summary,
+        json!({
+            "ingress_id": action.ingress_id,
+            "items": summaries,
+        }),
+    )
+    .await
+}
+
+async fn execute_process_ingress_attachment(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ProcessIngressAttachmentAction,
+) -> Result<GovernedActionExecutionResult> {
+    let outcome = attachments::process_ingress_attachment(
+        pool,
+        &ProcessIngressAttachmentRequest {
+            trace_id: record.trace_id,
+            execution_id: record.execution_id,
+            ingress_id: action.ingress_id,
+            attachment_id: action.attachment_id.trim().to_string(),
+            requested_by: "conscious-governed-action".to_string(),
+            request_kind: "governed_action".to_string(),
+        },
+    )
+    .await?;
+
+    let payload = json!({
+        "ingress_id": action.ingress_id,
+        "attachment_id": action.attachment_id,
+        "processing_status": format!("{:?}", outcome.attachment.processing_status).to_ascii_lowercase(),
+        "detail": outcome.detail,
+        "content_truncated": outcome.content_truncated,
+        "attachment": {
+            "ingress_attachment_id": outcome.attachment.ingress_attachment_id,
+            "processing_status": outcome.attachment.processing_status,
+            "media_type": outcome.attachment.media_type,
+            "file_name": outcome.attachment.file_name,
+            "size_bytes": outcome.attachment.size_bytes,
+            "last_processed_at": outcome.attachment.last_processed_at,
+            "last_failure_reason": outcome.attachment.last_failure_reason,
+        },
+        "extracted_artifact": outcome.extracted_artifact.as_ref().map(|artifact| json!({
+            "ingress_attachment_extracted_artifact_id": artifact.ingress_attachment_extracted_artifact_id,
+            "extractor_kind": artifact.extractor_kind,
+            "content_format": artifact.content_format,
+            "summary_text": artifact.summary_text,
+            "content_chars": artifact.content_chars,
+            "created_at": artifact.created_at,
+        })),
+    });
+
+    match outcome.status {
+        AttachmentProcessStatus::Processed => {
+            let summary = format!(
+                "processed attachment '{}' for ingress {}",
+                action.attachment_id.trim(),
+                action.ingress_id
+            );
+            complete_harness_native_action(pool, record, summary, payload).await
+        }
+        AttachmentProcessStatus::Unsupported => {
+            let summary = format!(
+                "attachment '{}' is currently unsupported for text extraction",
+                action.attachment_id.trim(),
+            );
+            complete_harness_native_action(pool, record, summary, payload).await
+        }
+        AttachmentProcessStatus::Failed => bail!(outcome.detail),
+    }
+}
+
 async fn execute_upsert_scheduled_foreground_task(
     config: &RuntimeConfig,
     pool: &PgPool,
@@ -1678,6 +1774,8 @@ pub fn validate_capability_scope(
             | GovernedActionKind::CreateWorkspaceScript
             | GovernedActionKind::AppendWorkspaceScriptVersion
             | GovernedActionKind::ListWorkspaceScriptRuns
+            | GovernedActionKind::InspectIngressAttachments
+            | GovernedActionKind::ProcessIngressAttachment
             | GovernedActionKind::UpsertScheduledForegroundTask
             | GovernedActionKind::RequestBackgroundJob
             | GovernedActionKind::RunDiagnostic
@@ -1807,6 +1905,20 @@ pub fn validate_capability_scope(
             validate_harness_native_scope(scope, "workspace script run listing")?;
         }
         (
+            GovernedActionKind::InspectIngressAttachments,
+            GovernedActionPayload::InspectIngressAttachments(action),
+        ) => {
+            validate_harness_native_scope(scope, "ingress attachment inspection")?;
+            validate_inspect_ingress_attachments_action(action)?;
+        }
+        (
+            GovernedActionKind::ProcessIngressAttachment,
+            GovernedActionPayload::ProcessIngressAttachment(action),
+        ) => {
+            validate_harness_native_scope(scope, "ingress attachment processing")?;
+            validate_process_ingress_attachment_action(action)?;
+        }
+        (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(_),
         ) => {
@@ -1883,6 +1995,14 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::ListWorkspaceScriptRuns,
             GovernedActionPayload::ListWorkspaceScriptRuns(action),
         ) => validate_list_workspace_script_runs_action(action),
+        (
+            GovernedActionKind::InspectIngressAttachments,
+            GovernedActionPayload::InspectIngressAttachments(action),
+        ) => validate_inspect_ingress_attachments_action(action),
+        (
+            GovernedActionKind::ProcessIngressAttachment,
+            GovernedActionPayload::ProcessIngressAttachment(action),
+        ) => validate_process_ingress_attachment_action(action),
         (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(action),
@@ -2028,6 +2148,27 @@ fn validate_list_workspace_script_runs_action(
         bail!("workspace script run listing script_id must not be nil");
     }
     validate_limit(action.limit, "workspace script run listing")
+}
+
+fn validate_inspect_ingress_attachments_action(
+    action: &InspectIngressAttachmentsAction,
+) -> Result<()> {
+    if action.ingress_id.is_nil() {
+        bail!("ingress attachment inspection ingress_id must not be nil");
+    }
+    Ok(())
+}
+
+fn validate_process_ingress_attachment_action(
+    action: &ProcessIngressAttachmentAction,
+) -> Result<()> {
+    if action.ingress_id.is_nil() {
+        bail!("ingress attachment processing ingress_id must not be nil");
+    }
+    if action.attachment_id.trim().is_empty() {
+        bail!("ingress attachment processing attachment_id must not be empty");
+    }
+    Ok(())
 }
 
 fn validate_upsert_scheduled_foreground_task_action(
@@ -3174,6 +3315,8 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
         GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -3194,6 +3337,8 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "create_workspace_script" => Ok(GovernedActionKind::CreateWorkspaceScript),
         "append_workspace_script_version" => Ok(GovernedActionKind::AppendWorkspaceScriptVersion),
         "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
+        "inspect_ingress_attachments" => Ok(GovernedActionKind::InspectIngressAttachments),
+        "process_ingress_attachment" => Ok(GovernedActionKind::ProcessIngressAttachment),
         "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
         "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_diagnostic" => Ok(GovernedActionKind::RunDiagnostic),
@@ -3341,6 +3486,13 @@ enum CanonicalGovernedActionPayload {
         status: Option<WorkspaceScriptRunStatus>,
         limit: u32,
     },
+    InspectIngressAttachments {
+        ingress_id: Uuid,
+    },
+    ProcessIngressAttachment {
+        ingress_id: Uuid,
+        attachment_id: String,
+    },
     UpsertScheduledForegroundTask {
         task_key: String,
         title: String,
@@ -3456,6 +3608,17 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                     script_id: action.script_id,
                     status: action.status,
                     limit: action.limit,
+                }
+            }
+            GovernedActionPayload::InspectIngressAttachments(action) => {
+                Self::InspectIngressAttachments {
+                    ingress_id: action.ingress_id,
+                }
+            }
+            GovernedActionPayload::ProcessIngressAttachment(action) => {
+                Self::ProcessIngressAttachment {
+                    ingress_id: action.ingress_id,
+                    attachment_id: action.attachment_id.trim().to_string(),
                 }
             }
             GovernedActionPayload::UpsertScheduledForegroundTask(action) => {

@@ -1,0 +1,24 @@
+{
+  "update_id": 1015,
+  "message": {
+    "message_id": 55,
+    "date": 1712301230,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "text": "/start now",
+    "document": {
+      "file_id": "doc-unsupported-1",
+      "file_name": "photo.jpg",
+      "mime_type": "image/jpeg",
+      "file_size": 1024
+    }
+  }
+}

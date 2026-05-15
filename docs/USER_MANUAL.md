@@ -162,6 +162,20 @@ cargo run -p runtime -- admin foreground schedules list
 cargo run -p runtime -- admin background list
 ```
 
+### Resolving approval prompts in Telegram
+
+When a governed action needs approval, Telegram shows an approval prompt that is
+resolved through a shared harness approval token flow.
+
+- Primary path: use the inline `Approve` or `Reject` buttons in the prompt.
+- Fallback path: send `/approve <token>` or `/reject <token>` in the same chat.
+- Both paths resolve the same approval request and follow the same policy and
+  idempotency checks.
+
+Approval outcomes are surfaced as normal follow-up messages. A request may end
+as `approved`, `rejected`, `expired`, or `invalidated` depending on timing,
+fingerprint checks, and prior resolution state.
+
 ### Identity formation and inspection
 
 On a fresh or reset runtime, the assistant can form its first complete identity

@@ -105,6 +105,13 @@ reasoning_mode = "off"
 api_key_env = "BLUE_LAGOON_FOREGROUND_API_KEY"
 timeout_ms = 60000
 
+[model_gateway.unconscious]
+provider = "z_ai"
+model = "z-ai-unconscious"
+reasoning_mode = "off"
+api_key_env = "BLUE_LAGOON_UNCONSCIOUS_API_KEY"
+timeout_ms = 60000
+
 [model_gateway.z_ai]
 api_surface = "coding"
 

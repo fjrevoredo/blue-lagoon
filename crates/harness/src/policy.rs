@@ -183,9 +183,11 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         | GovernedActionKind::ListWorkspaceScripts
         | GovernedActionKind::InspectWorkspaceScript
         | GovernedActionKind::ListWorkspaceScriptRuns
+        | GovernedActionKind::InspectIngressAttachments
         | GovernedActionKind::RunDiagnostic => GovernedActionRiskTier::Tier0,
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
+        | GovernedActionKind::ProcessIngressAttachment
         | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,
         GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
@@ -622,6 +624,16 @@ mod tests {
                 foreground: crate::config::ResolvedForegroundModelRouteConfig {
                     provider: contracts::ModelProviderKind::ZAi,
                     model: "glm".to_string(),
+                    api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+                    api_key: "secret".to_string(),
+                    provider_headers: Vec::new(),
+                    reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                    provider_reasoning: None,
+                    timeout_ms: 45_000,
+                },
+                unconscious: crate::config::ResolvedForegroundModelRouteConfig {
+                    provider: contracts::ModelProviderKind::ZAi,
+                    model: "glm-unconscious".to_string(),
                     api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                     api_key: "secret".to_string(),
                     provider_headers: Vec::new(),

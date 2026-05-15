@@ -8,12 +8,13 @@ use contracts::{
     ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
     GovernedActionKind, GovernedActionPayload, GovernedActionProposal, GovernedActionRiskTier,
     IdentityDeltaProposal, IdentityInterviewAnswer, IdentityKickstartAction,
-    IdentityLifecycleState, ModelProviderKind, NetworkAccessPosture, ProposalConflictPosture,
+    IdentityLifecycleState, IngressAttachmentProcessingStatus, ModelProviderKind,
+    NetworkAccessPosture, ProcessIngressAttachmentAction, ProposalConflictPosture,
     ProposalProvenance, ProposalProvenanceKind, SubprocessAction,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
-    audit,
+    attachments, audit,
     config::{
         ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, ResolvedTelegramConfig,
         SelfModelConfig,
@@ -713,6 +714,248 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
 
 #[tokio::test]
 #[serial]
+async fn staged_document_attachment_is_processed_and_visible_in_model_context() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let fixture_path =
+            telegram_fixture("private_command_with_document_attachment_payload.json");
+        let update = telegram::load_fixture_updates(&fixture_path)?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let normalized = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some(fixture_path.display().to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let staged = match foreground::stage_telegram_foreground_ingress(
+            &ctx.pool,
+            &sample_telegram_config(),
+            normalized,
+        )
+        .await?
+        {
+            foreground::StagedForegroundIngressOutcome::Accepted(staged) => staged,
+            other => panic!("fixture should stage foreground ingress, got {other:?}"),
+        };
+
+        let attachments_before =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_before.len(), 1);
+        assert_eq!(
+            attachments_before[0].processing_status,
+            IngressAttachmentProcessingStatus::Pending
+        );
+        assert_eq!(attachments_before[0].attachment_id, "doc-payload-1");
+
+        let processing = plan_and_execute_process_ingress_attachment_governed_action(
+            &config,
+            &ctx.pool,
+            staged.ingress_id,
+            "doc-payload-1",
+        )
+        .await?;
+        assert!(processing.outcome.summary.contains("processed attachment"));
+
+        let attachments_after =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_after.len(), 1);
+        assert_eq!(
+            attachments_after[0].processing_status,
+            IngressAttachmentProcessingStatus::Processed
+        );
+        assert!(attachments_after[0].last_failure_reason.is_none());
+        assert!(attachments_after[0].latest_extracted_artifact_id.is_some());
+
+        let latest_attempt_status: String = sqlx::query_scalar(
+            r#"
+            SELECT status
+            FROM ingress_attachment_processing_attempts
+            WHERE ingress_attachment_id = $1
+            ORDER BY started_at DESC, ingress_attachment_processing_attempt_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(latest_attempt_status, "succeeded");
+
+        let extracted_artifact_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_attachment_extracted_artifacts
+            WHERE ingress_attachment_id = $1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(extracted_artifact_count, 1);
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply with attachment context" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 22,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("unsupported_update.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.ignored_count, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "assistant reply with attachment context"
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 1);
+        let message_contents = seen_requests[0]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        let retrieved_context_message = message_contents
+            .iter()
+            .find(|content| content.contains("Retrieved canonical context:"))
+            .expect("retrieved context developer message should be present");
+        let retrieved_context_message_lower = retrieved_context_message.to_ascii_lowercase();
+        assert!(retrieved_context_message_lower.contains("attachment_excerpt"));
+        assert!(retrieved_context_message_lower.contains("project-notes.txt"));
+        assert!(retrieved_context_message_lower.contains("attachment fixture excerpt start"));
+        assert!(!retrieved_context_message_lower.contains("truncation_sentinel_end"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_attachment_processing_marks_unsupported_documents() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture_path = telegram_fixture("private_command_with_unsupported_document.json");
+        let update = telegram::load_fixture_updates(&fixture_path)?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let normalized = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some(fixture_path.display().to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let staged = match foreground::stage_telegram_foreground_ingress(
+            &ctx.pool,
+            &sample_telegram_config(),
+            normalized,
+        )
+        .await?
+        {
+            foreground::StagedForegroundIngressOutcome::Accepted(staged) => staged,
+            other => panic!("fixture should stage foreground ingress, got {other:?}"),
+        };
+
+        let attachments_before =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_before.len(), 1);
+        assert_eq!(
+            attachments_before[0].processing_status,
+            IngressAttachmentProcessingStatus::Pending
+        );
+        assert_eq!(attachments_before[0].attachment_id, "doc-unsupported-1");
+
+        let processing = plan_and_execute_process_ingress_attachment_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            staged.ingress_id,
+            "doc-unsupported-1",
+        )
+        .await?;
+        assert!(processing.outcome.summary.contains("unsupported"));
+
+        let attachments_after =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_after.len(), 1);
+        assert_eq!(
+            attachments_after[0].processing_status,
+            IngressAttachmentProcessingStatus::Unsupported
+        );
+        assert!(
+            attachments_after[0]
+                .last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not supported"))
+        );
+        assert!(attachments_after[0].latest_extracted_artifact_id.is_none());
+
+        let latest_attempt_status: String = sqlx::query_scalar(
+            r#"
+            SELECT status
+            FROM ingress_attachment_processing_attempts
+            WHERE ingress_attachment_id = $1
+            ORDER BY started_at DESC, ingress_attachment_processing_attempt_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(latest_attempt_status, "unsupported");
+
+        let extracted_artifact_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_attachment_extracted_artifacts
+            WHERE ingress_attachment_id = $1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(extracted_artifact_count, 0);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -1285,11 +1528,73 @@ async fn plan_nonrepeatable_recovery_governed_action(
     }
 }
 
+async fn plan_and_execute_process_ingress_attachment_governed_action(
+    config: &harness::config::RuntimeConfig,
+    pool: &sqlx::PgPool,
+    ingress_id: Uuid,
+    attachment_id: &str,
+) -> Result<governed_actions::GovernedActionExecutionResult> {
+    let planned = match governed_actions::plan_governed_action(
+        config,
+        pool,
+        &governed_actions::GovernedActionPlanningRequest {
+            governed_action_execution_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            proposal: GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: "Process ingress attachment".to_string(),
+                rationale: Some("Process staged attachment for integration coverage.".to_string()),
+                action_kind: GovernedActionKind::ProcessIngressAttachment,
+                requested_risk_tier: None,
+                capability_scope: CapabilityScope {
+                    filesystem: FilesystemCapabilityScope {
+                        read_roots: Vec::new(),
+                        write_roots: Vec::new(),
+                    },
+                    network: NetworkAccessPosture::Disabled,
+                    environment: EnvironmentCapabilityScope {
+                        allow_variables: Vec::new(),
+                    },
+                    execution: ExecutionCapabilityBudget {
+                        timeout_ms: 30_000,
+                        max_stdout_bytes: 65_536,
+                        max_stderr_bytes: 32_768,
+                    },
+                },
+                payload: GovernedActionPayload::ProcessIngressAttachment(
+                    ProcessIngressAttachmentAction {
+                        ingress_id,
+                        attachment_id: attachment_id.to_string(),
+                    },
+                ),
+            },
+        },
+    )
+    .await?
+    {
+        governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+        other => panic!("expected planned governed action, got {other:?}"),
+    };
+    assert!(!planned.requires_approval);
+    governed_actions::execute_governed_action(config, pool, &planned.record).await
+}
+
 fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
     ResolvedModelGatewayConfig {
         foreground: ResolvedForegroundModelRouteConfig {
             provider: ModelProviderKind::ZAi,
             model: "z-ai-foreground".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 30_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "provider-secret".to_string(),
             provider_headers: Vec::new(),

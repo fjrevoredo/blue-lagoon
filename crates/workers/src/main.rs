@@ -1613,6 +1613,8 @@ Available action kinds:
 - create_workspace_script: create a governed workspace script
 - append_workspace_script_version: append an auditable script version
 - list_workspace_script_runs: inspect bounded script run history
+- inspect_ingress_attachments: inspect attachment metadata and processing state for one ingress
+- process_ingress_attachment: run bounded text extraction for one attachment on one ingress
 - upsert_scheduled_foreground_task: create or update future foreground work
 - request_background_job: request bounded background maintenance work
 - run_diagnostic: run a harness-native read-only diagnostic query
@@ -1653,6 +1655,8 @@ Harness-native payload examples:
 - "payload": { "kind": "inspect_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null } }
 - "payload": { "kind": "create_workspace_artifact", "value": { "artifact_kind": "scratchpad", "title": "...", "content_text": "...", "provenance": "conversation" } }
 - "payload": { "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
+- "payload": { "kind": "inspect_ingress_attachments", "value": { "ingress_id": "<uuid>" } }
+- "payload": { "kind": "process_ingress_attachment", "value": { "ingress_id": "<uuid>", "attachment_id": "<attachment-id>" } }
 - "payload": { "kind": "upsert_scheduled_foreground_task", "value": { "task_key": "check_in", "title": "Check in", "user_facing_prompt": "...", "next_due_at_utc": "2026-04-29T10:00:00Z", "cadence_seconds": 86400, "cooldown_seconds": 3600, "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "active": true } }
 - One-shot scheduled foreground tasks must use task_key prefix "oneoff_" or "one_shot_" and cadence_seconds: 0. The harness stores a bounded placeholder cadence and disables the task after its terminal run outcome so it cannot repeat unless the user asks for recurrence.
 - "payload": { "kind": "request_background_job", "value": { "job_kind": "memory_consolidation", "rationale": "...", "input_scope_ref": null, "urgency": "normal", "wake_preference": null, "internal_conversation_ref": "telegram-primary" } }
@@ -1964,6 +1968,8 @@ fn detect_bare_governed_action_invocation(text: &str) -> Option<&str> {
         "create_workspace_script",
         "append_workspace_script_version",
         "list_workspace_script_runs",
+        "inspect_ingress_attachments",
+        "process_ingress_attachment",
         "upsert_scheduled_foreground_task",
         "request_background_job",
         "run_diagnostic",
@@ -2240,6 +2246,8 @@ fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static 
             "append_workspace_script_version"
         }
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }

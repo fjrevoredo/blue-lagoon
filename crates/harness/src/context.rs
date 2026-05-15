@@ -10,6 +10,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
+    attachments,
     config::RuntimeConfig,
     foreground, identity, retrieval,
     self_model::{self, InternalStateSeed},
@@ -113,7 +114,19 @@ pub async fn assemble_foreground_context(
     .await?;
     let (recent_history, truncated_history_message_count) =
         shape_recent_history(recent_history, options.limits.history_message_char_limit);
-    let retrieved_context = retrieval::assemble_retrieved_context(pool, config, &trigger).await?;
+    let mut retrieved_context =
+        retrieval::assemble_retrieved_context(pool, config, &trigger).await?;
+    let attachment_projection = attachments::project_ingress_attachment_context(
+        pool,
+        trigger.ingress.ingress_id,
+        attachments::DEFAULT_ATTACHMENT_CONTEXT_ITEM_LIMIT,
+        attachments::DEFAULT_ATTACHMENT_CONTEXT_EXCERPT_CHAR_LIMIT,
+    )
+    .await?;
+    let selected_attachment_context_count = attachment_projection.items.len();
+    let truncated_attachment_excerpt_count = attachment_projection.truncated_excerpt_count;
+    let selected_attachment_ids = attachment_projection.selected_attachment_ids.clone();
+    retrieved_context.items.extend(attachment_projection.items);
 
     let metadata = ContextAssemblyMetadata {
         source_ingress_id: trigger.ingress.ingress_id,
@@ -166,6 +179,9 @@ pub async fn assemble_foreground_context(
         selected_recent_history_episode_ids = ?metadata.selected_recent_history_episode_ids,
         selected_retrieved_context_count = metadata.selected_retrieved_context_count,
         selected_retrieved_context_item_ids = ?metadata.selected_retrieved_context_item_ids,
+        selected_attachment_context_count,
+        selected_attachment_ids = ?selected_attachment_ids,
+        truncated_attachment_excerpt_count,
         truncated_history_message_count = metadata.truncated_history_message_count,
         trigger_text_truncated = metadata.trigger_text_truncated,
         "assembled foreground context"

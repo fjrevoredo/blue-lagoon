@@ -787,6 +787,16 @@ async fn model_call_records_are_persisted_and_visible_in_trace_report() -> Resul
                 provider_reasoning: None,
                 timeout_ms: 30_000,
             },
+            unconscious: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "test-model-unconscious".to_string(),
+                api_base_url: "https://example.invalid".to_string(),
+                api_key: "redacted-test-key".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+                provider_reasoning: None,
+                timeout_ms: 30_000,
+            },
         };
         let request = ModelCallRequest {
             request_id: Uuid::now_v7(),
@@ -918,6 +928,16 @@ async fn model_call_payload_retention_clears_bulky_fields_but_keeps_metadata() -
             foreground: ResolvedForegroundModelRouteConfig {
                 provider: ModelProviderKind::ZAi,
                 model: "test-model".to_string(),
+                api_base_url: "https://example.invalid".to_string(),
+                api_key: "redacted-test-key".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+                provider_reasoning: None,
+                timeout_ms: 30_000,
+            },
+            unconscious: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::ZAi,
+                model: "test-model-unconscious".to_string(),
                 api_base_url: "https://example.invalid".to_string(),
                 api_key: "redacted-test-key".to_string(),
                 provider_headers: Vec::new(),

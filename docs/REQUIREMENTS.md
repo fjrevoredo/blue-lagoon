@@ -352,6 +352,12 @@ Each meaningful episodic record SHOULD capture:
 - The implementation MUST assume that model output can be incorrect, manipulated, or adversarial.
 - The implementation design SHOULD prefer least privilege, bounded execution, approval paths for sensitive actions, and isolated execution for risky tools.
 
+### 16.3 Archived workspace immutability
+- Workspace artifacts and workspace scripts in an archived state MUST be treated as immutable records.
+- The harness MUST NOT allow direct mutation or execution of archived workspace artifacts or archived workspace scripts through normal governed-action paths.
+- Returning archived workspace artifacts or scripts to active use MUST require an explicit restore or unarchive path that is harness-mediated, policy-evaluated, and auditable.
+- Restore or unarchive flows MUST record actor identity, reason, and timestamp before any subsequent active-state mutation proceeds.
+
 ## 17. Logging, traceability, and observability
 
 ### 17.1 Event logging

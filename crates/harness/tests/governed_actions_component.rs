@@ -37,6 +37,8 @@ fn kind_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
         GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",

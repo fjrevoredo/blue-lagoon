@@ -1361,11 +1361,13 @@ fn governed_action_recovery_action_classification(
         | GovernedActionKind::ListWorkspaceScripts
         | GovernedActionKind::InspectWorkspaceScript
         | GovernedActionKind::ListWorkspaceScriptRuns
+        | GovernedActionKind::InspectIngressAttachments
         | GovernedActionKind::RunDiagnostic => RecoveryActionClassification::SafeReplay,
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
         | GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
+        | GovernedActionKind::ProcessIngressAttachment
         | GovernedActionKind::UpsertScheduledForegroundTask
         | GovernedActionKind::RequestBackgroundJob
         | GovernedActionKind::RunSubprocess

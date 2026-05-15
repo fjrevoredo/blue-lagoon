@@ -28,8 +28,8 @@ structured outputs.
 | `crates/harness/src/background_execution.rs` | `lease_next_due_job()` (`crates/harness/src/background_execution.rs:47`), `execute_next_due_job()` (`crates/harness/src/background_execution.rs:219`), `execute_leased_job()` (`crates/harness/src/background_execution.rs:234`) |
 | `crates/harness/src/background.rs` | background job, run, and wake-signal persistence helpers including `insert_job()`, `lease_due_job()`, `insert_job_run()`, and `insert_wake_signal()` |
 | `crates/harness/src/worker.rs` | `launch_unconscious_worker()` (`crates/harness/src/worker.rs:329`), `launch_unconscious_worker_with_timeout()` (`crates/harness/src/worker.rs:345`) |
-| `crates/workers/src/main.rs` | `run_unconscious_worker()` (`crates/workers/src/main.rs:316`), `build_unconscious_model_call_request()` (`crates/workers/src/main.rs:497`) |
-| `crates/harness/src/model_gateway.rs` | `execute_background_model_call()` (`crates/harness/src/model_gateway.rs:204`), `execute_model_call_unchecked()` (`crates/harness/src/model_gateway.rs:213`) |
+| `crates/workers/src/main.rs` | `run_unconscious_worker()` (`crates/workers/src/main.rs:429`), `build_unconscious_model_call_request()` (`crates/workers/src/main.rs:612`) |
+| `crates/harness/src/model_gateway.rs` | `execute_background_model_call()` (`crates/harness/src/model_gateway.rs:204`), `execute_model_call_unchecked()` (`crates/harness/src/model_gateway.rs:219`) |
 | `crates/harness/src/policy.rs` | `default_background_budget()` (`crates/harness/src/policy.rs:41`), `evaluate_wake_signal()` (`crates/harness/src/policy.rs:307`) |
 | `crates/harness/src/governed_actions.rs` | `execute_request_background_job()` (`crates/harness/src/governed_actions.rs:1406`) |
 | `crates/harness/src/management.rs` | `enqueue_background_job()` (`crates/harness/src/management.rs:1954`), `run_next_background_job()` (`crates/harness/src/management.rs:2004`) |
@@ -67,17 +67,20 @@ paths:
 
 ### Model Routing Reality
 
-The current model-gateway implementation does distinguish foreground versus
-background request validation, but it does not provide separate route
-configuration. `execute_background_model_call()` validates that the request is
-`LoopKind::Unconscious` with `ModelCallPurpose::BackgroundAnalysis`, then calls
-the same shared `execute_model_call_unchecked()` path that resolves the single
-configured route from `ResolvedModelGatewayConfig` (`crates/harness/src/model_gateway.rs:204` through `crates/harness/src/model_gateway.rs:220`).
+The model-gateway implementation now has separate route configuration for
+foreground and unconscious execution. `execute_background_model_call()`
+validates that the request is `LoopKind::Unconscious` with
+`ModelCallPurpose::BackgroundAnalysis`, then resolves the unconscious route from
+`ResolvedModelGatewayConfig` before provider invocation
+(`crates/harness/src/model_gateway.rs:204` through
+`crates/harness/src/model_gateway.rs:229`,
+`crates/harness/src/model_gateway.rs:322` through
+`crates/harness/src/model_gateway.rs:327`).
 
-> **NOT IMPLEMENTED:** There is no separate background provider/model route in
-> `RuntimeConfig`. The only route config is `model_gateway.foreground`
-> (`crates/harness/src/config.rs:200` through `crates/harness/src/config.rs:218`),
-> and unconscious jobs currently use that same resolved provider/model.
+Route configuration lives in both `model_gateway.foreground.*` and
+`model_gateway.unconscious.*` (`crates/harness/src/config.rs:200` through
+`crates/harness/src/config.rs:202`, `crates/harness/src/config.rs:555` through
+`crates/harness/src/config.rs:597`).
 
 ### Automatic Origination Gaps
 
@@ -133,7 +136,8 @@ Important current behavior:
 | `background.wake_signals.max_pending_signals` | `8` | integer greater than zero | `config/default.toml:37`, `crates/harness/src/policy.rs:373` |
 | `background.wake_signals.cooldown_seconds` | `900` | integer greater than zero | `config/default.toml:38`, `crates/harness/src/background_execution.rs` wake-signal persistence path |
 | `worker.timeout_ms` | `10000` | integer greater than zero | `config/default.toml:80`, `crates/harness/src/worker.rs:340` |
-| `model_gateway.foreground.*` | provider-specific | see `docs/internal/harness/MODEL_PROVIDERS.md` | shared foreground and unconscious model route |
+| `model_gateway.foreground.*` | provider-specific | see `docs/internal/harness/MODEL_PROVIDERS.md` | conscious-loop provider/model route |
+| `model_gateway.unconscious.*` | provider-specific | see `docs/internal/harness/MODEL_PROVIDERS.md` | unconscious-loop/background provider/model route |
 
 ### Extension Points
 
@@ -145,11 +149,11 @@ To add autonomous background origination:
 4. Reuse `plan_background_job()` so deduplication, scoping, budgeting, and audit behavior stay centralized.
 5. Add component tests for planning and integration tests for end-to-end enqueue plus execution.
 
-To add a separate background model route:
+To extend foreground/unconscious route specialization:
 
-1. Extend `ModelGatewayConfig` and `ResolvedModelGatewayConfig` with an unconscious route instead of reusing `foreground`.
-2. Split route resolution in `model_gateway.rs` so `execute_background_model_call()` does not call the foreground route resolver.
-3. Document any new config keys and environment overrides in `docs/internal/harness/MODEL_PROVIDERS.md`.
+1. Keep route changes inside `model_gateway.foreground.*` and `model_gateway.unconscious.*`, with fail-closed validation in `RuntimeConfig`.
+2. Keep `execute_background_model_call()` on the unconscious resolver path and `execute_foreground_model_call()` on the foreground resolver path.
+3. Document any new route keys or environment overrides in `docs/internal/harness/MODEL_PROVIDERS.md`.
 4. Add tests covering route selection, timeout differences, and provider-specific compatibility.
 
 To add a new job kind:
@@ -165,8 +169,8 @@ To add a new job kind:
 
 - `docs/LOOP_ARCHITECTURE.md` defines the canonical conscious/unconscious split and the intended set of allowed unconscious triggers.
 - `docs/IMPLEMENTATION_DESIGN.md` states the canonical product posture that background work is bounded and harness-governed.
-- `docs/internal/harness/MODEL_PROVIDERS.md` explains the single current model route and provider-specific request encoding.
+- `docs/internal/harness/MODEL_PROVIDERS.md` explains the foreground/unconscious route split and provider-specific request encoding.
 - `docs/internal/harness/TRACE_EXPLORER.md` explains how background jobs, runs, and wake signals appear in traces and diagnostics.
 - `crates/harness/tests/unconscious_component.rs` and `crates/harness/tests/unconscious_integration.rs` cover the current planning and execution behavior end to end.
 
-Verified: 2026-05-07.
+Verified: 2026-05-15.

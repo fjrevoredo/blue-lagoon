@@ -31,9 +31,9 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1675), `build_governed_action_proposals()` (line 1713), `extract_standalone_governed_action_payload()` (line 2039), `build_legacy_governed_action_proposals()` (line 2085), `governed_action_kind_as_str()` (line 2230) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1431), attachment action payload structs (line 1538), `GovernedActionPayload` (line 1693) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1679), `build_governed_action_proposals()` (line 1717), `extract_standalone_governed_action_payload()` (line 2045), `build_legacy_governed_action_proposals()` (line 2091), `governed_action_kind_as_str()` (line 2236) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 525), `execute_inspect_ingress_attachments()` (line 1345), `execute_process_ingress_attachment()` (line 1368), `execute_run_diagnostic_action()` (line 1563), `validate_upsert_scheduled_foreground_task_action()` (line 2174), `is_one_shot_scheduled_task_key()` (line 2199), `governed_action_kind_as_str()` (line 3307), `CanonicalGovernedActionPayload` (line 3435) |
 | `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
@@ -43,6 +43,7 @@ created.
 | `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
 | `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for the completed conscious-loop action-kind strings |
 | `migrations/0014__diagnostic_action_kind.sql` | forward constraint update for the later `run_diagnostic` action kind on existing operator databases |
+| `migrations/0015__attachment_processing.sql` | attachment processing tables and forward action-kind constraint update for `inspect_ingress_attachments` / `process_ingress_attachment` |
 
 ### Model-Facing Action Kinds
 
@@ -59,6 +60,8 @@ The live governed-action enum contains these model-usable kinds:
 | `create_workspace_script` | Create a script artifact and initial append-only version | Tier 2 |
 | `append_workspace_script_version` | Append an auditable script version with conflict checking | Tier 2 |
 | `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
+| `inspect_ingress_attachments` | Inspect attachment metadata and processing state for one ingress | Tier 0 |
+| `process_ingress_attachment` | Run bounded attachment text extraction for one ingress attachment | Tier 1 |
 | `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
 | `request_background_job` | Request bounded background maintenance work | Tier 1 |
 | `run_diagnostic` | Execute one harness-native read-only diagnostic query | Tier 0 |
@@ -151,6 +154,13 @@ Workspace script payloads:
 { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
 ```
 
+Attachment payloads:
+
+```json
+{ "kind": "inspect_ingress_attachments", "value": { "ingress_id": "<uuid>" } }
+{ "kind": "process_ingress_attachment", "value": { "ingress_id": "<uuid>", "attachment_id": "<attachment-id>" } }
+```
+
 Schedule, background, subprocess, and fetch payloads:
 
 ```json
@@ -194,7 +204,7 @@ delivery sends only user-facing text.
 Read-only harness-native actions are replay-safe after a worker interruption:
 `inspect_workspace_artifact`, `list_workspace_artifacts`,
 `list_workspace_scripts`, `inspect_workspace_script`,
-`list_workspace_script_runs`, and `run_diagnostic`.
+`list_workspace_script_runs`, `inspect_ingress_attachments`, and `run_diagnostic`.
 
 Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
 produce side effects are classified as ambiguous or nonrepeatable during
@@ -215,7 +225,7 @@ recovery fails closed instead of blindly replaying the turn.
 
 | Rule | Applies to |
 |---|---|
-| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, schedule, and background request actions |
+| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, attachment inspection/processing, schedule, and background request actions |
 | At least one filesystem root | `run_subprocess`, `run_workspace_script` |
 | Non-empty execution limits within configured maxima | `run_subprocess`, `run_workspace_script` |
 | Network must be enabled; execution budget fields may be zero | `web_fetch` |
@@ -283,4 +293,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `further-optimizations`, session 2026-05-09.*
+*Last verified: 2026-05-15.*

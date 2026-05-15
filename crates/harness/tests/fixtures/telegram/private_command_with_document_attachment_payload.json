@@ -1,0 +1,29 @@
+{
+  "update_id": 1014,
+  "message": {
+    "message_id": 54,
+    "date": 1712301130,
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "chat": {
+      "id": 42,
+      "type": "private"
+    },
+    "text": "inspect this document and summarize it",
+    "document": {
+      "file_id": "doc-payload-1",
+      "file_name": "project-notes.txt",
+      "mime_type": "text/plain",
+      "file_size": 4096
+    }
+  },
+  "blue_lagoon_fixture_attachments": {
+    "doc-payload-1": {
+      "content_text": "Attachment fixture excerpt start. This paragraph should appear in retrieved canonical context after governed processing. We continue with additional deterministic words to ensure the worker-side retrieved-context summarizer truncates long attachment excerpts while still retaining the leading semantic signal for the assistant turn. Repeat token alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega. TRUNCATION_SENTINEL_END"
+    }
+  }
+}

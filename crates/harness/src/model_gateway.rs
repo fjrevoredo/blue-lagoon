@@ -198,7 +198,7 @@ pub async fn execute_foreground_model_call<T: ModelProviderTransport>(
     transport: &T,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_foreground_request(request)?;
-    execute_model_call_unchecked(gateway, request, transport).await
+    execute_model_call_unchecked(gateway, request, transport, ModelRoute::Foreground).await
 }
 
 pub async fn execute_background_model_call<T: ModelProviderTransport>(
@@ -207,16 +207,26 @@ pub async fn execute_background_model_call<T: ModelProviderTransport>(
     transport: &T,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_background_request(request)?;
-    execute_model_call_unchecked(gateway, request, transport).await
+    execute_model_call_unchecked(gateway, request, transport, ModelRoute::Unconscious).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRoute {
+    Foreground,
+    Unconscious,
 }
 
 async fn execute_model_call_unchecked<T: ModelProviderTransport>(
     gateway: &ResolvedModelGatewayConfig,
     request: &ModelCallRequest,
     transport: &T,
+    route: ModelRoute,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_common_request(request)?;
-    let route = resolve_foreground_route(gateway, request)?;
+    let route = match route {
+        ModelRoute::Foreground => resolve_foreground_route(gateway, request)?,
+        ModelRoute::Unconscious => resolve_unconscious_route(gateway, request)?,
+    };
 
     match route.provider {
         ModelProviderKind::ZAi => execute_z_ai_call(request, route, transport).await,
@@ -305,13 +315,22 @@ fn resolve_foreground_route<'a>(
     gateway: &'a ResolvedModelGatewayConfig,
     request: &ModelCallRequest,
 ) -> std::result::Result<&'a ResolvedForegroundModelRouteConfig, ModelGatewayError> {
-    validate_provider_hint(&request.provider_hint, &gateway.foreground)?;
+    validate_provider_hint(&request.provider_hint, &gateway.foreground, "foreground")?;
     Ok(&gateway.foreground)
+}
+
+fn resolve_unconscious_route<'a>(
+    gateway: &'a ResolvedModelGatewayConfig,
+    request: &ModelCallRequest,
+) -> std::result::Result<&'a ResolvedForegroundModelRouteConfig, ModelGatewayError> {
+    validate_provider_hint(&request.provider_hint, &gateway.unconscious, "unconscious")?;
+    Ok(&gateway.unconscious)
 }
 
 fn validate_provider_hint(
     hint: &Option<ModelProviderHint>,
     route: &ResolvedForegroundModelRouteConfig,
+    route_name: &str,
 ) -> std::result::Result<(), ModelGatewayError> {
     let Some(hint) = hint else {
         return Ok(());
@@ -321,8 +340,8 @@ fn validate_provider_hint(
         && provider != route.provider
     {
         return Err(ModelGatewayError::Validation(format!(
-            "provider hint {:?} did not match configured foreground provider {:?}",
-            provider, route.provider
+            "provider hint {:?} did not match configured {route_name} provider {:?}",
+            provider, route.provider,
         )));
     }
 
@@ -330,8 +349,8 @@ fn validate_provider_hint(
         && model != &route.model
     {
         return Err(ModelGatewayError::Validation(format!(
-            "provider hint model '{model}' did not match configured foreground model '{}'",
-            route.model
+            "provider hint model '{model}' did not match configured {route_name} model '{}'",
+            route.model,
         )));
     }
 
@@ -656,6 +675,7 @@ mod tests {
                 }),
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
         };
         let request = sample_request();
         let transport = FakeModelProviderTransport::new();
@@ -726,6 +746,7 @@ mod tests {
                 }),
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
         };
         let request = sample_request();
         let transport = FakeModelProviderTransport::new();
@@ -765,6 +786,7 @@ mod tests {
                 provider_reasoning: None,
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
         };
         let request = sample_request();
         let transport = FakeModelProviderTransport::new();
@@ -848,6 +870,7 @@ mod tests {
                 }),
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
         };
         let request = sample_request();
         let transport = FakeModelProviderTransport::new();
@@ -892,7 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executes_background_call_through_same_route() {
+    async fn executes_background_call_through_unconscious_route() {
         let gateway = sample_gateway();
         let mut request = sample_request();
         request.loop_kind = LoopKind::Unconscious;
@@ -919,7 +942,12 @@ mod tests {
             .expect("background gateway call should succeed");
 
         assert_eq!(response.output.text, "background summary");
-        assert_eq!(transport.seen_requests().len(), 1);
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].body.get("model").and_then(Value::as_str),
+            Some("z-ai-unconscious")
+        );
     }
 
     #[tokio::test]
@@ -949,6 +977,20 @@ mod tests {
                 provider_reasoning: None,
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
+        }
+    }
+
+    fn sample_unconscious_route() -> ResolvedForegroundModelRouteConfig {
+        ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "unconscious-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 20_000,
         }
     }
 

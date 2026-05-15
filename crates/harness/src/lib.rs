@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod attachments;
 pub mod audit;
 pub mod background;
 pub mod background_execution;

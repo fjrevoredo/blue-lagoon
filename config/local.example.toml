@@ -20,6 +20,13 @@ model_call_payload_retention_days = 30
 # api_key_env = "OPENROUTER_API_KEY"
 # timeout_ms = 60000
 #
+# [model_gateway.unconscious]
+# provider = "openrouter"
+# model = "openai/gpt-5.2"
+# reasoning_mode = "off"
+# api_key_env = "OPENROUTER_API_KEY"
+# timeout_ms = 60000
+#
 # [model_gateway.openrouter]
 # api_base_url = "https://openrouter.ai/api/v1"
 # http_referer = "https://example.invalid"

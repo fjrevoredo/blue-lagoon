@@ -1278,6 +1278,16 @@ fn resolved_model_gateway_config() -> ResolvedModelGatewayConfig {
             provider_reasoning: None,
             timeout_ms: 30_000,
         },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 30_000,
+        },
     }
 }
 
@@ -1286,6 +1296,14 @@ fn unresolved_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
         foreground: ForegroundModelRouteConfig {
             provider: ModelProviderKind::ZAi,
             model: "z-ai-background".to_string(),
+            api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
+            api_key_env: api_key_env.to_string(),
+            timeout_ms: 20_000,
+        },
+        unconscious: ForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
             reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
             api_key_env: api_key_env.to_string(),

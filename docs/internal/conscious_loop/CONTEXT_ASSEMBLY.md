@@ -10,7 +10,8 @@ It is the translation layer between the harness's stored state (self-model,
 identity lifecycle, episode history, retrieved context, recovery context) and
 what the model actually receives. Every detail the agent can reason about - its
 identity, its capabilities, recent conversation history, retrieved memories,
-pending actions - enters through this pipeline. Nothing else reaches the model.
+pending actions, and processed attachment excerpts - enters through this
+pipeline. Nothing else reaches the model.
 
 ---
 
@@ -20,7 +21,8 @@ pending actions - enters through this pipeline. Nothing else reaches the model.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 77), `apply_identity_lifecycle_context()` (line 206), assembly limit constants (lines 18-20) |
+| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 78), `apply_identity_lifecycle_context()` (line 221), retrieved+attachment projection merge (lines 117-131), assembly limit constants (lines 19-21) |
+| `crates/harness/src/attachments.rs` | `register_ingress_attachments()` (line 89), `process_ingress_attachment()` (line 235), `project_ingress_attachment_context()` (line 517), attachment projection limits (lines 14-15) |
 | `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 185), `ensure_episode_retrieval_artifacts()` (line 255), `fetch_retrieval_candidates()` (line 448), `score_candidates()` (line 516), `load_episode_context()` (line 623), `sanitize_retrieval_text()` (line 680), `is_sparse_follow_up_trigger()` (line 873) |
 | `crates/workers/src/main.rs` | `foreground_context_policy()` (line 680), `classify_foreground_context()` (line 725), `retrieval_eligible_for_scenario()` (line 765), `schema_disclosure_for_scenario()` (line 790), `build_model_input()` (line 824), `format_assistant_conversation_excerpt()` (line 1025), `enforce_foreground_input_budget()` (line 1071), `summarize_prompt_metrics()` (line 1138), `sparse_confirmation_context()` (line 1382), `troubleshooting_guidance_message()` (line 1509), `identity_kickstart_schema_message()` (line 1533), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1675), `is_foreground_visible_context_text()` (line 2757), `retrieved_context_summary()` (line 2832), `retrieved_episode_message_summary()` (line 2867), `sanitize_assistant_history_excerpt_text()` (line 2914) |
 | `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105), `PromptCompositionMetrics` (line 1883), `ModelCallRequest.prompt_metrics` (line 1906) |
@@ -41,7 +43,11 @@ Steps execute in order inside `assemble_foreground_context()`:
 5. Recent episode history fetched - up to `recent_history_limit` episodes before the trigger timestamp; each message truncated to `history_message_char_limit` characters, then labeled with author and UTC timestamp before model submission.
 6. Retrieved context assembled via `retrieval::assemble_retrieved_context()`.
    Episode retrieval refresh now skips failure/error outcomes, strips prefixed assistant-history wrappers, drops instruction-heavy or runtime-only text before lexical artifacts are created or reloaded into foreground context, and downranks sparse follow-up triggers such as `yes` or `go ahead` so they do not pull unrelated episode summaries into the foreground turn by default.
-7. Worker-side foreground scenario policy decides whether supplied retrieval is
+7. Processed attachment excerpts for the triggering ingress are projected via
+   `attachments::project_ingress_attachment_context()` and merged into
+   `retrieved_context.items` as bounded `attachment_excerpt` memory-style
+   entries.
+8. Worker-side foreground scenario policy decides whether supplied retrieval is
    eligible to be rendered. Routine greetings, plain factual questions,
    confirmations, retries, approval callbacks, and post-execution continuation
    calls suppress retrieved context even if the harness supplied candidates.
@@ -154,7 +160,7 @@ Messages are appended in this order by `build_model_input()`:
 | 1..N | User / Assistant | Recent episode excerpts, oldest first (reversed from DB fetch), formatted as `[YYYY-MM-DD HH:MM UTC] Author: text` | Always for user history; assistant excerpts that normalize into instruction bleed, operational runtime summaries, standalone control payloads, or stale approval/failure residue for independent routine turns are dropped at prompt assembly time |
 | N+1 | User | Current trigger `text_body`, formatted as `[YYYY-MM-DD HH:MM UTC] User: text` | Only if `text_body` is `Some` |
 | N+2 | Developer | Backlog recovery notice with ordered ingress batch | Only in `BacklogRecovery` mode with non-empty `ordered_ingress` |
-| N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with compact memory artifact text, concise episode summaries, timestamps, relevance reason, and short user/assistant cues only when useful; durable IDs are not included in the model-facing summary. Retrieval refresh and reload suppress failed/error episodes, instruction bleed, and normalized assistant-history prefixes before this text is surfaced. | Only if `retrieved_context.items` is non-empty and scenario policy marks retrieval eligible |
+| N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with compact memory artifact text, concise episode summaries, timestamps, relevance reason, and short user/assistant cues only when useful; durable IDs are not included in the model-facing summary. Retrieval refresh and reload suppress failed/error episodes, instruction bleed, and normalized assistant-history prefixes before this text is surfaced. Processed attachment excerpts from the triggering ingress are merged into the same bounded retrieved-context channel as `attachment_excerpt` items. | Only if `retrieved_context.items` is non-empty and scenario policy marks retrieval eligible |
 | N+4 | Developer | Governed action observations plus, when available, foreground action-loop state | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Sparse-confirmation bridge note that binds a terse trigger such as `yes` to the immediately preceding assistant prompt | If governed action observations are empty and `sparse_confirmation_context()` detects a recent assistant confirmation prompt |
 | N+5 (alt) | Developer | Full governed action schema or short governed-action reminder | If governed action observations are empty |
@@ -331,4 +337,4 @@ retrieval or schema disclosure by guesswork.
 
 ---
 
-*Last verified: 2026-05-14.*
+*Last verified: 2026-05-15.*

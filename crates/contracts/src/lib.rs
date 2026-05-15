@@ -1393,6 +1393,8 @@ pub enum GovernedActionKind {
     CreateWorkspaceScript,
     AppendWorkspaceScriptVersion,
     ListWorkspaceScriptRuns,
+    InspectIngressAttachments,
+    ProcessIngressAttachment,
     UpsertScheduledForegroundTask,
     RequestBackgroundJob,
     RunDiagnostic,
@@ -1508,6 +1510,39 @@ pub struct ListWorkspaceScriptRunsAction {
     pub status: Option<WorkspaceScriptRunStatus>,
     #[serde(default = "default_governed_action_list_limit")]
     pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressAttachmentProcessingStatus {
+    Pending,
+    Processed,
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressAttachmentSummary {
+    pub ingress_attachment_id: Uuid,
+    pub ingress_id: Uuid,
+    pub attachment_id: String,
+    pub media_type: Option<String>,
+    pub file_name: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub processing_status: IngressAttachmentProcessingStatus,
+    pub last_processed_at: Option<DateTime<Utc>>,
+    pub last_failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectIngressAttachmentsAction {
+    pub ingress_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIngressAttachmentAction {
+    pub ingress_id: Uuid,
+    pub attachment_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1665,6 +1700,8 @@ pub enum GovernedActionPayload {
     CreateWorkspaceScript(CreateWorkspaceScriptAction),
     AppendWorkspaceScriptVersion(AppendWorkspaceScriptVersionAction),
     ListWorkspaceScriptRuns(ListWorkspaceScriptRunsAction),
+    InspectIngressAttachments(InspectIngressAttachmentsAction),
+    ProcessIngressAttachment(ProcessIngressAttachmentAction),
     UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
     RequestBackgroundJob(RequestBackgroundJobAction),
     RunDiagnostic(RunDiagnosticAction),
