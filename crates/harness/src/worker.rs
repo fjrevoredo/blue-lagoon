@@ -621,7 +621,10 @@ fn explicit_worker_args(
 }
 
 fn is_worker_multiplexer_command(command: &str) -> bool {
-    let Some(file_name) = PathBuf::from(command)
+    // Normalize path separators so Windows-style command paths are recognized
+    // even when tests run on non-Windows CI hosts.
+    let normalized_command = command.replace('\\', "/");
+    let Some(file_name) = PathBuf::from(normalized_command)
         .file_stem()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
