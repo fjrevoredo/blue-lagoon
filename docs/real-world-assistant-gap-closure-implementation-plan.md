@@ -573,7 +573,7 @@ Implementation must not start until the user approves this plan.
 ## Plan Self-Check
 
 - [x] Plan location follows the default location rule.
-- [x] Plan status lifecycle is valid; current status is `APPROVED`.
+- [x] Plan status lifecycle is valid; current status is `COMPLETED`.
 - [x] Scope, non-goals, assumptions, and open questions are explicit.
 - [x] Any unresolved open questions have been surfaced to the user.
 - [x] Tasks are grouped into milestones because the plan has more than 10 tasks.
