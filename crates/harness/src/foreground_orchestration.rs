@@ -2971,6 +2971,8 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
         contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }

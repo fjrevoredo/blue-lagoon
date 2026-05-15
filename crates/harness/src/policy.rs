@@ -188,9 +188,11 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
         | GovernedActionKind::ProcessIngressAttachment
+        | GovernedActionKind::ListCalendarEvents
         | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,
         GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
+        | GovernedActionKind::UpsertCalendarEvent
         | GovernedActionKind::UpsertScheduledForegroundTask => GovernedActionRiskTier::Tier2,
         GovernedActionKind::WebFetch => GovernedActionRiskTier::Tier2,
         GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
@@ -229,7 +231,12 @@ pub fn evaluate_governed_action_identity_boundaries(
 
         if boundary_blocks_network(&normalized)
             && (proposal.capability_scope.network != NetworkAccessPosture::Disabled
-                || proposal.action_kind == GovernedActionKind::WebFetch)
+                || matches!(
+                    proposal.action_kind,
+                    GovernedActionKind::WebFetch
+                        | GovernedActionKind::ListCalendarEvents
+                        | GovernedActionKind::UpsertCalendarEvent
+                ))
         {
             return PolicyDecision::Denied {
                 reason: format!(
@@ -515,6 +522,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: None,
         }
     }

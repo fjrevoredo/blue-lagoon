@@ -1395,6 +1395,8 @@ pub enum GovernedActionKind {
     ListWorkspaceScriptRuns,
     InspectIngressAttachments,
     ProcessIngressAttachment,
+    ListCalendarEvents,
+    UpsertCalendarEvent,
     UpsertScheduledForegroundTask,
     RequestBackgroundJob,
     RunDiagnostic,
@@ -1543,6 +1545,28 @@ pub struct InspectIngressAttachmentsAction {
 pub struct ProcessIngressAttachmentAction {
     pub ingress_id: Uuid,
     pub attachment_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListCalendarEventsAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    #[serde(default = "default_governed_action_list_limit")]
+    pub max_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpsertCalendarEventAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub title: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub location: Option<String>,
+    pub details: Option<String>,
+    pub external_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1702,6 +1726,8 @@ pub enum GovernedActionPayload {
     ListWorkspaceScriptRuns(ListWorkspaceScriptRunsAction),
     InspectIngressAttachments(InspectIngressAttachmentsAction),
     ProcessIngressAttachment(ProcessIngressAttachmentAction),
+    ListCalendarEvents(ListCalendarEventsAction),
+    UpsertCalendarEvent(UpsertCalendarEventAction),
     UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
     RequestBackgroundJob(RequestBackgroundJobAction),
     RunDiagnostic(RunDiagnosticAction),
@@ -2276,6 +2302,49 @@ mod tests {
         };
         assert_eq!(payload.status, WorkspaceArtifactStatusFilter::Active);
         assert_eq!(payload.limit, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn governed_action_calendar_list_payload_defaults_bounded_max_results() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("list_calendar_events");
+        value["payload"] = serde_json::json!({
+            "kind": "list_calendar_events",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "start_at": "2026-05-20T09:00:00Z",
+                "end_at": "2026-05-20T18:00:00Z"
+            }
+        });
+
+        let decoded: GovernedActionProposal =
+            serde_json::from_value(value).expect("missing calendar max_results should default");
+        let GovernedActionPayload::ListCalendarEvents(payload) = decoded.payload else {
+            panic!("expected list calendar events payload");
+        };
+        assert_eq!(payload.max_results, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn governed_action_calendar_payload_rejects_missing_required_fields() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("upsert_calendar_event");
+        value["payload"] = serde_json::json!({
+            "kind": "upsert_calendar_event",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "starts_at": "2026-05-20T09:00:00Z",
+                "ends_at": "2026-05-20T10:00:00Z"
+            }
+        });
+
+        let error = serde_json::from_value::<GovernedActionProposal>(value)
+            .expect_err("missing title should fail calendar upsert payload parse");
+        assert!(error.to_string().contains("title"));
     }
 
     #[test]

@@ -37,6 +37,13 @@ allow_foreground_conversion = true
 max_pending_signals = 8
 cooldown_seconds = 900
 
+[integrations.calendar]
+enabled = false
+provider = ""
+credential_env = ""
+# Optional provider endpoint override for adapter-specific routing.
+api_base_url = ""
+
 [continuity.retrieval]
 max_recent_episode_candidates = 3
 max_memory_artifact_candidates = 5

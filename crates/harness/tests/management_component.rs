@@ -1470,6 +1470,194 @@ async fn operational_health_summary_records_recovery_pressure_anomalies() -> Res
 
 #[tokio::test]
 #[serial]
+async fn calendar_integration_run_listing_filters_and_surfaces_request_context() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let now = Utc::now();
+        let capability_scope_json = json!(immediate_scope());
+        let calendar_list_payload =
+            serde_json::to_value(contracts::GovernedActionPayload::ListCalendarEvents(
+                contracts::ListCalendarEventsAction {
+                    internal_principal_ref: "primary-user".to_string(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                    start_at: now,
+                    end_at: now + Duration::hours(8),
+                    max_results: 7,
+                },
+            ))?;
+        let calendar_upsert_payload =
+            serde_json::to_value(contracts::GovernedActionPayload::UpsertCalendarEvent(
+                contracts::UpsertCalendarEventAction {
+                    internal_principal_ref: "primary-user".to_string(),
+                    internal_conversation_ref: "telegram-primary".to_string(),
+                    title: "Project sync".to_string(),
+                    starts_at: now + Duration::hours(2),
+                    ends_at: now + Duration::hours(3),
+                    location: Some("Room A".to_string()),
+                    details: Some("Milestone review".to_string()),
+                    external_event_id: Some("evt_123".to_string()),
+                },
+            ))?;
+        let non_calendar_payload = serde_json::to_value(
+            contracts::GovernedActionPayload::RunSubprocess(platform_echo_action("not-calendar")),
+        )?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:calendar-list")
+        .bind("list_calendar_events")
+        .bind("tier_1")
+        .bind("executed")
+        .bind(&capability_scope_json)
+        .bind(&calendar_list_payload)
+        .bind(Option::<String>::None)
+        .bind(Some("execution_record:list".to_string()))
+        .bind(Some(now - Duration::minutes(3)))
+        .bind(Some(now - Duration::minutes(2)))
+        .execute(&ctx.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:calendar-upsert")
+        .bind("upsert_calendar_event")
+        .bind("tier_2")
+        .bind("failed")
+        .bind(&capability_scope_json)
+        .bind(&calendar_upsert_payload)
+        .bind(Some("provider rejected request".to_string()))
+        .bind(Some("execution_record:upsert".to_string()))
+        .bind(Some(now - Duration::minutes(1)))
+        .bind(Some(now))
+        .execute(&ctx.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO governed_action_executions (
+                governed_action_execution_id,
+                trace_id,
+                execution_id,
+                approval_request_id,
+                action_proposal_id,
+                action_fingerprint,
+                action_kind,
+                risk_tier,
+                status,
+                capability_scope_json,
+                payload_json,
+                workspace_script_id,
+                workspace_script_version_id,
+                blocked_reason,
+                output_ref,
+                started_at,
+                completed_at
+            ) VALUES (
+                $1, $2, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, $13
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("sha256:run-subprocess")
+        .bind("run_subprocess")
+        .bind("tier_1")
+        .bind("executed")
+        .bind(&capability_scope_json)
+        .bind(&non_calendar_payload)
+        .bind(Option::<String>::None)
+        .bind(Some("execution_record:subprocess".to_string()))
+        .bind(Some(now - Duration::minutes(5)))
+        .bind(Some(now - Duration::minutes(4)))
+        .execute(&ctx.pool)
+        .await?;
+
+        let runs = management::list_calendar_integration_runs(&ctx.config, None, 10).await?;
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| {
+            run.action_kind == "list_calendar_events" || run.action_kind == "upsert_calendar_event"
+        }));
+        assert!(
+            runs.iter()
+                .any(|run| run.action_kind == "list_calendar_events"
+                    && run.request_summary.contains("max_results=7"))
+        );
+        assert!(runs.iter().any(|run| {
+            run.action_kind == "upsert_calendar_event"
+                && run.status == "failed"
+                && run
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("provider rejected request"))
+        }));
+
+        let failed_runs = management::list_calendar_integration_runs(
+            &ctx.config,
+            Some(contracts::GovernedActionStatus::Failed),
+            10,
+        )
+        .await?;
+        assert_eq!(failed_runs.len(), 1);
+        assert_eq!(failed_runs[0].action_kind, "upsert_calendar_event");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn recovery_and_diagnostic_lists_surface_recent_operator_visibility() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let trace_id = Uuid::now_v7();

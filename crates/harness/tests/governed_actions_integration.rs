@@ -1,5 +1,7 @@
 mod support;
 
+use std::env;
+
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
@@ -916,6 +918,262 @@ async fn web_fetch_proposal_plans_with_approval_and_execution_is_attempted() -> 
     .await
 }
 
+#[tokio::test]
+#[serial]
+async fn calendar_upsert_action_executes_after_approval_with_audit_visibility() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "deterministic_fake".to_string();
+        config.integrations.calendar.credential_env = "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let starts_at = Utc::now() + Duration::hours(1);
+            let proposal = contracts::GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: "Create calendar event".to_string(),
+                rationale: Some("Integration test for approval-gated calendar upsert.".to_string()),
+                action_kind: GovernedActionKind::UpsertCalendarEvent,
+                requested_risk_tier: None,
+                capability_scope: calendar_integration_scope(),
+                payload: contracts::GovernedActionPayload::UpsertCalendarEvent(
+                    contracts::UpsertCalendarEventAction {
+                        internal_principal_ref: "primary-user".to_string(),
+                        internal_conversation_ref: "telegram-primary".to_string(),
+                        title: "Milestone sync".to_string(),
+                        starts_at,
+                        ends_at: starts_at + Duration::minutes(45),
+                        location: Some("Room A".to_string()),
+                        details: Some("Review integration rollout".to_string()),
+                        external_event_id: None,
+                    },
+                ),
+            };
+
+            let planned = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: proposal.clone(),
+                },
+            )
+            .await?;
+            let planned = match planned {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected approval-gated calendar upsert, got {other:?}"),
+            };
+            assert!(planned.requires_approval);
+            assert_eq!(
+                planned.record.risk_tier,
+                contracts::GovernedActionRiskTier::Tier2
+            );
+
+            let approval_request = approval::create_approval_request(
+                &config,
+                &ctx.pool,
+                &NewApprovalRequestRecord {
+                    approval_request_id: Uuid::now_v7(),
+                    trace_id: planned.record.trace_id,
+                    execution_id: None,
+                    action_proposal_id: planned.record.action_proposal_id,
+                    action_fingerprint: planned.record.action_fingerprint.clone(),
+                    action_kind: planned.record.action_kind,
+                    risk_tier: planned.record.risk_tier,
+                    title: proposal.title.clone(),
+                    consequence_summary: "Create calendar event for integration test.".to_string(),
+                    capability_scope: proposal.capability_scope,
+                    requested_by: "telegram:primary-user".to_string(),
+                    token: "calendar-upsert-approval-token".to_string(),
+                    requested_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::minutes(15),
+                },
+            )
+            .await?;
+            governed_actions::attach_approval_request(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                approval_request.approval_request_id,
+            )
+            .await?;
+
+            approval::resolve_approval_request(
+                &ctx.pool,
+                &approval::ApprovalResolutionAttempt {
+                    token: approval_request.token.clone(),
+                    actor_ref: "telegram:primary-user".to_string(),
+                    expected_action_fingerprint: planned.record.action_fingerprint.clone(),
+                    decision: contracts::ApprovalResolutionDecision::Approved,
+                    reason: Some("integration approval".to_string()),
+                    resolved_at: Utc::now(),
+                },
+            )
+            .await?;
+
+            let synced = governed_actions::sync_status_from_approval_resolution(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+                contracts::ApprovalResolutionDecision::Approved,
+                None,
+                Some("integration approval"),
+            )
+            .await?;
+            let outcome =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &synced).await?;
+
+            assert_eq!(
+                outcome.record.status,
+                contracts::GovernedActionStatus::Executed
+            );
+            assert!(outcome.outcome.summary.contains("upserted calendar event"));
+
+            let event_kinds: Vec<String> = sqlx::query_scalar(
+                r#"
+                SELECT event_kind
+                FROM audit_events
+                WHERE trace_id = $1
+                ORDER BY occurred_at, event_id
+                "#,
+            )
+            .bind(planned.record.trace_id)
+            .fetch_all(&ctx.pool)
+            .await?;
+            assert!(event_kinds.contains(&"governed_action_planned_for_approval".to_string()));
+            assert!(event_kinds.contains(&"governed_action_execution_started".to_string()));
+            assert!(event_kinds.contains(&"governed_action_execution_completed".to_string()));
+
+            let completed_payload = sqlx::query(
+                r#"
+                SELECT payload
+                FROM audit_events
+                WHERE trace_id = $1
+                  AND event_kind = 'governed_action_execution_completed'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(planned.record.trace_id)
+            .fetch_one(&ctx.pool)
+            .await?
+            .get::<serde_json::Value, _>("payload");
+            assert_eq!(
+                completed_payload["details"]["integration"],
+                serde_json::json!("calendar")
+            );
+            assert_eq!(
+                completed_payload["details"]["operation"],
+                serde_json::json!("upsert_event")
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn calendar_policy_recheck_failure_emits_recovery_diagnostic() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut planning_config = ctx.config.clone();
+        planning_config.integrations.calendar.enabled = true;
+        planning_config.integrations.calendar.provider = "deterministic_fake".to_string();
+        planning_config.integrations.calendar.credential_env =
+            "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let env_name = planning_config.integrations.calendar.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let start_at = Utc::now() + Duration::hours(2);
+            let planned = governed_actions::plan_governed_action(
+                &planning_config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: contracts::GovernedActionProposal {
+                        proposal_id: Uuid::now_v7(),
+                        title: "List calendar events".to_string(),
+                        rationale: Some("force calendar policy recheck failure".to_string()),
+                        action_kind: GovernedActionKind::ListCalendarEvents,
+                        requested_risk_tier: None,
+                        capability_scope: calendar_integration_scope(),
+                        payload: contracts::GovernedActionPayload::ListCalendarEvents(
+                            contracts::ListCalendarEventsAction {
+                                internal_principal_ref: "primary-user".to_string(),
+                                internal_conversation_ref: "telegram-primary".to_string(),
+                                start_at,
+                                end_at: start_at + Duration::hours(8),
+                                max_results: 5,
+                            },
+                        ),
+                    },
+                },
+            )
+            .await?;
+            let planned = match planned {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected planned calendar list action, got {other:?}"),
+            };
+
+            let mut execution_config = planning_config.clone();
+            execution_config.integrations.calendar.enabled = false;
+            let outcome = governed_actions::execute_governed_action(
+                &execution_config,
+                &ctx.pool,
+                &planned.record,
+            )
+            .await?;
+            assert_eq!(
+                outcome.outcome.status,
+                contracts::GovernedActionStatus::Blocked
+            );
+            assert!(
+                outcome
+                    .outcome
+                    .summary
+                    .contains("calendar integration is disabled")
+            );
+
+            let diagnostics =
+                harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.reason_code == "governed_action_policy_recheck_failed"
+                    && diagnostic.diagnostic_payload["governed_action_execution_id"]
+                        == serde_json::json!(planned.record.governed_action_execution_id)
+                    && diagnostic.diagnostic_payload["action_kind"]
+                        == serde_json::json!("list_calendar_events")
+            }));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
 fn web_fetch_scope() -> CapabilityScope {
     CapabilityScope {
         filesystem: FilesystemCapabilityScope {
@@ -1137,6 +1395,24 @@ fn immediate_scope() -> CapabilityScope {
             timeout_ms: 30_000,
             max_stdout_bytes: 65_536,
             max_stderr_bytes: 32_768,
+        },
+    }
+}
+
+fn calendar_integration_scope() -> CapabilityScope {
+    CapabilityScope {
+        filesystem: FilesystemCapabilityScope {
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+        },
+        network: NetworkAccessPosture::Disabled,
+        environment: EnvironmentCapabilityScope {
+            allow_variables: Vec::new(),
+        },
+        execution: ExecutionCapabilityBudget {
+            timeout_ms: 0,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: 0,
         },
     }
 }

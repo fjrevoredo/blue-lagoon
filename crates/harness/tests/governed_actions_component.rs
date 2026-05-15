@@ -1,5 +1,7 @@
 mod support;
 
+use std::env;
+
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use contracts::{
@@ -10,6 +12,7 @@ use contracts::{
 };
 use serde_json::json;
 use serial_test::serial;
+use sqlx::Row;
 use uuid::Uuid;
 
 use harness::{
@@ -39,6 +42,8 @@ fn kind_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
         GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -1261,6 +1266,314 @@ fn sample_web_fetch_action() -> contracts::WebFetchAction {
     }
 }
 
+fn sample_list_calendar_events_action() -> contracts::ListCalendarEventsAction {
+    contracts::ListCalendarEventsAction {
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        start_at: Utc::now(),
+        end_at: Utc::now() + Duration::hours(8),
+        max_results: 10,
+    }
+}
+
+fn sample_upsert_calendar_event_action() -> contracts::UpsertCalendarEventAction {
+    contracts::UpsertCalendarEventAction {
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        title: "Milestone sync".to_string(),
+        starts_at: Utc::now() + Duration::hours(1),
+        ends_at: Utc::now() + Duration::hours(2),
+        location: Some("Room A".to_string()),
+        details: Some("Discuss integration rollout".to_string()),
+        external_event_id: None,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn calendar_actions_fail_closed_when_integration_is_disabled() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let outcome = governed_actions::plan_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "List calendar events".to_string(),
+                    rationale: Some("check upcoming commitments".to_string()),
+                    action_kind: GovernedActionKind::ListCalendarEvents,
+                    requested_risk_tier: None,
+                    capability_scope: harness_native_capability_scope(),
+                    payload: contracts::GovernedActionPayload::ListCalendarEvents(
+                        sample_list_calendar_events_action(),
+                    ),
+                },
+            },
+        )
+        .await?;
+        let blocked = match outcome {
+            governed_actions::GovernedActionPlanningOutcome::Blocked(blocked) => blocked,
+            other => panic!("expected blocked calendar action while disabled, got {other:?}"),
+        };
+        assert!(
+            blocked
+                .record
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("disabled")
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn calendar_list_action_executes_with_deterministic_provider() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "deterministic_fake".to_string();
+        config.integrations.calendar.credential_env = "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let run_result = async {
+            let planned_result = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id: Uuid::now_v7(),
+                    execution_id: None,
+                    proposal: contracts::GovernedActionProposal {
+                        proposal_id: Uuid::now_v7(),
+                        title: "List calendar events".to_string(),
+                        rationale: Some("check upcoming commitments".to_string()),
+                        action_kind: GovernedActionKind::ListCalendarEvents,
+                        requested_risk_tier: None,
+                        capability_scope: harness_native_capability_scope(),
+                        payload: contracts::GovernedActionPayload::ListCalendarEvents(
+                            sample_list_calendar_events_action(),
+                        ),
+                    },
+                },
+            )
+            .await?;
+            let planned = match planned_result {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected planned calendar list action, got {other:?}"),
+            };
+            assert!(!planned.requires_approval);
+            assert_eq!(planned.record.risk_tier, GovernedActionRiskTier::Tier1);
+
+            let executed =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &planned.record)
+                    .await?;
+            assert_eq!(
+                executed.outcome.status,
+                contracts::GovernedActionStatus::Executed
+            );
+            assert!(executed.outcome.summary.contains("listed"));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        };
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn calendar_upsert_action_requires_approval_by_default_threshold() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "deterministic_fake".to_string();
+        config.integrations.calendar.credential_env = "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let outcome = governed_actions::plan_governed_action(
+            &config,
+            &ctx.pool,
+            &governed_actions::GovernedActionPlanningRequest {
+                governed_action_execution_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                proposal: contracts::GovernedActionProposal {
+                    proposal_id: Uuid::now_v7(),
+                    title: "Create calendar event".to_string(),
+                    rationale: Some("schedule milestone sync".to_string()),
+                    action_kind: GovernedActionKind::UpsertCalendarEvent,
+                    requested_risk_tier: None,
+                    capability_scope: harness_native_capability_scope(),
+                    payload: contracts::GovernedActionPayload::UpsertCalendarEvent(
+                        sample_upsert_calendar_event_action(),
+                    ),
+                },
+            },
+        )
+        .await?;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+
+        let planned = match outcome {
+            governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+            other => panic!("expected planned calendar upsert action, got {other:?}"),
+        };
+        assert!(planned.requires_approval);
+        assert_eq!(planned.record.risk_tier, GovernedActionRiskTier::Tier2);
+        assert_eq!(
+            planned.record.status,
+            contracts::GovernedActionStatus::AwaitingApproval
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn calendar_list_action_records_adapter_failure_and_failed_audit_event() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "fake".to_string();
+        config.integrations.calendar.credential_env = "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, "integration-test-token") };
+
+        let trace_id = Uuid::now_v7();
+        let run_result = async {
+            let planned_result = governed_actions::plan_governed_action(
+                &config,
+                &ctx.pool,
+                &governed_actions::GovernedActionPlanningRequest {
+                    governed_action_execution_id: Uuid::now_v7(),
+                    trace_id,
+                    execution_id: None,
+                    proposal: contracts::GovernedActionProposal {
+                        proposal_id: Uuid::now_v7(),
+                        title: "List calendar events".to_string(),
+                        rationale: Some("verify adapter failure handling".to_string()),
+                        action_kind: GovernedActionKind::ListCalendarEvents,
+                        requested_risk_tier: None,
+                        capability_scope: harness_native_capability_scope(),
+                        payload: contracts::GovernedActionPayload::ListCalendarEvents(
+                            sample_list_calendar_events_action(),
+                        ),
+                    },
+                },
+            )
+            .await?;
+            let planned = match planned_result {
+                governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+                other => panic!("expected planned calendar list action, got {other:?}"),
+            };
+            assert!(!planned.requires_approval);
+
+            let execution =
+                governed_actions::execute_governed_action(&config, &ctx.pool, &planned.record)
+                    .await?;
+            assert_eq!(
+                execution.outcome.status,
+                contracts::GovernedActionStatus::Failed
+            );
+            assert!(
+                execution
+                    .outcome
+                    .summary
+                    .contains("calendar list_events failed")
+            );
+            assert!(
+                execution
+                    .outcome
+                    .summary
+                    .contains("no fake calendar list response queued")
+            );
+
+            let persisted = governed_actions::get_governed_action_execution(
+                &ctx.pool,
+                planned.record.governed_action_execution_id,
+            )
+            .await?;
+            assert_eq!(persisted.status, contracts::GovernedActionStatus::Failed);
+            assert!(
+                persisted
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no fake calendar list response queued")
+            );
+
+            let event_kinds = audit::list_for_trace(&ctx.pool, trace_id)
+                .await?
+                .into_iter()
+                .map(|event| event.event_kind)
+                .collect::<Vec<_>>();
+            assert!(event_kinds.contains(&"governed_action_execution_started".to_string()));
+            assert!(event_kinds.contains(&"governed_action_execution_failed".to_string()));
+
+            let payload_row = sqlx::query(
+                r#"
+                SELECT payload
+                FROM audit_events
+                WHERE trace_id = $1
+                  AND event_kind = 'governed_action_execution_failed'
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(trace_id)
+            .fetch_one(&ctx.pool)
+            .await?;
+            let payload: serde_json::Value = payload_row.get("payload");
+            assert_eq!(
+                payload["details"]["integration"],
+                serde_json::json!("calendar")
+            );
+            assert_eq!(
+                payload["details"]["operation"],
+                serde_json::json!("list_events")
+            );
+            assert_eq!(
+                payload["details"]["error_kind"],
+                serde_json::json!("temporary_failure")
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match previous {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+        run_result?;
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 #[serial]
 async fn web_fetch_proposal_is_planned_with_tier2_and_requires_approval() -> Result<()> {
@@ -1528,6 +1841,10 @@ async fn all_action_kinds_are_accepted_by_db_constraints() -> Result<()> {
             GovernedActionKind::CreateWorkspaceScript,
             GovernedActionKind::AppendWorkspaceScriptVersion,
             GovernedActionKind::ListWorkspaceScriptRuns,
+            GovernedActionKind::InspectIngressAttachments,
+            GovernedActionKind::ProcessIngressAttachment,
+            GovernedActionKind::ListCalendarEvents,
+            GovernedActionKind::UpsertCalendarEvent,
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionKind::RequestBackgroundJob,
             GovernedActionKind::RunDiagnostic,

@@ -218,6 +218,7 @@ fn build_test_runtime_config(database_url: String) -> RuntimeConfig {
         },
         telegram: None,
         model_gateway: None,
+        integrations: harness::config::WorkflowIntegrationsConfig::default(),
         self_model: None,
     }
 }

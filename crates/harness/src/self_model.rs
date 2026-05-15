@@ -856,6 +856,7 @@ mod tests {
                 }),
             }),
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: Some(SelfModelConfig { seed_path }),
         }
     }

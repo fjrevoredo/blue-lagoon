@@ -371,6 +371,24 @@ pub struct GovernedActionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarIntegrationRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceScriptRunSummary {
     pub workspace_script_run_id: Uuid,
     pub workspace_script_id: Uuid,
@@ -2161,6 +2179,46 @@ pub async fn list_governed_actions(
         .await?
         .into_iter()
         .map(|record| Ok(governed_action_summary(&record)))
+        .collect()
+}
+
+pub async fn list_calendar_integration_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<CalendarIntegrationRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('list_calendar_events', 'upsert_calendar_event')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list calendar integration runs for management")?;
+
+    rows.into_iter()
+        .map(calendar_integration_run_summary_from_row)
         .collect()
 }
 
@@ -5219,6 +5277,64 @@ fn governed_action_summary(
     }
 }
 
+fn calendar_integration_run_summary_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<CalendarIntegrationRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode calendar integration payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::ListCalendarEvents(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "window={}..{} max_results={}",
+                action.start_at, action.end_at, action.max_results
+            ),
+        ),
+        contracts::GovernedActionPayload::UpsertCalendarEvent(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "title={} starts_at={} ends_at={} external_event_id={} location={}",
+                action.title,
+                action.starts_at,
+                action.ends_at,
+                action.external_event_id.as_deref().unwrap_or("new"),
+                action.location.as_deref().unwrap_or("none")
+            ),
+        ),
+        _ => bail!(
+            "calendar integration query returned non-calendar payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(CalendarIntegrationRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
 fn workspace_script_run_summary(
     record: &workspace::WorkspaceScriptRunRecord,
 ) -> WorkspaceScriptRunSummary {
@@ -5285,6 +5401,8 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
         contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -5306,6 +5424,10 @@ fn governed_action_risk_tier_label(risk_tier: contracts::GovernedActionRiskTier)
 }
 
 fn governed_action_status_label(status: contracts::GovernedActionStatus) -> String {
+    governed_action_status_as_str(status).to_string()
+}
+
+fn governed_action_status_as_str(status: contracts::GovernedActionStatus) -> &'static str {
     match status {
         contracts::GovernedActionStatus::Proposed => "proposed",
         contracts::GovernedActionStatus::AwaitingApproval => "awaiting_approval",
@@ -5317,7 +5439,6 @@ fn governed_action_status_label(status: contracts::GovernedActionStatus) -> Stri
         contracts::GovernedActionStatus::Executed => "executed",
         contracts::GovernedActionStatus::Failed => "failed",
     }
-    .to_string()
 }
 
 fn workspace_script_run_status_label(status: contracts::WorkspaceScriptRunStatus) -> String {
@@ -5635,6 +5756,7 @@ mod tests {
                 z_ai: None,
                 openrouter: None,
             }),
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: Some(SelfModelConfig {
                 seed_path: PathBuf::from("config/self_model_seed.toml"),
             }),

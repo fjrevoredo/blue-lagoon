@@ -1368,6 +1368,8 @@ fn governed_action_recovery_action_classification(
         | GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
         | GovernedActionKind::ProcessIngressAttachment
+        | GovernedActionKind::ListCalendarEvents
+        | GovernedActionKind::UpsertCalendarEvent
         | GovernedActionKind::UpsertScheduledForegroundTask
         | GovernedActionKind::RequestBackgroundJob
         | GovernedActionKind::RunSubprocess

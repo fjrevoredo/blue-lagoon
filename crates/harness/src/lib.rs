@@ -16,6 +16,7 @@ pub mod foreground_orchestration;
 pub mod governed_actions;
 pub mod identity;
 pub mod ingress;
+pub mod integrations;
 pub mod management;
 pub mod memory;
 pub mod migration;

@@ -89,22 +89,27 @@ pub struct AttachmentContextProjection {
     pub truncated_excerpt_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterIngressAttachmentsRequest<'a> {
+    pub ingress_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub internal_principal_ref: &'a str,
+    pub internal_conversation_ref: &'a str,
+    pub channel_kind: &'a str,
+    pub raw_payload_ref: Option<&'a str>,
+    pub attachments: &'a [AttachmentReference],
+}
+
 pub async fn register_ingress_attachments(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    ingress_id: Uuid,
-    trace_id: Uuid,
-    execution_id: Option<Uuid>,
-    internal_principal_ref: &str,
-    internal_conversation_ref: &str,
-    channel_kind: &str,
-    raw_payload_ref: Option<&str>,
-    attachments: &[AttachmentReference],
+    request: &RegisterIngressAttachmentsRequest<'_>,
 ) -> Result<()> {
-    if attachments.is_empty() {
+    if request.attachments.is_empty() {
         return Ok(());
     }
 
-    for attachment in attachments {
+    for attachment in request.attachments {
         sqlx::query(
             r#"
             INSERT INTO ingress_attachments (
@@ -152,17 +157,17 @@ pub async fn register_ingress_attachments(
             "#,
         )
         .bind(Uuid::now_v7())
-        .bind(ingress_id)
-        .bind(trace_id)
-        .bind(execution_id)
-        .bind(internal_principal_ref)
-        .bind(internal_conversation_ref)
-        .bind(channel_kind)
+        .bind(request.ingress_id)
+        .bind(request.trace_id)
+        .bind(request.execution_id)
+        .bind(request.internal_principal_ref)
+        .bind(request.internal_conversation_ref)
+        .bind(request.channel_kind)
         .bind(&attachment.attachment_id)
         .bind(&attachment.media_type)
         .bind(&attachment.file_name)
         .bind(attachment.size_bytes.map(|value| value as i64))
-        .bind(raw_payload_ref)
+        .bind(request.raw_payload_ref)
         .bind(attachment_status_as_str(
             IngressAttachmentProcessingStatus::Pending,
         ))

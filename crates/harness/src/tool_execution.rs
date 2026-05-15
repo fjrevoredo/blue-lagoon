@@ -418,6 +418,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: None,
         }
     }

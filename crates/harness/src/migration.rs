@@ -352,7 +352,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         assert_eq!(migrations[0].name, "runtime_foundation");
         assert_eq!(migrations[1].name, "foreground_loop");
@@ -368,6 +368,7 @@ mod tests {
         assert_eq!(migrations[12].name, "identity_self_model");
         assert_eq!(migrations[13].name, "diagnostic_action_kind");
         assert_eq!(migrations[14].name, "attachment_processing");
+        assert_eq!(migrations[15].name, "calendar_integration_action_kinds");
     }
 
     #[test]

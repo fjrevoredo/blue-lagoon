@@ -1587,14 +1587,16 @@ pub async fn intake_telegram_foreground_trigger(
     mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
     attachments::register_ingress_attachments(
         &mut tx,
-        ingress.ingress_id,
-        trace.trace_id,
-        Some(execution_id),
-        &ingress.internal_principal_ref,
-        &ingress.internal_conversation_ref,
-        channel_kind_as_str(ingress.channel_kind),
-        ingress.raw_payload_ref.as_deref(),
-        &ingress.attachments,
+        &attachments::RegisterIngressAttachmentsRequest {
+            ingress_id: ingress.ingress_id,
+            trace_id: trace.trace_id,
+            execution_id: Some(execution_id),
+            internal_principal_ref: &ingress.internal_principal_ref,
+            internal_conversation_ref: &ingress.internal_conversation_ref,
+            channel_kind: channel_kind_as_str(ingress.channel_kind),
+            raw_payload_ref: ingress.raw_payload_ref.as_deref(),
+            attachments: &ingress.attachments,
+        },
     )
     .await?;
 
@@ -1734,14 +1736,16 @@ pub async fn stage_telegram_foreground_ingress(
     .await?;
     attachments::register_ingress_attachments(
         &mut tx,
-        ingress.ingress_id,
-        trace.trace_id,
-        None,
-        &ingress.internal_principal_ref,
-        &ingress.internal_conversation_ref,
-        channel_kind_as_str(ingress.channel_kind),
-        ingress.raw_payload_ref.as_deref(),
-        &ingress.attachments,
+        &attachments::RegisterIngressAttachmentsRequest {
+            ingress_id: ingress.ingress_id,
+            trace_id: trace.trace_id,
+            execution_id: None,
+            internal_principal_ref: &ingress.internal_principal_ref,
+            internal_conversation_ref: &ingress.internal_conversation_ref,
+            channel_kind: channel_kind_as_str(ingress.channel_kind),
+            raw_payload_ref: ingress.raw_payload_ref.as_deref(),
+            attachments: &ingress.attachments,
+        },
     )
     .await?;
 

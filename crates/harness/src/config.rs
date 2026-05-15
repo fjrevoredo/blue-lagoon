@@ -30,6 +30,7 @@ pub struct RuntimeConfig {
     pub worker: WorkerConfig,
     pub telegram: Option<TelegramConfig>,
     pub model_gateway: Option<ModelGatewayConfig>,
+    pub integrations: WorkflowIntegrationsConfig,
     pub self_model: Option<SelfModelConfig>,
 }
 
@@ -95,6 +96,24 @@ pub struct WakeSignalPolicyConfig {
     pub allow_foreground_conversion: bool,
     pub max_pending_signals: u32,
     pub cooldown_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct WorkflowIntegrationsConfig {
+    #[serde(default)]
+    pub calendar: CalendarIntegrationConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct CalendarIntegrationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub credential_env: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -339,6 +358,13 @@ pub struct ResolvedSelfModelConfig {
     pub seed_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCalendarIntegrationConfig {
+    pub provider: String,
+    pub credential: String,
+    pub api_base_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FileConfig {
     app: AppConfig,
@@ -356,6 +382,8 @@ struct FileConfig {
     telegram: Option<TelegramConfig>,
     #[serde(default)]
     model_gateway: Option<ModelGatewayConfig>,
+    #[serde(default)]
+    integrations: WorkflowIntegrationsConfig,
     #[serde(default)]
     self_model: Option<SelfModelConfig>,
 }
@@ -464,6 +492,7 @@ impl RuntimeConfig {
             },
             telegram: file_config.telegram,
             model_gateway,
+            integrations: file_config.integrations,
             self_model: file_config.self_model,
         };
 
@@ -506,6 +535,7 @@ impl RuntimeConfig {
         if let Some(model_gateway) = &self.model_gateway {
             model_gateway.validate()?;
         }
+        self.integrations.validate()?;
         if let Some(self_model) = &self.self_model {
             self_model.validate()?;
         }
@@ -624,6 +654,34 @@ impl RuntimeConfig {
         }
 
         Ok(ResolvedSelfModelConfig { seed_path })
+    }
+
+    pub fn resolve_calendar_integration_config(
+        &self,
+    ) -> Result<Option<ResolvedCalendarIntegrationConfig>> {
+        self.integrations.validate()?;
+        if !self.integrations.calendar.enabled {
+            return Ok(None);
+        }
+
+        let calendar = &self.integrations.calendar;
+        let credential = require_secret_env(
+            &calendar.credential_env,
+            "calendar integration credential environment variable",
+        )?;
+        let provider = calendar.provider.trim().to_string();
+        let api_base_url = calendar
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        Ok(Some(ResolvedCalendarIntegrationConfig {
+            provider,
+            credential,
+            api_base_url,
+        }))
     }
 }
 
@@ -1089,6 +1147,39 @@ impl WakeSignalPolicyConfig {
     }
 }
 
+impl WorkflowIntegrationsConfig {
+    fn validate(&self) -> Result<()> {
+        self.calendar.validate()
+    }
+}
+
+impl CalendarIntegrationConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.provider.trim().is_empty() {
+            bail!(
+                "integrations.calendar.provider must not be empty when integrations.calendar.enabled is true"
+            );
+        }
+        if self.credential_env.trim().is_empty() {
+            bail!(
+                "integrations.calendar.credential_env must not be empty when integrations.calendar.enabled is true"
+            );
+        }
+        if let Some(api_base_url) = self.api_base_url.as_deref()
+            && api_base_url.trim().is_empty()
+        {
+            bail!(
+                "integrations.calendar.api_base_url must not be empty when integrations.calendar.enabled is true"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl RetrievalConfig {
     fn validate(&self) -> Result<()> {
         if self.max_recent_episode_candidates == 0 {
@@ -1457,6 +1548,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: WorkflowIntegrationsConfig::default(),
             self_model: None,
         }
     }
@@ -1853,6 +1945,107 @@ args = []
     }
 
     #[test]
+    fn validate_rejects_enabled_calendar_integration_without_provider() {
+        let mut config = sample_config();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "   ".to_string();
+        config.integrations.calendar.credential_env = "BLUE_LAGOON_TEST_CALENDAR_TOKEN".to_string();
+
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(error.to_string().contains("integrations.calendar.provider"));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_calendar_integration_without_credential_env() {
+        let mut config = sample_config();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "google_calendar".to_string();
+        config.integrations.calendar.credential_env = "   ".to_string();
+
+        let error = config.validate().expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("integrations.calendar.credential_env")
+        );
+    }
+
+    #[test]
+    fn resolve_calendar_integration_config_returns_none_when_disabled() {
+        let config = sample_config();
+        let resolved = config
+            .resolve_calendar_integration_config()
+            .expect("disabled calendar integration should resolve");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_calendar_integration_config_requires_env_secret_when_enabled() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "google_calendar".to_string();
+        config.integrations.calendar.credential_env =
+            format!("BLUE_LAGOON_TEST_CALENDAR_TOKEN_{}", Uuid::now_v7());
+        config.integrations.calendar.api_base_url =
+            Some("https://www.googleapis.com/calendar/v3".to_string());
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let original = env::var_os(&env_name);
+        unsafe {
+            env::remove_var(&env_name);
+        }
+
+        let error = config
+            .resolve_calendar_integration_config()
+            .expect_err("missing calendar credential should fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("calendar integration credential")
+        );
+
+        match original {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+    }
+
+    #[test]
+    fn resolve_calendar_integration_config_resolves_enabled_secret_and_endpoint() {
+        let _env_lock = env_lock();
+        let mut config = sample_config();
+        config.integrations.calendar.enabled = true;
+        config.integrations.calendar.provider = "google_calendar".to_string();
+        config.integrations.calendar.credential_env =
+            format!("BLUE_LAGOON_TEST_CALENDAR_TOKEN_{}", Uuid::now_v7());
+        config.integrations.calendar.api_base_url =
+            Some("https://www.googleapis.com/calendar/v3".to_string());
+
+        let env_name = config.integrations.calendar.credential_env.clone();
+        let original = env::var_os(&env_name);
+        unsafe {
+            env::set_var(&env_name, "calendar-secret");
+        }
+
+        let resolved = config
+            .resolve_calendar_integration_config()
+            .expect("calendar integration should resolve")
+            .expect("calendar integration should be enabled");
+        assert_eq!(resolved.provider, "google_calendar");
+        assert_eq!(resolved.credential, "calendar-secret");
+        assert_eq!(
+            resolved.api_base_url.as_deref(),
+            Some("https://www.googleapis.com/calendar/v3")
+        );
+
+        match original {
+            Some(value) => unsafe { env::set_var(&env_name, value) },
+            None => unsafe { env::remove_var(&env_name) },
+        }
+    }
+
+    #[test]
     fn validate_rejects_invalid_observability_settings() {
         let mut config = sample_config();
         config.observability.model_call_payload_retention_days = 0;
@@ -1879,6 +2072,7 @@ args = []
         assert_eq!(loaded.background.scheduler.max_due_jobs_per_iteration, 4);
         assert_eq!(loaded.background.execution.default_token_budget, 6_000);
         assert!(loaded.background.wake_signals.allow_foreground_conversion);
+        assert!(!loaded.integrations.calendar.enabled);
         assert_eq!(loaded.observability.model_call_payload_retention_days, 30);
 
         match original_database_url {

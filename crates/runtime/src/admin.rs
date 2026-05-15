@@ -7,11 +7,11 @@ use harness::{
     config::RuntimeConfig,
     management::{
         self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
-        BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
-        GovernedActionSummary, IdentityDiagnosticSummary, IdentityEditProposalReport,
-        IdentityEditProposalRequest, IdentityEditProposalSummary, IdentityEditResolutionReport,
-        IdentityEditResolutionRequest, IdentityHistorySummary, IdentityResetReport,
-        IdentityResetRequest, IdentityShowReport, IdentityStatusReport,
+        BackgroundJobSummary, BackgroundRunNextOutcome, CalendarIntegrationRunSummary,
+        EnqueueBackgroundJobRequest, GovernedActionSummary, IdentityDiagnosticSummary,
+        IdentityEditProposalReport, IdentityEditProposalRequest, IdentityEditProposalSummary,
+        IdentityEditResolutionReport, IdentityEditResolutionRequest, IdentityHistorySummary,
+        IdentityResetReport, IdentityResetRequest, IdentityShowReport, IdentityStatusReport,
         OperationalDiagnosticSummary, OperationalHealthSummary,
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
@@ -41,6 +41,7 @@ pub enum AdminSubcommand {
     Identity(IdentityCommand),
     Approvals(ApprovalsCommand),
     Actions(ActionsCommand),
+    Integrations(IntegrationsCommand),
     Workspace(WorkspaceCommand),
     Trace(TraceCommand),
     #[command(name = "wake-signals")]
@@ -522,6 +523,38 @@ pub struct ActionsListCommand {
 }
 
 #[derive(Debug, Parser)]
+pub struct IntegrationsCommand {
+    #[command(subcommand)]
+    pub command: IntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IntegrationsSubcommand {
+    Calendar(CalendarIntegrationsCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct CalendarIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: CalendarIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CalendarIntegrationsSubcommand {
+    List(CalendarIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct CalendarIntegrationListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
 pub struct WorkspaceCommand {
     #[command(subcommand)]
     pub command: WorkspaceSubcommand,
@@ -964,6 +997,19 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 print_governed_actions(actions, command.json)?;
             }
         },
+        AdminSubcommand::Integrations(command) => match command.command {
+            IntegrationsSubcommand::Calendar(command) => match command.command {
+                CalendarIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_calendar_integration_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_calendar_integration_runs(runs, command.json)?;
+                }
+            },
+        },
         AdminSubcommand::Workspace(command) => match command.command {
             WorkspaceSubcommand::Artifacts(command) => match command.command {
                 WorkspaceArtifactsSubcommand::List(command) => {
@@ -1352,6 +1398,19 @@ fn print_governed_actions(actions: Vec<GovernedActionSummary>, json: bool) -> Re
     }
 
     println!("{}", render_governed_actions_text(&actions));
+    Ok(())
+}
+
+fn print_calendar_integration_runs(
+    runs: Vec<CalendarIntegrationRunSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_calendar_integration_runs_text(&runs));
     Ok(())
 }
 
@@ -2029,6 +2088,43 @@ fn render_governed_actions_text(actions: &[GovernedActionSummary]) -> String {
             let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
         }
         if let Some(output_ref) = action.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_calendar_integration_runs_text(runs: &[CalendarIntegrationRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No calendar integration runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
             let _ = writeln!(output, "  output_ref: {output_ref}");
         }
     }
@@ -3283,6 +3379,26 @@ mod tests {
         .expect("sample governed action should deserialize")
     }
 
+    fn sample_calendar_integration_run_summary() -> CalendarIntegrationRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000111",
+            "trace_id": "00000000-0000-0000-0000-000000000112",
+            "execution_id": "00000000-0000-0000-0000-000000000113",
+            "approval_request_id": null,
+            "action_kind": "list_calendar_events",
+            "risk_tier": "tier_1",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "window=2026-05-20 09:00:00 UTC..2026-05-20 18:00:00 UTC max_results=10",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000113",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample calendar integration run should deserialize")
+    }
+
     fn sample_workspace_run_summary() -> WorkspaceScriptRunSummary {
         serde_json::from_value(json!({
             "workspace_script_run_id": "00000000-0000-0000-0000-000000000021",
@@ -3558,6 +3674,39 @@ mod tests {
     }
 
     #[test]
+    fn phase_five_admin_parser_accepts_calendar_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "calendar",
+            "list",
+            "--status",
+            "failed",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("calendar integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::Calendar(CalendarIntegrationsCommand {
+                        command: CalendarIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 5);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Failed)
+                ));
+                assert!(command.json);
+            }
+            other => panic!("expected calendar integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn phase_six_admin_parser_accepts_recovery_checkpoint_filters() {
         let command = AdminCommand::try_parse_from([
             "runtime",
@@ -3782,6 +3931,17 @@ mod tests {
         assert!(rendered.contains("status=blocked"));
         assert!(rendered.contains("blocked_reason: scope invalid"));
         assert!(rendered.contains("output_ref: execution_record:"));
+    }
+
+    #[test]
+    fn render_calendar_integration_runs_text_includes_request_and_scope() {
+        let rendered =
+            render_calendar_integration_runs_text(&[sample_calendar_integration_run_summary()]);
+        assert!(rendered.contains("status=executed"));
+        assert!(rendered.contains("kind=list_calendar_events"));
+        assert!(rendered.contains("principal=primary-user"));
+        assert!(rendered.contains("conversation=telegram-primary"));
+        assert!(rendered.contains("request: window=2026-05-20"));
     }
 
     #[test]

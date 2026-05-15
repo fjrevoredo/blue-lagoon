@@ -31,19 +31,23 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1431), attachment action payload structs (line 1538), `GovernedActionPayload` (line 1693) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1679), `build_governed_action_proposals()` (line 1717), `extract_standalone_governed_action_payload()` (line 2045), `build_legacy_governed_action_proposals()` (line 2091), `governed_action_kind_as_str()` (line 2236) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 525), `execute_inspect_ingress_attachments()` (line 1345), `execute_process_ingress_attachment()` (line 1368), `execute_run_diagnostic_action()` (line 1563), `validate_upsert_scheduled_foreground_task_action()` (line 2174), `is_one_shot_scheduled_task_key()` (line 2199), `governed_action_kind_as_str()` (line 3307), `CanonicalGovernedActionPayload` (line 3435) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
+| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1433), calendar payload structs (line 1551), `GovernedActionPayload` (line 1717) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1683), `build_governed_action_proposals()` (line 1721), `extract_standalone_governed_action_payload()` (line 2051), `build_legacy_governed_action_proposals()` (line 2097), `governed_action_kind_as_str()` (line 2242) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 532), `execute_inspect_ingress_attachments()` (line 1437), `execute_process_ingress_attachment()` (line 1460), `execute_run_diagnostic_action()` (line 1873), `validate_upsert_scheduled_foreground_task_action()` (line 2543), `is_one_shot_scheduled_task_key()` (line 2568), `governed_action_kind_as_str()` (line 3676), `CanonicalGovernedActionPayload` (line 3808) |
+| `crates/harness/src/integrations.rs` | `CalendarIntegrationAdapter` (line 79), `is_supported_calendar_provider()` (line 91), `DeterministicCalendarIntegrationAdapter` (line 99), `FakeCalendarIntegrationAdapter` (line 189) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 215), `evaluate_governed_action_identity_boundaries()` (line 222) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
+| `crates/harness/src/management.rs` | `CalendarIntegrationRunSummary` (line 374), `list_calendar_integration_runs()` (line 2185) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
 | `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
 | `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
+| `crates/runtime/src/admin.rs` | `IntegrationsCommand` (line 526), `render_calendar_integration_runs_text()` (line 2097) |
 | `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for the completed conscious-loop action-kind strings |
 | `migrations/0014__diagnostic_action_kind.sql` | forward constraint update for the later `run_diagnostic` action kind on existing operator databases |
 | `migrations/0015__attachment_processing.sql` | attachment processing tables and forward action-kind constraint update for `inspect_ingress_attachments` / `process_ingress_attachment` |
+| `migrations/0016__calendar_integration_action_kinds.sql` | forward action-kind constraint update for `list_calendar_events` / `upsert_calendar_event` |
 
 ### Model-Facing Action Kinds
 
@@ -62,12 +66,18 @@ The live governed-action enum contains these model-usable kinds:
 | `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
 | `inspect_ingress_attachments` | Inspect attachment metadata and processing state for one ingress | Tier 0 |
 | `process_ingress_attachment` | Run bounded attachment text extraction for one ingress attachment | Tier 1 |
+| `list_calendar_events` | List bounded calendar events for one principal/conversation time window | Tier 1 |
+| `upsert_calendar_event` | Create or update one calendar event for one principal/conversation | Tier 2 |
 | `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
 | `request_background_job` | Request bounded background maintenance work | Tier 1 |
 | `run_diagnostic` | Execute one harness-native read-only diagnostic query | Tier 0 |
 | `run_subprocess` | Execute a bounded subprocess | Tier 1-3 by scope |
 | `run_workspace_script` | Execute a registered script version | Tier 1-3 by scope |
 | `web_fetch` | Fetch one HTTP/HTTPS URL with bounded response capture | Tier 2 |
+
+Calendar run visibility for operator troubleshooting is available through
+`runtime admin integrations calendar list` (text or `--json`), backed by
+`management::list_calendar_integration_runs()`.
 
 ### Proposal Format
 
@@ -161,6 +171,13 @@ Attachment payloads:
 { "kind": "process_ingress_attachment", "value": { "ingress_id": "<uuid>", "attachment_id": "<attachment-id>" } }
 ```
 
+Calendar integration payloads:
+
+```json
+{ "kind": "list_calendar_events", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "start_at": "2026-05-20T09:00:00Z", "end_at": "2026-05-20T18:00:00Z", "max_results": 10 } }
+{ "kind": "upsert_calendar_event", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "title": "Project sync", "starts_at": "2026-05-20T13:00:00Z", "ends_at": "2026-05-20T14:00:00Z", "location": "Room A", "details": "Discuss milestone 3", "external_event_id": null } }
+```
+
 Schedule, background, subprocess, and fetch payloads:
 
 ```json
@@ -208,9 +225,11 @@ Read-only harness-native actions are replay-safe after a worker interruption:
 
 Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
 produce side effects are classified as ambiguous or nonrepeatable during
-governed-action recovery. Recovery must not automatically retry them unless
-durable completion evidence proves the original action already reached a
-terminal state.
+governed-action recovery. Calendar actions (`list_calendar_events`,
+`upsert_calendar_event`) are also treated as nonrepeatable because they depend
+on external integration state. Recovery must not automatically retry these
+actions unless durable completion evidence proves the original action already
+reached a terminal state.
 
 Foreground replay follows the same proof-based rule. If an interrupted
 foreground execution already linked one or more governed actions and every
@@ -225,7 +244,7 @@ recovery fails closed instead of blindly replaying the turn.
 
 | Rule | Applies to |
 |---|---|
-| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, attachment inspection/processing, schedule, and background request actions |
+| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, attachment inspection/processing, calendar integration, schedule, and background request actions |
 | At least one filesystem root | `run_subprocess`, `run_workspace_script` |
 | Non-empty execution limits within configured maxima | `run_subprocess`, `run_workspace_script` |
 | Network must be enabled; execution budget fields may be zero | `web_fetch` |
@@ -251,6 +270,22 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 `requested_risk_tier` may raise the final tier, but it cannot lower the
 intrinsic tier computed by `policy::classify_governed_action_risk()`.
 
+Calendar integration action config lives in `config/default.toml` under
+`[integrations.calendar]`:
+
+| Key | Default | Validation | Source |
+|---|---|---|---|
+| `integrations.calendar.enabled` | `false` | `true`/`false`; when `true`, provider and credential env are required | `config/default.toml:41`, `crates/harness/src/config.rs:102`, `crates/harness/src/config.rs:1163` |
+| `integrations.calendar.provider` | `""` | non-empty when enabled; currently supported values are `deterministic_fake` and `fake` | `config/default.toml:42`, `crates/harness/src/config.rs:108`, `crates/harness/src/config.rs:1164`, `crates/harness/src/integrations.rs:87` |
+| `integrations.calendar.credential_env` | `""` | non-empty env-var name when enabled; resolved fail-closed | `config/default.toml:43`, `crates/harness/src/config.rs:114`, `crates/harness/src/config.rs:659` |
+| `integrations.calendar.api_base_url` | `""` | optional; if set, must be non-empty when enabled | `config/default.toml:45`, `crates/harness/src/config.rs:116`, `crates/harness/src/config.rs:1172` |
+
+Provider behavior in the current harness path:
+
+- `deterministic_fake`: deterministic success-path adapter for predictable tests.
+- `fake`: failure-path adapter that returns temporary failures when no response
+  is queued (current runtime path does not inject queued fake responses).
+
 ### Identity Boundary Rules
 
 After capability-scope validation, planning and execution both load the compact
@@ -261,6 +296,9 @@ workspace write effects before approval or execution proceeds. This is a
 harness policy decision, not a model preference: the model can propose an
 action, but identity boundaries are rechecked by the harness at planning time
 and again immediately before execution.
+`list_calendar_events` and `upsert_calendar_event` are treated as
+network-dependent actions for this boundary evaluation even though they execute
+through harness-owned integration adapters instead of direct worker networking.
 
 ### Extension Checklist
 

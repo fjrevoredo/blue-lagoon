@@ -7,11 +7,12 @@ use contracts::{
     CreateWorkspaceScriptAction, GovernedActionExecutionOutcome, GovernedActionFingerprint,
     GovernedActionKind, GovernedActionObservation, GovernedActionPayload, GovernedActionProposal,
     GovernedActionRiskTier, GovernedActionStatus, InspectIngressAttachmentsAction,
-    InspectWorkspaceArtifactAction, InspectWorkspaceScriptAction, ListWorkspaceArtifactsAction,
-    ListWorkspaceScriptRunsAction, ListWorkspaceScriptsAction, NetworkAccessPosture,
-    ProcessIngressAttachmentAction, RequestBackgroundJobAction, RunDiagnosticAction,
-    SubprocessAction, UpdateWorkspaceArtifactAction, UpsertScheduledForegroundTaskAction,
-    WebFetchAction, WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
+    InspectWorkspaceArtifactAction, InspectWorkspaceScriptAction, ListCalendarEventsAction,
+    ListWorkspaceArtifactsAction, ListWorkspaceScriptRunsAction, ListWorkspaceScriptsAction,
+    NetworkAccessPosture, ProcessIngressAttachmentAction, RequestBackgroundJobAction,
+    RunDiagnosticAction, SubprocessAction, UpdateWorkspaceArtifactAction,
+    UpsertCalendarEventAction, UpsertScheduledForegroundTaskAction, WebFetchAction,
+    WorkspaceArtifactKind, WorkspaceArtifactStatusFilter, WorkspaceScriptAction,
     WorkspaceScriptRunStatus,
 };
 use serde::Serialize;
@@ -31,7 +32,13 @@ use crate::{
     fetched_content::{
         DefaultFetchedContentFormatter, FetchedContentFormatter, FetchedContentInput,
     },
-    identity, management, policy, recovery, scheduled_foreground, tool_execution,
+    identity,
+    integrations::{
+        self, CalendarEventSummary, CalendarIntegrationAdapter, CalendarIntegrationError,
+        CalendarIntegrationErrorKind, DeterministicCalendarIntegrationAdapter,
+        FakeCalendarIntegrationAdapter,
+    },
+    management, policy, recovery, scheduled_foreground, tool_execution,
     workspace::{
         self, NewWorkspaceScriptRun, UpdateWorkspaceScriptRunStatus, WorkspaceScriptRunRecord,
     },
@@ -630,6 +637,8 @@ pub async fn execute_governed_action(
         | GovernedActionPayload::ListWorkspaceScriptRuns(_)
         | GovernedActionPayload::InspectIngressAttachments(_)
         | GovernedActionPayload::ProcessIngressAttachment(_)
+        | GovernedActionPayload::ListCalendarEvents(_)
+        | GovernedActionPayload::UpsertCalendarEvent(_)
         | GovernedActionPayload::UpsertScheduledForegroundTask(_)
         | GovernedActionPayload::RequestBackgroundJob(_)
         | GovernedActionPayload::RunDiagnostic(_) => {
@@ -687,6 +696,12 @@ pub async fn execute_governed_action(
         GovernedActionPayload::ProcessIngressAttachment(action) => {
             execute_process_ingress_attachment(pool, &started_record, action).await
         }
+        GovernedActionPayload::ListCalendarEvents(action) => {
+            execute_list_calendar_events(config, pool, &started_record, action).await
+        }
+        GovernedActionPayload::UpsertCalendarEvent(action) => {
+            execute_upsert_calendar_event(config, pool, &started_record, action).await
+        }
         GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
             execute_upsert_scheduled_foreground_task(config, pool, &started_record, action).await
         }
@@ -740,11 +755,31 @@ async fn validate_governed_action_policy(
     proposal: &GovernedActionProposal,
 ) -> Result<()> {
     validate_capability_scope(config, proposal)?;
+    if matches!(
+        proposal.action_kind,
+        GovernedActionKind::ListCalendarEvents | GovernedActionKind::UpsertCalendarEvent
+    ) {
+        validate_calendar_integration_is_ready(config)?;
+    }
     let identity = identity::reconstruct_compact_identity_snapshot(pool, 32).await?;
     match policy::evaluate_governed_action_identity_boundaries(proposal, &identity.boundaries) {
         policy::PolicyDecision::Allowed => Ok(()),
         policy::PolicyDecision::Denied { reason } => bail!("{reason}"),
     }
+}
+
+fn validate_calendar_integration_is_ready(config: &RuntimeConfig) -> Result<()> {
+    let resolved = config.resolve_calendar_integration_config()?;
+    let Some(resolved) = resolved else {
+        bail!("calendar integration is disabled");
+    };
+    if !integrations::is_supported_calendar_provider(&resolved.provider) {
+        bail!(
+            "calendar integration provider '{}' is not supported",
+            resolved.provider
+        );
+    }
+    Ok(())
 }
 
 fn governed_action_result_is_timeout(result: &GovernedActionExecutionResult) -> bool {
@@ -831,6 +866,63 @@ async fn complete_harness_native_action(
     .await?;
     let outcome = GovernedActionExecutionOutcome {
         status: GovernedActionStatus::Executed,
+        summary,
+        fingerprint: Some(updated_record.action_fingerprint.clone()),
+        output_ref: Some(output_ref),
+    };
+    Ok(governed_action_execution_result(
+        updated_record,
+        outcome,
+        None,
+    ))
+}
+
+async fn fail_harness_native_action(
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    summary: String,
+    payload: serde_json::Value,
+) -> Result<GovernedActionExecutionResult> {
+    let execution_id = record
+        .execution_id
+        .context("harness-native governed action requires an execution record")?;
+    let output_ref = format!("execution_record:{execution_id}");
+    let started_at = record.started_at.unwrap_or_else(Utc::now);
+    let completed_at = Utc::now();
+    execution::mark_failed(
+        pool,
+        execution_id,
+        &json!({
+            "status": "failed",
+            "summary": summary,
+            "payload": payload,
+        }),
+    )
+    .await?;
+    let updated_record = update_governed_action_execution(
+        pool,
+        GovernedActionExecutionUpdate {
+            governed_action_execution_id: record.governed_action_execution_id,
+            status: GovernedActionStatus::Failed,
+            execution_id: Some(execution_id),
+            output_ref: Some(&output_ref),
+            blocked_reason: Some(&summary),
+            approval_request_id: None,
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+        },
+    )
+    .await?;
+    write_governed_action_audit_event(
+        pool,
+        &updated_record,
+        "governed_action_execution_failed",
+        "warn",
+        payload,
+    )
+    .await?;
+    let outcome = GovernedActionExecutionOutcome {
+        status: GovernedActionStatus::Failed,
         summary,
         fingerprint: Some(updated_record.action_fingerprint.clone()),
         output_ref: Some(output_ref),
@@ -1428,6 +1520,224 @@ async fn execute_process_ingress_attachment(
     }
 }
 
+async fn execute_list_calendar_events(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &ListCalendarEventsAction,
+) -> Result<GovernedActionExecutionResult> {
+    let request = integrations::CalendarListEventsRequest {
+        internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+        internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+        start_at: action.start_at,
+        end_at: action.end_at,
+        max_results: action.max_results,
+    };
+    match execute_calendar_list_events_via_adapter(config, &request).await {
+        Ok(events) => {
+            let items = events
+                .iter()
+                .map(calendar_event_summary_payload)
+                .collect::<Vec<_>>();
+            let summary = format!("listed {} calendar event(s)", items.len());
+            complete_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "calendar",
+                    "operation": "list_events",
+                    "request": {
+                        "internal_principal_ref": request.internal_principal_ref,
+                        "internal_conversation_ref": request.internal_conversation_ref,
+                        "start_at": request.start_at,
+                        "end_at": request.end_at,
+                        "max_results": request.max_results,
+                    },
+                    "items": items,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            let summary = format!("calendar list_events failed: {}", error.message);
+            fail_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "calendar",
+                    "operation": "list_events",
+                    "error_kind": calendar_integration_error_kind_label(error.kind),
+                    "error_message": error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_upsert_calendar_event(
+    config: &RuntimeConfig,
+    pool: &PgPool,
+    record: &GovernedActionExecutionRecord,
+    action: &UpsertCalendarEventAction,
+) -> Result<GovernedActionExecutionResult> {
+    let request = integrations::CalendarUpsertEventRequest {
+        internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+        internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+        title: action.title.trim().to_string(),
+        starts_at: action.starts_at,
+        ends_at: action.ends_at,
+        location: action
+            .location
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        details: action
+            .details
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+        external_event_id: action
+            .external_event_id
+            .as_ref()
+            .map(|value| value.trim().to_string()),
+    };
+    match execute_calendar_upsert_event_via_adapter(config, &request).await {
+        Ok(event) => {
+            let summary = format!(
+                "upserted calendar event '{}' ({})",
+                event.title, event.external_event_id
+            );
+            complete_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "calendar",
+                    "operation": "upsert_event",
+                    "request": {
+                        "internal_principal_ref": request.internal_principal_ref,
+                        "internal_conversation_ref": request.internal_conversation_ref,
+                        "title": request.title,
+                        "starts_at": request.starts_at,
+                        "ends_at": request.ends_at,
+                        "location": request.location,
+                        "details": request.details,
+                        "external_event_id": request.external_event_id,
+                    },
+                    "event": calendar_event_summary_payload(&event),
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            let summary = format!("calendar upsert_event failed: {}", error.message);
+            fail_harness_native_action(
+                pool,
+                record,
+                summary,
+                json!({
+                    "integration": "calendar",
+                    "operation": "upsert_event",
+                    "error_kind": calendar_integration_error_kind_label(error.kind),
+                    "error_message": error.message,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_calendar_list_events_via_adapter(
+    config: &RuntimeConfig,
+    request: &integrations::CalendarListEventsRequest,
+) -> std::result::Result<Vec<CalendarEventSummary>, CalendarIntegrationError> {
+    let resolved = match config.resolve_calendar_integration_config() {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return Err(CalendarIntegrationError::misconfigured(
+                "calendar integration is disabled",
+            ));
+        }
+        Err(error) => {
+            return Err(CalendarIntegrationError::misconfigured(error.to_string()));
+        }
+    };
+    let provider = resolved.provider.trim().to_ascii_lowercase();
+    if !integrations::is_supported_calendar_provider(&provider) {
+        return Err(CalendarIntegrationError::misconfigured(format!(
+            "calendar integration provider '{provider}' is not supported"
+        )));
+    }
+    match provider.as_str() {
+        "deterministic_fake" => {
+            let adapter = DeterministicCalendarIntegrationAdapter::from_resolved_config(&resolved);
+            adapter.list_events(request).await
+        }
+        "fake" => {
+            let adapter = FakeCalendarIntegrationAdapter::new();
+            adapter.list_events(request).await
+        }
+        _ => Err(CalendarIntegrationError::misconfigured(format!(
+            "calendar integration provider '{provider}' is not supported"
+        ))),
+    }
+}
+
+async fn execute_calendar_upsert_event_via_adapter(
+    config: &RuntimeConfig,
+    request: &integrations::CalendarUpsertEventRequest,
+) -> std::result::Result<CalendarEventSummary, CalendarIntegrationError> {
+    let resolved = match config.resolve_calendar_integration_config() {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return Err(CalendarIntegrationError::misconfigured(
+                "calendar integration is disabled",
+            ));
+        }
+        Err(error) => {
+            return Err(CalendarIntegrationError::misconfigured(error.to_string()));
+        }
+    };
+    let provider = resolved.provider.trim().to_ascii_lowercase();
+    if !integrations::is_supported_calendar_provider(&provider) {
+        return Err(CalendarIntegrationError::misconfigured(format!(
+            "calendar integration provider '{provider}' is not supported"
+        )));
+    }
+    match provider.as_str() {
+        "deterministic_fake" => {
+            let adapter = DeterministicCalendarIntegrationAdapter::from_resolved_config(&resolved);
+            adapter.upsert_event(request).await
+        }
+        "fake" => {
+            let adapter = FakeCalendarIntegrationAdapter::new();
+            adapter.upsert_event(request).await
+        }
+        _ => Err(CalendarIntegrationError::misconfigured(format!(
+            "calendar integration provider '{provider}' is not supported"
+        ))),
+    }
+}
+
+fn calendar_event_summary_payload(event: &CalendarEventSummary) -> serde_json::Value {
+    json!({
+        "external_event_id": event.external_event_id,
+        "title": event.title,
+        "starts_at": event.starts_at,
+        "ends_at": event.ends_at,
+        "location": event.location,
+    })
+}
+
+fn calendar_integration_error_kind_label(kind: CalendarIntegrationErrorKind) -> &'static str {
+    match kind {
+        CalendarIntegrationErrorKind::Misconfigured => "misconfigured",
+        CalendarIntegrationErrorKind::TemporaryFailure => "temporary_failure",
+        CalendarIntegrationErrorKind::PermanentFailure => "permanent_failure",
+    }
+}
+
 async fn execute_upsert_scheduled_foreground_task(
     config: &RuntimeConfig,
     pool: &PgPool,
@@ -1776,6 +2086,8 @@ pub fn validate_capability_scope(
             | GovernedActionKind::ListWorkspaceScriptRuns
             | GovernedActionKind::InspectIngressAttachments
             | GovernedActionKind::ProcessIngressAttachment
+            | GovernedActionKind::ListCalendarEvents
+            | GovernedActionKind::UpsertCalendarEvent
             | GovernedActionKind::UpsertScheduledForegroundTask
             | GovernedActionKind::RequestBackgroundJob
             | GovernedActionKind::RunDiagnostic
@@ -1919,6 +2231,20 @@ pub fn validate_capability_scope(
             validate_process_ingress_attachment_action(action)?;
         }
         (
+            GovernedActionKind::ListCalendarEvents,
+            GovernedActionPayload::ListCalendarEvents(action),
+        ) => {
+            validate_harness_native_scope(scope, "calendar event listing")?;
+            validate_list_calendar_events_action(action)?;
+        }
+        (
+            GovernedActionKind::UpsertCalendarEvent,
+            GovernedActionPayload::UpsertCalendarEvent(action),
+        ) => {
+            validate_harness_native_scope(scope, "calendar event upsert")?;
+            validate_upsert_calendar_event_action(action)?;
+        }
+        (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(_),
         ) => {
@@ -2003,6 +2329,14 @@ fn validate_proposal_shape(proposal: &GovernedActionProposal) -> Result<()> {
             GovernedActionKind::ProcessIngressAttachment,
             GovernedActionPayload::ProcessIngressAttachment(action),
         ) => validate_process_ingress_attachment_action(action),
+        (
+            GovernedActionKind::ListCalendarEvents,
+            GovernedActionPayload::ListCalendarEvents(action),
+        ) => validate_list_calendar_events_action(action),
+        (
+            GovernedActionKind::UpsertCalendarEvent,
+            GovernedActionPayload::UpsertCalendarEvent(action),
+        ) => validate_upsert_calendar_event_action(action),
         (
             GovernedActionKind::UpsertScheduledForegroundTask,
             GovernedActionPayload::UpsertScheduledForegroundTask(action),
@@ -2167,6 +2501,41 @@ fn validate_process_ingress_attachment_action(
     }
     if action.attachment_id.trim().is_empty() {
         bail!("ingress attachment processing attachment_id must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_list_calendar_events_action(action: &ListCalendarEventsAction) -> Result<()> {
+    if action.internal_principal_ref.trim().is_empty() {
+        bail!("calendar event listing internal_principal_ref must not be empty");
+    }
+    if action.internal_conversation_ref.trim().is_empty() {
+        bail!("calendar event listing internal_conversation_ref must not be empty");
+    }
+    if action.start_at >= action.end_at {
+        bail!("calendar event listing start_at must be before end_at");
+    }
+    if action.max_results == 0 || action.max_results > GOVERNED_ACTION_LIST_LIMIT_MAX {
+        bail!(
+            "calendar event listing max_results must be between 1 and {}",
+            GOVERNED_ACTION_LIST_LIMIT_MAX
+        );
+    }
+    Ok(())
+}
+
+fn validate_upsert_calendar_event_action(action: &UpsertCalendarEventAction) -> Result<()> {
+    if action.internal_principal_ref.trim().is_empty() {
+        bail!("calendar event upsert internal_principal_ref must not be empty");
+    }
+    if action.internal_conversation_ref.trim().is_empty() {
+        bail!("calendar event upsert internal_conversation_ref must not be empty");
+    }
+    if action.title.trim().is_empty() {
+        bail!("calendar event upsert title must not be empty");
+    }
+    if action.starts_at >= action.ends_at {
+        bail!("calendar event upsert starts_at must be before ends_at");
     }
     Ok(())
 }
@@ -3317,6 +3686,8 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
         GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
         GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -3339,6 +3710,8 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
         "inspect_ingress_attachments" => Ok(GovernedActionKind::InspectIngressAttachments),
         "process_ingress_attachment" => Ok(GovernedActionKind::ProcessIngressAttachment),
+        "list_calendar_events" => Ok(GovernedActionKind::ListCalendarEvents),
+        "upsert_calendar_event" => Ok(GovernedActionKind::UpsertCalendarEvent),
         "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
         "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_diagnostic" => Ok(GovernedActionKind::RunDiagnostic),
@@ -3493,6 +3866,23 @@ enum CanonicalGovernedActionPayload {
         ingress_id: Uuid,
         attachment_id: String,
     },
+    ListCalendarEvents {
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        start_at: chrono::DateTime<chrono::Utc>,
+        end_at: chrono::DateTime<chrono::Utc>,
+        max_results: u32,
+    },
+    UpsertCalendarEvent {
+        internal_principal_ref: String,
+        internal_conversation_ref: String,
+        title: String,
+        starts_at: chrono::DateTime<chrono::Utc>,
+        ends_at: chrono::DateTime<chrono::Utc>,
+        location: Option<String>,
+        details: Option<String>,
+        external_event_id: Option<String>,
+    },
     UpsertScheduledForegroundTask {
         task_key: String,
         title: String,
@@ -3621,6 +4011,32 @@ impl From<&GovernedActionPayload> for CanonicalGovernedActionPayload {
                     attachment_id: action.attachment_id.trim().to_string(),
                 }
             }
+            GovernedActionPayload::ListCalendarEvents(action) => Self::ListCalendarEvents {
+                internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                start_at: action.start_at,
+                end_at: action.end_at,
+                max_results: action.max_results,
+            },
+            GovernedActionPayload::UpsertCalendarEvent(action) => Self::UpsertCalendarEvent {
+                internal_principal_ref: action.internal_principal_ref.trim().to_string(),
+                internal_conversation_ref: action.internal_conversation_ref.trim().to_string(),
+                title: action.title.trim().to_string(),
+                starts_at: action.starts_at,
+                ends_at: action.ends_at,
+                location: action
+                    .location
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                details: action
+                    .details
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+                external_event_id: action
+                    .external_event_id
+                    .as_ref()
+                    .map(|value| value.trim().to_string()),
+            },
             GovernedActionPayload::UpsertScheduledForegroundTask(action) => {
                 Self::UpsertScheduledForegroundTask {
                     task_key: action.task_key.trim().to_string(),
@@ -3789,6 +4205,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: None,
         }
     }
@@ -3822,6 +4239,73 @@ mod tests {
                 command: "cmd".to_string(),
                 args: vec!["/c".to_string(), "echo".to_string(), "hello".to_string()],
                 working_directory: Some("D:/Repos/blue-lagoon".to_string()),
+            }),
+        }
+    }
+
+    fn sample_calendar_list_proposal() -> GovernedActionProposal {
+        GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "List calendar events".to_string(),
+            rationale: Some("inspect upcoming events".to_string()),
+            action_kind: GovernedActionKind::ListCalendarEvents,
+            requested_risk_tier: None,
+            capability_scope: CapabilityScope {
+                filesystem: FilesystemCapabilityScope {
+                    read_roots: Vec::new(),
+                    write_roots: Vec::new(),
+                },
+                network: NetworkAccessPosture::Disabled,
+                environment: EnvironmentCapabilityScope {
+                    allow_variables: Vec::new(),
+                },
+                execution: ExecutionCapabilityBudget {
+                    timeout_ms: 0,
+                    max_stdout_bytes: 0,
+                    max_stderr_bytes: 0,
+                },
+            },
+            payload: GovernedActionPayload::ListCalendarEvents(ListCalendarEventsAction {
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                start_at: Utc::now(),
+                end_at: Utc::now() + Duration::hours(6),
+                max_results: 10,
+            }),
+        }
+    }
+
+    fn sample_calendar_upsert_proposal() -> GovernedActionProposal {
+        GovernedActionProposal {
+            proposal_id: Uuid::now_v7(),
+            title: "Create calendar event".to_string(),
+            rationale: Some("schedule a milestone sync".to_string()),
+            action_kind: GovernedActionKind::UpsertCalendarEvent,
+            requested_risk_tier: None,
+            capability_scope: CapabilityScope {
+                filesystem: FilesystemCapabilityScope {
+                    read_roots: Vec::new(),
+                    write_roots: Vec::new(),
+                },
+                network: NetworkAccessPosture::Disabled,
+                environment: EnvironmentCapabilityScope {
+                    allow_variables: Vec::new(),
+                },
+                execution: ExecutionCapabilityBudget {
+                    timeout_ms: 0,
+                    max_stdout_bytes: 0,
+                    max_stderr_bytes: 0,
+                },
+            },
+            payload: GovernedActionPayload::UpsertCalendarEvent(UpsertCalendarEventAction {
+                internal_principal_ref: "primary-user".to_string(),
+                internal_conversation_ref: "telegram-primary".to_string(),
+                title: "Milestone sync".to_string(),
+                starts_at: Utc::now() + Duration::hours(1),
+                ends_at: Utc::now() + Duration::hours(2),
+                location: Some("Room A".to_string()),
+                details: Some("align on integration tasks".to_string()),
+                external_event_id: None,
             }),
         }
     }
@@ -3961,6 +4445,36 @@ mod tests {
                 .to_string()
                 .contains("captured output exceeds the configured maximum")
         );
+    }
+
+    #[test]
+    fn calendar_list_scope_rejects_invalid_limits_and_windows() {
+        let mut proposal = sample_calendar_list_proposal();
+        if let GovernedActionPayload::ListCalendarEvents(action) = &mut proposal.payload {
+            action.max_results = 0;
+        }
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("calendar list with max_results=0 should be rejected");
+        assert!(error.to_string().contains("max_results"));
+
+        if let GovernedActionPayload::ListCalendarEvents(action) = &mut proposal.payload {
+            action.max_results = 10;
+            action.end_at = action.start_at;
+        }
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("calendar list with invalid time window should be rejected");
+        assert!(error.to_string().contains("start_at"));
+    }
+
+    #[test]
+    fn calendar_upsert_rejects_empty_title() {
+        let mut proposal = sample_calendar_upsert_proposal();
+        if let GovernedActionPayload::UpsertCalendarEvent(action) = &mut proposal.payload {
+            action.title = "   ".to_string();
+        }
+        let error = validate_capability_scope(&sample_config(), &proposal)
+            .expect_err("calendar upsert with blank title should be rejected");
+        assert!(error.to_string().contains("title"));
     }
 
     #[test]

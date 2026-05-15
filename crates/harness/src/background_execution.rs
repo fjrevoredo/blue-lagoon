@@ -1220,6 +1220,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: None,
         };
         let reviewed_at = Utc::now();

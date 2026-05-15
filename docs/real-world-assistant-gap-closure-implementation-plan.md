@@ -222,7 +222,7 @@ Resolved on 2026-05-15:
 
 ### Milestone 3: Typed Workflow Integrations (R3)
 
-- Status: TO BE DONE
+- Status: IN PROGRESS
 - Purpose: Add first-class harness-governed workflow integrations, beginning
   with calendar as the easiest vertical slice, then extending to email and task
   sync.
@@ -231,7 +231,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.1: Define Integration Adapter Interfaces
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Introduce harness-owned adapter traits and configuration surfaces
   for external workflow systems.
 - Steps:
@@ -246,7 +246,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.2: Add Integration Governed Action Contracts
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Extend governed action kinds/payloads for calendar operations first
   and define compatible extension pattern for email/task sync.
 - Steps:
@@ -260,7 +260,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.3: Implement Integration Action Execution In Harness
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Execute calendar integration actions first, then extend to
   email/task sync through the same adapter and governance layer.
 - Steps:
@@ -273,7 +273,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.4: Add Integration Management Inspection Commands
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Extend management/admin surfaces for integration run visibility and
   troubleshooting.
 - Steps:
@@ -288,7 +288,7 @@ Resolved on 2026-05-15:
 
 #### Task 3.5: Add Integration Component/Integration Tests
 
-- Status: TO BE DONE
+- Status: COMPLETED
 - Objective: Prove read/write integration flows across approval and failure
   paths.
 - Steps:
@@ -604,3 +604,43 @@ Implementation must not start until the user approves this plan.
     - `cargo test -p harness --test governed_actions_component -- --nocapture`.
     - `cargo test -p harness --test foreground_component -- --nocapture`.
     - `cargo test -p harness --test foreground_integration -- --nocapture`.
+- 2026-05-15: Milestone 3 started.
+  - Task 3.1 completed: added harness-owned calendar integration adapter interfaces, fail-closed config validation, and deterministic fake adapter coverage.
+  - Validation runs:
+    - `cargo check --workspace`.
+    - `cargo test -p harness --lib integrations -- --nocapture`.
+    - `cargo test -p harness --lib config -- --nocapture`.
+- 2026-05-15: Task 3.2 completed.
+  - Added governed-action calendar contract variants (`list_calendar_events`, `upsert_calendar_event`), parser/schema exposure updates, and forward migration `0016__calendar_integration_action_kinds.sql`.
+  - Validation runs:
+    - `cargo test -p contracts --lib -- --nocapture`.
+    - `cargo test -p harness --lib governed_actions -- --nocapture`.
+    - `cargo test -p harness --test migration_component -- --nocapture`.
+    - `cargo test -p workers governed_action -- --nocapture`.
+    - `cargo fmt --all --check`.
+    - `cargo check --workspace`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Task 3.3 completed.
+  - Implemented calendar governed-action execution handlers with fail-closed integration readiness checks, deterministic adapter-backed execution, and structured failed execution outcomes.
+  - Validation runs:
+    - `cargo test -p harness --test governed_actions_component -- --nocapture`.
+    - `cargo test -p harness --test governed_actions_integration -- --nocapture`.
+    - `cargo fmt --all --check`.
+    - `cargo check --workspace`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Task 3.4 completed.
+  - Added management query surface and runtime admin command family for calendar integration run inspection (`admin integrations calendar list`) with text/JSON output and status filters.
+  - Validation runs:
+    - `cargo check --workspace`.
+    - `cargo test -p harness --test management_component -- --nocapture`.
+    - `cargo test -p runtime --bin runtime -- --nocapture`.
+    - `cargo test -p runtime --test admin_cli -- --nocapture`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-05-15: Task 3.5 completed.
+  - Added calendar integration failure-path component coverage, approval-required calendar upsert integration coverage, calendar policy recheck diagnostic coverage, and audit payload assertions for integration actions.
+  - Updated calendar provider dispatch so `integrations.calendar.provider = "fake"` exercises adapter failure paths in deterministic tests.
+  - Validation runs:
+    - `cargo test -p harness --test governed_actions_component -- --nocapture`.
+    - `cargo test -p harness --test governed_actions_integration -- --nocapture`.
+    - `cargo check --workspace`.
+    - `cargo clippy --workspace --all-targets -- -D warnings`.
