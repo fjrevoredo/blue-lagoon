@@ -938,6 +938,12 @@ async fn governed_action_workspace_and_script_tools_execute_through_harness() ->
                 .summary
                 .contains("listed 1 workspace artifacts")
         );
+        assert!(
+            listed
+                .outcome
+                .summary
+                .contains(&artifact.workspace_artifact_id.to_string())
+        );
 
         let updated = execute_test_action(
             &ctx.config,
@@ -1044,8 +1050,14 @@ async fn governed_action_workspace_and_script_tools_execute_through_harness() ->
                 .summary
                 .contains("listed 1 workspace scripts")
         );
+        assert!(
+            listed_scripts
+                .outcome
+                .summary
+                .contains(&script.script_id.to_string())
+        );
 
-        workspace::record_workspace_script_run(
+        let recorded_run = workspace::record_workspace_script_run(
             &ctx.pool,
             &NewWorkspaceScriptRun {
                 workspace_script_run_id: Uuid::now_v7(),
@@ -1083,6 +1095,12 @@ async fn governed_action_workspace_and_script_tools_execute_through_harness() ->
                 .outcome
                 .summary
                 .contains("listed 1 workspace script runs")
+        );
+        assert!(
+            listed_runs
+                .outcome
+                .summary
+                .contains(&recorded_run.workspace_script_run_id.to_string())
         );
 
         Ok(())

@@ -992,6 +992,26 @@ fn preview_text(content: &str, max_chars: usize) -> (String, bool) {
     (preview, truncated)
 }
 
+fn compact_summary_text(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim();
+    let (preview, truncated) = preview_text(trimmed, max_chars);
+    if truncated {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn workspace_artifact_kind_label(kind: WorkspaceArtifactKind) -> &'static str {
+    match kind {
+        WorkspaceArtifactKind::Note => "note",
+        WorkspaceArtifactKind::Runbook => "runbook",
+        WorkspaceArtifactKind::Scratchpad => "scratchpad",
+        WorkspaceArtifactKind::TaskList => "task_list",
+        WorkspaceArtifactKind::Script => "script",
+    }
+}
+
 fn artifact_status_matches(
     status: workspace::WorkspaceArtifactStatus,
     filter: WorkspaceArtifactStatusFilter,
@@ -1079,6 +1099,7 @@ async fn execute_list_workspace_artifacts(
         .as_ref()
         .map(|query| query.to_ascii_lowercase());
     let mut selected = Vec::new();
+    let mut summary_items = Vec::new();
     for artifact in artifacts {
         if selected.len() >= action.limit as usize {
             break;
@@ -1107,6 +1128,12 @@ async fn execute_list_workspace_artifacts(
         }
         let content = artifact.content_text.clone().unwrap_or_default();
         let (snippet, truncated) = preview_text(&content, 240);
+        summary_items.push(format!(
+            "{}:{}:'{}'",
+            workspace_artifact_kind_label(artifact.artifact_kind),
+            artifact.workspace_artifact_id,
+            compact_summary_text(&artifact.title, 64)
+        ));
         selected.push(json!({
             "workspace_artifact_id": artifact.workspace_artifact_id,
             "artifact_kind": artifact.artifact_kind,
@@ -1117,7 +1144,15 @@ async fn execute_list_workspace_artifacts(
             "snippet_truncated": truncated,
         }));
     }
-    let summary = format!("listed {} workspace artifacts", selected.len());
+    let summary = if summary_items.is_empty() {
+        format!("listed {} workspace artifacts", selected.len())
+    } else {
+        format!(
+            "listed {} workspace artifacts: {}",
+            selected.len(),
+            summary_items.join(" | ")
+        )
+    };
     complete_harness_native_action(
         pool,
         record,
@@ -1240,6 +1275,7 @@ async fn execute_list_workspace_scripts(
         .as_ref()
         .map(|query| query.to_ascii_lowercase());
     let mut selected = Vec::new();
+    let mut summary_items = Vec::new();
     for script in scripts {
         if selected.len() >= action.limit as usize {
             break;
@@ -1261,6 +1297,13 @@ async fn execute_list_workspace_scripts(
                 continue;
             }
         }
+        summary_items.push(format!(
+            "{}:{}:v{}:'{}'",
+            script.script_id,
+            script.language,
+            script.latest_version,
+            compact_summary_text(&artifact.title, 64)
+        ));
         selected.push(json!({
             "workspace_script_id": script.script_id,
             "workspace_artifact_id": script.workspace_artifact_id,
@@ -1271,7 +1314,15 @@ async fn execute_list_workspace_scripts(
             "updated_at": script.updated_at,
         }));
     }
-    let summary = format!("listed {} workspace scripts", selected.len());
+    let summary = if summary_items.is_empty() {
+        format!("listed {} workspace scripts", selected.len())
+    } else {
+        format!(
+            "listed {} workspace scripts: {}",
+            selected.len(),
+            summary_items.join(" | ")
+        )
+    };
     complete_harness_native_action(
         pool,
         record,
@@ -1454,11 +1505,19 @@ async fn execute_list_workspace_script_runs(
         i64::from(action.limit * 4),
     )
     .await?;
+    let mut summary_items = Vec::new();
     let selected = runs
         .into_iter()
         .filter(|run| script_run_status_matches(run.status, action.status))
         .take(action.limit as usize)
         .map(|run| {
+            summary_items.push(format!(
+                "{}:{}:script={}::version={}",
+                run.workspace_script_run_id,
+                format!("{:?}", run.status).to_ascii_lowercase(),
+                run.workspace_script_id,
+                run.workspace_script_version_id
+            ));
             json!({
                 "workspace_script_run_id": run.workspace_script_run_id,
                 "workspace_script_id": run.workspace_script_id,
@@ -1472,7 +1531,15 @@ async fn execute_list_workspace_script_runs(
             })
         })
         .collect::<Vec<_>>();
-    let summary = format!("listed {} workspace script runs", selected.len());
+    let summary = if summary_items.is_empty() {
+        format!("listed {} workspace script runs", selected.len())
+    } else {
+        format!(
+            "listed {} workspace script runs: {}",
+            selected.len(),
+            summary_items.join(" | ")
+        )
+    };
     complete_harness_native_action(
         pool,
         record,
@@ -2181,6 +2248,75 @@ fn format_task_list_content(items: &[String]) -> String {
         .join("\n")
 }
 
+fn summarize_workspace_artifact_diagnostics(
+    requested_limit: u32,
+    artifacts: &[contracts::WorkspaceArtifactSummary],
+) -> String {
+    if artifacts.is_empty() {
+        return format!("listed 0 workspace artifacts (requested limit={requested_limit})");
+    }
+    let listed = artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}:{}:v{}:'{}'",
+                workspace_artifact_kind_label(artifact.artifact_kind),
+                artifact.artifact_id,
+                artifact.latest_version,
+                compact_summary_text(&artifact.title, 64)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("listed {} workspace artifacts: {}", artifacts.len(), listed)
+}
+
+fn summarize_workspace_script_diagnostics(
+    requested_limit: u32,
+    scripts: &[contracts::WorkspaceScriptSummary],
+) -> String {
+    if scripts.is_empty() {
+        return format!("listed 0 workspace scripts (requested limit={requested_limit})");
+    }
+    let listed = scripts
+        .iter()
+        .map(|script| {
+            format!(
+                "{}:{}:v{}:artifact={}",
+                script.script_id,
+                script.language,
+                script.latest_version,
+                script.workspace_artifact_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("listed {} workspace scripts: {}", scripts.len(), listed)
+}
+
+fn summarize_workspace_script_run_diagnostics(
+    requested_limit: u32,
+    runs: &[management::WorkspaceScriptRunSummary],
+) -> String {
+    if runs.is_empty() {
+        return format!("listed 0 workspace script runs (requested limit={requested_limit})");
+    }
+    let listed = runs
+        .iter()
+        .map(|run| {
+            format!(
+                "{}:{}:script={}::version={}",
+                run.workspace_script_run_id,
+                run.status,
+                run.workspace_script_id,
+                run.workspace_script_version_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("listed {} workspace script runs: {}", runs.len(), listed)
+}
+
 fn email_message_summary_payload(message: &EmailMessageSummary) -> serde_json::Value {
     json!({
         "external_message_id": message.external_message_id,
@@ -2453,22 +2589,27 @@ async fn execute_run_diagnostic_action(
             format!("listed {limit} identity diagnostics"),
             serde_json::to_value(management::list_identity_diagnostics(config, *limit).await?)?,
         ),
-        contracts::DiagnosticQuery::WorkspaceArtifacts { limit } => (
-            format!("listed {limit} workspace artifacts"),
-            serde_json::to_value(
-                management::list_workspace_artifact_summaries(config, *limit).await?,
-            )?,
-        ),
-        contracts::DiagnosticQuery::WorkspaceScripts { limit } => (
-            format!("listed {limit} workspace scripts"),
-            serde_json::to_value(management::list_workspace_scripts(config, *limit).await?)?,
-        ),
-        contracts::DiagnosticQuery::WorkspaceRuns { script_id, limit } => (
-            format!("listed {limit} workspace script runs"),
-            serde_json::to_value(
-                management::list_workspace_script_runs(config, *script_id, *limit).await?,
-            )?,
-        ),
+        contracts::DiagnosticQuery::WorkspaceArtifacts { limit } => {
+            let artifacts = management::list_workspace_artifact_summaries(config, *limit).await?;
+            (
+                summarize_workspace_artifact_diagnostics(*limit, &artifacts),
+                serde_json::to_value(&artifacts)?,
+            )
+        }
+        contracts::DiagnosticQuery::WorkspaceScripts { limit } => {
+            let scripts = management::list_workspace_scripts(config, *limit).await?;
+            (
+                summarize_workspace_script_diagnostics(*limit, &scripts),
+                serde_json::to_value(&scripts)?,
+            )
+        }
+        contracts::DiagnosticQuery::WorkspaceRuns { script_id, limit } => {
+            let runs = management::list_workspace_script_runs(config, *script_id, *limit).await?;
+            (
+                summarize_workspace_script_run_diagnostics(*limit, &runs),
+                serde_json::to_value(&runs)?,
+            )
+        }
         contracts::DiagnosticQuery::InternalDoc { document } => {
             let (path, content) = read_allowed_internal_diagnostic_doc(*document)?;
             (
