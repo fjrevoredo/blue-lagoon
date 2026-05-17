@@ -31,11 +31,12 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1436), workflow integration payload structs (line 1554), `GovernedActionPayload` (line 1751) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 790), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1689), `build_governed_action_proposals()` (line 1727), `extract_standalone_governed_action_payload()` (line 2060), `build_legacy_governed_action_proposals()` (line 2106), `governed_action_kind_as_str()` (line 2251) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 537), `execute_inspect_ingress_attachments()` (line 1488), `execute_process_ingress_attachment()` (line 1511), `execute_list_email_messages()` (line 1792), `execute_send_email_message()` (line 1852), `execute_sync_task_list()` (line 1923), `execute_run_diagnostic_action()` (line 2343), `validate_upsert_scheduled_foreground_task_action()` (line 3096), `is_one_shot_scheduled_task_key()` (line 3121), `governed_action_kind_as_str()` (line 4229), `CanonicalGovernedActionPayload` (line 4367) |
+| `crates/contracts/src/lib.rs` | `WorkerFailureMetadata` (line 228), `ForegroundGovernedActionLoopState` (line 457), `ForegroundGovernedActionRepairGuidance` (line 467), `GovernedActionKind` (line 1422), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1472), workflow integration payload structs (line 1590), `GovernedActionPayload` (line 1787) |
+| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 794), `governed_action_schema_message()` (line 1616), `governed_action_reminder_message()` (line 1704), `governed_action_repair_guidance_message()` (line 1711), `build_governed_action_proposals()` (line 1759), `validate_governed_action_response_shape()` (line 1777), `invalid_model_output_metadata()` (line 1819), `governed_action_kind_as_str()` (line 2133) |
+| `crates/harness/src/foreground_orchestration.rs` | `execute_conscious_turn_with_governed_action_loop()` (line 1814), `extract_worker_failure_signal()` (line 2502), `recoverable_malformed_action_signal()` (line 2515), `classify_conscious_worker_failure()` (line 2530), malformed re-steer audit/diagnostic emissions (lines 1903-1936) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 537), `execute_inspect_ingress_attachments()` (line 1555), `execute_process_ingress_attachment()` (line 1578), `execute_list_email_messages()` (line 1859), `execute_send_email_message()` (line 1919), `execute_sync_task_list()` (line 1990), `execute_run_diagnostic_action()` (line 2479), `validate_upsert_scheduled_foreground_task_action()` (line 3237), `is_one_shot_scheduled_task_key()` (line 3262), `governed_action_kind_as_str()` (line 4370), `CanonicalGovernedActionPayload` (line 4508) |
 | `crates/harness/src/integrations.rs` | `CalendarIntegrationAdapter` (line 128), `EmailIntegrationAdapter` (line 178), `TaskSyncIntegrationAdapter` (line 228), provider support checks (lines 235-249), deterministic/fake adapters (calendar lines 257/347, email lines 505/600, task sync lines 625/682) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 215), `evaluate_governed_action_identity_boundaries()` (line 222) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 176), `governed_action_requires_approval()` (line 223), `evaluate_governed_action_identity_boundaries()` (line 230) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
 | `crates/harness/src/management.rs` | `CalendarIntegrationRunSummary` (line 374), `EmailIntegrationRunSummary` (line 392), `TaskSyncRunSummary` (line 410), integration run queries (calendar line 2221, email line 2261, task sync line 2301) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
@@ -123,20 +124,14 @@ append one block tagged `blue-lagoon-governed-actions`:
 ````
 
 `build_governed_action_proposals()` extracts the last matching tagged block. If
-no tagged block is present, it also recognizes a standalone JSON payload that
-is clearly intended as a governed-action proposal. The
+no tagged block is present, no governed-action proposals are parsed. Untagged
+JSON payloads are rejected by `validate_governed_action_response_shape()` as
+malformed governed-action output. The
 foreground orchestrator may continue through multiple governed-action rounds in
 the same foreground turn: the worker receives harness observations, may propose
 another action if one is still needed, and the harness then decides whether the
 next proposal is allowed, approval-gated, or denied under policy, remaining
 budgets, and the configured per-turn action cap.
-
-For compatibility hardening, the worker also translates one known legacy shape:
-a standalone or tagged `schedule_task` reminder payload under the old
-`"governed-actions"` wrapper is converted into the canonical
-`upsert_scheduled_foreground_task` proposal before harness validation. This is
-deliberately narrow and exists to recover from observed model regressions, not
-to preserve a second public schema.
 
 Read-only list and diagnostic payloads should include an explicit `limit`.
 For parser robustness, the contracts layer applies a bounded default of `10`
@@ -148,6 +143,82 @@ queries. Workspace artifact and script list payloads also default omitted
 intentionally limited to read-only discovery actions; mutating payload fields,
 identifiers, and required diagnostic selectors still fail as malformed
 proposals when absent.
+
+### Strictness Guardrails (No Masking)
+
+The governed-action parser and harness error handling follow a strict-first
+policy. Guardrails are used to make malformed output recoverable, not to coerce
+invalid payloads into accepted behavior.
+
+Required behavior:
+
+- Model-emitted action proposals MUST use the tagged
+  `blue-lagoon-governed-actions` block. Any untagged or alternate shape MUST
+  fail as malformed.
+- Missing required proposal fields (for example `actions` or required payload
+  fields like `artifact_kind` for `inspect_workspace_artifact`) MUST fail as
+  malformed; they MUST NOT be defaulted.
+- Bare action tokens, invented aliases, and tool-call wrapper shapes MUST fail
+  as malformed.
+- Malformed proposal output MUST NOT execute any governed action side effects.
+- Compatibility defaults MAY be applied only to bounded read-only discovery
+  fields (`limit`, selected status/filter defaults) as documented above.
+
+Primary implementation hooks:
+
+- Worker parse/shape validation:
+  `build_governed_action_proposals()`,
+  `validate_governed_action_response_shape()`,
+  `detect_bare_governed_action_invocation()`,
+  `looks_like_untagged_governed_action_payload()`,
+  `invalid_model_output_metadata()`.
+- Harness re-steer/failure classification:
+  `foreground_orchestration::execute_conscious_turn_with_governed_action_loop()`,
+  `foreground_orchestration::extract_worker_failure_signal()`,
+  `foreground_orchestration::recoverable_malformed_action_signal()`,
+  `foreground_orchestration::classify_conscious_worker_failure()`.
+
+Regression coverage anchors:
+
+- `build_governed_action_proposals_requires_tagged_block`
+- `build_governed_action_proposals_ignores_untagged_payloads`
+- `build_governed_action_proposals_rejects_missing_actions_field`
+- `build_governed_action_proposals_rejects_missing_required_payload_field`
+- `conscious_worker_response_rejects_bare_governed_action_token`
+- `conscious_worker_response_rejects_bare_unknown_governed_action_alias`
+- `conscious_worker_response_rejects_tool_call_style_governed_action_wrapper`
+- `foreground_orchestration_resteers_malformed_action_and_completes`
+- `foreground_orchestration_records_diagnostic_when_resteer_attempts_exhausted`
+- `telegram_fixture_runtime_resteers_malformed_governed_action_and_completes_same_turn`
+
+### Same-Turn Malformed-Action Re-Steer
+
+Malformed proposal handling stays strict, but the harness may re-steer once or
+twice in the same turn when the failure is explicitly recoverable:
+
+- Worker marks recoverable malformed-output failures through
+  `WorkerFailureMetadata` with:
+  `failure_kind=malformed_action_proposal`,
+  `side_effect_status=none_executed`,
+  `retry_recommended=true`.
+- Harness retries only when this metadata is present and retry budget remains.
+- Retry attempts inject a targeted Developer message from
+  `governed_action_repair_guidance_message()` so the worker can correct the
+  exact schema failure.
+- Each retry emits `foreground_malformed_action_resteer_attempt` audit events.
+- Retry exhaustion emits one operational diagnostic with
+  `reason_code=foreground_malformed_action_resteer_exhausted`.
+- Non-recoverable invalid outputs still fail explicitly; no parser coercion is
+  applied.
+
+### Model-Output Parsing Inventory (Anti-Masking Audit)
+
+| Parsing path | Current posture | Disposition |
+|---|---|---|
+| `build_governed_action_proposals()` + `validate_governed_action_response_shape()` | Strict tagged-block-only parsing; malformed/untagged shapes fail | High-risk masking path remediated; guarded by strict regression tests and same-turn re-steer |
+| `build_identity_kickstart_proposals()` | Optional control block; malformed identity block is ignored with no governed-action execution | Retained as bounded low-risk tolerance for bootstrap UX; no side effects |
+| `parse_identity_reflection_output()` | Structured JSON required for identity reflection; invalid JSON downgraded to diagnostic and ignored | Retained fail-closed posture for writes; invalid output never becomes canonical proposal |
+| `build_memory_consolidation_proposals()` | Free-text summarization path (no governed-action parsing) | Not a governed-action parser; no coercive schema fallback path |
 
 ### Payload Families
 
@@ -269,6 +340,8 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 | `default_subprocess_timeout_ms` | `30000` |
 | `max_subprocess_timeout_ms` | `120000` |
 | `max_actions_per_foreground_turn` | `10` |
+| `malformed_action_resteer_max_attempts` | `2` |
+| `malformed_action_resteer_timeout_ms` | `10000` |
 | `cap_exceeded_behavior` | `"escalate"` |
 | `max_filesystem_roots_per_action` | `4` |
 | `default_network_access` | `"disabled"` |
@@ -366,4 +439,4 @@ The short version is:
 
 ---
 
-*Last verified: 2026-05-15.*
+*Last verified: 2026-05-17.*

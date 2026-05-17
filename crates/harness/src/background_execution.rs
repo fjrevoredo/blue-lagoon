@@ -1204,6 +1204,8 @@ mod tests {
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
                 max_actions_per_foreground_turn: 10,
+                malformed_action_resteer_max_attempts: 2,
+                malformed_action_resteer_timeout_ms: 10_000,
                 cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,

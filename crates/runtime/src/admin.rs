@@ -107,12 +107,15 @@ pub struct TraceLookupCommandArgs {
 pub enum TraceFocusArg {
     #[value(name = "failing-node")]
     FailingNode,
+    #[value(name = "failing-model-call")]
+    FailingModelCall,
 }
 
 impl From<TraceFocusArg> for TraceFocusSelector {
     fn from(value: TraceFocusArg) -> Self {
         match value {
             TraceFocusArg::FailingNode => Self::FailingNode,
+            TraceFocusArg::FailingModelCall => Self::FailingModelCall,
         }
     }
 }
@@ -1953,6 +1956,7 @@ fn format_trace_likely_cause_kind(kind: harness::management::TraceLikelyCauseKin
 fn format_trace_focus_selector(selector: TraceFocusSelector) -> String {
     match selector {
         TraceFocusSelector::FailingNode => "failing_node",
+        TraceFocusSelector::FailingModelCall => "failing_model_call",
     }
     .to_string()
 }
@@ -3280,6 +3284,35 @@ mod tests {
                     Some("00000000-0000-0000-0000-000000000041")
                 );
                 assert_eq!(command.focus, Some(TraceFocusArg::FailingNode));
+                assert!(command.json);
+            }
+            _ => panic!("expected trace explain command"),
+        }
+    }
+
+    #[test]
+    fn parses_trace_explain_command_with_failing_model_call_focus() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "trace",
+            "explain",
+            "--trace-id",
+            "00000000-0000-0000-0000-000000000042",
+            "--focus",
+            "failing-model-call",
+            "--json",
+        ])
+        .expect("trace explain command should parse");
+
+        match command.command {
+            AdminSubcommand::Trace(TraceCommand {
+                command: TraceSubcommand::Explain(command),
+            }) => {
+                assert_eq!(
+                    command.lookup.trace_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000042")
+                );
+                assert_eq!(command.focus, Some(TraceFocusArg::FailingModelCall));
                 assert!(command.json);
             }
             _ => panic!("expected trace explain command"),

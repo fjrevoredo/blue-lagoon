@@ -112,7 +112,12 @@ pub async fn launch_smoke_worker(
     let response: WorkerResponse =
         serde_json::from_slice(&stdout).context("failed to decode worker response")?;
     if let WorkerResult::Error(error) = &response.result {
-        bail!("worker returned an error response: {}", error.message);
+        let metadata_suffix = worker_error_metadata_suffix(error);
+        bail!(
+            "worker returned an error response: {}{}",
+            error.message,
+            metadata_suffix
+        );
     }
     Ok(response)
 }
@@ -314,10 +319,12 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         bail!("conscious worker subprocess failed: {stderr}");
     }
     if let WorkerResult::Error(error) = &response.result {
+        let metadata_suffix = worker_error_metadata_suffix(error);
         bail!(
-            "conscious worker returned an error response: worker_error_code={} message={}",
+            "conscious worker returned an error response: worker_error_code={} message={}{}",
             error.code.as_str(),
-            error.message
+            error.message,
+            metadata_suffix
         );
     }
     if !matches!(response.result, WorkerResult::Conscious(_)) {
@@ -523,10 +530,12 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         bail!("unconscious worker subprocess failed: {stderr}");
     }
     if let WorkerResult::Error(error) = &response.result {
+        let metadata_suffix = worker_error_metadata_suffix(error);
         bail!(
-            "unconscious worker returned an error response: worker_error_code={} message={}",
+            "unconscious worker returned an error response: worker_error_code={} message={}{}",
             error.code.as_str(),
-            error.message
+            error.message,
+            metadata_suffix
         );
     }
     if !matches!(response.result, WorkerResult::Unconscious(_)) {
@@ -657,6 +666,16 @@ async fn read_child_stream(
             .with_context(|| format!("failed to join worker {stream_name} reader task"))?
             .with_context(|| format!("failed to read worker {stream_name}")),
         None => Ok(Vec::new()),
+    }
+}
+
+fn worker_error_metadata_suffix(error: &contracts::WorkerFailure) -> String {
+    match &error.metadata {
+        Some(metadata) => match serde_json::to_string(metadata) {
+            Ok(serialized) => format!(" worker_error_metadata={serialized}"),
+            Err(_) => String::new(),
+        },
+        None => String::new(),
     }
 }
 

@@ -142,12 +142,14 @@ impl ForegroundActionLoopTracker {
     fn as_contract_state(
         self,
         config: &RuntimeConfig,
+        repair_guidance: Option<contracts::ForegroundGovernedActionRepairGuidance>,
     ) -> contracts::ForegroundGovernedActionLoopState {
         contracts::ForegroundGovernedActionLoopState {
             executed_action_count: self.executed_action_count,
             max_actions_per_turn: self.max_actions_per_turn(config),
             remaining_actions_before_cap: self.remaining_actions_before_cap(config),
             cap_exceeded_behavior: config.governed_actions.cap_exceeded_behavior,
+            repair_guidance,
         }
     }
 }
@@ -1835,6 +1837,17 @@ where
     let mut governed_action_summary = GovernedActionProcessingSummary::default();
     let mut limit_follow_up_consumed = false;
     let mut worker_pass_count = 0u32;
+    let mut malformed_repair_guidance: Option<contracts::ForegroundGovernedActionRepairGuidance> =
+        None;
+    let malformed_resteer_max_attempts = config
+        .governed_actions
+        .malformed_action_resteer_max_attempts;
+    let malformed_resteer_timeout_ms = foreground_timeout_ms.min(
+        config
+            .governed_actions
+            .malformed_action_resteer_timeout_ms
+            .max(1),
+    );
 
     loop {
         if worker_pass_count > 0 {
@@ -1847,24 +1860,96 @@ where
             )
             .await;
         }
-        worker_pass_count = worker_pass_count.saturating_add(1);
-        context.governed_action_loop_state = Some(action_loop_tracker.as_contract_state(config));
+        context.governed_action_loop_state =
+            Some(action_loop_tracker.as_contract_state(config, malformed_repair_guidance.clone()));
         let request_context = context.clone();
         let request = contracts::WorkerRequest::conscious(
             trigger.trace_id,
             trigger.execution_id,
             request_context.clone(),
         );
-        let response = launch_leased_conscious_worker(
+        let worker_timeout_ms = if malformed_repair_guidance.is_some() {
+            malformed_resteer_timeout_ms
+        } else {
+            foreground_timeout_ms
+        };
+        let response = match launch_leased_conscious_worker(
             pool,
             config,
             model_gateway_config,
             trigger,
             &request,
             transport,
-            foreground_timeout_ms,
+            worker_timeout_ms,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => {
+                malformed_repair_guidance = None;
+                response
+            }
+            Err(error) => {
+                if let Some(signal) = recoverable_malformed_action_signal(&error) {
+                    let attempt_index = malformed_repair_guidance
+                        .as_ref()
+                        .map_or(1, |guidance| guidance.attempt_index.saturating_add(1));
+                    if attempt_index <= malformed_resteer_max_attempts {
+                        let failure_detail = signal.detail.clone();
+                        audit::insert(
+                            pool,
+                            &NewAuditEvent {
+                                loop_kind: "conscious".to_string(),
+                                subsystem: "foreground_orchestration".to_string(),
+                                event_kind: "foreground_malformed_action_resteer_attempt"
+                                    .to_string(),
+                                severity: "info".to_string(),
+                                trace_id: trigger.trace_id,
+                                execution_id: Some(trigger.execution_id),
+                                worker_pid: None,
+                                payload: json!({
+                                    "attempt_index": attempt_index,
+                                    "max_attempts": malformed_resteer_max_attempts,
+                                    "failure_kind": "malformed_action_proposal",
+                                    "failure_detail": failure_detail,
+                                    "retry_timeout_ms": malformed_resteer_timeout_ms,
+                                }),
+                            },
+                        )
+                        .await?;
+                        malformed_repair_guidance =
+                            Some(contracts::ForegroundGovernedActionRepairGuidance {
+                                attempt_index,
+                                max_attempts: malformed_resteer_max_attempts,
+                                failure_kind: signal.failure_kind,
+                                failure_detail: signal.detail,
+                            });
+                        continue;
+                    }
+                    recovery::insert_operational_diagnostic(
+                        pool,
+                        &recovery::NewOperationalDiagnostic {
+                            operational_diagnostic_id: Uuid::now_v7(),
+                            trace_id: Some(trigger.trace_id),
+                            execution_id: Some(trigger.execution_id),
+                            subsystem: "foreground_orchestration".to_string(),
+                            severity: recovery::OperationalDiagnosticSeverity::Warn,
+                            reason_code: "foreground_malformed_action_resteer_exhausted"
+                                .to_string(),
+                            summary: "Malformed governed-action re-steer attempts exhausted"
+                                .to_string(),
+                            diagnostic_payload: json!({
+                                "max_attempts": malformed_resteer_max_attempts,
+                                "failure_kind": "malformed_action_proposal",
+                                "failure_detail": signal.detail,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+        };
+        worker_pass_count = worker_pass_count.saturating_add(1);
         let contracts::WorkerResult::Conscious(result) = &response.result else {
             bail!("conscious follow-up worker returned a non-conscious result");
         };
@@ -2359,7 +2444,7 @@ where
 fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
     match failure_kind {
         ForegroundFailureKind::MalformedActionProposal => format!(
-            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the trace with `admin trace explain --trace-id {trace_id}`.",
+            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the relevant model-call payload with `admin trace explain --trace-id {trace_id} --focus failing-model-call --json`.",
             failure_kind.as_str()
         ),
         ForegroundFailureKind::WorkerProtocolFailure => format!(
@@ -2406,8 +2491,49 @@ impl ForegroundFailureKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerFailureSignal {
+    failure_kind: contracts::WorkerFailureKind,
+    detail: Option<String>,
+    side_effect_status: Option<contracts::WorkerFailureSideEffectStatus>,
+    retry_recommended: bool,
+}
+
+fn extract_worker_failure_signal(message: &str) -> Option<WorkerFailureSignal> {
+    const MARKER: &str = "worker_error_metadata=";
+    let marker_index = message.rfind(MARKER)?;
+    let metadata_json = message[marker_index + MARKER.len()..].trim();
+    let metadata: contracts::WorkerFailureMetadata = serde_json::from_str(metadata_json).ok()?;
+    Some(WorkerFailureSignal {
+        failure_kind: metadata.failure_kind,
+        detail: metadata.detail,
+        side_effect_status: metadata.side_effect_status,
+        retry_recommended: metadata.retry_recommended,
+    })
+}
+
+fn recoverable_malformed_action_signal(error: &Error) -> Option<WorkerFailureSignal> {
+    let message = format_error_chain(error);
+    let signal = extract_worker_failure_signal(&message)?;
+    if signal.failure_kind != contracts::WorkerFailureKind::MalformedActionProposal {
+        return None;
+    }
+    if signal.side_effect_status != Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted) {
+        return None;
+    }
+    if !signal.retry_recommended {
+        return None;
+    }
+    Some(signal)
+}
+
 fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     let message = format_error_chain(error);
+    if let Some(signal) = extract_worker_failure_signal(&message) {
+        if signal.failure_kind == contracts::WorkerFailureKind::MalformedActionProposal {
+            return ForegroundFailureKind::MalformedActionProposal;
+        }
+    }
     if message.contains("provider returned status") {
         return ForegroundFailureKind::ProviderRejected;
     }
@@ -3411,6 +3537,8 @@ mod tests {
         assert!(notice.contains("valid governed-action proposal"));
         assert!(notice.contains("malformed_action_proposal"));
         assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("--focus failing-model-call"));
+        assert!(notice.contains("--json"));
         assert!(notice.contains(&trace_id.to_string()));
     }
 
@@ -3447,6 +3575,103 @@ mod tests {
         let error = anyhow::anyhow!(
             "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
         );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn extract_worker_failure_signal_parses_metadata_suffix() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid governed-action proposal block: missing field `actions`".to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let signal = extract_worker_failure_signal(&format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=invalid output worker_error_metadata={serialized}"
+        ))
+        .expect("metadata suffix should parse");
+
+        assert_eq!(
+            signal.failure_kind,
+            contracts::WorkerFailureKind::MalformedActionProposal
+        );
+        assert_eq!(
+            signal.side_effect_status,
+            Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted)
+        );
+        assert!(signal.retry_recommended);
+        assert_eq!(
+            signal.detail.as_deref(),
+            Some("invalid governed-action proposal block: missing field `actions`")
+        );
+    }
+
+    #[test]
+    fn recoverable_malformed_action_signal_accepts_none_executed_retry_recommended() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid governed-action proposal block: missing field `actions`".to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
+
+        let signal = recoverable_malformed_action_signal(&error)
+            .expect("recoverable malformed signal should be detected");
+        assert_eq!(
+            signal.failure_kind,
+            contracts::WorkerFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn recoverable_malformed_action_signal_rejects_non_retryable_metadata() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid governed-action proposal block: missing field `actions`".to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: false,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
+
+        assert!(recoverable_malformed_action_signal(&error).is_none());
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_uses_worker_failure_metadata() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid governed-action proposal block: missing field `artifact_kind`".to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
 
         assert_eq!(
             classify_conscious_worker_failure(&error),

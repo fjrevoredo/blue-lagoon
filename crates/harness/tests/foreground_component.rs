@@ -2689,6 +2689,219 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
 
 #[tokio::test]
 #[serial]
+async fn foreground_orchestration_resteers_malformed_action_and_completes() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.governed_actions.malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "I will inspect this now.\n```blue-lagoon-governed-actions\n{\"version\":\"1\"}\n```"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 17
+                }
+            }),
+        }));
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "Recovered response after repair."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 29,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed orchestration, got {other:?}"),
+        };
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Recovered response after repair."
+        );
+
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 2);
+        let second_request_messages = seen[1]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages");
+        assert!(second_request_messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .any(|content| {
+                content.contains("Harness requested a malformed-action repair retry")
+                    && content.contains("missing field `actions`")
+            }));
+
+        let audit_events = audit::list_for_execution(&ctx.pool, completed.execution_id).await?;
+        assert!(audit_events.iter().any(|event| {
+            event.event_kind == "foreground_malformed_action_resteer_attempt"
+        }));
+        assert!(audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_execution_completed"));
+        assert!(!audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_execution_failed"));
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhausted() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config.governed_actions.malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        for _ in 0..2 {
+            transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "Retrying.\n```blue-lagoon-governed-actions\n{\"version\":\"1\"}\n```"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 27,
+                        "completion_tokens": 12
+                    }
+                }),
+            }));
+        }
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("repeated malformed proposals should fail after retry budget");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid governed-action proposal block")
+        );
+
+        let execution_row = sqlx::query(
+            r#"
+            SELECT execution_id
+            FROM execution_records
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let execution_id: Uuid = execution_row.get("execution_id");
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(audit_events.iter().any(|event| {
+            event.event_kind == "foreground_malformed_action_resteer_attempt"
+        }));
+        assert!(audit_events
+            .iter()
+            .any(|event| event.event_kind == "foreground_execution_failed"));
+
+        let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "foreground_malformed_action_resteer_exhausted"
+        }));
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn foreground_orchestration_closes_planned_ingress_batch_on_terminal_failure() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();

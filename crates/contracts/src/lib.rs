@@ -200,6 +200,8 @@ pub struct EpisodeSummary {
 pub struct WorkerFailure {
     pub code: WorkerErrorCode,
     pub message: String,
+    #[serde(default)]
+    pub metadata: Option<WorkerFailureMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +222,29 @@ impl WorkerErrorCode {
             Self::InternalFailure => "internal_failure",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFailureMetadata {
+    pub failure_kind: WorkerFailureKind,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub side_effect_status: Option<WorkerFailureSideEffectStatus>,
+    #[serde(default)]
+    pub retry_recommended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureKind {
+    MalformedActionProposal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureSideEffectStatus {
+    NoneExecuted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +459,17 @@ pub struct ForegroundGovernedActionLoopState {
     pub max_actions_per_turn: u32,
     pub remaining_actions_before_cap: u32,
     pub cap_exceeded_behavior: GovernedActionCapExceededBehavior,
+    #[serde(default)]
+    pub repair_guidance: Option<ForegroundGovernedActionRepairGuidance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundGovernedActionRepairGuidance {
+    pub attempt_index: u32,
+    pub max_attempts: u32,
+    pub failure_kind: WorkerFailureKind,
+    #[serde(default)]
+    pub failure_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2585,6 +2621,7 @@ mod tests {
                 max_actions_per_turn: 10,
                 remaining_actions_before_cap: 10,
                 cap_exceeded_behavior: GovernedActionCapExceededBehavior::Escalate,
+                repair_guidance: None,
             }),
             recovery_context: ForegroundRecoveryContext {
                 mode: ForegroundExecutionMode::BacklogRecovery,

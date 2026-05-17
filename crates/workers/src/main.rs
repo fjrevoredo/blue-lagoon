@@ -18,7 +18,8 @@ use contracts::{
     RetrievalUpdateProposal, SelfModelObservationProposal, SmokeWorkerResult, ToolPolicy,
     UnconsciousContext, UnconsciousJobKind, UnconsciousMaintenanceOutputs,
     UnconsciousWorkerRequest, UnconsciousWorkerResult, UnconsciousWorkerStatus, WakeSignal,
-    WorkerErrorCode, WorkerFailure, WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult,
+    WorkerErrorCode, WorkerFailure, WorkerFailureKind, WorkerFailureMetadata,
+    WorkerFailureSideEffectStatus, WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult,
     predefined_identity_delta,
 };
 use serde::Serialize;
@@ -415,9 +416,12 @@ fn run_conscious_worker() -> Result<()> {
 
     let response = match build_conscious_worker_response(&request, payload, model_response) {
         Ok(response) => response,
-        Err(message) => {
-            request_error_response(&request, WorkerErrorCode::InvalidModelOutput, message)
-        }
+        Err(message) => request_error_response_with_metadata(
+            &request,
+            WorkerErrorCode::InvalidModelOutput,
+            message.clone(),
+            invalid_model_output_metadata(&message),
+        ),
     };
     write_json_line(
         &mut handle,
@@ -923,6 +927,17 @@ fn build_model_input(
                 role: ModelMessageRole::Developer,
                 content: sparse_confirmation_bridge_message(confirmation),
                 kind: ForegroundMessageKind::ConfirmationBridge,
+            });
+        }
+        if let Some(repair_guidance) = context
+            .governed_action_loop_state
+            .as_ref()
+            .and_then(|state| state.repair_guidance.as_ref())
+        {
+            messages.push(ForegroundMessageCandidate {
+                role: ModelMessageRole::Developer,
+                content: governed_action_repair_guidance_message(repair_guidance),
+                kind: ForegroundMessageKind::GovernedActionInstructions,
             });
         }
         messages.push(ForegroundMessageCandidate {
@@ -1693,6 +1708,23 @@ fn governed_action_reminder_message() -> String {
     )
 }
 
+fn governed_action_repair_guidance_message(
+    guidance: &contracts::ForegroundGovernedActionRepairGuidance,
+) -> String {
+    format!(
+        "Harness requested a malformed-action repair retry (attempt {attempt} of {max_attempts}). Previous governed-action output failed validation with failure kind `{failure_kind}` and detail: {detail}. Do not repeat the invalid shape. If an action is needed, return a corrected governed-action JSON block with all required fields and exact action-kind names. If no action is needed, do not emit a governed-action block.",
+        attempt = guidance.attempt_index,
+        max_attempts = guidance.max_attempts,
+        failure_kind = match guidance.failure_kind {
+            WorkerFailureKind::MalformedActionProposal => "malformed_action_proposal",
+        },
+        detail = guidance
+            .failure_detail
+            .as_deref()
+            .unwrap_or("<none provided>")
+    )
+}
+
 fn governed_action_observation_summary(observations: &[GovernedActionObservation]) -> String {
     observations
         .iter()
@@ -1725,12 +1757,10 @@ fn governed_action_loop_state_summary(
 }
 
 fn build_governed_action_proposals(
-    context: &ConsciousContext,
+    _context: &ConsciousContext,
     model_text: &str,
 ) -> std::result::Result<Vec<GovernedActionProposal>, String> {
-    let Some(block_json) = extract_governed_action_block(model_text)
-        .or_else(|| extract_standalone_governed_action_payload(model_text))
-    else {
+    let Some(block_json) = extract_governed_action_block(model_text) else {
         return Ok(Vec::new());
     };
 
@@ -1739,11 +1769,9 @@ fn build_governed_action_proposals(
         actions: Vec<GovernedActionProposal>,
     }
 
-    match serde_json::from_str::<GovernedActionEnvelope>(block_json) {
-        Ok(envelope) => Ok(envelope.actions),
-        Err(primary_error) => build_legacy_governed_action_proposals(context, block_json)
-            .map_err(|_| format!("invalid governed-action proposal block: {primary_error}")),
-    }
+    serde_json::from_str::<GovernedActionEnvelope>(block_json)
+        .map(|envelope| envelope.actions)
+        .map_err(|error| format!("invalid governed-action proposal block: {error}"))
 }
 
 fn validate_governed_action_response_shape(
@@ -1777,6 +1805,27 @@ fn validate_governed_action_response_shape(
     }
 
     Ok(())
+}
+
+fn is_malformed_governed_action_proposal_error(message: &str) -> bool {
+    message.contains("invalid governed-action proposal block")
+        || message.contains("attempted a governed action without the required governed-action block")
+        || message.contains("returned a likely governed-action payload outside the required governed-action block")
+        || message.contains(
+            "governed-action control block marker was present but the block was malformed or incomplete",
+        )
+}
+
+fn invalid_model_output_metadata(message: &str) -> Option<WorkerFailureMetadata> {
+    if !is_malformed_governed_action_proposal_error(message) {
+        return None;
+    }
+    Some(WorkerFailureMetadata {
+        failure_kind: WorkerFailureKind::MalformedActionProposal,
+        detail: Some(message.to_string()),
+        side_effect_status: Some(WorkerFailureSideEffectStatus::NoneExecuted),
+        retry_recommended: true,
+    })
 }
 
 fn build_identity_kickstart_proposals(
@@ -1959,12 +2008,7 @@ fn identity_interview_action_proposal(
 
 fn strip_worker_control_blocks(model_text: &str) -> String {
     let without_identity = strip_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG);
-    let without_governed = strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG);
-    if extract_standalone_governed_action_payload(&without_governed).is_some() {
-        String::new()
-    } else {
-        without_governed
-    }
+    strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG)
 }
 
 fn detect_bare_governed_action_invocation(text: &str) -> Option<&str> {
@@ -2055,168 +2099,6 @@ fn strip_json_language_prefix(text: &str) -> &str {
         return rest.trim_start();
     }
     trimmed
-}
-
-fn extract_standalone_governed_action_payload(model_text: &str) -> Option<&str> {
-    let trimmed = strip_json_language_prefix(model_text).trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return None;
-    }
-
-    let looks_like_payload = trimmed.contains("\"governed-actions\"")
-        || (trimmed.contains("\"actions\"")
-            && (trimmed.contains("\"action_kind\"")
-                || trimmed.contains("\"payload\"")
-                || trimmed.contains("\"action\"")));
-    looks_like_payload.then_some(trimmed)
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyGovernedActionEnvelope {
-    #[serde(rename = "governed-actions")]
-    governed_actions: Option<LegacyGovernedActionWrapper>,
-    actions: Option<Vec<LegacyGovernedAction>>,
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyGovernedActionWrapper {
-    actions: Vec<LegacyGovernedAction>,
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyGovernedAction {
-    action: String,
-    #[serde(default)]
-    params: serde_json::Value,
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyScheduleTaskParams {
-    task: Option<String>,
-    trigger: Option<String>,
-    delay_seconds: Option<u64>,
-    payload: Option<LegacyReminderPayload>,
-}
-
-#[derive(serde::Deserialize)]
-struct LegacyReminderPayload {
-    message: Option<String>,
-}
-
-fn build_legacy_governed_action_proposals(
-    context: &ConsciousContext,
-    block_json: &str,
-) -> std::result::Result<Vec<GovernedActionProposal>, String> {
-    let envelope: LegacyGovernedActionEnvelope = serde_json::from_str(block_json)
-        .map_err(|error| format!("legacy governed-action parse failed: {error}"))?;
-    let actions = envelope
-        .governed_actions
-        .map(|wrapper| wrapper.actions)
-        .or(envelope.actions)
-        .ok_or_else(|| "legacy governed-action payload missing actions".to_string())?;
-
-    actions
-        .into_iter()
-        .map(|action| build_legacy_governed_action_proposal(context, action))
-        .collect()
-}
-
-fn build_legacy_governed_action_proposal(
-    context: &ConsciousContext,
-    action: LegacyGovernedAction,
-) -> std::result::Result<GovernedActionProposal, String> {
-    match action.action.as_str() {
-        "schedule_task" => {
-            let params: LegacyScheduleTaskParams = serde_json::from_value(action.params)
-                .map_err(|error| format!("legacy schedule_task params invalid: {error}"))?;
-            let trigger = params.trigger.unwrap_or_else(|| "relative".to_string());
-            if trigger != "relative" {
-                return Err(format!(
-                    "legacy schedule_task trigger '{trigger}' is unsupported"
-                ));
-            }
-
-            let delay_seconds = params.delay_seconds.unwrap_or(0);
-            if delay_seconds == 0 {
-                return Err(
-                    "legacy schedule_task delay_seconds must be greater than zero".to_string(),
-                );
-            }
-
-            let reminder_message = params
-                .payload
-                .and_then(|payload| payload.message)
-                .filter(|message| !message.trim().is_empty())
-                .unwrap_or_else(|| "Reminder".to_string());
-            let task_slug = params
-                .task
-                .unwrap_or_else(|| "reminder".to_string())
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() {
-                        character.to_ascii_lowercase()
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>()
-                .trim_matches('_')
-                .to_string();
-            let next_due_at = context.trigger.ingress.occurred_at
-                + chrono::Duration::seconds(delay_seconds as i64);
-
-            Ok(GovernedActionProposal {
-                proposal_id: uuid::Uuid::now_v7(),
-                title: "Schedule reminder".to_string(),
-                rationale: Some(
-                    "Converted legacy schedule_task reminder proposal into canonical scheduled foreground work."
-                        .to_string(),
-                ),
-                action_kind: contracts::GovernedActionKind::UpsertScheduledForegroundTask,
-                requested_risk_tier: None,
-                capability_scope: harness_native_governed_action_scope(),
-                payload: contracts::GovernedActionPayload::UpsertScheduledForegroundTask(
-                    contracts::UpsertScheduledForegroundTaskAction {
-                        task_key: format!(
-                            "oneoff_{}_{}",
-                            if task_slug.is_empty() { "reminder" } else { &task_slug },
-                            uuid::Uuid::now_v7().simple()
-                        ),
-                        title: "Reminder".to_string(),
-                        user_facing_prompt: reminder_message,
-                        next_due_at_utc: Some(next_due_at),
-                        cadence_seconds: 0,
-                        cooldown_seconds: Some(3600),
-                        internal_principal_ref: context
-                            .trigger
-                            .ingress
-                            .internal_principal_ref
-                            .clone(),
-                        internal_conversation_ref: context
-                            .trigger
-                            .ingress
-                            .internal_conversation_ref
-                            .clone(),
-                        active: true,
-                    },
-                ),
-            })
-        }
-        other => Err(format!("unsupported legacy governed action '{other}'")),
-    }
-}
-
-fn harness_native_governed_action_scope() -> contracts::CapabilityScope {
-    contracts::CapabilityScope {
-        filesystem: contracts::FilesystemCapabilityScope::default(),
-        network: contracts::NetworkAccessPosture::Disabled,
-        environment: contracts::EnvironmentCapabilityScope::default(),
-        execution: contracts::ExecutionCapabilityBudget {
-            timeout_ms: 0,
-            max_stdout_bytes: 0,
-            max_stderr_bytes: 0,
-        },
-    }
 }
 
 fn strip_tagged_block(model_text: &str, tag: &str) -> String {
@@ -3195,13 +3077,25 @@ fn write_json_line<T: Serialize>(handle: &mut impl Write, value: &T) -> Result<(
 }
 
 fn error_response(code: WorkerErrorCode, message: String) -> WorkerResponse {
+    error_response_with_metadata(code, message, None)
+}
+
+fn error_response_with_metadata(
+    code: WorkerErrorCode,
+    message: String,
+    metadata: Option<WorkerFailureMetadata>,
+) -> WorkerResponse {
     WorkerResponse {
         request_id: uuid::Uuid::nil(),
         trace_id: uuid::Uuid::nil(),
         execution_id: uuid::Uuid::nil(),
         finished_at: chrono::Utc::now(),
         worker_pid: std::process::id(),
-        result: WorkerResult::Error(WorkerFailure { code, message }),
+        result: WorkerResult::Error(WorkerFailure {
+            code,
+            message,
+            metadata,
+        }),
     }
 }
 
@@ -3210,13 +3104,26 @@ fn request_error_response(
     code: WorkerErrorCode,
     message: String,
 ) -> WorkerResponse {
+    request_error_response_with_metadata(request, code, message, None)
+}
+
+fn request_error_response_with_metadata(
+    request: &WorkerRequest,
+    code: WorkerErrorCode,
+    message: String,
+    metadata: Option<WorkerFailureMetadata>,
+) -> WorkerResponse {
     WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
         execution_id: request.execution_id,
         finished_at: chrono::Utc::now(),
         worker_pid: std::process::id(),
-        result: WorkerResult::Error(WorkerFailure { code, message }),
+        result: WorkerResult::Error(WorkerFailure {
+            code,
+            message,
+            metadata,
+        }),
     }
 }
 
@@ -4234,6 +4141,46 @@ mod tests {
     }
 
     #[test]
+    fn conscious_model_request_includes_repair_guidance_for_harness_resteer_attempts() {
+        let mut context = ConsciousContextFixture::new()
+            .with_trigger_text("check the workspace artifacts")
+            .build();
+        context.governed_action_loop_state = Some(contracts::ForegroundGovernedActionLoopState {
+            executed_action_count: 0,
+            max_actions_per_turn: 10,
+            remaining_actions_before_cap: 10,
+            cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
+            repair_guidance: Some(contracts::ForegroundGovernedActionRepairGuidance {
+                attempt_index: 1,
+                max_attempts: 2,
+                failure_kind: WorkerFailureKind::MalformedActionProposal,
+                failure_detail: Some(
+                    "invalid governed-action proposal block: missing field `actions`".to_string(),
+                ),
+            }),
+        });
+
+        let model_request = conscious_model_request_for_context(context);
+        let developer_messages = model_request
+            .input
+            .messages
+            .iter()
+            .filter(|message| message.role == ModelMessageRole::Developer)
+            .collect::<Vec<_>>();
+
+        assert!(developer_messages.iter().any(|message| {
+            message
+                .content
+                .contains("Harness requested a malformed-action repair retry")
+        }));
+        assert!(
+            developer_messages
+                .iter()
+                .any(|message| message.content.contains("missing field `actions`"))
+        );
+    }
+
+    #[test]
     fn action_request_golden_allows_retrieval_and_full_schema() {
         for trigger in [
             "get the current weather",
@@ -4662,88 +4609,135 @@ mod tests {
     }
 
     #[test]
-    fn build_governed_action_proposals_converts_legacy_schedule_task_payload() {
+    fn build_governed_action_proposals_ignores_untagged_payloads() {
         let context = sample_context();
         let model_text = r#"json
 {
-  "governed-actions": {
-    "version": "0.1.0",
-    "actions": [
-      {
-        "action": "schedule_task",
-        "params": {
-          "task": "remind_user",
-          "trigger": "relative",
-          "delay_seconds": 180,
-          "payload": {
-            "message": "3-minute reminder from Richard"
-          }
-        }
+  "actions": [
+    {
+      "proposal_id": "019e32bf-2ba8-7e62-8949-0dbcf783d488",
+      "title": "List artifacts",
+      "rationale": "Need context",
+      "action_kind": "list_workspace_artifacts",
+      "requested_risk_tier": null,
+      "capability_scope": {
+        "filesystem": { "read_roots": [], "write_roots": [] },
+        "network": "disabled",
+        "environment": { "allow_variables": [] },
+        "execution": { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 }
+      },
+      "payload": {
+        "kind": "list_workspace_artifacts",
+        "value": { "artifact_kind": null, "status": "active", "query": null, "limit": 10 }
       }
-    ]
-  }
+    }
+  ]
 }"#;
 
         let proposals = build_governed_action_proposals(&context, model_text)
-            .expect("legacy payload should convert");
-        assert_eq!(proposals.len(), 1);
-        assert_eq!(
-            proposals[0].action_kind,
-            contracts::GovernedActionKind::UpsertScheduledForegroundTask
-        );
-        let contracts::GovernedActionPayload::UpsertScheduledForegroundTask(action) =
-            &proposals[0].payload
-        else {
-            panic!("expected scheduled foreground payload");
-        };
-        assert!(action.task_key.starts_with("oneoff_"));
-        assert_eq!(action.cadence_seconds, 0);
-        assert_eq!(action.user_facing_prompt, "3-minute reminder from Richard");
+            .expect("untagged payload should be ignored at parser stage");
+        assert!(proposals.is_empty());
     }
 
     #[test]
-    fn build_governed_action_proposals_rejects_unsupported_legacy_payload() {
+    fn build_governed_action_proposals_requires_tagged_block() {
         let context = sample_context();
-        let model_text = r#"json
-{
-  "governed-actions": {
-    "version": "0.1.0",
-    "actions": [
-      {
-        "action": "send_email",
-        "params": {
-          "to": "user@example.com"
-        }
-      }
-    ]
-  }
-}"#;
+        let model_text = "{\"actions\":[]}";
 
-        let error = build_governed_action_proposals(&context, model_text)
-            .expect_err("unsupported legacy action should fail closed");
-        assert!(error.contains("invalid governed-action proposal block"));
+        let proposals = build_governed_action_proposals(&context, model_text)
+            .expect("untagged payload should not be parsed");
+        assert!(proposals.is_empty());
     }
 
     #[test]
-    fn strip_worker_control_blocks_removes_standalone_legacy_governed_action_payload() {
+    fn build_governed_action_proposals_rejects_missing_actions_field() {
+        let context = sample_context();
+        let model_text = format!(
+            "```{tag}\n{{\"version\":\"1\"}}\n```",
+            tag = GOVERNED_ACTIONS_BLOCK_TAG
+        );
+
+        let error = build_governed_action_proposals(&context, &model_text)
+            .expect_err("missing actions field should fail closed");
+        assert!(error.contains("invalid governed-action proposal block"));
+        assert!(error.contains("missing field `actions`"));
+    }
+
+    #[test]
+    fn build_governed_action_proposals_rejects_missing_required_payload_field() {
+        let context = sample_context();
+        let proposal_json = format!(
+            r#"{{
+  "actions": [
+    {{
+      "proposal_id": "{proposal_id}",
+      "title": "Inspect artifact",
+      "rationale": "Need the artifact content",
+      "action_kind": "inspect_workspace_artifact",
+      "requested_risk_tier": null,
+      "capability_scope": {{
+        "filesystem": {{ "read_roots": [], "write_roots": [] }},
+        "network": "disabled",
+        "environment": {{ "allow_variables": [] }},
+        "execution": {{ "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 }}
+      }},
+      "payload": {{
+        "kind": "inspect_workspace_artifact",
+        "value": {{
+          "artifact_id": "{artifact_id}"
+        }}
+      }}
+    }}
+  ]
+}}"#,
+            proposal_id = uuid::Uuid::now_v7(),
+            artifact_id = uuid::Uuid::now_v7()
+        );
+        let model_text = format!(
+            "```{tag}\n{json}\n```",
+            tag = GOVERNED_ACTIONS_BLOCK_TAG,
+            json = proposal_json
+        );
+
+        let error = build_governed_action_proposals(&context, &model_text)
+            .expect_err("missing required payload field should fail closed");
+        assert!(error.contains("invalid governed-action proposal block"));
+        assert!(error.contains("missing field `artifact_kind`"));
+    }
+
+    #[test]
+    fn invalid_model_output_metadata_marks_malformed_action_as_recoverable() {
+        let metadata = invalid_model_output_metadata(
+            "invalid governed-action proposal block: missing field `actions`",
+        )
+        .expect("malformed action output should produce metadata");
+        assert_eq!(
+            metadata.failure_kind,
+            WorkerFailureKind::MalformedActionProposal
+        );
+        assert_eq!(
+            metadata.side_effect_status,
+            Some(WorkerFailureSideEffectStatus::NoneExecuted)
+        );
+        assert!(metadata.retry_recommended);
+        assert!(metadata.detail.is_some());
+    }
+
+    #[test]
+    fn invalid_model_output_metadata_ignores_non_malformed_errors() {
+        let metadata = invalid_model_output_metadata("identity interview answer was invalid");
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn strip_worker_control_blocks_preserves_untagged_payload_text() {
         let model_text = r#"json
 {
-  "governed-actions": {
-    "version": "0.1.0",
-    "actions": [
-      {
-        "action": "schedule_task",
-        "params": {
-          "task": "remind_user",
-          "trigger": "relative",
-          "delay_seconds": 180
-        }
-      }
-    ]
-  }
+  "actions": []
 }"#;
 
-        assert!(strip_worker_control_blocks(model_text).is_empty());
+        let stripped = strip_worker_control_blocks(model_text);
+        assert!(stripped.contains("\"actions\""));
     }
 
     #[test]
@@ -5333,6 +5327,7 @@ mod tests {
                 max_actions_per_turn: 10,
                 remaining_actions_before_cap: 10,
                 cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
+                repair_guidance: None,
             }),
             recovery_context: contracts::ForegroundRecoveryContext::default(),
         }

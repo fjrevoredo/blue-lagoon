@@ -135,6 +135,134 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
 
 #[tokio::test]
 #[serial]
+async fn telegram_fixture_runtime_resteers_malformed_governed_action_and_completes_same_turn()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+
+        let malformed_payload = serde_json::json!({
+            "payload": {
+                "kind": "list_workspace_artifacts",
+                "value": {
+                    "artifact_kind": serde_json::Value::Null,
+                    "status": "active",
+                    "query": serde_json::Value::Null,
+                    "limit": 10
+                }
+            }
+        })
+        .to_string();
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": malformed_payload },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 18,
+                    "completion_tokens": 10
+                }
+            }),
+        }));
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": "assistant reply after malformed-action repair" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 22,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("private_text_message.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "assistant reply after malformed-action repair"
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 2);
+        let retry_request_messages = seen_requests[1]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(retry_request_messages.iter().any(|content| {
+            content.contains("Harness requested a malformed-action repair retry")
+        }));
+
+        let execution_row = sqlx::query(
+            r#"
+            SELECT execution_id
+            FROM execution_records
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let execution_id: Uuid = execution_row.get("execution_id");
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_malformed_action_resteer_attempt")
+        );
+
+        let exhausted_resteer_diagnostic_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM operational_diagnostics
+            WHERE reason_code = 'foreground_malformed_action_resteer_exhausted'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(exhausted_resteer_diagnostic_count, 0);
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn telegram_fixture_runtime_run_applies_predefined_identity_selection() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();

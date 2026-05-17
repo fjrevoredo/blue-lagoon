@@ -615,6 +615,7 @@ pub struct TraceDiagnosisSummary {
 #[serde(rename_all = "snake_case")]
 pub enum TraceFocusSelector {
     FailingNode,
+    FailingModelCall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2464,6 +2465,9 @@ pub fn inspect_trace_report_focus(
                 .find(|candidate| candidate.node_id == node.node_id)
                 .cloned()
         }),
+        TraceFocusSelector::FailingModelCall => {
+            find_relevant_failing_model_call_node(report, diagnosis)
+        }
     };
     let (payload_availability, payload_availability_reason, mut notes) =
         classify_focus_payload_availability(resolved_node.as_ref());
@@ -2478,6 +2482,47 @@ pub fn inspect_trace_report_focus(
         payload_availability_reason,
         notes,
     }
+}
+
+fn find_relevant_failing_model_call_node(
+    report: &TraceReport,
+    diagnosis: &TraceDiagnosisSummary,
+) -> Option<TraceNode> {
+    if let Some(failing_node) = diagnosis.first_failing_node.as_ref() {
+        if failing_node.node_kind == "model_call" {
+            return report
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == failing_node.node_id)
+                .cloned();
+        }
+        if let Some(node) = report
+            .nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.node_kind == "model_call"
+                    && candidate.occurred_at <= failing_node.occurred_at
+            })
+            .max_by(|left, right| {
+                left.occurred_at
+                    .cmp(&right.occurred_at)
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            })
+        {
+            return Some(node.clone());
+        }
+    }
+
+    report
+        .nodes
+        .iter()
+        .filter(|candidate| candidate.node_kind == "model_call")
+        .max_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        })
+        .cloned()
 }
 
 pub async fn list_recent_traces(config: &RuntimeConfig, limit: u32) -> Result<Vec<TraceSummary>> {
@@ -5942,6 +5987,8 @@ mod tests {
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
                 max_actions_per_foreground_turn: 10,
+                malformed_action_resteer_max_attempts: 2,
+                malformed_action_resteer_timeout_ms: 10_000,
                 cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,
@@ -6024,6 +6071,119 @@ mod tests {
     #[test]
     fn default_cli_actor_ref_falls_back_when_requested_by_is_malformed() {
         assert_eq!(default_cli_actor_ref("primary-user"), "cli:operator");
+    }
+
+    fn sample_trace_report(nodes: Vec<TraceNode>) -> TraceReport {
+        TraceReport {
+            trace_id: Uuid::now_v7(),
+            root_execution_id: Some(Uuid::now_v7()),
+            generated_at: Utc::now(),
+            node_count: nodes.len(),
+            edge_count: 0,
+            nodes,
+            edges: Vec::new(),
+            scheduling: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn sample_trace_node(
+        node_id: &str,
+        node_kind: &str,
+        occurred_at: DateTime<Utc>,
+        status: Option<&str>,
+        payload: JsonValue,
+    ) -> TraceNode {
+        TraceNode {
+            node_id: node_id.to_string(),
+            node_kind: node_kind.to_string(),
+            source_id: Uuid::now_v7(),
+            occurred_at,
+            status: status.map(ToOwned::to_owned),
+            title: node_id.to_string(),
+            summary: node_kind.to_string(),
+            payload,
+            related_ids: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn failing_model_call_focus_resolves_latest_model_call_before_failure() {
+        let model_call_at = Utc::now();
+        let report = sample_trace_report(vec![
+            sample_trace_node(
+                "model_call:foreground",
+                "model_call",
+                model_call_at,
+                Some("succeeded"),
+                json!({
+                    "request_payload_json": {
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }
+                }),
+            ),
+            sample_trace_node(
+                "audit_event:failed",
+                "audit_event",
+                model_call_at + Duration::seconds(1),
+                Some("error"),
+                json!({
+                    "payload": {
+                        "failure_kind": "malformed_action_proposal"
+                    }
+                }),
+            ),
+        ]);
+
+        let diagnosis = diagnose_trace_report(&report);
+        assert_eq!(
+            diagnosis
+                .first_failing_node
+                .as_ref()
+                .map(|node| node.node_id.as_str()),
+            Some("audit_event:failed")
+        );
+
+        let focus =
+            inspect_trace_report_focus(&report, &diagnosis, TraceFocusSelector::FailingModelCall);
+        let resolved = focus
+            .resolved_node
+            .as_ref()
+            .expect("failing-model-call focus should resolve a model call");
+        assert_eq!(resolved.node_id, "model_call:foreground");
+    }
+
+    #[test]
+    fn failing_model_call_focus_prefers_failing_model_call_node() {
+        let model_call_at = Utc::now();
+        let report = sample_trace_report(vec![sample_trace_node(
+            "model_call:failed",
+            "model_call",
+            model_call_at,
+            Some("failed"),
+            json!({
+                "response_payload_json": {
+                    "error": "provider timeout"
+                }
+            }),
+        )]);
+
+        let diagnosis = diagnose_trace_report(&report);
+        assert_eq!(
+            diagnosis
+                .first_failing_node
+                .as_ref()
+                .map(|node| node.node_id.as_str()),
+            Some("model_call:failed")
+        );
+
+        let focus =
+            inspect_trace_report_focus(&report, &diagnosis, TraceFocusSelector::FailingModelCall);
+        let resolved = focus
+            .resolved_node
+            .as_ref()
+            .expect("failing-model-call focus should resolve the failing model call");
+        assert_eq!(resolved.node_id, "model_call:failed");
     }
 
     #[test]

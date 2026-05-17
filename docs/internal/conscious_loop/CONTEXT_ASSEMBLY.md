@@ -21,11 +21,11 @@ pipeline. Nothing else reaches the model.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 78), `apply_identity_lifecycle_context()` (line 221), retrieved+attachment projection merge (lines 117-131), assembly limit constants (lines 19-21) |
-| `crates/harness/src/attachments.rs` | `register_ingress_attachments()` (line 89), `process_ingress_attachment()` (line 235), `project_ingress_attachment_context()` (line 517), attachment projection limits (lines 14-15) |
-| `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 185), `ensure_episode_retrieval_artifacts()` (line 255), `fetch_retrieval_candidates()` (line 448), `score_candidates()` (line 516), `load_episode_context()` (line 623), `sanitize_retrieval_text()` (line 680), `is_sparse_follow_up_trigger()` (line 873) |
-| `crates/workers/src/main.rs` | `foreground_context_policy()` (line 680), `classify_foreground_context()` (line 725), `retrieval_eligible_for_scenario()` (line 765), `schema_disclosure_for_scenario()` (line 790), `build_model_input()` (line 824), `format_assistant_conversation_excerpt()` (line 1025), `enforce_foreground_input_budget()` (line 1071), `summarize_prompt_metrics()` (line 1138), `sparse_confirmation_context()` (line 1382), `troubleshooting_guidance_message()` (line 1509), `identity_kickstart_schema_message()` (line 1533), `governed_action_schema_message()` (line 1601), `governed_action_reminder_message()` (line 1675), `is_foreground_visible_context_text()` (line 2757), `retrieved_context_summary()` (line 2832), `retrieved_episode_message_summary()` (line 2867), `sanitize_assistant_history_excerpt_text()` (line 2914) |
-| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 440), `predefined_identity_templates()` (line 646), `predefined_identity_delta()` (line 672), `RetrievedEpisodeContext` (line 1105), `PromptCompositionMetrics` (line 1883), `ModelCallRequest.prompt_metrics` (line 1906) |
+| `crates/harness/src/context.rs` | `assemble_foreground_context()` (line 78), `apply_identity_lifecycle_context()` (line 222), retrieved+attachment projection merge (lines 117-131), assembly limit constants (lines 19-21) |
+| `crates/harness/src/attachments.rs` | `register_ingress_attachments()` (line 104), `process_ingress_attachment()` (line 244), `project_ingress_attachment_context()` (line 530), attachment projection limits (lines 14-15) |
+| `crates/harness/src/retrieval.rs` | `assemble_retrieved_context()` (line 186), `ensure_episode_retrieval_artifacts()` (line 256), `fetch_retrieval_candidates()` (line 449), `score_candidates()` (line 517), `load_episode_context()` (line 624), `sanitize_retrieval_text()` (line 681), `is_sparse_follow_up_trigger()` (line 874) |
+| `crates/workers/src/main.rs` | `foreground_context_policy()` (line 684), `classify_foreground_context()` (line 729), `retrieval_eligible_for_scenario()` (line 769), `schema_disclosure_for_scenario()` (line 794), `build_model_input()` (line 828), `format_assistant_conversation_excerpt()` (line 1040), `enforce_foreground_input_budget()` (line 1086), `summarize_prompt_metrics()` (line 1153), `sparse_confirmation_context()` (line 1397), `troubleshooting_guidance_message()` (line 1524), `identity_kickstart_schema_message()` (line 1548), `governed_action_schema_message()` (line 1616), `governed_action_reminder_message()` (line 1704), `governed_action_repair_guidance_message()` (line 1711), `is_foreground_visible_context_text()` (line 2667), `retrieved_context_summary()` (line 2742), `retrieved_episode_message_summary()` (line 2777), `sanitize_assistant_history_excerpt_text()` (line 2824) |
+| `crates/contracts/src/lib.rs` | `SelfModelSnapshot` (line 476), `predefined_identity_templates()` (line 682), `predefined_identity_delta()` (line 708), `RetrievedEpisodeContext` (line 1141), `PromptCompositionMetrics` (line 2019), `ModelCallRequest.prompt_metrics` (line 2051) |
 | `config/self_model_seed.toml` | Bootstrap self-model and seed identity values |
 | `config/default.toml` | `harness.default_foreground_token_budget` |
 
@@ -68,15 +68,15 @@ details.
 
 ### Token Budget
 
-Computed in `build_model_call_request()` (`crates/workers/src/main.rs:489`):
+Computed in `build_model_call_request()` (`crates/workers/src/main.rs:585`):
 
 | Field | Value | Source |
 |---|---|---|
 | `token_budget` | `4_000` (default) | `config/default.toml: harness.default_foreground_token_budget` |
-| `max_output_tokens` | `min(token_budget, 800)` | `crates/workers/src/main.rs:494` |
-| `max_input_tokens` | `max(1, token_budget - max_output_tokens)` | `crates/workers/src/main.rs:495` |
+| `max_output_tokens` | `min(token_budget, 800)` | `crates/workers/src/main.rs:590` |
+| `max_input_tokens` | `max(1, token_budget - max_output_tokens)` | `crates/workers/src/main.rs:591` |
 
-The unconscious loop uses the same pattern but caps `max_output_tokens` at `1_200` (`crates/workers/src/main.rs:525`).
+The unconscious loop uses the same pattern but caps `max_output_tokens` at `1_200` (`crates/workers/src/main.rs:621`).
 
 Foreground prompt assembly now performs a final budget pass inside `build_model_input()`. The worker estimates input size with a coarse character-based token heuristic and trims low-priority context until the estimated foreground request fits `max_input_tokens` or no further safe trims remain. The trim order is deterministic:
 
@@ -90,7 +90,7 @@ The current trigger message, governed-action instructions, identity-kickstart gu
 
 ### System Prompt Template
 
-Constructed in `build_model_input()` at `crates/workers/src/main.rs:587`. Exact format:
+Constructed in `build_model_input()` at `crates/workers/src/main.rs:828`. Exact format:
 
 ```
 You are {stable_identity}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.
@@ -163,25 +163,26 @@ Messages are appended in this order by `build_model_input()`:
 | N+3 | Developer | `"Retrieved canonical context: ..."` content-first list with compact memory artifact text, concise episode summaries, timestamps, relevance reason, and short user/assistant cues only when useful; durable IDs are not included in the model-facing summary. Retrieval refresh and reload suppress failed/error episodes, instruction bleed, and normalized assistant-history prefixes before this text is surfaced. Processed attachment excerpts from the triggering ingress are merged into the same bounded retrieved-context channel as `attachment_excerpt` items. | Only if `retrieved_context.items` is non-empty and scenario policy marks retrieval eligible |
 | N+4 | Developer | Governed action observations plus, when available, foreground action-loop state | If `governed_action_observations` is non-empty |
 | N+4 (alt) | Developer | Sparse-confirmation bridge note that binds a terse trigger such as `yes` to the immediately preceding assistant prompt | If governed action observations are empty and `sparse_confirmation_context()` detects a recent assistant confirmation prompt |
-| N+5 (alt) | Developer | Full governed action schema or short governed-action reminder | If governed action observations are empty |
-| N+6 (alt) | Developer | Troubleshooting capability guidance | If governed action observations are empty and the current trigger asks about errors, traces, logs, diagnostics, debugging, or failures |
-| N+7 (alt) | Developer | Identity kickstart action block schema and predefined template summaries | If governed action observations are empty and identity kickstart is available |
+| N+5 (alt) | Developer | Malformed-action repair guidance with exact prior validation failure | If governed action observations are empty and `governed_action_loop_state.repair_guidance` is present |
+| N+6 (alt) | Developer | Full governed action schema or short governed-action reminder | If governed action observations are empty |
+| N+7 (alt) | Developer | Troubleshooting capability guidance | If governed action observations are empty and the current trigger asks about errors, traces, logs, diagnostics, debugging, or failures |
+| N+8 (alt) | Developer | Identity kickstart action block schema and predefined template summaries | If governed action observations are empty and identity kickstart is available |
 
-`ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:474`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
+`ModelMessageRole::Developer` maps to `"system"` in the API request body (`crates/harness/src/model_gateway.rs:601`). Multiple system-role messages in the messages array are valid in the ZAi/OpenAI-compatible API format used.
 
 When governed action observations are present, `build_model_input()` appends a Developer message that summarizes the observations, includes the current `ForegroundGovernedActionLoopState` when the harness supplied it, and explicitly tells the worker to continue the same foreground turn. The worker may propose another governed action in that same turn if it is still needed, but the harness remains the authority for whether the proposal is allowed, approval-gated, or denied under policy, the configured per-turn action cap, and the remaining loop budget.
 
-When governed action observations are absent, the worker no longer receives the full governed-action schema on every turn. `schema_disclosure_for_scenario()` injects the full schema for explicit action requests, reminder scheduling, troubleshooting turns, approval follow-ups, sparse confirmations, natural-language confirmation variants, and malformed-action retries. Routine chat and plain factual turns receive the short reminder from `governed_action_reminder_message()` instead.
+When governed action observations are absent, the worker no longer receives the full governed-action schema on every turn. `schema_disclosure_for_scenario()` injects the full schema for explicit action requests, reminder scheduling, troubleshooting turns, approval follow-ups, sparse confirmations, natural-language confirmation variants, and malformed-action retries. Routine chat and plain factual turns receive the short reminder from `governed_action_reminder_message()` instead. On harness-initiated malformed-action retries, `governed_action_repair_guidance_message()` is inserted before schema/reminder disclosure with the prior validation failure details and retry attempt index.
 
-`sparse_confirmation_context()` in `crates/workers/src/main.rs:1382` is the foreground guard for replies such as `yes`, `well yes`, `ok`, `sure`, `go ahead`, `please do`, or short retry utterances after a malformed action proposal. When the trigger is a terse confirmation or retry and the most recent assistant history message looks like a request to proceed, approve an action, or retry the previous task, prompt assembly adds a Developer bridge note and suppresses retrieved canonical context for that turn. This keeps the model anchored on the immediately preceding assistant question instead of replaying unrelated retrieval summaries.
+`sparse_confirmation_context()` in `crates/workers/src/main.rs:1397` is the foreground guard for replies such as `yes`, `well yes`, `ok`, `sure`, `go ahead`, `please do`, or short retry utterances after a malformed action proposal. When the trigger is a terse confirmation or retry and the most recent assistant history message looks like a request to proceed, approve an action, or retry the previous task, prompt assembly adds a Developer bridge note and suppresses retrieved canonical context for that turn. This keeps the model anchored on the immediately preceding assistant question instead of replaying unrelated retrieval summaries.
 
-Assistant history now has a prompt-time sanitation pass separate from persistence normalization. `sanitize_assistant_history_excerpt_text()` in `crates/workers/src/main.rs:2914` removes already-persisted instruction bleed, standalone governed-action control payloads, and operational runtime summaries such as `foreground response completed for ...` before those lines can be replayed into later model calls through `recent_history`. Scenario policy also suppresses stale approval and malformed-action residue for independent routine and factual turns.
+Assistant history now has a prompt-time sanitation pass separate from persistence normalization. `sanitize_assistant_history_excerpt_text()` in `crates/workers/src/main.rs:2824` removes already-persisted instruction bleed, standalone governed-action control payloads, and operational runtime summaries such as `foreground response completed for ...` before those lines can be replayed into later model calls through `recent_history`. Scenario policy also suppresses stale approval and malformed-action residue for independent routine and factual turns.
 
 The worker now records prompt-composition metrics directly on each `ModelCallRequest` through `prompt_metrics`. These metrics include post-trim character counts for system prompt, developer messages, user messages, assistant-history messages, total estimated input tokens, any trim events applied during final assembly, the scenario label, schema disclosure mode, retrieval eligibility, and high-level inclusion/exclusion decisions. Because the full `ModelCallRequest` is already retained at the worker gateway boundary, these metrics become visible in retained trace payloads without a second prompt-analysis pass.
 
-Troubleshooting is progressively disclosed by scenario policy. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:1509` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
+Troubleshooting is progressively disclosed by scenario policy. When the current user trigger asks about errors, traces, logs, diagnostics, debugging, or failures, `troubleshooting_guidance_message()` in `crates/workers/src/main.rs:1524` adds a bounded operational note. The note frames the assistant as the conscious identity rather than the harness, allows read-only inspection of `PHILOSOPHY.md`, canonical docs, and `docs/internal/`, and instructs the worker to use the harness-native `run_diagnostic` governed action rather than `run_subprocess` for runtime troubleshooting. It explicitly excludes mutating admin commands and preserves the rule that the conscious loop cannot directly mutate memory, identity, storage, workers, or harness internals.
 
-Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2486` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2514`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. Both durable persistence and user delivery now normalize repeated `[... UTC] Assistant:` wrappers before storage so contaminated assistant-history prefixes do not recursively accumulate across turns. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
+Approval-triggered governed actions add one more persistence rule: after an approved action executes, `approval_follow_up_episode_text()` in `crates/harness/src/foreground_orchestration.rs:2809` stores the model follow-up text first, then appends the harness observation. That persisted message is then available to later context assembly through normal `recent_history`, independent of the transient `governed_action_observations` field used for the immediate follow-up call. The model text comes first because `history_message_char_limit` truncates from the start of each message; user-visible commitments such as follow-up actions must survive even when a long fetched preview is appended. Telegram delivery uses `approval_follow_up_delivery_text()` in `crates/harness/src/foreground_orchestration.rs:2837`, so the user sees only the model-facing follow-up text while the harness observation remains in durable context. Both durable persistence and user delivery now normalize repeated `[... UTC] Assistant:` wrappers before storage so contaminated assistant-history prefixes do not recursively accumulate across turns. For `web_fetch`, the observation text contains the formatter kind and a bounded model-facing preview produced by `FetchedContentFormatter` (`crates/harness/src/fetched_content.rs:27`), including terminal-style `<pre>` extraction for HTML responses when present, while the full raw body remains in the execution record payload.
 
 ### Self-Model Seed
 
@@ -189,7 +190,7 @@ Location: `config/self_model_seed.toml`. Loaded by
 `self_model::load_self_model_snapshot()`. Flat seed fields preserve the legacy
 bootstrap self-model, while `[identity]` seed fields provide initial rich
 identity context until a complete identity is selected. `SelfModelSnapshot` is
-defined in `crates/contracts/src/lib.rs:440`.
+defined in `crates/contracts/src/lib.rs:476`.
 
 | Field | Type | Semantic meaning |
 |---|---|---|
@@ -224,18 +225,18 @@ conversation can resume deterministically. Each answer is persisted in
 harness into canonical identity items and a complete lifecycle transition.
 
 Worker-side identity block parsing is intentionally tolerant:
-`build_identity_kickstart_proposals()` in `crates/workers/src/main.rs:1441`
+`build_identity_kickstart_proposals()` in `crates/workers/src/main.rs:1831`
 ignores malformed optional identity blocks rather than failing the whole worker
 turn. `parse_identity_interview_answer()` in
-`crates/workers/src/main.rs:1530` accepts the canonical structured answer shape,
+`crates/workers/src/main.rs:1919` accepts the canonical structured answer shape,
 a plain string answer, or a missing/null answer that can be inferred from the
 current trigger and `kickstart.next_step`.
 
 Foreground orchestration augments worker-emitted proposals through
 `foreground_candidate_proposals()`
-(`crates/harness/src/foreground_orchestration.rs:2523`). If the worker omits an
+(`crates/harness/src/foreground_orchestration.rs:2846`). If the worker omits an
 identity block, `inferred_identity_kickstart_proposals()`
-(`crates/harness/src/foreground_orchestration.rs:2665`) can still infer a
+(`crates/harness/src/foreground_orchestration.rs:2988`) can still infer a
 bounded harness-native proposal from obvious bootstrap custom-start or
 predefined-template intent, and from non-ambiguous answers while a custom
 interview is in progress. Ambiguous acknowledgements such as `ok` do not become
@@ -245,7 +246,7 @@ Foreground delivery treats the stripped control-block text as the primary
 assistant reply. If the model emits only a control block, or if the harness
 inferred an identity kickstart proposal, the harness falls back inside
 `foreground_assistant_delivery_text()`
-(`crates/harness/src/foreground_orchestration.rs:2537`): pending approvals use
+(`crates/harness/src/foreground_orchestration.rs:2860`): pending approvals use
 an approval-specific continuation prompt, and identity kickstart proposals use a
 bounded identity-specific prompt such as the first custom interview question.
 Custom interview prompt text is owned by
@@ -256,20 +257,24 @@ empty-response fallback.
 
 After Telegram chat metadata has been parsed, foreground failures are also
 reported back to the user through `record_and_deliver_foreground_failure()`
-(`crates/harness/src/foreground_orchestration.rs:1891`). The message generated
+(`crates/harness/src/foreground_orchestration.rs:2076`). The message generated
 by `foreground_failure_notice_text()`
-(`crates/harness/src/foreground_orchestration.rs:2259`) includes the trace id
+(`crates/harness/src/foreground_orchestration.rs:2444`) includes the trace id
 and failure kind, and known classes such as worker protocol failure and
 scheduled foreground validation failure give a specific `admin trace explain`
-next step instead of only asking the user to retry. The same bounded notice is
+next step instead of only asking the user to retry. For malformed governed-action
+proposal failures, the notice also points operators to
+`admin trace explain --trace-id <trace-id> --focus failing-model-call --json`
+so they can inspect the exact retained model-call payload that triggered the
+failure classification. The same bounded notice is
 persisted as an assistant episode message through `persist_foreground_failure_notice()`
-(`crates/harness/src/foreground_orchestration.rs:1948`) so later context
+(`crates/harness/src/foreground_orchestration.rs:2133`) so later context
 assembly can show the assistant the failure notice and trace id through normal
 `recent_history` and retrieved episode excerpts. The full internal error chain
 remains only in execution records, episode failure summaries, and audit events.
 Terminal foreground failures that reach this path also close the selected
 ingress rows through `mark_terminal_failure_ingress_processed()`
-(`crates/harness/src/foreground_orchestration.rs:1988`). This prevents stale
+(`crates/harness/src/foreground_orchestration.rs:2173`). This prevents stale
 `processing` ingress from being recovered every poll interval after a failure
 notice has already been sent or persisted. Actual Telegram delivery failures for
 a completed assistant reply remain retryable because the user may not have
@@ -281,7 +286,7 @@ received the reply.
 
 ### Tunable Limits
 
-All three assembly limits live as constants in `crates/harness/src/context.rs:18-20` and can be overridden at the call site via `ContextAssemblyLimits`:
+All three assembly limits live as constants in `crates/harness/src/context.rs:19-21` and can be overridden at the call site via `ContextAssemblyLimits`:
 
 | Constant | Default | What it controls |
 |---|---|---|
@@ -291,7 +296,7 @@ All three assembly limits live as constants in `crates/harness/src/context.rs:18
 
 ### Token Budget
 
-Change `harness.default_foreground_token_budget` in `config/local.toml` to override the default of `4_000`. The `max_output_tokens` cap of `800` is hardcoded in `crates/workers/src/main.rs:494` - raise it there if longer responses are needed (re-run the component test suite afterwards).
+Change `harness.default_foreground_token_budget` in `config/local.toml` to override the default of `4_000`. The `max_output_tokens` cap of `800` is hardcoded in `crates/workers/src/main.rs:590` - raise it there if longer responses are needed (re-run the component test suite afterwards).
 
 ### Self-Model Seed
 
@@ -337,4 +342,4 @@ retrieval or schema disclosure by guesswork.
 
 ---
 
-*Last verified: 2026-05-15.*
+*Last verified: 2026-05-17.*
