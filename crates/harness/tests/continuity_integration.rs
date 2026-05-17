@@ -29,11 +29,13 @@ async fn continuity_runtime_retrieves_prior_canonical_memory_on_later_run() -> R
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let first_reply = conscious_structured_reply("assistant reply after preference capture");
+        let second_reply = conscious_structured_reply("assistant reply after retrieval");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": first_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 20, "completion_tokens": 7 }
@@ -43,7 +45,7 @@ async fn continuity_runtime_retrieves_prior_canonical_memory_on_later_run() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after retrieval" },
+                    "message": { "content": second_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 6 }
@@ -106,11 +108,14 @@ async fn continuity_runtime_persists_self_model_into_later_context() -> Result<(
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let first_reply = conscious_structured_reply("assistant reply after preference capture");
+        let second_reply =
+            conscious_structured_reply("assistant reply after self-model carry-forward");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": first_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 20, "completion_tokens": 7 }
@@ -120,7 +125,7 @@ async fn continuity_runtime_persists_self_model_into_later_context() -> Result<(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after self-model carry-forward" },
+                    "message": { "content": second_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 6 }
@@ -181,11 +186,13 @@ async fn continuity_runtime_preserves_backlog_durability_under_single_reply_reco
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let backlog_reply =
+            conscious_structured_reply("assistant reply from continuity backlog integration");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from continuity backlog integration" },
+                    "message": { "content": backlog_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 23, "completion_tokens": 9 }
@@ -294,4 +301,11 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             timeout_ms: 30_000,
         },
     }
+}
+
+fn conscious_structured_reply(text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": text
+    })
+    .to_string()
 }

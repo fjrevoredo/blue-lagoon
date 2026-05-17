@@ -1,8 +1,12 @@
 use std::fmt::Write as _;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use contracts::{
+    LoopKind, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelInput, ModelInputMessage,
+    ModelMessageRole, ModelOutputMode, ModelProviderHint, ModelProviderKind, ToolPolicy,
+};
 use harness::{
     config::RuntimeConfig,
     management::{
@@ -22,7 +26,9 @@ use harness::{
         UpsertScheduledForegroundTaskRequest, WakeSignalSummary, WorkerLeaseInspectionSummary,
         WorkspaceScriptRunSummary,
     },
+    model_gateway,
 };
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 pub struct AdminCommand {
@@ -45,6 +51,7 @@ pub enum AdminSubcommand {
     Integrations(IntegrationsCommand),
     Workspace(WorkspaceCommand),
     Trace(TraceCommand),
+    Model(ModelCommand),
     #[command(name = "wake-signals")]
     WakeSignals(WakeSignalsCommand),
 }
@@ -161,6 +168,24 @@ pub enum TraceRenderFormatArg {
 
 #[derive(Debug, Args)]
 pub struct TraceCleanupModelPayloadsCommand {
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ModelCommand {
+    #[command(subcommand)]
+    pub command: ModelSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelSubcommand {
+    #[command(name = "preflight-structured-output")]
+    PreflightStructuredOutput(ModelPreflightStructuredOutputCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ModelPreflightStructuredOutputCommand {
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -1156,6 +1181,11 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 }
             }
         },
+        AdminSubcommand::Model(command) => match command.command {
+            ModelSubcommand::PreflightStructuredOutput(command) => {
+                run_model_structured_output_preflight(config, command.json).await?;
+            }
+        },
         AdminSubcommand::WakeSignals(command) => match command.command {
             WakeSignalsSubcommand::List(command) => {
                 let signals = management::list_wake_signals(config, command.limit).await?;
@@ -1235,6 +1265,15 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
     if let Some(timeout_ms) = report.model_gateway.timeout_ms {
         println!("  timeout_ms: {timeout_ms}");
     }
+    if let Some(compatible) = report.model_gateway.conscious_structured_output_compatible {
+        println!(
+            "  conscious structured output route compatible: {}",
+            yes_no(compatible)
+        );
+    }
+    if let Some(issue) = &report.model_gateway.conscious_structured_output_issue {
+        println!("  conscious structured output issue: {issue}");
+    }
 
     println!("Self model");
     println!("  configured: {}", yes_no(report.self_model.configured));
@@ -1274,6 +1313,176 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ModelStructuredOutputPreflightReport {
+    status: String,
+    provider: String,
+    model: String,
+    request_id: String,
+    detail: String,
+    response_preview: Option<String>,
+}
+
+async fn run_model_structured_output_preflight(config: &RuntimeConfig, json: bool) -> Result<()> {
+    let gateway = config.require_model_gateway_config()?;
+    let request_id = Uuid::now_v7();
+    let trace_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+
+    let request = ModelCallRequest {
+        request_id,
+        trace_id,
+        execution_id,
+        loop_kind: LoopKind::Conscious,
+        purpose: ModelCallPurpose::ForegroundResponse,
+        task_class: "admin_structured_output_preflight".to_string(),
+        budget: ModelBudget {
+            max_input_tokens: 512,
+            max_output_tokens: 128,
+            timeout_ms: gateway.foreground.timeout_ms.min(20_000),
+        },
+        input: ModelInput {
+            system_prompt: "You are running a structured-output preflight. Return only valid JSON."
+                .to_string(),
+            messages: vec![
+                ModelInputMessage {
+                    role: ModelMessageRole::Developer,
+                    content:
+                        "Return one JSON object with required `assistant_text` and optional `governed_actions`."
+                            .to_string(),
+                },
+                ModelInputMessage {
+                    role: ModelMessageRole::User,
+                    content: "Return a valid preflight response.".to_string(),
+                },
+            ],
+        },
+        prompt_metrics: None,
+        output_mode: ModelOutputMode::JsonObject,
+        schema_name: Some("admin_conscious_output_preflight".to_string()),
+        schema_json: Some(serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["assistant_text"],
+            "properties": {
+                "assistant_text": { "type": "string", "minLength": 1 },
+                "governed_actions": { "type": "array" },
+                "identity_kickstart": { "type": "object" }
+            }
+        })),
+        tool_policy: ToolPolicy::NoTools,
+        provider_hint: Some(ModelProviderHint {
+            preferred_provider: Some(gateway.foreground.provider),
+            preferred_model: Some(gateway.foreground.model.clone()),
+        }),
+    };
+
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let provider = model_provider_identifier(gateway.foreground.provider).to_string();
+    let model = gateway.foreground.model.clone();
+
+    let report =
+        match model_gateway::execute_foreground_model_call(&gateway, &request, &transport).await {
+            Ok(response) => {
+                let validation =
+                    validate_structured_output_preflight_response(response.output.json.as_ref());
+                match validation {
+                    Ok(detail) => ModelStructuredOutputPreflightReport {
+                        status: "success".to_string(),
+                        provider,
+                        model,
+                        request_id: request_id.to_string(),
+                        detail,
+                        response_preview: Some(bounded_preview(&response.output.text, 600)),
+                    },
+                    Err(error) => ModelStructuredOutputPreflightReport {
+                        status: "failed".to_string(),
+                        provider,
+                        model,
+                        request_id: request_id.to_string(),
+                        detail: error.to_string(),
+                        response_preview: Some(bounded_preview(&response.output.text, 600)),
+                    },
+                }
+            }
+            Err(error) => ModelStructuredOutputPreflightReport {
+                status: "failed".to_string(),
+                provider,
+                model,
+                request_id: request_id.to_string(),
+                detail: error.to_string(),
+                response_preview: None,
+            },
+        };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Structured output preflight");
+        println!("  status: {}", report.status);
+        println!("  provider: {}", report.provider);
+        println!("  model: {}", report.model);
+        println!("  request_id: {}", report.request_id);
+        println!("  detail: {}", report.detail);
+        if let Some(preview) = &report.response_preview {
+            println!("  response preview: {preview}");
+        }
+    }
+
+    if report.status != "success" {
+        bail!("structured-output preflight failed");
+    }
+
+    Ok(())
+}
+
+fn validate_structured_output_preflight_response(
+    json: Option<&serde_json::Value>,
+) -> Result<String> {
+    let Some(output_json) = json else {
+        bail!("provider response did not include output.json for json_object mode");
+    };
+    let Some(obj) = output_json.as_object() else {
+        bail!("provider output.json was not an object");
+    };
+
+    let assistant_text = obj
+        .get("assistant_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if assistant_text.trim().is_empty() {
+        bail!("provider output.json.assistant_text must be a non-empty string");
+    }
+
+    if let Some(governed_actions) = obj.get("governed_actions") {
+        let Some(actions) = governed_actions.as_array() else {
+            bail!("provider output.json.governed_actions must be an array when present");
+        };
+        if actions.len() > 1 {
+            bail!("provider output.json.governed_actions may include at most one proposal");
+        }
+    }
+
+    Ok("response JSON matched conscious structured-output baseline".to_string())
+}
+
+fn bounded_preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.trim().replace('\n', "\\n");
+    if preview.chars().count() <= max_chars {
+        return preview;
+    }
+    preview = preview.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn model_provider_identifier(provider: ModelProviderKind) -> &'static str {
+    match provider {
+        ModelProviderKind::ZAi => "z_ai",
+        ModelProviderKind::OpenRouter => "openrouter",
+    }
 }
 
 fn print_health_summary(summary: OperationalHealthSummary, json: bool) -> Result<()> {
@@ -3905,6 +4114,26 @@ mod tests {
                 assert_eq!(command.limit, 3);
             }
             other => panic!("expected actions list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_model_structured_output_preflight_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "model",
+            "preflight-structured-output",
+            "--json",
+        ])
+        .expect("model structured-output preflight command should parse");
+
+        match command.command {
+            AdminSubcommand::Model(ModelCommand {
+                command: ModelSubcommand::PreflightStructuredOutput(command),
+            }) => {
+                assert!(command.json);
+            }
+            other => panic!("expected model preflight command, got {other:?}"),
         }
     }
 

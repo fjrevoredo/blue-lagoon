@@ -266,6 +266,8 @@ pub struct ModelGatewayStatusReport {
     pub api_key_env: Option<String>,
     pub api_key_present: bool,
     pub timeout_ms: Option<u64>,
+    pub conscious_structured_output_compatible: Option<bool>,
+    pub conscious_structured_output_issue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4590,15 +4592,25 @@ fn inspect_telegram_status(config: &RuntimeConfig) -> TelegramStatusReport {
 
 fn inspect_model_gateway_status(config: &RuntimeConfig) -> ModelGatewayStatusReport {
     match &config.model_gateway {
-        Some(model_gateway) => ModelGatewayStatusReport {
-            configured: true,
-            provider: Some(model_gateway.foreground.provider.identifier().to_string()),
-            model: Some(model_gateway.foreground.model.clone()),
-            api_base_url: model_gateway.foreground.api_base_url.clone(),
-            api_key_env: Some(model_gateway.foreground.api_key_env.clone()),
-            api_key_present: env_var_present(&model_gateway.foreground.api_key_env),
-            timeout_ms: Some(model_gateway.foreground.timeout_ms),
-        },
+        Some(model_gateway) => {
+            let structured_output_compatibility =
+                model_gateway.validate_foreground_structured_output_route();
+            ModelGatewayStatusReport {
+                configured: true,
+                provider: Some(model_gateway.foreground.provider.identifier().to_string()),
+                model: Some(model_gateway.foreground.model.clone()),
+                api_base_url: model_gateway.foreground.api_base_url.clone(),
+                api_key_env: Some(model_gateway.foreground.api_key_env.clone()),
+                api_key_present: env_var_present(&model_gateway.foreground.api_key_env),
+                timeout_ms: Some(model_gateway.foreground.timeout_ms),
+                conscious_structured_output_compatible: Some(
+                    structured_output_compatibility.is_ok(),
+                ),
+                conscious_structured_output_issue: structured_output_compatibility
+                    .err()
+                    .map(|error| error.to_string()),
+            }
+        }
         None => ModelGatewayStatusReport {
             configured: false,
             provider: None,
@@ -4607,6 +4619,8 @@ fn inspect_model_gateway_status(config: &RuntimeConfig) -> ModelGatewayStatusRep
             api_key_env: None,
             api_key_present: false,
             timeout_ms: None,
+            conscious_structured_output_compatible: None,
+            conscious_structured_output_issue: None,
         },
     }
 }

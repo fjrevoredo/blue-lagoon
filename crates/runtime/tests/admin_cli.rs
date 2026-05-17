@@ -31,6 +31,7 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .stdout(predicate::str::contains("integrations"))
         .stdout(predicate::str::contains("workspace"))
         .stdout(predicate::str::contains("trace"))
+        .stdout(predicate::str::contains("model"))
         .stdout(predicate::str::contains("wake-signals"));
     Ok(())
 }
@@ -104,6 +105,21 @@ fn admin_trace_cleanup_help_lists_json_argument() -> Result<()> {
         .arg("admin")
         .arg("trace")
         .arg("cleanup-model-payloads")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_model_preflight_help_lists_json_argument() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("model")
+        .arg("preflight-structured-output")
         .arg("--help");
     command
         .assert()

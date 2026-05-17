@@ -2444,7 +2444,7 @@ where
 fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
     match failure_kind {
         ForegroundFailureKind::MalformedActionProposal => format!(
-            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the relevant model-call payload with `admin trace explain --trace-id {trace_id} --focus failing-model-call --json`.",
+            "I couldn't complete that because the assistant failed to produce a valid structured governed-action response for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the relevant model-call payload with `admin trace explain --trace-id {trace_id} --focus failing-model-call --json`.",
             failure_kind.as_str()
         ),
         ForegroundFailureKind::WorkerProtocolFailure => format!(
@@ -2557,23 +2557,7 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
         return ForegroundFailureKind::ModelGatewayTransportFailure;
     }
     if message.contains("worker_error_code=invalid_model_output")
-        && (message.contains("invalid governed-action proposal block")
-            || message.contains(
-                "attempted a governed action without the required governed-action block",
-            )
-            || message.contains(
-                "returned a likely governed-action payload outside the required governed-action block",
-            )
-            || message.contains(
-                "governed-action control block marker was present but the block was malformed or incomplete",
-            ))
-    {
-        return ForegroundFailureKind::MalformedActionProposal;
-    }
-    if message.contains("invalid governed-action proposal block")
-        || message.contains("attempted a governed action without the required governed-action block")
-        || message.contains("returned a likely governed-action payload outside the required governed-action block")
-        || message.contains("governed-action control block marker was present but the block was malformed or incomplete")
+        && message.contains("invalid conscious structured output")
     {
         return ForegroundFailureKind::MalformedActionProposal;
     }
@@ -3534,7 +3518,7 @@ mod tests {
             ForegroundFailureKind::MalformedActionProposal,
         );
 
-        assert!(notice.contains("valid governed-action proposal"));
+        assert!(notice.contains("valid structured governed-action response"));
         assert!(notice.contains("malformed_action_proposal"));
         assert!(notice.contains("admin trace explain --trace-id"));
         assert!(notice.contains("--focus failing-model-call"));
@@ -3573,7 +3557,7 @@ mod tests {
     #[test]
     fn classify_conscious_worker_failure_detects_malformed_action_proposal() {
         let error = anyhow::anyhow!(
-            "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=invalid conscious structured output: `governed_actions` may include at most one proposal per response"
         );
 
         assert_eq!(
@@ -3587,7 +3571,8 @@ mod tests {
         let metadata = contracts::WorkerFailureMetadata {
             failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
             detail: Some(
-                "invalid governed-action proposal block: missing field `actions`".to_string(),
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
             ),
             side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
             retry_recommended: true,
@@ -3610,7 +3595,9 @@ mod tests {
         assert!(signal.retry_recommended);
         assert_eq!(
             signal.detail.as_deref(),
-            Some("invalid governed-action proposal block: missing field `actions`")
+            Some(
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+            )
         );
     }
 
@@ -3619,7 +3606,8 @@ mod tests {
         let metadata = contracts::WorkerFailureMetadata {
             failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
             detail: Some(
-                "invalid governed-action proposal block: missing field `actions`".to_string(),
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
             ),
             side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
             retry_recommended: true,
@@ -3643,7 +3631,8 @@ mod tests {
         let metadata = contracts::WorkerFailureMetadata {
             failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
             detail: Some(
-                "invalid governed-action proposal block: missing field `actions`".to_string(),
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
             ),
             side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
             retry_recommended: false,
@@ -3662,7 +3651,7 @@ mod tests {
         let metadata = contracts::WorkerFailureMetadata {
             failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
             detail: Some(
-                "invalid governed-action proposal block: missing field `artifact_kind`".to_string(),
+                "invalid conscious structured output: model response JSON did not match conscious output contract: missing field `artifact_kind`".to_string(),
             ),
             side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
             retry_recommended: true,

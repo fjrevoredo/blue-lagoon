@@ -112,8 +112,9 @@ Current compatibility rules:
 - `model_gateway.openrouter.reasoning_effort` remains accepted as a
   compatibility alias only when the selected route reasoning mode is absent.
 - Explicit reasoning levels are currently rejected for `z_ai` routes.
-- Explicit reasoning levels are currently rejected for OpenRouter `auto`
-  routing if that route is configured in the future.
+- Foreground conscious structured-output routing rejects OpenRouter `auto`
+  (`auto` / `openrouter/auto`) and requires a pinned model id in
+  `<provider>/<model>` form.
 
 ### Response Parsing
 
@@ -219,6 +220,19 @@ BLUE_LAGOON_UNCONSCIOUS_REASONING_MODE=minimal
 BLUE_LAGOON_UNCONSCIOUS_API_KEY=<secret>
 ```
 
+### Structured-Output Preflight
+
+Run:
+
+```text
+cargo run -p runtime -- admin model preflight-structured-output
+```
+
+This performs one foreground conscious `json_object` model call against the
+resolved foreground route and fails closed unless the provider returns
+`output.json` with non-empty `assistant_text` and (when present) a bounded
+`governed_actions` array.
+
 ### Adding A Provider
 
 1. Add a `ModelProviderKind` variant with an explicit serialized label.
@@ -252,4 +266,4 @@ BLUE_LAGOON_UNCONSCIOUS_API_KEY=<secret>
 
 ---
 
-Verified: 2026-05-15.
+Verified: 2026-05-17.

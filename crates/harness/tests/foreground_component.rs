@@ -1813,7 +1813,7 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
         status: 200,
         body: serde_json::json!({
             "choices": [{
-                "message": { "content": "hello from fake provider" },
+                "message": { "content": conscious_output_content("hello from fake provider") },
                 "finish_reason": "stop"
             }],
             "usage": {
@@ -1830,7 +1830,10 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
     assert_eq!(response.request_id, request.request_id);
     assert_eq!(response.provider, contracts::ModelProviderKind::ZAi);
     assert_eq!(response.model, "z-ai-foreground");
-    assert_eq!(response.output.text, "hello from fake provider");
+    assert_eq!(
+        response.output.text,
+        conscious_output_content("hello from fake provider")
+    );
 
     let seen = transport.seen_requests();
     assert_eq!(seen.len(), 1);
@@ -2003,7 +2006,7 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2066,7 +2069,7 @@ async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2136,7 +2139,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2308,7 +2311,7 @@ async fn foreground_orchestration_infers_custom_identity_start_without_worker_bl
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "" },
+                    "message": { "content": conscious_output_content("Starting the custom identity interview. What name should this assistant identity use?") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2441,7 +2444,7 @@ async fn planned_foreground_orchestration_processes_backlog_batch_with_single_re
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply for delayed backlog" },
+                    "message": { "content": conscious_output_content("assistant reply for delayed backlog") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2697,7 +2700,9 @@ async fn foreground_orchestration_resteers_malformed_action_and_completes() -> R
                 .join("config")
                 .join("self_model_seed.toml"),
         });
-        config.governed_actions.malformed_action_resteer_max_attempts = 1;
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
         config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
@@ -2723,7 +2728,10 @@ async fn foreground_orchestration_resteers_malformed_action_and_completes() -> R
             body: serde_json::json!({
                 "choices": [{
                     "message": {
-                        "content": "I will inspect this now.\n```blue-lagoon-governed-actions\n{\"version\":\"1\"}\n```"
+                        "content": serde_json::json!({
+                            "assistant_text": "I will inspect this now.",
+                            "governed_actions": [{ "version": "1" }]
+                        }).to_string()
                     },
                     "finish_reason": "stop"
                 }],
@@ -2738,7 +2746,7 @@ async fn foreground_orchestration_resteers_malformed_action_and_completes() -> R
             body: serde_json::json!({
                 "choices": [{
                     "message": {
-                        "content": "Recovered response after repair."
+                        "content": conscious_output_content("Recovered response after repair.")
                     },
                     "finish_reason": "stop"
                 }],
@@ -2780,24 +2788,32 @@ async fn foreground_orchestration_resteers_malformed_action_and_completes() -> R
             .get("messages")
             .and_then(serde_json::Value::as_array)
             .expect("provider request should include messages");
-        assert!(second_request_messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
-            .any(|content| {
-                content.contains("Harness requested a malformed-action repair retry")
-                    && content.contains("missing field `actions`")
-            }));
+        assert!(
+            second_request_messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+                .any(|content| {
+                    content.contains("Harness requested a malformed-action repair retry")
+                        && content.contains("invalid conscious structured output")
+                })
+        );
 
         let audit_events = audit::list_for_execution(&ctx.pool, completed.execution_id).await?;
-        assert!(audit_events.iter().any(|event| {
-            event.event_kind == "foreground_malformed_action_resteer_attempt"
-        }));
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_kind == "foreground_execution_completed"));
-        assert!(!audit_events
-            .iter()
-            .any(|event| event.event_kind == "foreground_execution_failed"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| { event.event_kind == "foreground_malformed_action_resteer_attempt" })
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_completed")
+        );
+        assert!(
+            !audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_failed")
+        );
 
         Ok(())
     })
@@ -2815,7 +2831,9 @@ async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhau
                 .join("config")
                 .join("self_model_seed.toml"),
         });
-        config.governed_actions.malformed_action_resteer_max_attempts = 1;
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
         config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
@@ -2842,7 +2860,10 @@ async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhau
                 body: serde_json::json!({
                     "choices": [{
                         "message": {
-                            "content": "Retrying.\n```blue-lagoon-governed-actions\n{\"version\":\"1\"}\n```"
+                            "content": serde_json::json!({
+                                "assistant_text": "Retrying.",
+                                "governed_actions": [{ "version": "1" }]
+                            }).to_string()
                         },
                         "finish_reason": "stop"
                     }],
@@ -2868,7 +2889,7 @@ async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhau
         assert!(
             error
                 .to_string()
-                .contains("invalid governed-action proposal block")
+                .contains("invalid conscious structured output")
         );
 
         let execution_row = sqlx::query(
@@ -2883,12 +2904,16 @@ async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhau
         .await?;
         let execution_id: Uuid = execution_row.get("execution_id");
         let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
-        assert!(audit_events.iter().any(|event| {
-            event.event_kind == "foreground_malformed_action_resteer_attempt"
-        }));
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_kind == "foreground_execution_failed"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| { event.event_kind == "foreground_malformed_action_resteer_attempt" })
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_failed")
+        );
 
         let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
         assert!(diagnostics.iter().any(|diagnostic| {
@@ -3011,7 +3036,7 @@ async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fixture runtime path" },
+                    "message": { "content": conscious_output_content("assistant reply from fixture runtime path") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -3178,7 +3203,7 @@ async fn runtime_fixture_resumes_stale_processing_backlog_without_new_accepted_u
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after resumed backlog" },
+                    "message": { "content": conscious_output_content("assistant reply after resumed backlog") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -3305,7 +3330,7 @@ async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "scheduled proactive reply" },
+                    "message": { "content": conscious_output_content("scheduled proactive reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -3425,7 +3450,7 @@ async fn scheduled_foreground_runtime_executes_one_shot_task_and_disables_after_
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "one-shot proactive reply" },
+                    "message": { "content": conscious_output_content("one-shot proactive reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -4279,6 +4304,13 @@ fn sample_capability_scope() -> CapabilityScope {
             max_stderr_bytes: 32_768,
         },
     }
+}
+
+fn conscious_output_content(assistant_text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": assistant_text,
+    })
+    .to_string()
 }
 
 async fn insert_pending_ingress(

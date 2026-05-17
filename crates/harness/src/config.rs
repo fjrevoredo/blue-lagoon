@@ -1191,9 +1191,14 @@ impl TelegramForegroundBindingConfig {
 }
 
 impl ModelGatewayConfig {
+    pub fn validate_foreground_structured_output_route(&self) -> Result<()> {
+        validate_conscious_structured_output_route(self, &self.foreground, "foreground")
+    }
+
     fn validate(&self) -> Result<()> {
         validate_model_route(self, &self.foreground, "foreground")?;
         validate_model_route(self, &self.unconscious, "unconscious")?;
+        self.validate_foreground_structured_output_route()?;
         if let Some(z_ai) = &self.z_ai
             && z_ai
                 .api_base_url
@@ -1280,6 +1285,30 @@ fn validate_model_route(
     if route.timeout_ms == 0 {
         bail!("model_gateway.{route_name}.timeout_ms must be greater than zero");
     }
+    Ok(())
+}
+
+fn validate_conscious_structured_output_route(
+    _gateway: &ModelGatewayConfig,
+    route: &ForegroundModelRouteConfig,
+    route_name: &str,
+) -> Result<()> {
+    if route.provider != ModelProviderKind::OpenRouter {
+        return Ok(());
+    }
+
+    let model = route.model.trim();
+    if model.eq_ignore_ascii_case("auto") || model.eq_ignore_ascii_case("openrouter/auto") {
+        bail!(
+            "model_gateway.{route_name}.model '{model}' is unsupported for conscious structured-output mode: OpenRouter auto routing is not allowed; use a pinned provider/model id such as 'openai/gpt-5.2'"
+        );
+    }
+    if !model.contains('/') {
+        bail!(
+            "model_gateway.{route_name}.model '{model}' is unsupported for conscious structured-output mode: expected pinned OpenRouter model id in '<provider>/<model>' form"
+        );
+    }
+
     Ok(())
 }
 
@@ -2664,7 +2693,7 @@ api_surface = "coding"
 {}
 [model_gateway.foreground]
 provider = "openrouter"
-model = "configured-model"
+model = "openai/gpt-5.2"
 api_key_env = "BLUE_LAGOON_TEST_FOREGROUND_API_KEY"
 timeout_ms = 30000
 
@@ -3192,6 +3221,100 @@ api_surface = "coding"
             .expect_err("unsupported reasoning mode should fail");
         assert!(error.to_string().contains("reasoning_mode"));
         assert!(error.to_string().contains("z_ai"));
+    }
+
+    #[test]
+    fn validate_rejects_openrouter_auto_for_conscious_structured_output() {
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "auto".to_string(),
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                reasoning_mode: Some(ForegroundReasoningMode::Off),
+                api_key_env: "BLUE_LAGOON_TEST_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
+            unconscious: sample_unconscious_route(),
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: None,
+                exclude_reasoning: None,
+            }),
+        });
+
+        let error = config
+            .validate()
+            .expect_err("openrouter auto route should be rejected for conscious structured output");
+        assert!(
+            error
+                .to_string()
+                .contains("OpenRouter auto routing is not allowed")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_openrouter_unpinned_model_for_conscious_structured_output() {
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "gpt-5.2".to_string(),
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                reasoning_mode: Some(ForegroundReasoningMode::Off),
+                api_key_env: "BLUE_LAGOON_TEST_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
+            unconscious: sample_unconscious_route(),
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: None,
+                exclude_reasoning: None,
+            }),
+        });
+
+        let error = config.validate().expect_err(
+            "unpinned openrouter model should be rejected for conscious structured output",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("expected pinned OpenRouter model id")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_openrouter_pinned_model_for_conscious_structured_output() {
+        let mut config = sample_config();
+        config.model_gateway = Some(ModelGatewayConfig {
+            foreground: ForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                reasoning_mode: Some(ForegroundReasoningMode::Off),
+                api_key_env: "BLUE_LAGOON_TEST_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
+            unconscious: sample_unconscious_route(),
+            z_ai: None,
+            openrouter: Some(OpenRouterProviderConfig {
+                api_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                http_referer: None,
+                app_title: None,
+                reasoning_effort: None,
+                exclude_reasoning: None,
+            }),
+        });
+
+        config
+            .validate()
+            .expect("pinned openrouter model should be accepted for conscious structured output");
     }
 
     #[test]

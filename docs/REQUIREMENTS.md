@@ -101,6 +101,15 @@ This specification does not select:
 - The conscious loop MUST NOT directly instantiate or control unconscious workers.
 - The conscious loop MUST NOT bypass harness policy or permission checks.
 
+### 6.3 Output constraints
+- Conscious workers MUST return structured outputs only.
+- Foreground structured output MUST include a required user-facing reply field.
+- Governed-action proposals and identity-control directives, when present, MUST
+  be carried as optional structured fields in the same foreground output object.
+- A conscious worker response MUST include at most one governed-action proposal;
+  additional action rounds, if needed, MUST occur through harness-mediated
+  continuation turns.
+
 ## 7. Unconscious loop requirements
 
 ### 7.1 Responsibilities

@@ -22,10 +22,34 @@ use contracts::{
     WorkerFailureSideEffectStatus, WorkerPayload, WorkerRequest, WorkerResponse, WorkerResult,
     predefined_identity_delta,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-const GOVERNED_ACTIONS_BLOCK_TAG: &str = "blue-lagoon-governed-actions";
+const CONSCIOUS_OUTPUT_SCHEMA_NAME: &str = "conscious_foreground_output";
+const STRUCTURED_OUTPUT_ERROR_PREFIX: &str = "invalid conscious structured output";
+#[cfg(test)]
 const IDENTITY_KICKSTART_BLOCK_TAG: &str = "blue-lagoon-identity-kickstart";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsciousModelOutputEnvelope {
+    assistant_text: String,
+    #[serde(default)]
+    governed_actions: Vec<GovernedActionProposal>,
+    #[serde(default)]
+    identity_kickstart: Option<ConsciousIdentityKickstartDirective>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsciousIdentityKickstartDirective {
+    action: String,
+    #[serde(default)]
+    template_key: Option<String>,
+    #[serde(default)]
+    answer: Option<serde_json::Value>,
+    #[serde(default)]
+    cancel_reason: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundMessageKind {
@@ -605,9 +629,9 @@ fn build_model_call_request(
         },
         input,
         prompt_metrics: Some(prompt_metrics),
-        output_mode: ModelOutputMode::PlainText,
-        schema_name: None,
-        schema_json: None,
+        output_mode: ModelOutputMode::JsonObject,
+        schema_name: Some(CONSCIOUS_OUTPUT_SCHEMA_NAME.to_string()),
+        schema_json: Some(conscious_foreground_output_schema()),
         tool_policy: ToolPolicy::ProposalOnly,
         provider_hint: None,
     }
@@ -676,6 +700,37 @@ fn identity_reflection_output_schema() -> serde_json::Value {
                 "type": "array",
                 "description": "Optional wake-signal requests when user guidance or later foreground attention is warranted.",
                 "items": { "type": "object" }
+            }
+        }
+    })
+}
+
+fn conscious_foreground_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assistant_text"],
+        "properties": {
+            "assistant_text": {
+                "type": "string",
+                "description": "User-facing assistant reply text."
+            },
+            "governed_actions": {
+                "type": "array",
+                "description": "Optional governed-action proposals. At most one proposal is allowed per response.",
+                "items": { "type": "object" }
+            },
+            "identity_kickstart": {
+                "type": ["object", "null"],
+                "description": "Optional identity kickstart control directive.",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "action": { "type": "string" },
+                    "template_key": { "type": ["string", "null"] },
+                    "answer": {},
+                    "cancel_reason": { "type": ["string", "null"] }
+                }
             }
         }
     })
@@ -901,6 +956,11 @@ fn build_model_input(
         });
     }
 
+    let repair_guidance = context
+        .governed_action_loop_state
+        .as_ref()
+        .and_then(|state| state.repair_guidance.as_ref());
+
     if policy.schema_disclosure == SchemaDisclosureMode::GovernedActionObservations {
         let loop_state_fragment = context
             .governed_action_loop_state
@@ -921,6 +981,18 @@ fn build_model_input(
             ),
             kind: ForegroundMessageKind::GovernedActionObservations,
         });
+        if let Some(repair_guidance) = repair_guidance {
+            messages.push(ForegroundMessageCandidate {
+                role: ModelMessageRole::Developer,
+                content: governed_action_repair_guidance_message(repair_guidance),
+                kind: ForegroundMessageKind::GovernedActionInstructions,
+            });
+        }
+        messages.push(ForegroundMessageCandidate {
+            role: ModelMessageRole::Developer,
+            content: governed_action_reminder_message(),
+            kind: ForegroundMessageKind::GovernedActionInstructions,
+        });
     } else {
         if let Some(confirmation) = &sparse_confirmation {
             messages.push(ForegroundMessageCandidate {
@@ -929,11 +1001,7 @@ fn build_model_input(
                 kind: ForegroundMessageKind::ConfirmationBridge,
             });
         }
-        if let Some(repair_guidance) = context
-            .governed_action_loop_state
-            .as_ref()
-            .and_then(|state| state.repair_guidance.as_ref())
-        {
+        if let Some(repair_guidance) = repair_guidance {
             messages.push(ForegroundMessageCandidate {
                 role: ModelMessageRole::Developer,
                 content: governed_action_repair_guidance_message(repair_guidance),
@@ -990,7 +1058,7 @@ fn build_model_input(
     let identity_fragment = identity_system_prompt_fragment(context);
 
     let system_prompt = format!(
-        "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nOperational estimates from harness counters: load_estimate={load}%, health_estimate={health}%, confidence_estimate={confidence}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. When an action is required, never output only an action or payload name; emit the full tagged governed-action JSON block.",
+        "You are {name}, a harness-governed personal AI assistant. You communicate with a single privileged user via Telegram.\n\nRole: {role}. Communication style: {style}. Behavioral preferences: {preferences}.{identity}\n\nCapabilities: {capabilities}.\nActive constraints: {constraints}.\nGoals: {goals}.{subgoals}{conditions}\n\nCurrent time: {current_time}.\n\nOperational estimates from harness counters: load_estimate={load}%, health_estimate={health}%, confidence_estimate={confidence}%, foreground_mode={mode}. Treat these as derived runtime signals, not as personal knowledge or proof that work happened.\n\nYou have governed actions available for executing commands and running workspace scripts. Network access is disabled by default; any proposal with network enabled is automatically routed for approval. See the developer message for the full action schema. Never tell the user you have no tools — use the governed action system when needed. Always produce one structured JSON object with `assistant_text` and optional control fields.",
         name = foreground_label_or_default(&context.self_model.stable_identity, "blue-lagoon"),
         role = foreground_label_or_default(&context.self_model.role, "personal_assistant"),
         style = foreground_label_or_default(&context.self_model.communication_style, "direct"),
@@ -1058,11 +1126,10 @@ fn should_replay_assistant_history(
     normalized_text: &str,
 ) -> bool {
     match policy.scenario {
-        ForegroundContextScenario::RoutineGreeting
-        | ForegroundContextScenario::PlainFactualQuestion => {
-            !is_stale_approval_or_failure_history(normalized_text)
-        }
-        _ => true,
+        ForegroundContextScenario::TerseConfirmation
+        | ForegroundContextScenario::NaturalLanguageConfirmation
+        | ForegroundContextScenario::RetryAfterMalformedAction => true,
+        _ => !is_stale_approval_or_failure_history(normalized_text),
     }
 }
 
@@ -1516,7 +1583,7 @@ fn assistant_message_invites_retry(message: &str) -> bool {
 
 fn sparse_confirmation_bridge_message(context: &SparseConfirmationContext) -> String {
     format!(
-        "The current user message is a terse confirmation (`{}`) replying to the immediately preceding assistant prompt. Treat it as consent to continue the specific pending action implied by that prompt, not as a new standalone topic. Anchor on the latest assistant message: \"{}\". If continuing requires a governed action, respond normally to the user and append the governed-action JSON block for that specific action.",
+        "The current user message is a terse confirmation (`{}`) replying to the immediately preceding assistant prompt. Treat it as consent to continue the specific pending action implied by that prompt, not as a new standalone topic. Anchor on the latest assistant message: \"{}\". If continuing requires a governed action, respond normally to the user and include the action in the structured `governed_actions` field.",
         context.normalized_trigger, context.antecedent_assistant_message
     )
 }
@@ -1593,30 +1660,33 @@ Resume summary: {resume_summary}
 Predefined identities:
 {templates}
 
-To request identity formation, append exactly one fenced code block tagged "{tag}" after your user-visible reply. Omit this block unless the user is choosing, starting, answering, or canceling identity formation.
+If identity formation is needed in this turn, set the optional `identity_kickstart` field in the structured output object. Keep user-visible text in `assistant_text`.
 
-```{tag}
+`identity_kickstart` example:
 {{
   "action": "select_predefined_identity",
-  "template_key": "<one predefined identity key, or null>",
+  "template_key": "<one predefined identity key>",
   "answer": null,
   "cancel_reason": null
 }}
-```
 
-For a custom path, use action "start_custom_identity_interview" or "answer_custom_identity_question". For cancellation, use action "cancel_identity_formation"."#,
+For a custom path, use action `start_custom_identity_interview` or `answer_custom_identity_question`. For cancellation, use `cancel_identity_formation`."#,
         available_actions = available_actions.join(", "),
         next_step = next_step,
         resume_summary = resume_summary,
         templates = templates,
-        tag = IDENTITY_KICKSTART_BLOCK_TAG,
     ))
 }
 
 fn governed_action_schema_message() -> String {
-    let template = r#"GOVERNED ACTION SYSTEM
+    r#"GOVERNED ACTION SYSTEM
 
-To perform an action, append exactly one fenced code block tagged "TAG" after your user-visible reply. Omit the block entirely if no action is needed. Keep all user-facing text outside the block. Returning only an action name such as "list_workspace_artifacts" is invalid; you must emit the full tagged JSON block. Use the exact action-kind names listed below and do not invent aliases such as "read_workspace_artifacts". Tool-call wrappers such as {"governed-action": {"name": "...", "arguments": {...}}} are also invalid.
+Return one structured JSON object with:
+- `assistant_text`: required user-visible reply string
+- `governed_actions`: optional array of governed-action proposals (at most one proposal per response)
+- `identity_kickstart`: optional identity control object
+
+Returning only an action name such as "list_workspace_artifacts" is invalid. Use the exact action-kind names listed below and do not invent aliases such as "read_workspace_artifacts". Tool-call wrappers such as {"governed-action": {"name": "...", "arguments": {...}}} are invalid.
 
 Available action kinds:
 - inspect_workspace_artifact: inspect one non-script workspace artifact by UUID
@@ -1642,10 +1712,10 @@ Available action kinds:
 - run_workspace_script: run a registered workspace script by its script_id UUID
 - web_fetch: perform an HTTP GET request to a URL (requires network: "enabled"; automatically routed for approval)
 
-Block format (wrap all proposals in {"actions": [...]}):
-```TAG
+Structured output format example:
 {
-  "actions": [
+  "assistant_text": "I found the script metadata. Running it now.",
+  "governed_actions": [
     {
       "proposal_id": "<generate a fresh UUID v4>",
       "title": "<one-line description>",
@@ -1665,7 +1735,6 @@ Block format (wrap all proposals in {"actions": [...]}):
     }
   ]
 }
-```
 
 Alternate payload shape for run_workspace_script:
 - "payload": { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
@@ -1697,22 +1766,18 @@ Alternate payload shape for web_fetch:
 - capability_scope.environment: { "allow_variables": [] }
 - capability_scope.execution: { "timeout_ms": 0, "max_stdout_bytes": 0, "max_stderr_bytes": 0 } (ignored for web_fetch)
 
-Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action in each model response; if another action is needed after an observation, the harness will make another bounded same-turn model call."#;
-    template.replace("TAG", GOVERNED_ACTIONS_BLOCK_TAG)
+Scope rules: filesystem.read_roots must be non-empty for subprocess/script actions. write_roots only if the action writes files. Propose at most one action in each model response; if another action is needed after an observation, the harness will make another bounded same-turn model call."#.to_string()
 }
 
 fn governed_action_reminder_message() -> String {
-    format!(
-        "If a governed action is needed, add at most one fenced `{}` JSON block after the user-visible reply. Omit the block entirely when no action is needed.",
-        GOVERNED_ACTIONS_BLOCK_TAG
-    )
+    "Return one structured JSON object with `assistant_text`. If a governed action is needed, set `governed_actions` to an array with at most one full proposal object; otherwise omit `governed_actions` or set it to an empty array.".to_string()
 }
 
 fn governed_action_repair_guidance_message(
     guidance: &contracts::ForegroundGovernedActionRepairGuidance,
 ) -> String {
     format!(
-        "Harness requested a malformed-action repair retry (attempt {attempt} of {max_attempts}). Previous governed-action output failed validation with failure kind `{failure_kind}` and detail: {detail}. Do not repeat the invalid shape. If an action is needed, return a corrected governed-action JSON block with all required fields and exact action-kind names. If no action is needed, do not emit a governed-action block.",
+        "Harness requested a malformed-action repair retry (attempt {attempt} of {max_attempts}). Previous structured output failed validation with failure kind `{failure_kind}` and detail: {detail}. Do not repeat the invalid shape. Return one corrected structured JSON object with required `assistant_text` and, only when needed, a corrected `governed_actions` proposal using exact action-kind names.",
         attempt = guidance.attempt_index,
         max_attempts = guidance.max_attempts,
         failure_kind = match guidance.failure_kind {
@@ -1756,68 +1821,58 @@ fn governed_action_loop_state_summary(
     )
 }
 
+fn structured_output_error(details: impl AsRef<str>) -> String {
+    format!("{STRUCTURED_OUTPUT_ERROR_PREFIX}: {}", details.as_ref())
+}
+
+fn parse_conscious_model_output(
+    model_response: &ModelCallResponse,
+) -> std::result::Result<ConsciousModelOutputEnvelope, String> {
+    let model_json = model_response.output.json.as_ref().ok_or_else(|| {
+        structured_output_error("model response did not include `output.json` for json_object mode")
+    })?;
+    let output: ConsciousModelOutputEnvelope =
+        serde_json::from_value(model_json.clone()).map_err(|error| {
+            structured_output_error(format!(
+                "model response JSON did not match conscious output contract: {error}"
+            ))
+        })?;
+
+    if output.assistant_text.trim().is_empty() {
+        return Err(structured_output_error(
+            "`assistant_text` must be a non-empty string",
+        ));
+    }
+    if output.governed_actions.len() > 1 {
+        return Err(structured_output_error(
+            "`governed_actions` may include at most one proposal per response",
+        ));
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
 fn build_governed_action_proposals(
     _context: &ConsciousContext,
     model_text: &str,
 ) -> std::result::Result<Vec<GovernedActionProposal>, String> {
-    let Some(block_json) = extract_governed_action_block(model_text) else {
-        return Ok(Vec::new());
-    };
-
-    #[derive(serde::Deserialize)]
-    struct GovernedActionEnvelope {
-        actions: Vec<GovernedActionProposal>,
-    }
-
-    serde_json::from_str::<GovernedActionEnvelope>(block_json)
-        .map(|envelope| envelope.actions)
-        .map_err(|error| format!("invalid governed-action proposal block: {error}"))
-}
-
-fn validate_governed_action_response_shape(
-    model_text: &str,
-    assistant_text: &str,
-    proposals: &[GovernedActionProposal],
-) -> std::result::Result<(), String> {
-    if !proposals.is_empty() {
-        return Ok(());
-    }
-
-    let action_marker = format!("```{GOVERNED_ACTIONS_BLOCK_TAG}");
-    if model_text.contains(&action_marker) && extract_governed_action_block(model_text).is_none() {
-        return Err(
-            "governed-action control block marker was present but the block was malformed or incomplete"
-                .to_string(),
-        );
-    }
-
-    let trimmed = assistant_text.trim();
-    if let Some(action_name) = detect_bare_governed_action_invocation(trimmed) {
-        return Err(format!(
-            "model attempted a governed action without the required governed-action block; returned bare action token '{action_name}'"
+    let output: ConsciousModelOutputEnvelope =
+        serde_json::from_str(model_text).map_err(|error| {
+            structured_output_error(format!(
+                "model response JSON did not match conscious output contract: {error}"
+            ))
+        })?;
+    if output.governed_actions.len() > 1 {
+        return Err(structured_output_error(
+            "`governed_actions` may include at most one proposal per response",
         ));
     }
-    if looks_like_untagged_governed_action_payload(trimmed) {
-        return Err(
-            "model returned a likely governed-action payload outside the required governed-action block"
-                .to_string(),
-        );
-    }
-
-    Ok(())
-}
-
-fn is_malformed_governed_action_proposal_error(message: &str) -> bool {
-    message.contains("invalid governed-action proposal block")
-        || message.contains("attempted a governed action without the required governed-action block")
-        || message.contains("returned a likely governed-action payload outside the required governed-action block")
-        || message.contains(
-            "governed-action control block marker was present but the block was malformed or incomplete",
-        )
+    Ok(output.governed_actions)
 }
 
 fn invalid_model_output_metadata(message: &str) -> Option<WorkerFailureMetadata> {
-    if !is_malformed_governed_action_proposal_error(message) {
+    if !message.starts_with(STRUCTURED_OUTPUT_ERROR_PREFIX) {
         return None;
     }
     Some(WorkerFailureMetadata {
@@ -1828,43 +1883,83 @@ fn invalid_model_output_metadata(message: &str) -> Option<WorkerFailureMetadata>
     })
 }
 
+fn identity_action_kind_from_str(action: &str) -> Option<IdentityKickstartActionKind> {
+    match action {
+        "select_predefined_identity" => Some(IdentityKickstartActionKind::SelectPredefinedTemplate),
+        "start_custom_identity_interview" => {
+            Some(IdentityKickstartActionKind::StartCustomInterview)
+        }
+        "answer_custom_identity_question" => {
+            Some(IdentityKickstartActionKind::AnswerCustomInterview)
+        }
+        "cancel_identity_formation" => Some(IdentityKickstartActionKind::Cancel),
+        _ => None,
+    }
+}
+
 fn build_identity_kickstart_proposals(
     context: &ConsciousContext,
-    model_text: &str,
+    directive: Option<&ConsciousIdentityKickstartDirective>,
 ) -> std::result::Result<Vec<CanonicalProposal>, String> {
-    let Some(block_json) = extract_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG) else {
+    let Some(directive) = directive else {
         return Ok(Vec::new());
     };
+    let kickstart = context
+        .self_model
+        .identity_lifecycle
+        .kickstart
+        .as_ref()
+        .ok_or_else(|| {
+            structured_output_error(
+                "identity_kickstart directive was provided but kickstart context is unavailable",
+            )
+        })?;
     if !context.self_model.identity_lifecycle.kickstart_available {
-        return Ok(Vec::new());
-    }
-    #[derive(serde::Deserialize)]
-    struct IdentityKickstartBlock {
-        action: String,
-        template_key: Option<String>,
-        answer: Option<serde_json::Value>,
-        cancel_reason: Option<String>,
+        return Err(structured_output_error(
+            "identity_kickstart directive was provided but kickstart is unavailable",
+        ));
     }
 
-    let block: IdentityKickstartBlock = match serde_json::from_str(block_json) {
-        Ok(block) => block,
-        Err(_) => return Ok(Vec::new()),
-    };
-    match block.action.as_str() {
+    let action_kind = identity_action_kind_from_str(directive.action.trim()).ok_or_else(|| {
+        structured_output_error(format!(
+            "identity_kickstart.action '{}' is unsupported",
+            directive.action
+        ))
+    })?;
+    if !kickstart.available_actions.contains(&action_kind) {
+        return Err(structured_output_error(format!(
+            "identity_kickstart.action '{}' is not available in this lifecycle step",
+            directive.action
+        )));
+    }
+
+    match directive.action.as_str() {
         "select_predefined_identity" => {
             if context.self_model.identity_lifecycle.state
                 != IdentityLifecycleState::BootstrapSeedOnly
             {
-                return Ok(Vec::new());
+                return Err(structured_output_error(
+                    "select_predefined_identity is only valid in bootstrap_seed_only state",
+                ));
             }
-            let Some(template_key) = block.template_key.as_deref() else {
-                return Ok(Vec::new());
-            };
-            let Some(delta) =
+            let template_key = directive
+                .template_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    structured_output_error(
+                        "identity_kickstart.template_key is required for select_predefined_identity",
+                    )
+                })?;
+            let delta =
                 predefined_identity_delta(template_key, context.trigger.ingress.occurred_at)
-            else {
-                return Ok(Vec::new());
-            };
+                    .ok_or_else(|| {
+                        structured_output_error(format!(
+                            "identity_kickstart.template_key '{}' is unknown",
+                            template_key
+                        ))
+                    })?;
             Ok(vec![CanonicalProposal {
                 proposal_id: uuid::Uuid::now_v7(),
                 proposal_kind: CanonicalProposalKind::IdentityDelta,
@@ -1893,10 +1988,12 @@ fn build_identity_kickstart_proposals(
             "User started a custom identity interview.",
         )]),
         "answer_custom_identity_question" => {
-            let Some(answer) = parse_identity_interview_answer(context, block.answer.as_ref())?
-            else {
-                return Ok(Vec::new());
-            };
+            let answer = parse_identity_interview_answer(context, directive.answer.as_ref())?
+                .ok_or_else(|| {
+                    structured_output_error(
+                        "identity_kickstart.answer is required or inferable for answer_custom_identity_question",
+                    )
+                })?;
             Ok(vec![identity_interview_action_proposal(
                 context,
                 IdentityKickstartAction::AnswerCustomInterview(answer),
@@ -1907,12 +2004,14 @@ fn build_identity_kickstart_proposals(
         "cancel_identity_formation" => Ok(vec![identity_interview_action_proposal(
             context,
             IdentityKickstartAction::Cancel {
-                reason: block.cancel_reason,
+                reason: directive.cancel_reason.clone(),
             },
             IdentityLifecycleState::BootstrapSeedOnly,
             "User cancelled identity formation.",
         )]),
-        _ => Ok(Vec::new()),
+        _ => Err(structured_output_error(
+            "identity_kickstart action did not match supported action set",
+        )),
     }
 }
 
@@ -2004,130 +2103,6 @@ fn identity_interview_action_proposal(
             rationale: rationale.to_string(),
         }),
     }
-}
-
-fn strip_worker_control_blocks(model_text: &str) -> String {
-    let without_identity = strip_tagged_block(model_text, IDENTITY_KICKSTART_BLOCK_TAG);
-    strip_tagged_block(&without_identity, GOVERNED_ACTIONS_BLOCK_TAG)
-}
-
-fn detect_bare_governed_action_invocation(text: &str) -> Option<&str> {
-    const GOVERNED_ACTION_BARE_TOKENS: &[&str] = &[
-        "inspect_workspace_artifact",
-        "list_workspace_artifacts",
-        "create_workspace_artifact",
-        "update_workspace_artifact",
-        "list_workspace_scripts",
-        "inspect_workspace_script",
-        "create_workspace_script",
-        "append_workspace_script_version",
-        "list_workspace_script_runs",
-        "inspect_ingress_attachments",
-        "process_ingress_attachment",
-        "list_calendar_events",
-        "upsert_calendar_event",
-        "list_email_messages",
-        "send_email_message",
-        "sync_task_list",
-        "upsert_scheduled_foreground_task",
-        "request_background_job",
-        "run_diagnostic",
-        "run_subprocess",
-        "run_workspace_script",
-        "web_fetch",
-    ];
-
-    GOVERNED_ACTION_BARE_TOKENS
-        .iter()
-        .copied()
-        .find(|token| text == *token)
-        .or_else(|| looks_like_bare_governed_action_alias(text).then_some(text))
-}
-
-fn looks_like_bare_governed_action_alias(text: &str) -> bool {
-    if text.is_empty() || text.contains(char::is_whitespace) {
-        return false;
-    }
-    if !text
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return false;
-    }
-
-    let actionish_prefix = [
-        "inspect_", "list_", "create_", "update_", "append_", "request_", "run_", "upsert_",
-        "read_",
-    ]
-    .iter()
-    .any(|prefix| text.starts_with(prefix));
-    if !actionish_prefix {
-        return false;
-    }
-
-    text == "web_fetch"
-        || text.contains("workspace_")
-        || text.contains("artifact")
-        || text.contains("script")
-        || text.contains("diagnostic")
-        || text.contains("subprocess")
-        || text.contains("background_job")
-        || text.contains("foreground_task")
-}
-
-fn looks_like_untagged_governed_action_payload(text: &str) -> bool {
-    let jsonish = strip_json_language_prefix(text);
-    (jsonish.starts_with('{')
-        && jsonish.contains("\"actions\"")
-        && (jsonish.contains("\"action_kind\"") || jsonish.contains("\"payload\"")))
-        || (jsonish.starts_with('{')
-            && jsonish.contains("\"payload\"")
-            && jsonish.contains("\"kind\"")
-            && jsonish.contains("\"value\""))
-        || (jsonish.starts_with('{')
-            && jsonish.contains("\"governed-action\"")
-            && jsonish.contains("\"name\"")
-            && jsonish.contains("\"arguments\""))
-}
-
-fn strip_json_language_prefix(text: &str) -> &str {
-    let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("json\n") {
-        return rest.trim_start();
-    }
-    if let Some(rest) = trimmed.strip_prefix("json\r\n") {
-        return rest.trim_start();
-    }
-    trimmed
-}
-
-fn strip_tagged_block(model_text: &str, tag: &str) -> String {
-    match tagged_block_bounds(model_text, tag) {
-        Some((start, _json_start, _json_end, _end)) => model_text[..start].trim_end().to_string(),
-        None => model_text.to_string(),
-    }
-}
-
-fn extract_governed_action_block(model_text: &str) -> Option<&str> {
-    extract_tagged_block(model_text, GOVERNED_ACTIONS_BLOCK_TAG)
-}
-
-fn extract_tagged_block<'a>(model_text: &'a str, tag: &str) -> Option<&'a str> {
-    tagged_block_bounds(model_text, tag)
-        .map(|(_start, json_start, json_end, _end)| model_text[json_start..json_end].trim())
-}
-
-fn tagged_block_bounds(model_text: &str, tag: &str) -> Option<(usize, usize, usize, usize)> {
-    let marker = format!("```{tag}");
-    let start = model_text.rfind(&marker)?;
-    let after_marker = &model_text[start + marker.len()..];
-    let newline_offset = after_marker.find('\n')?;
-    let json_start = start + marker.len() + newline_offset + 1;
-    let after_json = &model_text[json_start..];
-    let fence_offset = after_json.find("\n```")?;
-    let json_end = json_start + fence_offset;
-    let end = json_end + "\n```".len();
-    Some((start, json_start, json_end, end))
 }
 
 fn governed_action_kind_as_str(kind: contracts::GovernedActionKind) -> &'static str {
@@ -2233,20 +2208,14 @@ fn build_conscious_worker_response(
     payload: &ConsciousWorkerRequest,
     model_response: ModelCallResponse,
 ) -> std::result::Result<WorkerResponse, String> {
+    let structured_output = parse_conscious_model_output(&model_response)?;
     let mut candidate_proposals = build_candidate_proposals(&payload.context)?;
     candidate_proposals.extend(build_identity_kickstart_proposals(
         &payload.context,
-        &model_response.output.text,
+        structured_output.identity_kickstart.as_ref(),
     )?);
-    let governed_action_proposals =
-        build_governed_action_proposals(&payload.context, &model_response.output.text)?;
-    let assistant_text =
-        normalize_assistant_history_text(&strip_worker_control_blocks(&model_response.output.text));
-    validate_governed_action_response_shape(
-        &model_response.output.text,
-        &assistant_text,
-        &governed_action_proposals,
-    )?;
+    let governed_action_proposals = structured_output.governed_actions;
+    let assistant_text = normalize_assistant_history_text(&structured_output.assistant_text);
     Ok(WorkerResponse {
         request_id: request.request_id,
         trace_id: request.trace_id,
@@ -2841,8 +2810,10 @@ fn is_assistant_history_noise_text(value: &str) -> bool {
             || lowered.contains("\"actions\""));
     let noise_fragments = [
         "do not propose multiple actions in a single response",
-        "if a governed action is needed, add at most one fenced",
+        "return one structured json object with `assistant_text`",
         "governed action system",
+        "<governed-action>",
+        "</governed-action>",
         "blue-lagoon-governed-actions",
         "approval requested. use the approval prompt above to continue",
         "harness governed-action observation",
@@ -3178,7 +3149,12 @@ mod tests {
         assert_eq!(model_request.loop_kind, LoopKind::Conscious);
         assert_eq!(model_request.purpose, ModelCallPurpose::ForegroundResponse);
         assert_eq!(model_request.budget.timeout_ms, 30_000);
-        assert_eq!(model_request.output_mode, ModelOutputMode::PlainText);
+        assert_eq!(model_request.output_mode, ModelOutputMode::JsonObject);
+        assert_eq!(
+            model_request.schema_name.as_deref(),
+            Some(CONSCIOUS_OUTPUT_SCHEMA_NAME)
+        );
+        assert!(model_request.schema_json.is_some());
         assert_eq!(model_request.tool_policy, ToolPolicy::ProposalOnly);
         assert!(model_request.input.system_prompt.contains("blue-lagoon"));
         assert!(model_request.input.system_prompt.contains("conversation"));
@@ -3216,7 +3192,7 @@ mod tests {
                 .input
                 .messages
                 .iter()
-                .any(|message| { message.content.contains(GOVERNED_ACTIONS_BLOCK_TAG) })
+                .any(|message| { message.content.contains("structured JSON object") })
         );
     }
 
@@ -3250,7 +3226,7 @@ mod tests {
             .input
             .messages
             .iter()
-            .find(|message| message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG))
+            .find(|message| message.content.contains("IDENTITY FORMATION CAPABILITY"))
             .expect("identity formation capability should be present");
 
         assert!(
@@ -3311,7 +3287,7 @@ mod tests {
                 .input
                 .messages
                 .iter()
-                .any(|message| message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG))
+                .any(|message| message.content.contains("IDENTITY FORMATION CAPABILITY"))
         );
         assert!(
             model_request
@@ -3592,23 +3568,8 @@ mod tests {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: "hello back".to_string(),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 12,
-                output_tokens: 4,
-            },
-        };
+        let model_response =
+            conscious_model_response(&request, &model_request, "hello back".to_string());
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
             .expect("worker response should be valid");
@@ -3645,8 +3606,7 @@ mod tests {
             .expect("current dir should resolve")
             .display()
             .to_string();
-        let action_block = serde_json::json!({
-            "actions": [{
+        let governed_action = serde_json::json!({
                 "proposal_id": uuid::Uuid::now_v7(),
                 "title": "Echo test",
                 "rationale": "Need a bounded workspace check",
@@ -3678,29 +3638,16 @@ mod tests {
                         },
                         "working_directory": workspace_root.clone(),
                     },
-                },
-            }],
+                }
         });
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: format!(
-                    "I will run a bounded check.\n```{GOVERNED_ACTIONS_BLOCK_TAG}\n{}\n```",
-                    action_block
-                ),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 20,
-                output_tokens: 12,
-            },
-        };
+        let model_response = conscious_structured_model_response(
+            &request,
+            &model_request,
+            serde_json::json!({
+                "assistant_text": "I will run a bounded check.",
+                "governed_actions": [governed_action],
+            }),
+        );
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
             .expect("worker response should be valid");
@@ -3725,8 +3672,7 @@ mod tests {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let action_block = serde_json::json!({
-            "actions": [{
+        let governed_action = serde_json::json!({
                 "proposal_id": uuid::Uuid::now_v7(),
                 "title": "List workspace artifacts",
                 "rationale": "Need to inspect existing workspace state",
@@ -3750,29 +3696,16 @@ mod tests {
                 "payload": {
                     "kind": "list_workspace_artifacts",
                     "value": {},
-                },
-            }],
+                }
         });
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: format!(
-                    "I will check the workspace list.\n```{GOVERNED_ACTIONS_BLOCK_TAG}\n{}\n```",
-                    action_block
-                ),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 20,
-                output_tokens: 12,
-            },
-        };
+        let model_response = conscious_structured_model_response(
+            &request,
+            &model_request,
+            serde_json::json!({
+                "assistant_text": "I will check the workspace list.",
+                "governed_actions": [governed_action],
+            }),
+        );
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
             .expect("missing read-only list bounds should default");
@@ -3798,103 +3731,72 @@ mod tests {
     }
 
     #[test]
-    fn conscious_worker_response_rejects_bare_governed_action_token() {
+    fn conscious_worker_response_treats_bare_action_token_as_plain_text_without_heuristics() {
         let request =
             WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
         let WorkerPayload::Conscious(payload) = &request.payload else {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: "list_workspace_artifacts".to_string(),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 10,
-                output_tokens: 1,
-            },
-        };
+        let model_response = conscious_model_response(
+            &request,
+            &model_request,
+            "list_workspace_artifacts".to_string(),
+        );
 
-        let error = build_conscious_worker_response(&request, payload.as_ref(), model_response)
-            .expect_err("bare governed action token should be rejected");
-        assert!(error.contains(
-            "model attempted a governed action without the required governed-action block"
-        ));
-        assert!(error.contains("list_workspace_artifacts"));
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("plain assistant_text should be accepted without heuristic rejection");
+        let WorkerResult::Conscious(result) = response.result else {
+            panic!("expected conscious worker result");
+        };
+        assert_eq!(result.assistant_output.text, "list_workspace_artifacts");
+        assert!(result.governed_action_proposals.is_empty());
     }
 
     #[test]
-    fn conscious_worker_response_rejects_bare_unknown_governed_action_alias() {
-        let request =
-            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
-        let WorkerPayload::Conscious(payload) = &request.payload else {
-            panic!("expected conscious payload");
-        };
-        let response = ModelCallResponse {
-            request_id: uuid::Uuid::now_v7(),
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            received_at: chrono::Utc::now(),
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            output: ModelOutput {
-                text: "read_workspace_artifacts".to_string(),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 10,
-                output_tokens: 1,
-            },
-        };
-
-        let error = build_conscious_worker_response(&request, payload, response)
-            .expect_err("bare governed action alias should be rejected");
-        assert!(error.contains(
-            "model attempted a governed action without the required governed-action block"
-        ));
-        assert!(error.contains("read_workspace_artifacts"));
-    }
-
-    #[test]
-    fn conscious_worker_response_rejects_tool_call_style_governed_action_wrapper() {
+    fn conscious_worker_response_treats_bare_action_alias_as_plain_text_without_heuristics() {
         let request =
             WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
         let WorkerPayload::Conscious(payload) = &request.payload else {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: "json\n{\"governed-action\": {\"name\": \"read_workspace_artifacts\", \"arguments\": {}}}".to_string(),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 16,
-                output_tokens: 8,
-            },
-        };
+        let response = conscious_model_response(
+            &request,
+            &model_request,
+            "read_workspace_artifacts".to_string(),
+        );
 
-        let error = build_conscious_worker_response(&request, payload.as_ref(), model_response)
-            .expect_err("tool-call style governed action wrapper should be rejected");
-        assert!(error.contains(
-            "model returned a likely governed-action payload outside the required governed-action block"
-        ));
+        let worker_response = build_conscious_worker_response(&request, payload, response)
+            .expect("plain alias text should be accepted without heuristic rejection");
+        let WorkerResult::Conscious(result) = worker_response.result else {
+            panic!("expected conscious worker result");
+        };
+        assert_eq!(result.assistant_output.text, "read_workspace_artifacts");
+        assert!(result.governed_action_proposals.is_empty());
+    }
+
+    #[test]
+    fn conscious_worker_response_treats_tool_call_wrapper_text_as_plain_text_without_heuristics() {
+        let request =
+            WorkerRequest::conscious(uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), sample_context());
+        let WorkerPayload::Conscious(payload) = &request.payload else {
+            panic!("expected conscious payload");
+        };
+        let model_request = build_model_call_request(&request, payload.as_ref());
+        let model_response = conscious_model_response(
+            &request,
+            &model_request,
+            "json\n{\"governed-action\": {\"name\": \"read_workspace_artifacts\", \"arguments\": {}}}"
+                .to_string(),
+        );
+
+        let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
+            .expect("plain wrapper text should be accepted without heuristic rejection");
+        let WorkerResult::Conscious(result) = response.result else {
+            panic!("expected conscious worker result");
+        };
+        assert!(result.governed_action_proposals.is_empty());
     }
 
     #[test]
@@ -3915,32 +3817,19 @@ mod tests {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let identity_block = serde_json::json!({
-            "action": "select_predefined_identity",
-            "template_key": "continuity_operator",
-            "answer": serde_json::Value::Null,
-            "cancel_reason": serde_json::Value::Null,
-        });
-        let model_response = ModelCallResponse {
-            request_id: model_request.request_id,
-            trace_id: request.trace_id,
-            execution_id: request.execution_id,
-            provider: contracts::ModelProviderKind::ZAi,
-            model: "z-ai-foreground".to_string(),
-            received_at: chrono::Utc::now(),
-            output: ModelOutput {
-                text: format!(
-                    "Continuity Operator selected.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\n{}\n```",
-                    identity_block
-                ),
-                json: None,
-                finish_reason: "stop".to_string(),
-            },
-            usage: ModelUsage {
-                input_tokens: 20,
-                output_tokens: 12,
-            },
-        };
+        let model_response = conscious_structured_model_response(
+            &request,
+            &model_request,
+            serde_json::json!({
+                "assistant_text": "Continuity Operator selected.",
+                "identity_kickstart": {
+                    "action": "select_predefined_identity",
+                    "template_key": "continuity_operator",
+                    "answer": serde_json::Value::Null,
+                    "cancel_reason": serde_json::Value::Null
+                }
+            }),
+        );
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
             .expect("worker response should be valid");
@@ -3992,19 +3881,18 @@ mod tests {
             panic!("expected conscious payload");
         };
         let model_request = build_model_call_request(&request, payload.as_ref());
-        let identity_block = serde_json::json!({
-            "action": "answer_custom_identity_question",
-            "template_key": serde_json::Value::Null,
-            "answer": "Richard",
-            "cancel_reason": serde_json::Value::Null,
-        });
-        let model_response = conscious_model_response(
+        let model_response = conscious_structured_model_response(
             &request,
             &model_request,
-            format!(
-                "Got it.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\n{}\n```",
-                identity_block
-            ),
+            serde_json::json!({
+                "assistant_text": "Got it.",
+                "identity_kickstart": {
+                    "action": "answer_custom_identity_question",
+                    "template_key": serde_json::Value::Null,
+                    "answer": "Richard",
+                    "cancel_reason": serde_json::Value::Null
+                }
+            }),
         );
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
@@ -4045,11 +3933,11 @@ mod tests {
             .iter()
             .filter(|message| message.role == ModelMessageRole::Developer)
             .collect::<Vec<_>>();
-        assert!(
-            developer_messages
-                .iter()
-                .any(|message| { message.content.contains("add at most one fenced") })
-        );
+        assert!(developer_messages.iter().any(|message| {
+            message
+                .content
+                .contains("Return one structured JSON object with `assistant_text`")
+        }));
         assert!(
             !developer_messages
                 .iter()
@@ -4320,7 +4208,7 @@ mod tests {
             "governed_action_observations",
         );
         assert_no_message_kind(&post_execution_request.input, "governed_action_full_schema");
-        assert_no_message_kind(
+        assert_has_message_kind(
             &post_execution_request.input,
             "governed_action_short_reminder",
         );
@@ -4342,6 +4230,63 @@ mod tests {
         );
         assert_has_message_kind(&approval_request.input, "governed_action_full_schema");
         assert_no_message_kind(&approval_request.input, "retrieved_context");
+    }
+
+    #[test]
+    fn post_execution_follow_up_includes_repair_guidance_when_present() {
+        let mut context = ConsciousContextFixture::new()
+            .with_trigger_text("continue")
+            .with_governed_observation()
+            .build();
+        context.governed_action_loop_state = Some(contracts::ForegroundGovernedActionLoopState {
+            executed_action_count: 1,
+            max_actions_per_turn: 10,
+            remaining_actions_before_cap: 9,
+            cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
+            repair_guidance: Some(contracts::ForegroundGovernedActionRepairGuidance {
+                attempt_index: 2,
+                max_attempts: 3,
+                failure_kind: WorkerFailureKind::MalformedActionProposal,
+                failure_detail: Some(
+                    "invalid conscious structured output: model response JSON did not match conscious output contract: unknown field `actions`, expected one of `assistant_text`, `governed_actions`, `identity_kickstart`".to_string(),
+                ),
+            }),
+        });
+
+        let model_request = conscious_model_request_for_context(context);
+        assert_has_message_kind(&model_request.input, "governed_action_observations");
+        assert_has_message_kind(&model_request.input, "governed_action_short_reminder");
+        assert!(
+            model_request.input.messages.iter().any(|message| message
+                .content
+                .contains("Harness requested a malformed-action repair retry")),
+            "expected post-execution repair guidance to be present"
+        );
+    }
+
+    #[test]
+    fn post_execution_follow_up_suppresses_stale_failure_history() {
+        let model_request = conscious_model_request_for_context(
+            ConsciousContextFixture::new()
+                .with_trigger_text("continue")
+                .with_governed_observation()
+                .with_recent_episode(
+                    Some("check each task list"),
+                    Some(
+                        "I couldn't complete that because the assistant failed to produce a valid structured governed-action response for the required task.",
+                    ),
+                )
+                .build(),
+        );
+
+        assert!(
+            !model_request.input.messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("failed to produce a valid structured governed-action response")
+            }),
+            "stale malformed-action failure history should not be replayed in post-execution follow-up"
+        );
     }
 
     #[test]
@@ -4609,7 +4554,7 @@ mod tests {
     }
 
     #[test]
-    fn build_governed_action_proposals_ignores_untagged_payloads() {
+    fn build_governed_action_proposals_rejects_non_json_envelope() {
         let context = sample_context();
         let model_text = r#"json
 {
@@ -4634,33 +4579,30 @@ mod tests {
   ]
 }"#;
 
+        let error = build_governed_action_proposals(&context, model_text)
+            .expect_err("non-JSON envelope should fail closed");
+        assert!(error.starts_with(STRUCTURED_OUTPUT_ERROR_PREFIX));
+    }
+
+    #[test]
+    fn build_governed_action_proposals_accepts_empty_structured_actions() {
+        let context = sample_context();
+        let model_text = r#"{"assistant_text":"done","governed_actions":[]}"#;
+
         let proposals = build_governed_action_proposals(&context, model_text)
-            .expect("untagged payload should be ignored at parser stage");
+            .expect("structured empty governed_actions should parse");
         assert!(proposals.is_empty());
     }
 
     #[test]
-    fn build_governed_action_proposals_requires_tagged_block() {
+    fn build_governed_action_proposals_rejects_unknown_legacy_fields() {
         let context = sample_context();
-        let model_text = "{\"actions\":[]}";
-
-        let proposals = build_governed_action_proposals(&context, model_text)
-            .expect("untagged payload should not be parsed");
-        assert!(proposals.is_empty());
-    }
-
-    #[test]
-    fn build_governed_action_proposals_rejects_missing_actions_field() {
-        let context = sample_context();
-        let model_text = format!(
-            "```{tag}\n{{\"version\":\"1\"}}\n```",
-            tag = GOVERNED_ACTIONS_BLOCK_TAG
-        );
+        let model_text = r#"{"actions":[{"proposal_id":"019e32bf-2ba8-7e62-8949-0dbcf783d488"}]}"#;
 
         let error = build_governed_action_proposals(&context, &model_text)
-            .expect_err("missing actions field should fail closed");
-        assert!(error.contains("invalid governed-action proposal block"));
-        assert!(error.contains("missing field `actions`"));
+            .expect_err("legacy actions-only shape should fail closed");
+        assert!(error.starts_with(STRUCTURED_OUTPUT_ERROR_PREFIX));
+        assert!(error.contains("unknown field `actions`"));
     }
 
     #[test]
@@ -4668,7 +4610,8 @@ mod tests {
         let context = sample_context();
         let proposal_json = format!(
             r#"{{
-  "actions": [
+  "assistant_text": "Inspecting artifact now.",
+  "governed_actions": [
     {{
       "proposal_id": "{proposal_id}",
       "title": "Inspect artifact",
@@ -4693,24 +4636,20 @@ mod tests {
             proposal_id = uuid::Uuid::now_v7(),
             artifact_id = uuid::Uuid::now_v7()
         );
-        let model_text = format!(
-            "```{tag}\n{json}\n```",
-            tag = GOVERNED_ACTIONS_BLOCK_TAG,
-            json = proposal_json
-        );
+        let model_text = proposal_json;
 
         let error = build_governed_action_proposals(&context, &model_text)
             .expect_err("missing required payload field should fail closed");
-        assert!(error.contains("invalid governed-action proposal block"));
+        assert!(error.starts_with(STRUCTURED_OUTPUT_ERROR_PREFIX));
         assert!(error.contains("missing field `artifact_kind`"));
     }
 
     #[test]
-    fn invalid_model_output_metadata_marks_malformed_action_as_recoverable() {
+    fn invalid_model_output_metadata_marks_structured_output_errors_as_recoverable() {
         let metadata = invalid_model_output_metadata(
-            "invalid governed-action proposal block: missing field `actions`",
+            "invalid conscious structured output: `governed_actions` may include at most one proposal per response",
         )
-        .expect("malformed action output should produce metadata");
+        .expect("structured output errors should produce metadata");
         assert_eq!(
             metadata.failure_kind,
             WorkerFailureKind::MalformedActionProposal
@@ -4725,19 +4664,10 @@ mod tests {
 
     #[test]
     fn invalid_model_output_metadata_ignores_non_malformed_errors() {
-        let metadata = invalid_model_output_metadata("identity interview answer was invalid");
+        let metadata = invalid_model_output_metadata(
+            "candidate proposal confidence_pct must be greater than zero",
+        );
         assert!(metadata.is_none());
-    }
-
-    #[test]
-    fn strip_worker_control_blocks_preserves_untagged_payload_text() {
-        let model_text = r#"json
-{
-  "actions": []
-}"#;
-
-        let stripped = strip_worker_control_blocks(model_text);
-        assert!(stripped.contains("\"actions\""));
     }
 
     #[test]
@@ -4759,7 +4689,7 @@ mod tests {
     }
 
     #[test]
-    fn conscious_worker_response_ignores_malformed_identity_block() {
+    fn conscious_worker_response_preserves_plain_text_when_no_identity_directive_is_provided() {
         let mut context = sample_context();
         context.trigger.ingress.text_body = Some("Richard".to_string());
         context.self_model.identity_lifecycle = IdentityLifecycleContext {
@@ -4784,12 +4714,15 @@ mod tests {
         );
 
         let response = build_conscious_worker_response(&request, payload.as_ref(), model_response)
-            .expect("malformed optional identity block should not fail worker response");
+            .expect("plain assistant_text should not fail without identity_kickstart directive");
         let WorkerResult::Conscious(result) = response.result else {
             panic!("expected conscious worker result");
         };
         assert!(result.candidate_proposals.is_empty());
-        assert_eq!(result.assistant_output.text, "Got it.");
+        assert_eq!(
+            result.assistant_output.text,
+            format!("Got it.\n```{IDENTITY_KICKSTART_BLOCK_TAG}\nnot json\n```")
+        );
     }
 
     #[test]
@@ -5364,7 +5297,7 @@ mod tests {
                     "governed_action_full_schema"
                 } else if message.content.contains("TROUBLESHOOTING CAPABILITY") {
                     "troubleshooting_guidance"
-                } else if message.content.contains(IDENTITY_KICKSTART_BLOCK_TAG) {
+                } else if message.content.contains("IDENTITY FORMATION CAPABILITY") {
                     "identity_kickstart_guidance"
                 } else {
                     "governed_action_short_reminder"
@@ -5413,6 +5346,17 @@ mod tests {
         model_request: &contracts::ModelCallRequest,
         text: String,
     ) -> ModelCallResponse {
+        let structured_output = serde_json::json!({
+            "assistant_text": text,
+        });
+        conscious_structured_model_response(request, model_request, structured_output)
+    }
+
+    fn conscious_structured_model_response(
+        request: &WorkerRequest,
+        model_request: &contracts::ModelCallRequest,
+        structured_output: serde_json::Value,
+    ) -> ModelCallResponse {
         ModelCallResponse {
             request_id: model_request.request_id,
             trace_id: request.trace_id,
@@ -5421,8 +5365,9 @@ mod tests {
             model: "z-ai-foreground".to_string(),
             received_at: chrono::Utc::now(),
             output: ModelOutput {
-                text,
-                json: None,
+                text: serde_json::to_string(&structured_output)
+                    .expect("structured output should serialize"),
+                json: Some(structured_output),
                 finish_reason: "stop".to_string(),
             },
             usage: ModelUsage {

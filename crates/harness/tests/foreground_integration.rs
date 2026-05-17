@@ -26,6 +26,13 @@ use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
 
+fn conscious_output_content(assistant_text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": assistant_text,
+    })
+    .to_string()
+}
+
 #[tokio::test]
 #[serial]
 async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit() -> Result<()> {
@@ -45,7 +52,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from foreground integration" },
+                    "message": { "content": conscious_output_content("assistant reply from foreground integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -182,7 +189,7 @@ async fn telegram_fixture_runtime_resteers_malformed_governed_action_and_complet
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after malformed-action repair" },
+                    "message": { "content": conscious_output_content("assistant reply after malformed-action repair") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -281,10 +288,11 @@ async fn telegram_fixture_runtime_run_applies_predefined_identity_selection() ->
             "answer": serde_json::Value::Null,
             "cancel_reason": serde_json::Value::Null,
         });
-        let model_text = format!(
-            "Continuity Operator selected.\n```blue-lagoon-identity-kickstart\n{}\n```",
-            identity_block
-        );
+        let model_text = serde_json::json!({
+            "assistant_text": "Continuity Operator selected.",
+            "identity_kickstart": identity_block,
+        })
+        .to_string();
         let transport = model_gateway::FakeModelProviderTransport::new();
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
@@ -393,10 +401,10 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
             body: serde_json::json!({
                 "choices": [{
                     "message": {
-                        "content": format!(
-                            "Let's build a custom identity.\n```blue-lagoon-identity-kickstart\n{}\n```",
-                            start_block
-                        )
+                        "content": serde_json::json!({
+                            "assistant_text": "Let's build a custom identity.",
+                            "identity_kickstart": start_block,
+                        }).to_string()
                     },
                     "finish_reason": "stop"
                 }],
@@ -419,7 +427,10 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
         )
         .await?;
         assert_eq!(summary.completed_count, 1);
-        assert_eq!(delivery.sent_messages()[0].text, "Let's build a custom identity.");
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Let's build a custom identity."
+        );
 
         let lifecycle = identity::get_current_lifecycle(&ctx.pool)
             .await?
@@ -493,7 +504,8 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
         assert_eq!(completed_interview.status, "completed");
         assert_eq!(completed_interview.current_step, "completed");
 
-        let compact_identity = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        let compact_identity =
+            identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
         assert_eq!(compact_identity.identity_summary, "Lagoon Forge");
         assert!(
             compact_identity
@@ -799,7 +811,7 @@ async fn telegram_fixture_runtime_batch_activates_backlog_recovery() -> Result<(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from backlog runtime integration" },
+                    "message": { "content": conscious_output_content("assistant reply from backlog runtime integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -916,7 +928,7 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": conscious_output_content("assistant reply after preference capture") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -929,7 +941,7 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after retrieval" },
+                    "message": { "content": conscious_output_content("assistant reply after retrieval") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1092,7 +1104,7 @@ async fn staged_document_attachment_is_processed_and_visible_in_model_context() 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply with attachment context" },
+                    "message": { "content": conscious_output_content("assistant reply with attachment context") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1255,7 +1267,7 @@ async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply for duplicate integration" },
+                    "message": { "content": conscious_output_content("assistant reply for duplicate integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1441,7 +1453,7 @@ async fn runtime_fixture_blocks_stale_processing_replay_when_prior_governed_acti
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "unexpected resumed reply" },
+                    "message": { "content": conscious_output_content("unexpected resumed reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1575,7 +1587,7 @@ async fn scheduled_foreground_runtime_run_executes_due_task_through_worker_binar
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "scheduled integration reply" },
+                    "message": { "content": conscious_output_content("scheduled integration reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {

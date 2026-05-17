@@ -143,6 +143,9 @@ api_surface = "coding"
 # "openrouter" in local config or BLUE_LAGOON_FOREGROUND_ROUTE to
 # "openrouter/<provider-model-id>". The default endpoint follows the
 # OpenRouter OpenAI-compatible chat completions API.
+# Conscious structured-output mode requires a pinned model id in
+# "<provider>/<model>" form (for example "openai/gpt-5.2"). Auto routes such as
+# "openrouter/auto" are rejected for foreground conscious calls.
 api_base_url = "https://openrouter.ai/api/v1"
 
 [self_model]

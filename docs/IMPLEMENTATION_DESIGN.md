@@ -92,6 +92,10 @@ A conscious episode should follow this high-level flow:
 5. The conscious loop emits user-facing outputs, episodic records, candidate memories, and optional background job requests.
 6. The loop halts when the goal is satisfied or its budgets are exhausted.
 
+Conscious foreground model outputs should remain structured-only. The user-facing
+reply should be a required field in the same output object that carries optional
+governed-action and identity-control directives.
+
 Allowed conscious triggers remain:
 
 - User input.
@@ -530,6 +534,13 @@ Logical model tiers are also part of the current direction:
 - Tier C: low-cost utility extraction and bounded transforms.
 
 Structured outputs should be the default whenever practical, especially for unconscious work. Unconscious jobs should stay constrained to structured results such as proposals, diagnostics, alerts, retrieval updates, self-model deltas, and optional wake signals.
+
+For conscious foreground routing, structured output support is mandatory rather
+than best-effort. Route selection should fail closed if the configured provider
+or model cannot reliably satisfy `json_object` output mode for foreground calls.
+OpenRouter auto routing should be treated as incompatible for this foreground
+structured-output contract; pinned provider/model identifiers should be used
+instead.
 
 Tool execution stays outside the gateway. The gateway may return structured tool-call candidates or equivalent proposals, but actual tool execution, validation, approval, and routing remain inside the harness execution and policy layers.
 

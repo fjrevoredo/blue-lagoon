@@ -5,10 +5,13 @@
 ## 1. Overview
 
 The governed action system is the conscious loop's proposal-only tool surface.
-The model emits plain text plus, when needed, one fenced JSON proposal block.
-Returning only an action or payload name such as `list_workspace_artifacts` is
-invalid. Invented aliases such as `read_workspace_artifacts` are also invalid.
-These shapes are treated as malformed governed-action proposals.
+The model must return one structured JSON object for foreground turns, with:
+`assistant_text` (required), `governed_actions` (optional array), and
+`identity_kickstart` (optional object). Action proposals are valid only when
+they appear inside `governed_actions` with canonical action-kind names and
+required payload fields. Action-like text in `assistant_text` (for example
+`list_workspace_artifacts` or `read_workspace_artifacts`) is not interpreted as
+an action proposal and never executes side effects.
 Each model response may propose at most one governed action. If another action
 is needed after the harness returns an observation, the harness performs another
 bounded same-turn model call and revalidates the next proposal.
@@ -32,7 +35,7 @@ created.
 | File | Relevant symbol |
 |---|---|
 | `crates/contracts/src/lib.rs` | `WorkerFailureMetadata` (line 228), `ForegroundGovernedActionLoopState` (line 457), `ForegroundGovernedActionRepairGuidance` (line 467), `GovernedActionKind` (line 1422), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1472), workflow integration payload structs (line 1590), `GovernedActionPayload` (line 1787) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 26), `schema_disclosure_for_scenario()` (line 794), `governed_action_schema_message()` (line 1616), `governed_action_reminder_message()` (line 1704), `governed_action_repair_guidance_message()` (line 1711), `build_governed_action_proposals()` (line 1759), `validate_governed_action_response_shape()` (line 1777), `invalid_model_output_metadata()` (line 1819), `governed_action_kind_as_str()` (line 2133) |
+| `crates/workers/src/main.rs` | `CONSCIOUS_OUTPUT_SCHEMA_NAME` (line 27), `schema_disclosure_for_scenario()` (line 849), `governed_action_schema_message()` (line 1681), `governed_action_reminder_message()` (line 1772), `governed_action_repair_guidance_message()` (line 1776), `parse_conscious_model_output()` (line 1828), `build_governed_action_proposals()` (line 1856, test-only guardrail), `invalid_model_output_metadata()` (line 1874), `build_identity_kickstart_proposals()` (line 1900), `governed_action_kind_as_str()` (line 2108) |
 | `crates/harness/src/foreground_orchestration.rs` | `execute_conscious_turn_with_governed_action_loop()` (line 1814), `extract_worker_failure_signal()` (line 2502), `recoverable_malformed_action_signal()` (line 2515), `classify_conscious_worker_failure()` (line 2530), malformed re-steer audit/diagnostic emissions (lines 1903-1936) |
 | `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 537), `execute_inspect_ingress_attachments()` (line 1555), `execute_process_ingress_attachment()` (line 1578), `execute_list_email_messages()` (line 1859), `execute_send_email_message()` (line 1919), `execute_sync_task_list()` (line 1990), `execute_run_diagnostic_action()` (line 2479), `validate_upsert_scheduled_foreground_task_action()` (line 3237), `is_one_shot_scheduled_task_key()` (line 3262), `governed_action_kind_as_str()` (line 4370), `CanonicalGovernedActionPayload` (line 4508) |
 | `crates/harness/src/integrations.rs` | `CalendarIntegrationAdapter` (line 128), `EmailIntegrationAdapter` (line 178), `TaskSyncIntegrationAdapter` (line 228), provider support checks (lines 235-249), deterministic/fake adapters (calendar lines 257/347, email lines 505/600, task sync lines 625/682) |
@@ -94,13 +97,13 @@ explicit action requests, reminder scheduling, troubleshooting turns, approval
 follow-ups, terse confirmation follow-ups such as `yes` or `well yes`, and
 retry-on-last-task follow-ups after a malformed action proposal, scenario policy
 sends the full schema; routine chat and plain factual turns receive only the
-short reminder from `governed_action_reminder_message()`. When an action is needed, the model may
-append one block tagged `blue-lagoon-governed-actions`:
+short reminder from `governed_action_reminder_message()`. When an action is
+needed, the model must return it in the structured output envelope:
 
-````json
-```blue-lagoon-governed-actions
+```json
 {
-  "actions": [
+  "assistant_text": "I can inspect the workspace artifacts now.",
+  "governed_actions": [
     {
       "proposal_id": "<uuid>",
       "title": "<one-line description>",
@@ -121,12 +124,11 @@ append one block tagged `blue-lagoon-governed-actions`:
   ]
 }
 ```
-````
 
-`build_governed_action_proposals()` extracts the last matching tagged block. If
-no tagged block is present, no governed-action proposals are parsed. Untagged
-JSON payloads are rejected by `validate_governed_action_response_shape()` as
-malformed governed-action output. The
+`parse_conscious_model_output()` validates this object from `output.json`
+(`ModelOutputMode::JsonObject`). The envelope must contain non-empty
+`assistant_text` and at most one governed-action proposal. Invalid envelopes
+fail closed as malformed governed-action output. The
 foreground orchestrator may continue through multiple governed-action rounds in
 the same foreground turn: the worker receives harness observations, may propose
 another action if one is still needed, and the harness then decides whether the
@@ -152,14 +154,15 @@ invalid payloads into accepted behavior.
 
 Required behavior:
 
-- Model-emitted action proposals MUST use the tagged
-  `blue-lagoon-governed-actions` block. Any untagged or alternate shape MUST
-  fail as malformed.
-- Missing required proposal fields (for example `actions` or required payload
-  fields like `artifact_kind` for `inspect_workspace_artifact`) MUST fail as
-  malformed; they MUST NOT be defaulted.
-- Bare action tokens, invented aliases, and tool-call wrapper shapes MUST fail
-  as malformed.
+- Model-emitted action proposals MUST use the structured conscious envelope and
+  appear only inside `governed_actions`.
+- Missing required proposal fields (for example `governed_actions` element
+  fields or required payload fields like `artifact_kind` for
+  `inspect_workspace_artifact`) MUST fail as malformed; they MUST NOT be
+  defaulted.
+- Bare action tokens, invented aliases, and tool-call wrapper shapes in
+  `assistant_text` MUST NOT be reinterpreted as governed-action proposals and
+  MUST NOT execute side effects.
 - Malformed proposal output MUST NOT execute any governed action side effects.
 - Compatibility defaults MAY be applied only to bounded read-only discovery
   fields (`limit`, selected status/filter defaults) as documented above.
@@ -167,10 +170,8 @@ Required behavior:
 Primary implementation hooks:
 
 - Worker parse/shape validation:
-  `build_governed_action_proposals()`,
-  `validate_governed_action_response_shape()`,
-  `detect_bare_governed_action_invocation()`,
-  `looks_like_untagged_governed_action_payload()`,
+  `parse_conscious_model_output()`,
+  `build_identity_kickstart_proposals()`,
   `invalid_model_output_metadata()`.
 - Harness re-steer/failure classification:
   `foreground_orchestration::execute_conscious_turn_with_governed_action_loop()`,
@@ -180,13 +181,12 @@ Primary implementation hooks:
 
 Regression coverage anchors:
 
-- `build_governed_action_proposals_requires_tagged_block`
-- `build_governed_action_proposals_ignores_untagged_payloads`
-- `build_governed_action_proposals_rejects_missing_actions_field`
+- `build_governed_action_proposals_rejects_non_json_envelope`
+- `build_governed_action_proposals_rejects_unknown_legacy_fields`
 - `build_governed_action_proposals_rejects_missing_required_payload_field`
-- `conscious_worker_response_rejects_bare_governed_action_token`
-- `conscious_worker_response_rejects_bare_unknown_governed_action_alias`
-- `conscious_worker_response_rejects_tool_call_style_governed_action_wrapper`
+- `conscious_worker_response_treats_bare_action_token_as_plain_text_without_heuristics`
+- `conscious_worker_response_treats_bare_action_alias_as_plain_text_without_heuristics`
+- `conscious_worker_response_treats_tool_call_wrapper_text_as_plain_text_without_heuristics`
 - `foreground_orchestration_resteers_malformed_action_and_completes`
 - `foreground_orchestration_records_diagnostic_when_resteer_attempts_exhausted`
 - `telegram_fixture_runtime_resteers_malformed_governed_action_and_completes_same_turn`
@@ -215,8 +215,8 @@ twice in the same turn when the failure is explicitly recoverable:
 
 | Parsing path | Current posture | Disposition |
 |---|---|---|
-| `build_governed_action_proposals()` + `validate_governed_action_response_shape()` | Strict tagged-block-only parsing; malformed/untagged shapes fail | High-risk masking path remediated; guarded by strict regression tests and same-turn re-steer |
-| `build_identity_kickstart_proposals()` | Optional control block; malformed identity block is ignored with no governed-action execution | Retained as bounded low-risk tolerance for bootstrap UX; no side effects |
+| `parse_conscious_model_output()` | Strict structured envelope with `deny_unknown_fields`; missing `output.json`, empty `assistant_text`, malformed proposals, and envelope shape drift fail closed | High-risk masking path removed; guarded by strict regression tests and same-turn re-steer |
+| `build_identity_kickstart_proposals()` | Optional control object; invalid or unavailable actions fail explicitly as structured output errors | Fail-closed, no identity side effects on malformed control output |
 | `parse_identity_reflection_output()` | Structured JSON required for identity reflection; invalid JSON downgraded to diagnostic and ignored | Retained fail-closed posture for writes; invalid output never becomes canonical proposal |
 | `build_memory_consolidation_proposals()` | Free-text summarization path (no governed-action parsing) | Not a governed-action parser; no coercive schema fallback path |
 

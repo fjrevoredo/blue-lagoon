@@ -1720,11 +1720,19 @@ fn web_fetch_scope() -> CapabilityScope {
 }
 
 fn provider_response(message: &str) -> ProviderHttpResponse {
+    let content = if serde_json::from_str::<serde_json::Value>(message).is_ok() {
+        message.to_string()
+    } else {
+        serde_json::json!({
+            "assistant_text": message,
+        })
+        .to_string()
+    };
     ProviderHttpResponse {
         status: 200,
         body: serde_json::json!({
             "choices": [{
-                "message": { "content": message },
+                "message": { "content": content },
                 "finish_reason": "stop"
             }],
             "usage": {
@@ -1737,8 +1745,7 @@ fn provider_response(message: &str) -> ProviderHttpResponse {
 
 fn immediate_action_model_output() -> String {
     let workspace_root = support::workspace_root().display().to_string();
-    let action_block = serde_json::json!({
-        "actions": [{
+    let governed_action = serde_json::json!({
             "proposal_id": Uuid::now_v7(),
             "title": "Immediate bounded check",
             "rationale": "Need one scoped local check before replying",
@@ -1770,18 +1777,17 @@ fn immediate_action_model_output() -> String {
                     },
                     "working_directory": workspace_root.clone(),
                 },
-            },
-        }],
+            }
     });
-    format!(
-        "I will run a bounded workspace check.\n```blue-lagoon-governed-actions\n{}\n```",
-        action_block,
-    )
+    serde_json::json!({
+        "assistant_text": "I will run a bounded workspace check.",
+        "governed_actions": [governed_action],
+    })
+    .to_string()
 }
 
 fn harness_native_artifact_list_model_output(title: &str, rationale: &str) -> String {
-    let action_block = serde_json::json!({
-        "actions": [{
+    let governed_action = serde_json::json!({
             "proposal_id": Uuid::now_v7(),
             "title": title,
             "rationale": rationale,
@@ -1810,19 +1816,18 @@ fn harness_native_artifact_list_model_output(title: &str, rationale: &str) -> St
                     "query": serde_json::Value::Null,
                     "limit": 5,
                 },
-            },
-        }],
+            }
     });
-    format!(
-        "I will inspect current workspace artifacts.\n```blue-lagoon-governed-actions\n{}\n```",
-        action_block,
-    )
+    serde_json::json!({
+        "assistant_text": "I will inspect current workspace artifacts.",
+        "governed_actions": [governed_action],
+    })
+    .to_string()
 }
 
 fn blocked_action_model_output() -> String {
     let workspace_root = support::workspace_root().display().to_string();
-    let action_block = serde_json::json!({
-        "actions": [{
+    let governed_action = serde_json::json!({
             "proposal_id": Uuid::now_v7(),
             "title": "Blocked bounded check",
             "rationale": "Need one local check, but request is intentionally invalid for integration coverage.",
@@ -1854,13 +1859,13 @@ fn blocked_action_model_output() -> String {
                     },
                     "working_directory": workspace_root.clone(),
                 },
-            },
-        }],
+            }
     });
-    format!(
-        "I want to run a local check.\n```blue-lagoon-governed-actions\n{}\n```",
-        action_block,
-    )
+    serde_json::json!({
+        "assistant_text": "I want to run a local check.",
+        "governed_actions": [governed_action],
+    })
+    .to_string()
 }
 
 fn sample_telegram_config() -> harness::config::ResolvedTelegramConfig {

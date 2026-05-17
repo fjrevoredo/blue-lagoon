@@ -44,6 +44,8 @@ model_call_payload_retention_days = 30
 # Optional foreground model provider override for OpenRouter testing.
 # Use an OpenRouter model id after the provider prefix, preserving any slash in
 # the model id, for example "openrouter/openai/gpt-5.2".
+# Foreground conscious structured-output mode does not allow auto routing
+# ("openrouter/auto"): use a pinned model id.
 #
 # [model_gateway.foreground]
 # provider = "openrouter"
