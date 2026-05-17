@@ -5,10 +5,13 @@
 ## 1. Overview
 
 The governed action system is the conscious loop's proposal-only tool surface.
-The model emits plain text plus, when needed, one fenced JSON proposal block.
-Returning only an action or payload name such as `list_workspace_artifacts` is
-invalid. Invented aliases such as `read_workspace_artifacts` are also invalid.
-These shapes are treated as malformed governed-action proposals.
+The model must return one structured JSON object for foreground turns, with:
+`assistant_text` (required), `governed_actions` (optional array), and
+`identity_kickstart` (optional object). Action proposals are valid only when
+they appear inside `governed_actions` with canonical action-kind names and
+required payload fields. Action-like text in `assistant_text` (for example
+`list_workspace_artifacts` or `read_workspace_artifacts`) is not interpreted as
+an action proposal and never executes side effects.
 Each model response may propose at most one governed action. If another action
 is needed after the harness returns an observation, the harness performs another
 bounded same-turn model call and revalidates the next proposal.
@@ -31,18 +34,25 @@ created.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/contracts/src/lib.rs` | `GovernedActionKind` (line 1386), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1429), payload structs (line 1444), `GovernedActionPayload` (line 1658) |
-| `crates/workers/src/main.rs` | `GOVERNED_ACTIONS_BLOCK_TAG` (line 25), `governed_action_schema_message()` (line 888), `build_governed_action_proposals()` (line 993), `governed_action_kind_as_str()` (line 1334) |
-| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 523), `execute_run_diagnostic_action()` (line 1467), `validate_upsert_scheduled_foreground_task_action()` (line 2033), `is_one_shot_scheduled_task_key()` (line 2058), `governed_action_kind_as_str()` (line 3166), `CanonicalGovernedActionPayload` (line 3290) |
-| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 171), `governed_action_requires_approval()` (line 211), `evaluate_governed_action_identity_boundaries()` (line 218) |
+| `crates/contracts/src/lib.rs` | `WorkerFailureMetadata` (line 228), `ForegroundGovernedActionLoopState` (line 457), `ForegroundGovernedActionRepairGuidance` (line 467), `GovernedActionKind` (line 1422), `DEFAULT_GOVERNED_ACTION_LIST_LIMIT` (line 1472), workflow integration payload structs (line 1590), `GovernedActionPayload` (line 1787) |
+| `crates/workers/src/main.rs` | `CONSCIOUS_OUTPUT_SCHEMA_NAME` (line 27), `schema_disclosure_for_scenario()` (line 849), `governed_action_schema_message()` (line 1681), `governed_action_reminder_message()` (line 1772), `governed_action_repair_guidance_message()` (line 1776), `parse_conscious_model_output()` (line 1828), `build_governed_action_proposals()` (line 1856, test-only guardrail), `invalid_model_output_metadata()` (line 1874), `build_identity_kickstart_proposals()` (line 1900), `governed_action_kind_as_str()` (line 2108) |
+| `crates/harness/src/foreground_orchestration.rs` | `execute_conscious_turn_with_governed_action_loop()` (line 1814), `extract_worker_failure_signal()` (line 2502), `recoverable_malformed_action_signal()` (line 2515), `classify_conscious_worker_failure()` (line 2530), malformed re-steer audit/diagnostic emissions (lines 1903-1936) |
+| `crates/harness/src/governed_actions.rs` | `execute_governed_action()` (line 537), `execute_inspect_ingress_attachments()` (line 1555), `execute_process_ingress_attachment()` (line 1578), `execute_list_email_messages()` (line 1859), `execute_send_email_message()` (line 1919), `execute_sync_task_list()` (line 1990), `execute_run_diagnostic_action()` (line 2479), `validate_upsert_scheduled_foreground_task_action()` (line 3237), `is_one_shot_scheduled_task_key()` (line 3262), `governed_action_kind_as_str()` (line 4370), `CanonicalGovernedActionPayload` (line 4508) |
+| `crates/harness/src/integrations.rs` | `CalendarIntegrationAdapter` (line 128), `EmailIntegrationAdapter` (line 178), `TaskSyncIntegrationAdapter` (line 228), provider support checks (lines 235-249), deterministic/fake adapters (calendar lines 257/347, email lines 505/600, task sync lines 625/682) |
+| `crates/harness/src/policy.rs` | `classify_governed_action_risk()` (line 176), `governed_action_requires_approval()` (line 223), `evaluate_governed_action_identity_boundaries()` (line 230) |
 | `crates/harness/src/recovery.rs` | `governed_action_recovery_action_classification()` (line 1355) |
+| `crates/harness/src/management.rs` | `CalendarIntegrationRunSummary` (line 374), `EmailIntegrationRunSummary` (line 392), `TaskSyncRunSummary` (line 410), integration run queries (calendar line 2221, email line 2261, task sync line 2301) |
 | `crates/harness/src/approval.rs` | action-kind persistence mapping for approval requests |
 | `crates/harness/src/workspace.rs` | workspace artifact, script, version, and run persistence services |
 | `crates/harness/src/scheduled_foreground.rs` | `upsert_task()` for scheduled foreground work |
 | `crates/harness/src/background_planning.rs` | `plan_background_job()` for conscious-to-background delegation |
 | `crates/harness/src/causal_links.rs` | explicit trace edges for governed-action cause/effect records |
+| `crates/runtime/src/admin.rs` | `IntegrationsCommand` (line 527), integration subcommands (calendar/email/task sync lines 533-589), integration run renderers (calendar line 2185, email line 2222, task sync line 2259) |
 | `migrations/0010__conscious_tool_action_kinds.sql` | reviewed constraint update for the completed conscious-loop action-kind strings |
 | `migrations/0014__diagnostic_action_kind.sql` | forward constraint update for the later `run_diagnostic` action kind on existing operator databases |
+| `migrations/0015__attachment_processing.sql` | attachment processing tables and forward action-kind constraint update for `inspect_ingress_attachments` / `process_ingress_attachment` |
+| `migrations/0016__calendar_integration_action_kinds.sql` | forward action-kind constraint update for `list_calendar_events` / `upsert_calendar_event` |
+| `migrations/0017__workflow_integration_email_task_action_kinds.sql` | forward action-kind constraint update for `list_email_messages` / `send_email_message` / `sync_task_list` |
 
 ### Model-Facing Action Kinds
 
@@ -59,6 +69,13 @@ The live governed-action enum contains these model-usable kinds:
 | `create_workspace_script` | Create a script artifact and initial append-only version | Tier 2 |
 | `append_workspace_script_version` | Append an auditable script version with conflict checking | Tier 2 |
 | `list_workspace_script_runs` | Inspect bounded script run history | Tier 0 |
+| `inspect_ingress_attachments` | Inspect attachment metadata and processing state for one ingress | Tier 0 |
+| `process_ingress_attachment` | Run bounded attachment text extraction for one ingress attachment | Tier 1 |
+| `list_calendar_events` | List bounded calendar events for one principal/conversation time window | Tier 1 |
+| `upsert_calendar_event` | Create or update one calendar event for one principal/conversation | Tier 2 |
+| `list_email_messages` | List bounded messages in one mailbox/query scope for one principal/conversation | Tier 1 |
+| `send_email_message` | Send one outbound email with explicit recipient and body fields | Tier 2 |
+| `sync_task_list` | Sync one external task list into a workspace task-list artifact | Tier 2 |
 | `upsert_scheduled_foreground_task` | Create or update future foreground work | Tier 2 |
 | `request_background_job` | Request bounded background maintenance work | Tier 1 |
 | `run_diagnostic` | Execute one harness-native read-only diagnostic query | Tier 0 |
@@ -66,15 +83,27 @@ The live governed-action enum contains these model-usable kinds:
 | `run_workspace_script` | Execute a registered script version | Tier 1-3 by scope |
 | `web_fetch` | Fetch one HTTP/HTTPS URL with bounded response capture | Tier 2 |
 
+Workflow integration run visibility for operator troubleshooting is available
+through `runtime admin integrations calendar list`, `runtime admin integrations
+email list`, and `runtime admin integrations task-sync list` (text or `--json`),
+backed by `management::list_calendar_integration_runs()`,
+`management::list_email_integration_runs()`, and
+`management::list_task_sync_runs()`.
+
 ### Proposal Format
 
-The worker injects the schema as a Developer message. The model may append one
-block tagged `blue-lagoon-governed-actions`:
+The worker injects governed-action instructions as a Developer message. For
+explicit action requests, reminder scheduling, troubleshooting turns, approval
+follow-ups, terse confirmation follow-ups such as `yes` or `well yes`, and
+retry-on-last-task follow-ups after a malformed action proposal, scenario policy
+sends the full schema; routine chat and plain factual turns receive only the
+short reminder from `governed_action_reminder_message()`. When an action is
+needed, the model must return it in the structured output envelope:
 
-````json
-```blue-lagoon-governed-actions
+```json
 {
-  "actions": [
+  "assistant_text": "I can inspect the workspace artifacts now.",
+  "governed_actions": [
     {
       "proposal_id": "<uuid>",
       "title": "<one-line description>",
@@ -95,9 +124,11 @@ block tagged `blue-lagoon-governed-actions`:
   ]
 }
 ```
-````
 
-`build_governed_action_proposals()` extracts the last matching block. The
+`parse_conscious_model_output()` validates this object from `output.json`
+(`ModelOutputMode::JsonObject`). The envelope must contain non-empty
+`assistant_text` and at most one governed-action proposal. Invalid envelopes
+fail closed as malformed governed-action output. The
 foreground orchestrator may continue through multiple governed-action rounds in
 the same foreground turn: the worker receives harness observations, may propose
 another action if one is still needed, and the harness then decides whether the
@@ -114,6 +145,80 @@ queries. Workspace artifact and script list payloads also default omitted
 intentionally limited to read-only discovery actions; mutating payload fields,
 identifiers, and required diagnostic selectors still fail as malformed
 proposals when absent.
+
+### Strictness Guardrails (No Masking)
+
+The governed-action parser and harness error handling follow a strict-first
+policy. Guardrails are used to make malformed output recoverable, not to coerce
+invalid payloads into accepted behavior.
+
+Required behavior:
+
+- Model-emitted action proposals MUST use the structured conscious envelope and
+  appear only inside `governed_actions`.
+- Missing required proposal fields (for example `governed_actions` element
+  fields or required payload fields like `artifact_kind` for
+  `inspect_workspace_artifact`) MUST fail as malformed; they MUST NOT be
+  defaulted.
+- Bare action tokens, invented aliases, and tool-call wrapper shapes in
+  `assistant_text` MUST NOT be reinterpreted as governed-action proposals and
+  MUST NOT execute side effects.
+- Malformed proposal output MUST NOT execute any governed action side effects.
+- Compatibility defaults MAY be applied only to bounded read-only discovery
+  fields (`limit`, selected status/filter defaults) as documented above.
+
+Primary implementation hooks:
+
+- Worker parse/shape validation:
+  `parse_conscious_model_output()`,
+  `build_identity_kickstart_proposals()`,
+  `invalid_model_output_metadata()`.
+- Harness re-steer/failure classification:
+  `foreground_orchestration::execute_conscious_turn_with_governed_action_loop()`,
+  `foreground_orchestration::extract_worker_failure_signal()`,
+  `foreground_orchestration::recoverable_malformed_action_signal()`,
+  `foreground_orchestration::classify_conscious_worker_failure()`.
+
+Regression coverage anchors:
+
+- `build_governed_action_proposals_rejects_non_json_envelope`
+- `build_governed_action_proposals_rejects_unknown_legacy_fields`
+- `build_governed_action_proposals_rejects_missing_required_payload_field`
+- `conscious_worker_response_treats_bare_action_token_as_plain_text_without_heuristics`
+- `conscious_worker_response_treats_bare_action_alias_as_plain_text_without_heuristics`
+- `conscious_worker_response_treats_tool_call_wrapper_text_as_plain_text_without_heuristics`
+- `foreground_orchestration_resteers_malformed_action_and_completes`
+- `foreground_orchestration_records_diagnostic_when_resteer_attempts_exhausted`
+- `telegram_fixture_runtime_resteers_malformed_governed_action_and_completes_same_turn`
+
+### Same-Turn Malformed-Action Re-Steer
+
+Malformed proposal handling stays strict, but the harness may re-steer once or
+twice in the same turn when the failure is explicitly recoverable:
+
+- Worker marks recoverable malformed-output failures through
+  `WorkerFailureMetadata` with:
+  `failure_kind=malformed_action_proposal`,
+  `side_effect_status=none_executed`,
+  `retry_recommended=true`.
+- Harness retries only when this metadata is present and retry budget remains.
+- Retry attempts inject a targeted Developer message from
+  `governed_action_repair_guidance_message()` so the worker can correct the
+  exact schema failure.
+- Each retry emits `foreground_malformed_action_resteer_attempt` audit events.
+- Retry exhaustion emits one operational diagnostic with
+  `reason_code=foreground_malformed_action_resteer_exhausted`.
+- Non-recoverable invalid outputs still fail explicitly; no parser coercion is
+  applied.
+
+### Model-Output Parsing Inventory (Anti-Masking Audit)
+
+| Parsing path | Current posture | Disposition |
+|---|---|---|
+| `parse_conscious_model_output()` | Strict structured envelope with `deny_unknown_fields`; missing `output.json`, empty `assistant_text`, malformed proposals, and envelope shape drift fail closed | High-risk masking path removed; guarded by strict regression tests and same-turn re-steer |
+| `build_identity_kickstart_proposals()` | Optional control object; invalid or unavailable actions fail explicitly as structured output errors | Fail-closed, no identity side effects on malformed control output |
+| `parse_identity_reflection_output()` | Structured JSON required for identity reflection; invalid JSON downgraded to diagnostic and ignored | Retained fail-closed posture for writes; invalid output never becomes canonical proposal |
+| `build_memory_consolidation_proposals()` | Free-text summarization path (no governed-action parsing) | Not a governed-action parser; no coercive schema fallback path |
 
 ### Payload Families
 
@@ -135,6 +240,23 @@ Workspace script payloads:
 { "kind": "append_workspace_script_version", "value": { "script_id": "<uuid>", "expected_latest_version_id": "<uuid>", "expected_content_sha256": null, "language": "python", "content_text": "...", "change_summary": "..." } }
 { "kind": "list_workspace_script_runs", "value": { "script_id": "<uuid>", "status": null, "limit": 10 } }
 { "kind": "run_workspace_script", "value": { "script_id": "<uuid>", "script_version_id": null, "args": [] } }
+```
+
+Attachment payloads:
+
+```json
+{ "kind": "inspect_ingress_attachments", "value": { "ingress_id": "<uuid>" } }
+{ "kind": "process_ingress_attachment", "value": { "ingress_id": "<uuid>", "attachment_id": "<attachment-id>" } }
+```
+
+Workflow integration payloads:
+
+```json
+{ "kind": "list_calendar_events", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "start_at": "2026-05-20T09:00:00Z", "end_at": "2026-05-20T18:00:00Z", "max_results": 10 } }
+{ "kind": "upsert_calendar_event", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "title": "Project sync", "starts_at": "2026-05-20T13:00:00Z", "ends_at": "2026-05-20T14:00:00Z", "location": "Room A", "details": "Discuss milestone 3", "external_event_id": null } }
+{ "kind": "list_email_messages", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "mailbox": "inbox", "query": "subject:\"project\" newer_than:7d", "max_results": 10 } }
+{ "kind": "send_email_message", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "to": ["teammate@example.com"], "cc": [], "subject": "Project update", "body_text": "Quick update on Milestone 3...", "reply_to_external_message_id": null } }
+{ "kind": "sync_task_list", "value": { "internal_principal_ref": "primary-user", "internal_conversation_ref": "telegram-primary", "task_list_title": "Milestone 4 Tracker", "items": ["Design planner stage", "Implement trigger producers"], "external_list_id": null, "workspace_artifact_id": null } }
 ```
 
 Schedule, background, subprocess, and fetch payloads:
@@ -180,13 +302,16 @@ delivery sends only user-facing text.
 Read-only harness-native actions are replay-safe after a worker interruption:
 `inspect_workspace_artifact`, `list_workspace_artifacts`,
 `list_workspace_scripts`, `inspect_workspace_script`,
-`list_workspace_script_runs`, and `run_diagnostic`.
+`list_workspace_script_runs`, `inspect_ingress_attachments`, and `run_diagnostic`.
 
 Actions that can create, update, schedule, delegate, execute, fetch, or otherwise
 produce side effects are classified as ambiguous or nonrepeatable during
-governed-action recovery. Recovery must not automatically retry them unless
-durable completion evidence proves the original action already reached a
-terminal state.
+governed-action recovery. Workflow integration actions
+(`list_calendar_events`, `upsert_calendar_event`, `list_email_messages`,
+`send_email_message`, `sync_task_list`) are also treated as nonrepeatable
+because they depend on external integration state. Recovery must not
+automatically retry these actions unless durable completion evidence proves the
+original action already reached a terminal state.
 
 Foreground replay follows the same proof-based rule. If an interrupted
 foreground execution already linked one or more governed actions and every
@@ -201,7 +326,7 @@ recovery fails closed instead of blindly replaying the turn.
 
 | Rule | Applies to |
 |---|---|
-| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, schedule, and background request actions |
+| Empty filesystem, environment, and disabled network | harness-native workspace, script authoring/discovery, attachment inspection/processing, workflow integrations (calendar/email/task sync), schedule, and background request actions |
 | At least one filesystem root | `run_subprocess`, `run_workspace_script` |
 | Non-empty execution limits within configured maxima | `run_subprocess`, `run_workspace_script` |
 | Network must be enabled; execution budget fields may be zero | `web_fetch` |
@@ -215,6 +340,8 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 | `default_subprocess_timeout_ms` | `30000` |
 | `max_subprocess_timeout_ms` | `120000` |
 | `max_actions_per_foreground_turn` | `10` |
+| `malformed_action_resteer_max_attempts` | `2` |
+| `malformed_action_resteer_timeout_ms` | `10000` |
 | `cap_exceeded_behavior` | `"escalate"` |
 | `max_filesystem_roots_per_action` | `4` |
 | `default_network_access` | `"disabled"` |
@@ -227,6 +354,45 @@ Config defaults live in `config/default.toml` under `[governed_actions]`:
 `requested_risk_tier` may raise the final tier, but it cannot lower the
 intrinsic tier computed by `policy::classify_governed_action_risk()`.
 
+Workflow integration action config lives in `config/default.toml` under
+`[integrations.calendar]`, `[integrations.email]`, and
+`[integrations.task_sync]`:
+
+| Key | Default | Validation | Source |
+|---|---|---|---|
+| `integrations.calendar.enabled` | `false` | `true`/`false`; when `true`, provider and credential env are required | `config/default.toml:41`, `crates/harness/src/config.rs:112`, `crates/harness/src/config.rs:1265` |
+| `integrations.calendar.provider` | `""` | non-empty when enabled; supported values are `deterministic_fake` and `fake` | `config/default.toml:42`, `crates/harness/src/config.rs:112`, `crates/harness/src/config.rs:1268`, `crates/harness/src/integrations.rs:235` |
+| `integrations.calendar.credential_env` | `""` | non-empty env-var name when enabled; resolved fail-closed | `config/default.toml:43`, `crates/harness/src/config.rs:112`, `crates/harness/src/config.rs:1275`, `crates/harness/src/config.rs:774` |
+| `integrations.calendar.api_base_url` | `""` | optional; if set, must be non-empty when enabled | `config/default.toml:45`, `crates/harness/src/config.rs:112`, `crates/harness/src/config.rs:1280` |
+| `integrations.email.enabled` | `false` | `true`/`false`; when `true`, provider and credential env are required | `config/default.toml:48`, `crates/harness/src/config.rs:124`, `crates/harness/src/config.rs:1292` |
+| `integrations.email.provider` | `""` | non-empty when enabled; supported values are `deterministic_fake` and `fake` | `config/default.toml:49`, `crates/harness/src/config.rs:124`, `crates/harness/src/config.rs:1295`, `crates/harness/src/integrations.rs:242` |
+| `integrations.email.credential_env` | `""` | non-empty env-var name when enabled; resolved fail-closed | `config/default.toml:50`, `crates/harness/src/config.rs:124`, `crates/harness/src/config.rs:1302`, `crates/harness/src/config.rs:774` |
+| `integrations.email.api_base_url` | `""` | optional; if set, must be non-empty when enabled | `config/default.toml:52`, `crates/harness/src/config.rs:124`, `crates/harness/src/config.rs:1307` |
+| `integrations.task_sync.enabled` | `false` | `true`/`false`; when `true`, provider and credential env are required | `config/default.toml:55`, `crates/harness/src/config.rs:136`, `crates/harness/src/config.rs:1319` |
+| `integrations.task_sync.provider` | `""` | non-empty when enabled; supported values are `deterministic_fake` and `fake` | `config/default.toml:56`, `crates/harness/src/config.rs:136`, `crates/harness/src/config.rs:1322`, `crates/harness/src/integrations.rs:249` |
+| `integrations.task_sync.credential_env` | `""` | non-empty env-var name when enabled; resolved fail-closed | `config/default.toml:57`, `crates/harness/src/config.rs:136`, `crates/harness/src/config.rs:1329`, `crates/harness/src/config.rs:774` |
+| `integrations.task_sync.api_base_url` | `""` | optional; if set, must be non-empty when enabled | `config/default.toml:59`, `crates/harness/src/config.rs:136`, `crates/harness/src/config.rs:1334` |
+
+Approval collaboration policy config (Telegram foreground binding):
+
+| Key | Default | Validation | Source |
+|---|---|---|---|
+| `telegram.foreground_binding.delegates` | `[]` | each entry must define non-zero `allowed_user_id` and non-empty `internal_principal_ref`; duplicates are rejected across owner + delegates | `crates/harness/src/config.rs:234`, `crates/harness/src/config.rs:1144` |
+| `telegram.foreground_binding.approval_resolution_policy` | `"delegate_allowed"` | enum: `delegate_allowed` or `owner_only`; resolved approval actor policy is enforced during callback/command resolution | `crates/harness/src/config.rs:236`, `crates/harness/src/config.rs:247`, `crates/harness/src/foreground_orchestration.rs:504`, `crates/harness/src/approval.rs:432` |
+
+Resolved integration config entrypoints:
+
+- `resolve_calendar_integration_config()` (`crates/harness/src/config.rs:701`)
+- `resolve_email_integration_config()` (`crates/harness/src/config.rs:725`)
+- `resolve_task_sync_integration_config()` (`crates/harness/src/config.rs:749`)
+- shared resolver helper: `resolve_workflow_integration_config_fields()`
+  (`crates/harness/src/config.rs:774`)
+
+Provider behavior in the current harness path for calendar/email/task sync:
+
+- `deterministic_fake`: deterministic success-path adapter for predictable tests.
+- `fake`: deterministic failure-path adapter that returns temporary failures.
+
 ### Identity Boundary Rules
 
 After capability-scope validation, planning and execution both load the compact
@@ -237,6 +403,10 @@ workspace write effects before approval or execution proceeds. This is a
 harness policy decision, not a model preference: the model can propose an
 action, but identity boundaries are rechecked by the harness at planning time
 and again immediately before execution.
+`list_calendar_events`, `upsert_calendar_event`, `list_email_messages`,
+`send_email_message`, and `sync_task_list` are treated as network-dependent
+actions for this boundary evaluation even though they execute through
+harness-owned integration adapters instead of direct worker networking.
 
 ### Extension Checklist
 
@@ -269,4 +439,4 @@ The short version is:
 
 ---
 
-*Last verified: branch `codex/runtime-workflow-reliability`, session 2026-05-07.*
+*Last verified: 2026-05-17.*

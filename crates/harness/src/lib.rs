@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod attachments;
 pub mod audit;
 pub mod background;
 pub mod background_execution;
@@ -15,6 +16,7 @@ pub mod foreground_orchestration;
 pub mod governed_actions;
 pub mod identity;
 pub mod ingress;
+pub mod integrations;
 pub mod management;
 pub mod memory;
 pub mod migration;

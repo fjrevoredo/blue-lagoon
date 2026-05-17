@@ -17,6 +17,20 @@ use crate::{
 const APPROVAL_EXPIRY_ACTOR: &str = "system:approval-expiry";
 const APPROVAL_INVALIDATION_ACTOR: &str = "system:approval-invalidation";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResolutionActorPolicyMode {
+    RequestingPrincipalOnly,
+    DelegateAllowed,
+    OwnerOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalResolutionActorPolicy {
+    pub mode: ApprovalResolutionActorPolicyMode,
+    pub owner_principal_ref: String,
+    pub allowlisted_principal_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewApprovalRequestRecord {
     pub approval_request_id: Uuid,
@@ -412,6 +426,14 @@ pub async fn resolve_approval_request(
     pool: &PgPool,
     attempt: &ApprovalResolutionAttempt,
 ) -> Result<ApprovalResolutionResult> {
+    resolve_approval_request_with_actor_policy(pool, attempt, None).await
+}
+
+pub async fn resolve_approval_request_with_actor_policy(
+    pool: &PgPool,
+    attempt: &ApprovalResolutionAttempt,
+    actor_policy: Option<&ApprovalResolutionActorPolicy>,
+) -> Result<ApprovalResolutionResult> {
     validate_resolution_attempt(attempt)?;
 
     let mut tx = pool
@@ -480,7 +502,7 @@ pub async fn resolve_approval_request(
             severity: "warn",
         }
     } else {
-        validate_resolution_actor(&record, attempt)?;
+        validate_resolution_actor(&record, attempt, actor_policy)?;
         ResolutionTransition {
             decision: attempt.decision,
             actor_ref: attempt.actor_ref.clone(),
@@ -650,7 +672,10 @@ async fn apply_resolution_transition(
             "action_proposal_id": record.action_proposal_id,
             "action_fingerprint": record.action_fingerprint.value,
             "decision": approval_resolution_decision_as_str(transition.decision),
+            "requested_by": record.requested_by,
+            "requested_principal_ref": actor_ref_principal(&record.requested_by),
             "resolved_by": event.resolved_by,
+            "resolved_principal_ref": actor_ref_principal(&event.resolved_by),
             "resolved_at": event.resolved_at,
             "reason": event.reason,
         }),
@@ -777,9 +802,63 @@ fn validate_resolution_attempt(attempt: &ApprovalResolutionAttempt) -> Result<()
 fn validate_resolution_actor(
     record: &ApprovalRequestRecord,
     attempt: &ApprovalResolutionAttempt,
+    actor_policy: Option<&ApprovalResolutionActorPolicy>,
 ) -> Result<()> {
     let requested_by = parse_actor_ref(&record.requested_by)?;
     let actor = parse_actor_ref(&attempt.actor_ref)?;
+
+    if let Some(policy) = actor_policy {
+        let owner_principal_ref = policy.owner_principal_ref.trim();
+        if owner_principal_ref.is_empty() {
+            bail!("approval actor policy owner_principal_ref must not be empty");
+        }
+
+        let mut allowlisted_principals = std::collections::BTreeSet::new();
+        allowlisted_principals.insert(owner_principal_ref.to_string());
+        allowlisted_principals.extend(
+            policy
+                .allowlisted_principal_refs
+                .iter()
+                .map(|principal| principal.trim().to_string())
+                .filter(|principal| !principal.is_empty()),
+        );
+
+        if !allowlisted_principals.contains(requested_by.principal) {
+            bail!(
+                "approval request principal '{}' is not allowlisted by policy",
+                record.requested_by
+            );
+        }
+        if !allowlisted_principals.contains(actor.principal) {
+            bail!(
+                "approval resolution actor '{}' is not allowlisted by policy",
+                attempt.actor_ref
+            );
+        }
+
+        return match policy.mode {
+            ApprovalResolutionActorPolicyMode::DelegateAllowed => Ok(()),
+            ApprovalResolutionActorPolicyMode::OwnerOnly => {
+                if actor.principal != owner_principal_ref {
+                    bail!(
+                        "approval resolution actor '{}' is not allowed under owner-only policy",
+                        attempt.actor_ref
+                    );
+                }
+                Ok(())
+            }
+            ApprovalResolutionActorPolicyMode::RequestingPrincipalOnly => {
+                if actor.principal != requested_by.principal {
+                    bail!(
+                        "approval resolution actor '{}' does not match the requested principal '{}'",
+                        attempt.actor_ref,
+                        record.requested_by
+                    );
+                }
+                Ok(())
+            }
+        };
+    }
 
     if actor.principal != requested_by.principal {
         bail!(
@@ -814,6 +893,13 @@ fn approval_event_kind(decision: ApprovalResolutionDecision) -> &'static str {
         ApprovalResolutionDecision::Expired => "approval_request_expired",
         ApprovalResolutionDecision::Invalidated => "approval_request_invalidated",
     }
+}
+
+fn actor_ref_principal(actor_ref: &str) -> Option<&str> {
+    actor_ref
+        .trim()
+        .split_once(':')
+        .map(|(_, principal)| principal)
 }
 
 fn approval_event_severity(decision: ApprovalResolutionDecision) -> &'static str {
@@ -885,6 +971,13 @@ fn governed_action_kind_as_str(kind: GovernedActionKind) -> &'static str {
         GovernedActionKind::CreateWorkspaceScript => "create_workspace_script",
         GovernedActionKind::AppendWorkspaceScriptVersion => "append_workspace_script_version",
         GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        GovernedActionKind::ListEmailMessages => "list_email_messages",
+        GovernedActionKind::SendEmailMessage => "send_email_message",
+        GovernedActionKind::SyncTaskList => "sync_task_list",
         GovernedActionKind::UpsertScheduledForegroundTask => "upsert_scheduled_foreground_task",
         GovernedActionKind::RequestBackgroundJob => "request_background_job",
         GovernedActionKind::RunDiagnostic => "run_diagnostic",
@@ -905,6 +998,13 @@ fn parse_governed_action_kind(value: &str) -> Result<GovernedActionKind> {
         "create_workspace_script" => Ok(GovernedActionKind::CreateWorkspaceScript),
         "append_workspace_script_version" => Ok(GovernedActionKind::AppendWorkspaceScriptVersion),
         "list_workspace_script_runs" => Ok(GovernedActionKind::ListWorkspaceScriptRuns),
+        "inspect_ingress_attachments" => Ok(GovernedActionKind::InspectIngressAttachments),
+        "process_ingress_attachment" => Ok(GovernedActionKind::ProcessIngressAttachment),
+        "list_calendar_events" => Ok(GovernedActionKind::ListCalendarEvents),
+        "upsert_calendar_event" => Ok(GovernedActionKind::UpsertCalendarEvent),
+        "list_email_messages" => Ok(GovernedActionKind::ListEmailMessages),
+        "send_email_message" => Ok(GovernedActionKind::SendEmailMessage),
+        "sync_task_list" => Ok(GovernedActionKind::SyncTaskList),
         "upsert_scheduled_foreground_task" => Ok(GovernedActionKind::UpsertScheduledForegroundTask),
         "request_background_job" => Ok(GovernedActionKind::RequestBackgroundJob),
         "run_diagnostic" => Ok(GovernedActionKind::RunDiagnostic),
@@ -1087,7 +1187,7 @@ mod tests {
     fn validate_resolution_actor_accepts_matching_principal_across_surfaces() {
         let record = sample_pending_record();
         let attempt = sample_resolution_attempt();
-        validate_resolution_actor(&record, &attempt)
+        validate_resolution_actor(&record, &attempt, None)
             .expect("matching principal across surfaces should be accepted");
     }
 
@@ -1097,12 +1197,53 @@ mod tests {
         let mut attempt = sample_resolution_attempt();
         attempt.actor_ref = "cli:someone-else".to_string();
 
-        let error = validate_resolution_actor(&record, &attempt)
+        let error = validate_resolution_actor(&record, &attempt, None)
             .expect_err("mismatched principal should be rejected");
         assert!(
             error
                 .to_string()
                 .contains("does not match the requested principal")
         );
+    }
+
+    #[test]
+    fn validate_resolution_actor_delegate_allowed_accepts_owner_for_delegate_request() {
+        let mut record = sample_pending_record();
+        record.requested_by = "telegram:delegate-user".to_string();
+        let mut attempt = sample_resolution_attempt();
+        attempt.actor_ref = "telegram:primary-user".to_string();
+
+        let policy = ApprovalResolutionActorPolicy {
+            mode: ApprovalResolutionActorPolicyMode::DelegateAllowed,
+            owner_principal_ref: "primary-user".to_string(),
+            allowlisted_principal_refs: vec![
+                "primary-user".to_string(),
+                "delegate-user".to_string(),
+            ],
+        };
+
+        validate_resolution_actor(&record, &attempt, Some(&policy))
+            .expect("owner should be allowed when delegate_allowed policy is active");
+    }
+
+    #[test]
+    fn validate_resolution_actor_owner_only_rejects_delegate_actor() {
+        let mut record = sample_pending_record();
+        record.requested_by = "telegram:delegate-user".to_string();
+        let mut attempt = sample_resolution_attempt();
+        attempt.actor_ref = "telegram:delegate-user".to_string();
+
+        let policy = ApprovalResolutionActorPolicy {
+            mode: ApprovalResolutionActorPolicyMode::OwnerOnly,
+            owner_principal_ref: "primary-user".to_string(),
+            allowlisted_principal_refs: vec![
+                "primary-user".to_string(),
+                "delegate-user".to_string(),
+            ],
+        };
+
+        let error = validate_resolution_actor(&record, &attempt, Some(&policy))
+            .expect_err("delegate actor should be rejected when owner-only policy is active");
+        assert!(error.to_string().contains("owner-only policy"));
     }
 }

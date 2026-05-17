@@ -162,6 +162,20 @@ cargo run -p runtime -- admin foreground schedules list
 cargo run -p runtime -- admin background list
 ```
 
+### Resolving approval prompts in Telegram
+
+When a governed action needs approval, Telegram shows an approval prompt that is
+resolved through a shared harness approval token flow.
+
+- Primary path: use the inline `Approve` or `Reject` buttons in the prompt.
+- Fallback path: send `/approve <token>` or `/reject <token>` in the same chat.
+- Both paths resolve the same approval request and follow the same policy and
+  idempotency checks.
+
+Approval outcomes are surfaced as normal follow-up messages. A request may end
+as `approved`, `rejected`, `expired`, or `invalidated` depending on timing,
+fingerprint checks, and prior resolution state.
+
 ### Identity formation and inspection
 
 On a fresh or reset runtime, the assistant can form its first complete identity
@@ -179,6 +193,10 @@ cargo run -p runtime -- admin identity history list
 cargo run -p runtime -- admin identity diagnostics list
 ```
 
+If a custom interview answer is rejected, `admin identity diagnostics list`
+shows whether the harness treated it as a generic invalid answer or as a
+suspicious attempt to fill a stable identity field with process chatter.
+
 Reset identity formation when an operator intentionally needs to reopen the
 first-identity flow:
 
@@ -188,6 +206,16 @@ cargo run -p runtime -- admin identity reset \
   --actor-ref operator:local \
   --reason "restart identity formation"
 ```
+
+The supported recovery path for a polluted active identity is:
+
+1. Inspect `admin identity show` and `admin identity diagnostics list`.
+2. Reset with `admin identity reset --force ...`.
+3. Let the user re-run the first identity flow in foreground conversation.
+
+The reset path preserves audit history, supersedes existing active identity
+items, and cancels in-progress interviews instead of rewriting identity rows in
+place.
 
 Controlled identity edits after first identity completion are proposal-based,
 not direct writes. Stable identity edits require explicit confirmation:
@@ -323,6 +351,16 @@ cargo run -p runtime -- admin recovery supervise \
   --actor-ref operator:local \
   --reason "manual supervision pass"
 ```
+
+For context-quality troubleshooting, inspect a retained trace directly:
+
+```bash
+cargo run -p runtime -- admin trace show --trace-id <uuid> --json
+```
+
+Foreground model-call payloads now retain prompt-composition metrics such as
+system-prompt size, developer-message share, assistant-history size, estimated
+input tokens, and any final trim events applied before provider invocation.
 
 ### Schema and upgrades
 

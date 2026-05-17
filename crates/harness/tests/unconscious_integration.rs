@@ -149,6 +149,112 @@ async fn background_runtime_flows_due_job_to_memory_merge_end_to_end() -> Result
 
 #[tokio::test]
 #[serial]
+async fn background_scheduler_autonomous_origination_executes_time_schedule_job_end_to_end()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.model_gateway = Some(sample_model_gateway_config(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+        ));
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["unconscious-worker".to_string()];
+        config.background.thresholds.episode_backlog_threshold = u32::MAX;
+        config.background.thresholds.candidate_memory_threshold = u32::MAX;
+        config.background.scheduler.poll_interval_seconds = 1;
+
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": wake_signal_reflection_output_content() },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+
+        let executed = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
+            || async {
+                runtime::run_background_scheduler_once_with_transport(
+                    &ctx.pool, &config, &transport,
+                )
+                .await
+            },
+        )
+        .await?;
+        assert_eq!(executed, 1);
+
+        let job_row = sqlx::query(
+            r#"
+            SELECT background_job_id, job_kind, trigger_kind, status
+            FROM background_jobs
+            ORDER BY created_at DESC, background_job_id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let background_job_id: Uuid = job_row.get("background_job_id");
+        assert_eq!(
+            job_row.get::<String, _>("job_kind"),
+            "self_model_reflection".to_string()
+        );
+        assert_eq!(
+            job_row.get::<String, _>("trigger_kind"),
+            "time_schedule".to_string()
+        );
+        assert_eq!(job_row.get::<String, _>("status"), "completed".to_string());
+
+        let completed_runs =
+            background::list_completed_job_runs(&ctx.pool, background_job_id, 5).await?;
+        assert_eq!(completed_runs.len(), 1);
+        assert_eq!(
+            completed_runs[0].status,
+            background::BackgroundJobRunStatus::Completed
+        );
+
+        let planner_audit_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE event_kind = 'background_scheduler_planning_pass_completed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert!(planner_audit_count >= 1);
+
+        let second_executed = with_env_var(
+            "BLUE_LAGOON_TEST_UNCONSCIOUS_RUNTIME_API_KEY",
+            Some("test-unconscious-runtime-key"),
+            || async {
+                runtime::run_background_scheduler_once_with_transport(
+                    &ctx.pool, &config, &transport,
+                )
+                .await
+            },
+        )
+        .await?;
+        assert_eq!(second_executed, 0);
+
+        let background_job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM background_jobs")
+            .fetch_one(&ctx.pool)
+            .await?;
+        assert_eq!(background_job_count, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn background_runtime_recovers_stranded_run_during_supervisor_restart() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -830,6 +936,15 @@ fn sample_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             provider: ModelProviderKind::ZAi,
             model: "z-ai-background".to_string(),
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
+            api_key_env: api_key_env.to_string(),
+            timeout_ms: 20_000,
+        },
+        unconscious: ForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
             api_key_env: api_key_env.to_string(),
             timeout_ms: 20_000,
         },
@@ -837,6 +952,7 @@ fn sample_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             api_surface: None,
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
         }),
+        openrouter: None,
     }
 }
 
@@ -850,6 +966,9 @@ fn sample_telegram_config() -> TelegramConfig {
             allowed_chat_id: 24,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            delegates: Vec::new(),
+            approval_resolution_policy:
+                harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
         }),
     }
 }

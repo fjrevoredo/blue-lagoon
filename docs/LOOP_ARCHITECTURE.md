@@ -34,6 +34,8 @@ The conscious loop is the foreground executive that handles perception, present-
      - Current internal state snapshot (load, health, etc.).
 3. **Budget initialization**
    - Harness sets or restores iteration, time, and compute budgets for this conscious episode (e.g., max turns, max wall-clock time, max cost).
+   - Harness also resolves the provider route and any active model-call
+     reasoning policy before issuing a provider request on the loop's behalf.
 4. **Perceive**
    - Conscious agent reads the context and current input (user message, goal, event).
 5. **Plan**
@@ -46,6 +48,8 @@ The conscious loop is the foreground executive that handles perception, present-
    - Results and observations are returned to the agent through harness-managed channels.
 9. **Record**
    - Agent emits:
+     - One structured foreground output object containing required user-facing
+       reply text plus optional governed-action and identity-control fields.
      - Episodic entries (what happened, when, outcome).
      - Candidate memory items (facts, preferences, relationships).
      - Optional background job requests (e.g., dream, reconciliation).
@@ -125,6 +129,10 @@ All cross-loop interactions are mediated by the harness:
   - Both may emit proposals (episodic entries, memory deltas, self-model or
     identity deltas).
   - Only the harness can commit changes to canonical storage.
+- Both loops to model providers:
+  - Workers emit provider-agnostic model-call requests only.
+  - The harness resolves route, budgets, and any provider-specific reasoning
+    request encoding before calling the external provider.
 
 No direct calls or shared references between the conscious and unconscious loops are allowed.
 

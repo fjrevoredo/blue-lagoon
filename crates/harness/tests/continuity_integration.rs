@@ -29,11 +29,13 @@ async fn continuity_runtime_retrieves_prior_canonical_memory_on_later_run() -> R
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let first_reply = conscious_structured_reply("assistant reply after preference capture");
+        let second_reply = conscious_structured_reply("assistant reply after retrieval");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": first_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 20, "completion_tokens": 7 }
@@ -43,7 +45,7 @@ async fn continuity_runtime_retrieves_prior_canonical_memory_on_later_run() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after retrieval" },
+                    "message": { "content": second_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 6 }
@@ -106,11 +108,14 @@ async fn continuity_runtime_persists_self_model_into_later_context() -> Result<(
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let first_reply = conscious_structured_reply("assistant reply after preference capture");
+        let second_reply =
+            conscious_structured_reply("assistant reply after self-model carry-forward");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": first_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 20, "completion_tokens": 7 }
@@ -120,7 +125,7 @@ async fn continuity_runtime_persists_self_model_into_later_context() -> Result<(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after self-model carry-forward" },
+                    "message": { "content": second_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 6 }
@@ -181,11 +186,13 @@ async fn continuity_runtime_preserves_backlog_durability_under_single_reply_reco
         config.worker.args = vec!["conscious-worker".to_string()];
 
         let transport = model_gateway::FakeModelProviderTransport::new();
+        let backlog_reply =
+            conscious_structured_reply("assistant reply from continuity backlog integration");
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from continuity backlog integration" },
+                    "message": { "content": backlog_reply },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 23, "completion_tokens": 9 }
@@ -250,6 +257,13 @@ fn sample_telegram_config() -> ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
         poll_limit: 10,
     }
 }
@@ -271,7 +285,27 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 30_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 30_000,
         },
     }
+}
+
+fn conscious_structured_reply(text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": text
+    })
+    .to_string()
 }

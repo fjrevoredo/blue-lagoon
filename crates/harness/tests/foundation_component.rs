@@ -63,6 +63,9 @@ async fn migration_application_creates_foundation_and_foreground_tables() -> Res
         assert!(names.contains(&"workspace_script_runs".to_string()));
         assert!(names.contains(&"approval_requests".to_string()));
         assert!(names.contains(&"governed_action_executions".to_string()));
+        assert!(names.contains(&"ingress_attachments".to_string()));
+        assert!(names.contains(&"ingress_attachment_processing_attempts".to_string()));
+        assert!(names.contains(&"ingress_attachment_extracted_artifacts".to_string()));
         assert_eq!(ctx.config.database.minimum_supported_schema_version, 1);
         Ok(())
     })

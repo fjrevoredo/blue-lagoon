@@ -8,7 +8,10 @@ use crate::{
     approval,
     audit::{self, NewAuditEvent},
     causal_links::{self, NewCausalLink},
-    config::{ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig},
+    config::{
+        ResolvedModelGatewayConfig, ResolvedTelegramConfig, RuntimeConfig,
+        TelegramApprovalResolutionPolicy,
+    },
     context, execution,
     foreground::{self, ForegroundTriggerIntakeOutcome, NewEpisode, NewEpisodeMessage},
     governed_actions, identity,
@@ -139,12 +142,14 @@ impl ForegroundActionLoopTracker {
     fn as_contract_state(
         self,
         config: &RuntimeConfig,
+        repair_guidance: Option<contracts::ForegroundGovernedActionRepairGuidance>,
     ) -> contracts::ForegroundGovernedActionLoopState {
         contracts::ForegroundGovernedActionLoopState {
             executed_action_count: self.executed_action_count,
             max_actions_per_turn: self.max_actions_per_turn(config),
             remaining_actions_before_cap: self.remaining_actions_before_cap(config),
             cap_exceeded_behavior: config.governed_actions.cap_exceeded_behavior,
+            repair_guidance,
         }
     }
 }
@@ -223,6 +228,7 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            Some(telegram_config),
             model_gateway_config,
             trigger,
             parsed_resolution,
@@ -264,6 +270,7 @@ where
 pub async fn orchestrate_telegram_foreground_plan<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    telegram_config: Option<&ResolvedTelegramConfig>,
     model_gateway_config: &ResolvedModelGatewayConfig,
     execution: TelegramForegroundPlanExecution,
     transport: &T,
@@ -295,6 +302,7 @@ where
         return orchestrate_telegram_approval_resolution_trigger(
             pool,
             config,
+            telegram_config,
             model_gateway_config,
             trigger,
             parsed_resolution,
@@ -339,9 +347,11 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn orchestrate_telegram_approval_resolution_trigger<T, D>(
     pool: &sqlx::PgPool,
     config: &RuntimeConfig,
+    telegram_config: Option<&ResolvedTelegramConfig>,
     model_gateway_config: &ResolvedModelGatewayConfig,
     trigger: contracts::ForegroundTrigger,
     parsed_resolution: ParsedApprovalResolutionIngress,
@@ -359,71 +369,6 @@ where
         approval_token = %parsed_resolution.approval_token,
         "resolving telegram approval trigger"
     );
-    let approval_request = match approval::get_approval_request_by_token(
-        pool,
-        &parsed_resolution.approval_token,
-    )
-    .await
-    {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::ApprovalResolutionFailure,
-                anyhow::anyhow!(
-                    "approval callback referenced unknown approval token '{}'",
-                    parsed_resolution.approval_token
-                ),
-            )
-            .await;
-        }
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::PersistenceFailure,
-                error,
-            )
-            .await;
-        }
-    };
-
-    let resolution = match approval::resolve_approval_request(
-        pool,
-        &approval::ApprovalResolutionAttempt {
-            token: parsed_resolution.approval_token.clone(),
-            actor_ref: format!("telegram:{}", trigger.ingress.internal_principal_ref),
-            expected_action_fingerprint: parsed_resolution
-                .expected_action_fingerprint
-                .clone()
-                .unwrap_or_else(|| approval_request.action_fingerprint.clone()),
-            decision: parsed_resolution.decision,
-            reason: Some(parsed_resolution.resolution_source.clone()),
-            resolved_at: trigger.received_at,
-        },
-    )
-    .await
-    {
-        Ok(resolution) => resolution,
-        Err(error) => {
-            return record_and_return_approval_resolution_failure(
-                pool,
-                &trigger,
-                ForegroundFailureKind::ApprovalResolutionFailure,
-                error,
-            )
-            .await;
-        }
-    };
-    info!(
-        trace_id = %trigger.trace_id,
-        execution_id = %trigger.execution_id,
-        approval_request_id = %resolution.request.approval_request_id,
-        decision = ?resolution.event.decision,
-        "approval request resolved"
-    );
-
     let chat_id = match parse_telegram_chat_id(&trigger.ingress) {
         Ok(chat_id) => chat_id,
         Err(error) => {
@@ -448,6 +393,163 @@ where
             .await;
         }
     };
+
+    let approval_request = match approval::get_approval_request_by_token(
+        pool,
+        &parsed_resolution.approval_token,
+    )
+    .await
+    {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            record_approval_resolution_diagnostic(
+                pool,
+                Some(trigger.trace_id),
+                Some(trigger.execution_id),
+                "approval_resolution_unknown_token",
+                "approval resolution attempt referenced an unknown token",
+                json!({
+                    "approval_token": parsed_resolution.approval_token,
+                    "source": parsed_resolution.resolution_source,
+                }),
+            )
+            .await;
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::ApprovalResolutionFailure,
+                anyhow::anyhow!(
+                    "approval callback referenced unknown approval token '{}'",
+                    parsed_resolution.approval_token
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::PersistenceFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    if approval_request.status != contracts::ApprovalRequestStatus::Pending {
+        let decision = approval_terminal_decision(&approval_request);
+        if let Some(decision) = decision {
+            record_approval_resolution_diagnostic(
+                pool,
+                Some(trigger.trace_id),
+                Some(trigger.execution_id),
+                "approval_resolution_stale_token",
+                "approval resolution attempt targeted a non-pending request",
+                json!({
+                    "approval_request_id": approval_request.approval_request_id,
+                    "status": approval_request_status_label(approval_request.status),
+                    "decision": approval_resolution_decision_label(decision),
+                    "source": parsed_resolution.resolution_source,
+                }),
+            )
+            .await;
+
+            let delivery_receipt = match delivery
+                .send_message(&TelegramOutboundMessage {
+                    chat_id,
+                    text: approval_terminal_message(&approval_request, decision),
+                    reply_to_message_id,
+                    reply_markup: None,
+                })
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return record_and_return_approval_resolution_failure(
+                        pool,
+                        &trigger,
+                        ForegroundFailureKind::TelegramDeliveryFailure,
+                        error,
+                    )
+                    .await;
+                }
+            };
+            return Ok(TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                TelegramApprovalResolutionCompletion {
+                    trace_id: trigger.trace_id,
+                    execution_id: trigger.execution_id,
+                    ingress_id: trigger.ingress.ingress_id,
+                    approval_request_id: approval_request.approval_request_id,
+                    decision,
+                    outbound_message_id: delivery_receipt.message_id,
+                },
+            ));
+        }
+    }
+
+    let resolved_telegram_config = match telegram_config {
+        Some(telegram_config) => telegram_config.clone(),
+        None => match config.require_telegram_config() {
+            Ok(telegram_config) => telegram_config,
+            Err(error) => {
+                return record_and_return_approval_resolution_failure(
+                    pool,
+                    &trigger,
+                    ForegroundFailureKind::ApprovalResolutionFailure,
+                    error,
+                )
+                .await;
+            }
+        },
+    };
+
+    let actor_policy = approval::ApprovalResolutionActorPolicy {
+        mode: match resolved_telegram_config.approval_resolution_policy {
+            TelegramApprovalResolutionPolicy::DelegateAllowed => {
+                approval::ApprovalResolutionActorPolicyMode::DelegateAllowed
+            }
+            TelegramApprovalResolutionPolicy::OwnerOnly => {
+                approval::ApprovalResolutionActorPolicyMode::OwnerOnly
+            }
+        },
+        owner_principal_ref: resolved_telegram_config.internal_principal_ref.clone(),
+        allowlisted_principal_refs: resolved_telegram_config.allowlisted_principal_refs(),
+    };
+
+    let resolution = match approval::resolve_approval_request_with_actor_policy(
+        pool,
+        &approval::ApprovalResolutionAttempt {
+            token: parsed_resolution.approval_token.clone(),
+            actor_ref: format!("telegram:{}", trigger.ingress.internal_principal_ref),
+            expected_action_fingerprint: parsed_resolution
+                .expected_action_fingerprint
+                .clone()
+                .unwrap_or_else(|| approval_request.action_fingerprint.clone()),
+            decision: parsed_resolution.decision,
+            reason: Some(parsed_resolution.resolution_source.clone()),
+            resolved_at: trigger.received_at,
+        },
+        Some(&actor_policy),
+    )
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return record_and_return_approval_resolution_failure(
+                pool,
+                &trigger,
+                ForegroundFailureKind::ApprovalResolutionFailure,
+                error,
+            )
+            .await;
+        }
+    };
+    info!(
+        trace_id = %trigger.trace_id,
+        execution_id = %trigger.execution_id,
+        approval_request_id = %resolution.request.approval_request_id,
+        decision = ?resolution.event.decision,
+        "approval request resolved"
+    );
     emit_typing_chat_action(
         delivery,
         chat_id,
@@ -1735,6 +1837,17 @@ where
     let mut governed_action_summary = GovernedActionProcessingSummary::default();
     let mut limit_follow_up_consumed = false;
     let mut worker_pass_count = 0u32;
+    let mut malformed_repair_guidance: Option<contracts::ForegroundGovernedActionRepairGuidance> =
+        None;
+    let malformed_resteer_max_attempts = config
+        .governed_actions
+        .malformed_action_resteer_max_attempts;
+    let malformed_resteer_timeout_ms = foreground_timeout_ms.min(
+        config
+            .governed_actions
+            .malformed_action_resteer_timeout_ms
+            .max(1),
+    );
 
     loop {
         if worker_pass_count > 0 {
@@ -1747,24 +1860,96 @@ where
             )
             .await;
         }
-        worker_pass_count = worker_pass_count.saturating_add(1);
-        context.governed_action_loop_state = Some(action_loop_tracker.as_contract_state(config));
+        context.governed_action_loop_state =
+            Some(action_loop_tracker.as_contract_state(config, malformed_repair_guidance.clone()));
         let request_context = context.clone();
         let request = contracts::WorkerRequest::conscious(
             trigger.trace_id,
             trigger.execution_id,
             request_context.clone(),
         );
-        let response = launch_leased_conscious_worker(
+        let worker_timeout_ms = if malformed_repair_guidance.is_some() {
+            malformed_resteer_timeout_ms
+        } else {
+            foreground_timeout_ms
+        };
+        let response = match launch_leased_conscious_worker(
             pool,
             config,
             model_gateway_config,
             trigger,
             &request,
             transport,
-            foreground_timeout_ms,
+            worker_timeout_ms,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => {
+                malformed_repair_guidance = None;
+                response
+            }
+            Err(error) => {
+                if let Some(signal) = recoverable_malformed_action_signal(&error) {
+                    let attempt_index = malformed_repair_guidance
+                        .as_ref()
+                        .map_or(1, |guidance| guidance.attempt_index.saturating_add(1));
+                    if attempt_index <= malformed_resteer_max_attempts {
+                        let failure_detail = signal.detail.clone();
+                        audit::insert(
+                            pool,
+                            &NewAuditEvent {
+                                loop_kind: "conscious".to_string(),
+                                subsystem: "foreground_orchestration".to_string(),
+                                event_kind: "foreground_malformed_action_resteer_attempt"
+                                    .to_string(),
+                                severity: "info".to_string(),
+                                trace_id: trigger.trace_id,
+                                execution_id: Some(trigger.execution_id),
+                                worker_pid: None,
+                                payload: json!({
+                                    "attempt_index": attempt_index,
+                                    "max_attempts": malformed_resteer_max_attempts,
+                                    "failure_kind": "malformed_action_proposal",
+                                    "failure_detail": failure_detail,
+                                    "retry_timeout_ms": malformed_resteer_timeout_ms,
+                                }),
+                            },
+                        )
+                        .await?;
+                        malformed_repair_guidance =
+                            Some(contracts::ForegroundGovernedActionRepairGuidance {
+                                attempt_index,
+                                max_attempts: malformed_resteer_max_attempts,
+                                failure_kind: signal.failure_kind,
+                                failure_detail: signal.detail,
+                            });
+                        continue;
+                    }
+                    recovery::insert_operational_diagnostic(
+                        pool,
+                        &recovery::NewOperationalDiagnostic {
+                            operational_diagnostic_id: Uuid::now_v7(),
+                            trace_id: Some(trigger.trace_id),
+                            execution_id: Some(trigger.execution_id),
+                            subsystem: "foreground_orchestration".to_string(),
+                            severity: recovery::OperationalDiagnosticSeverity::Warn,
+                            reason_code: "foreground_malformed_action_resteer_exhausted"
+                                .to_string(),
+                            summary: "Malformed governed-action re-steer attempts exhausted"
+                                .to_string(),
+                            diagnostic_payload: json!({
+                                "max_attempts": malformed_resteer_max_attempts,
+                                "failure_kind": "malformed_action_proposal",
+                                "failure_detail": signal.detail,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+        };
+        worker_pass_count = worker_pass_count.saturating_add(1);
         let contracts::WorkerResult::Conscious(result) = &response.result else {
             bail!("conscious follow-up worker returned a non-conscious result");
         };
@@ -2259,7 +2444,7 @@ where
 fn foreground_failure_notice_text(trace_id: Uuid, failure_kind: ForegroundFailureKind) -> String {
     match failure_kind {
         ForegroundFailureKind::MalformedActionProposal => format!(
-            "I couldn't complete that because the assistant failed to produce a valid governed-action proposal for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the trace with `admin trace explain --trace-id {trace_id}`.",
+            "I couldn't complete that because the assistant failed to produce a valid structured governed-action response for the required task. Trace: {trace_id}. Failure kind: {}. Send the request again; if it repeats, inspect the relevant model-call payload with `admin trace explain --trace-id {trace_id} --focus failing-model-call --json`.",
             failure_kind.as_str()
         ),
         ForegroundFailureKind::WorkerProtocolFailure => format!(
@@ -2306,8 +2491,49 @@ impl ForegroundFailureKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerFailureSignal {
+    failure_kind: contracts::WorkerFailureKind,
+    detail: Option<String>,
+    side_effect_status: Option<contracts::WorkerFailureSideEffectStatus>,
+    retry_recommended: bool,
+}
+
+fn extract_worker_failure_signal(message: &str) -> Option<WorkerFailureSignal> {
+    const MARKER: &str = "worker_error_metadata=";
+    let marker_index = message.rfind(MARKER)?;
+    let metadata_json = message[marker_index + MARKER.len()..].trim();
+    let metadata: contracts::WorkerFailureMetadata = serde_json::from_str(metadata_json).ok()?;
+    Some(WorkerFailureSignal {
+        failure_kind: metadata.failure_kind,
+        detail: metadata.detail,
+        side_effect_status: metadata.side_effect_status,
+        retry_recommended: metadata.retry_recommended,
+    })
+}
+
+fn recoverable_malformed_action_signal(error: &Error) -> Option<WorkerFailureSignal> {
+    let message = format_error_chain(error);
+    let signal = extract_worker_failure_signal(&message)?;
+    if signal.failure_kind != contracts::WorkerFailureKind::MalformedActionProposal {
+        return None;
+    }
+    if signal.side_effect_status != Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted) {
+        return None;
+    }
+    if !signal.retry_recommended {
+        return None;
+    }
+    Some(signal)
+}
+
 fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
     let message = format_error_chain(error);
+    if let Some(signal) = extract_worker_failure_signal(&message) {
+        if signal.failure_kind == contracts::WorkerFailureKind::MalformedActionProposal {
+            return ForegroundFailureKind::MalformedActionProposal;
+        }
+    }
     if message.contains("provider returned status") {
         return ForegroundFailureKind::ProviderRejected;
     }
@@ -2331,23 +2557,7 @@ fn classify_conscious_worker_failure(error: &Error) -> ForegroundFailureKind {
         return ForegroundFailureKind::ModelGatewayTransportFailure;
     }
     if message.contains("worker_error_code=invalid_model_output")
-        && (message.contains("invalid governed-action proposal block")
-            || message.contains(
-                "attempted a governed action without the required governed-action block",
-            )
-            || message.contains(
-                "returned a likely governed-action payload outside the required governed-action block",
-            )
-            || message.contains(
-                "governed-action control block marker was present but the block was malformed or incomplete",
-            ))
-    {
-        return ForegroundFailureKind::MalformedActionProposal;
-    }
-    if message.contains("invalid governed-action proposal block")
-        || message.contains("attempted a governed action without the required governed-action block")
-        || message.contains("returned a likely governed-action payload outside the required governed-action block")
-        || message.contains("governed-action control block marker was present but the block was malformed or incomplete")
+        && message.contains("invalid conscious structured output")
     {
         return ForegroundFailureKind::MalformedActionProposal;
     }
@@ -2466,19 +2676,116 @@ fn parse_approval_callback_decision(
     }
 }
 
+async fn record_approval_resolution_diagnostic(
+    pool: &sqlx::PgPool,
+    trace_id: Option<Uuid>,
+    execution_id: Option<Uuid>,
+    reason_code: &str,
+    summary: &str,
+    diagnostic_payload: serde_json::Value,
+) {
+    let _ = recovery::insert_operational_diagnostic(
+        pool,
+        &recovery::NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id,
+            execution_id,
+            subsystem: "foreground_orchestration".to_string(),
+            severity: recovery::OperationalDiagnosticSeverity::Info,
+            reason_code: reason_code.to_string(),
+            summary: summary.to_string(),
+            diagnostic_payload,
+        },
+    )
+    .await;
+}
+
+fn approval_terminal_decision(
+    request: &approval::ApprovalRequestRecord,
+) -> Option<contracts::ApprovalResolutionDecision> {
+    request.resolution_kind.or(match request.status {
+        contracts::ApprovalRequestStatus::Approved => {
+            Some(contracts::ApprovalResolutionDecision::Approved)
+        }
+        contracts::ApprovalRequestStatus::Rejected => {
+            Some(contracts::ApprovalResolutionDecision::Rejected)
+        }
+        contracts::ApprovalRequestStatus::Expired => {
+            Some(contracts::ApprovalResolutionDecision::Expired)
+        }
+        contracts::ApprovalRequestStatus::Invalidated => {
+            Some(contracts::ApprovalResolutionDecision::Invalidated)
+        }
+        contracts::ApprovalRequestStatus::Pending => None,
+    })
+}
+
+fn approval_request_status_label(status: contracts::ApprovalRequestStatus) -> &'static str {
+    match status {
+        contracts::ApprovalRequestStatus::Pending => "pending",
+        contracts::ApprovalRequestStatus::Approved => "approved",
+        contracts::ApprovalRequestStatus::Rejected => "rejected",
+        contracts::ApprovalRequestStatus::Expired => "expired",
+        contracts::ApprovalRequestStatus::Invalidated => "invalidated",
+    }
+}
+
+fn approval_resolution_decision_label(
+    decision: contracts::ApprovalResolutionDecision,
+) -> &'static str {
+    match decision {
+        contracts::ApprovalResolutionDecision::Approved => "approved",
+        contracts::ApprovalResolutionDecision::Rejected => "rejected",
+        contracts::ApprovalResolutionDecision::Expired => "expired",
+        contracts::ApprovalResolutionDecision::Invalidated => "invalidated",
+    }
+}
+
+fn approval_terminal_message(
+    request: &approval::ApprovalRequestRecord,
+    decision: contracts::ApprovalResolutionDecision,
+) -> String {
+    match decision {
+        contracts::ApprovalResolutionDecision::Approved => format!(
+            "Approval already approved: {}\nState: approved\nNext: no additional action is needed.",
+            request.title
+        ),
+        contracts::ApprovalResolutionDecision::Rejected => format!(
+            "Approval already rejected: {}\nState: rejected\nNext: no action will be executed.",
+            request.title
+        ),
+        contracts::ApprovalResolutionDecision::Expired => {
+            "Approval request already expired.\nState: expired\nNext: request the action again to create a new approval."
+                .to_string()
+        }
+        contracts::ApprovalResolutionDecision::Invalidated => {
+            "Approval request already invalidated because the requested action changed.\nState: invalidated\nNext: request the action again."
+                .to_string()
+        }
+    }
+}
+
 fn approval_resolution_message(resolution: &approval::ApprovalResolutionResult) -> String {
     match resolution.event.decision {
         contracts::ApprovalResolutionDecision::Approved => {
-            format!("Approved: {}", resolution.request.title)
+            format!(
+                "Approval approved: {}\nState: approved\nNext: running the approved action now.",
+                resolution.request.title
+            )
         }
         contracts::ApprovalResolutionDecision::Rejected => {
-            format!("Rejected: {}", resolution.request.title)
+            format!(
+                "Approval rejected: {}\nState: rejected\nNext: no action was executed.",
+                resolution.request.title
+            )
         }
         contracts::ApprovalResolutionDecision::Expired => {
-            "Approval request expired before it could be applied.".to_string()
+            "Approval request expired.\nState: expired\nNext: request the action again to create a new approval."
+                .to_string()
         }
         contracts::ApprovalResolutionDecision::Invalidated => {
-            "Approval request is no longer valid because the requested action changed.".to_string()
+            "Approval request invalidated because the requested action changed.\nState: invalidated\nNext: request the action again."
+                .to_string()
         }
     }
 }
@@ -2503,20 +2810,20 @@ fn approval_follow_up_episode_text(
             .join(" | ");
         format!("Harness governed-action observations: {joined}")
     };
-    let trimmed_model_text = model_text.trim();
-    if trimmed_model_text.is_empty() {
+    let normalized_model_text = normalize_assistant_history_text(model_text);
+    if normalized_model_text.is_empty() {
         observation_text
     } else {
-        format!("{trimmed_model_text}\n\n{observation_text}")
+        format!("{normalized_model_text}\n\n{observation_text}")
     }
 }
 
 fn approval_follow_up_delivery_text(model_text: &str) -> String {
-    let trimmed = model_text.trim();
-    if trimmed.is_empty() {
+    let normalized = normalize_assistant_history_text(model_text);
+    if normalized.is_empty() {
         "Approved action completed.".to_string()
     } else {
-        trimmed.to_string()
+        normalized
     }
 }
 
@@ -2540,17 +2847,17 @@ fn foreground_assistant_delivery_text(
     candidate_proposals: &[contracts::CanonicalProposal],
     context: &contracts::ConsciousContext,
 ) -> String {
-    let trimmed = model_text.trim();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
+    let normalized = normalize_assistant_history_text(model_text);
+    if !normalized.is_empty() {
+        return normalized;
     }
 
     if governed_action_summary.pending_approval_count > 0 {
         return if governed_action_summary.pending_approval_count == 1 {
-            "Approval requested. Use the approval prompt above to continue.".to_string()
+            "Approval pending. Use the approval prompt above to approve or reject.".to_string()
         } else {
             format!(
-                "{} approvals requested. Use the approval prompts above to continue.",
+                "{} approvals pending. Use the approval prompts above to approve or reject.",
                 governed_action_summary.pending_approval_count
             )
         };
@@ -2572,6 +2879,33 @@ fn foreground_assistant_delivery_text(
     }
 
     "No assistant response was generated.".to_string()
+}
+
+fn normalize_assistant_history_text(model_text: &str) -> String {
+    let mut current = model_text.trim();
+    loop {
+        if let Some(rest) = strip_history_prefix_once(current, "Assistant") {
+            current = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = current.strip_prefix("Assistant:") {
+            current = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    current.trim().to_string()
+}
+
+fn strip_history_prefix_once<'a>(text: &'a str, author: &str) -> Option<&'a str> {
+    if !text.starts_with('[') {
+        return None;
+    }
+    let closing = text.find(']')?;
+    let remainder = text.get(closing + 1..)?.trim_start();
+    let remainder = remainder.strip_prefix(author)?;
+    let remainder = remainder.strip_prefix(':')?;
+    Some(remainder.trim_start())
 }
 
 fn identity_kickstart_delivery_fallback(
@@ -2880,8 +3214,18 @@ fn is_ambiguous_identity_answer(normalized: &str) -> bool {
     trimmed.is_empty()
         || matches!(
             trimmed,
-            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no"
+            "ok" | "okay" | "hello" | "hi" | "hey" | "hmm" | "yes" | "no" | "sure" | "fine"
         )
+        || trimmed.contains("what are the options")
+        || trimmed.contains("what are my options")
+        || trimmed.contains("what's the next step")
+        || trimmed.contains("what is the next step")
+        || trimmed.contains("what's the next question")
+        || trimmed.contains("what is the next question")
+        || trimmed.contains("are you finished")
+        || trimmed.contains("are we finished")
+        || trimmed.contains("next question")
+        || trimmed.contains("next step")
 }
 
 async fn emit_typing_chat_action<D>(
@@ -2932,6 +3276,13 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> &'static s
             "append_workspace_script_version"
         }
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        contracts::GovernedActionKind::ListEmailMessages => "list_email_messages",
+        contracts::GovernedActionKind::SendEmailMessage => "send_email_message",
+        contracts::GovernedActionKind::SyncTaskList => "sync_task_list",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -3009,6 +3360,22 @@ mod tests {
     }
 
     #[test]
+    fn foreground_assistant_delivery_normalizes_prefixed_history_text() {
+        let context = test_conscious_context(
+            contracts::IdentityLifecycleState::BootstrapSeedOnly,
+            Some("choose_predefined_identity_or_start_custom_interview"),
+            "waiting",
+        );
+        let normalized = foreground_assistant_delivery_text(
+            "[2026-05-07 12:00 UTC] Assistant: [2026-05-07 11:59 UTC] Assistant: Ready.",
+            &GovernedActionProcessingSummary::default(),
+            &[],
+            &context,
+        );
+        assert_eq!(normalized, "Ready.");
+    }
+
+    #[test]
     fn foreground_assistant_delivery_falls_back_for_single_pending_approval() {
         let summary = GovernedActionProcessingSummary {
             pending_approval_count: 1,
@@ -3022,7 +3389,7 @@ mod tests {
 
         assert_eq!(
             foreground_assistant_delivery_text("", &summary, &[], &context),
-            "Approval requested. Use the approval prompt above to continue."
+            "Approval pending. Use the approval prompt above to approve or reject."
         );
     }
 
@@ -3040,7 +3407,7 @@ mod tests {
 
         assert_eq!(
             foreground_assistant_delivery_text(" \n", &summary, &[], &context),
-            "2 approvals requested. Use the approval prompts above to continue."
+            "2 approvals pending. Use the approval prompts above to approve or reject."
         );
     }
 
@@ -3151,9 +3518,11 @@ mod tests {
             ForegroundFailureKind::MalformedActionProposal,
         );
 
-        assert!(notice.contains("valid governed-action proposal"));
+        assert!(notice.contains("valid structured governed-action response"));
         assert!(notice.contains("malformed_action_proposal"));
         assert!(notice.contains("admin trace explain --trace-id"));
+        assert!(notice.contains("--focus failing-model-call"));
+        assert!(notice.contains("--json"));
         assert!(notice.contains(&trace_id.to_string()));
     }
 
@@ -3188,8 +3557,110 @@ mod tests {
     #[test]
     fn classify_conscious_worker_failure_detects_malformed_action_proposal() {
         let error = anyhow::anyhow!(
-            "conscious worker returned an error response: model attempted a governed action without the required governed-action block; returned bare action token 'list_workspace_artifacts'"
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=invalid conscious structured output: `governed_actions` may include at most one proposal per response"
         );
+
+        assert_eq!(
+            classify_conscious_worker_failure(&error),
+            ForegroundFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn extract_worker_failure_signal_parses_metadata_suffix() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let signal = extract_worker_failure_signal(&format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=invalid output worker_error_metadata={serialized}"
+        ))
+        .expect("metadata suffix should parse");
+
+        assert_eq!(
+            signal.failure_kind,
+            contracts::WorkerFailureKind::MalformedActionProposal
+        );
+        assert_eq!(
+            signal.side_effect_status,
+            Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted)
+        );
+        assert!(signal.retry_recommended);
+        assert_eq!(
+            signal.detail.as_deref(),
+            Some(
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+            )
+        );
+    }
+
+    #[test]
+    fn recoverable_malformed_action_signal_accepts_none_executed_retry_recommended() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
+
+        let signal = recoverable_malformed_action_signal(&error)
+            .expect("recoverable malformed signal should be detected");
+        assert_eq!(
+            signal.failure_kind,
+            contracts::WorkerFailureKind::MalformedActionProposal
+        );
+    }
+
+    #[test]
+    fn recoverable_malformed_action_signal_rejects_non_retryable_metadata() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid conscious structured output: `assistant_text` must be a non-empty string"
+                    .to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: false,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
+
+        assert!(recoverable_malformed_action_signal(&error).is_none());
+    }
+
+    #[test]
+    fn classify_conscious_worker_failure_uses_worker_failure_metadata() {
+        let metadata = contracts::WorkerFailureMetadata {
+            failure_kind: contracts::WorkerFailureKind::MalformedActionProposal,
+            detail: Some(
+                "invalid conscious structured output: model response JSON did not match conscious output contract: missing field `artifact_kind`".to_string(),
+            ),
+            side_effect_status: Some(contracts::WorkerFailureSideEffectStatus::NoneExecuted),
+            retry_recommended: true,
+        };
+        let serialized =
+            serde_json::to_string(&metadata).expect("worker failure metadata should serialize");
+        let error = anyhow::anyhow!(format!(
+            "conscious worker returned an error response: worker_error_code=invalid_model_output message=model output invalid worker_error_metadata={serialized}"
+        ));
 
         assert_eq!(
             classify_conscious_worker_failure(&error),

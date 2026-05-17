@@ -1,0 +1,22 @@
+{
+  "update_id": 1006,
+  "callback_query": {
+    "id": "callback-124",
+    "from": {
+      "id": 42,
+      "is_bot": false,
+      "first_name": "Francisco",
+      "username": "fjr"
+    },
+    "data": "reject:42",
+    "message": {
+      "message_id": 46,
+      "date": 1712300040,
+      "chat": {
+        "id": 42,
+        "type": "private"
+      },
+      "text": "Approve this action?"
+    }
+  }
+}

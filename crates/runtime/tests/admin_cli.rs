@@ -28,8 +28,10 @@ fn admin_help_lists_management_subcommands() -> Result<()> {
         .stdout(predicate::str::contains("identity"))
         .stdout(predicate::str::contains("approvals"))
         .stdout(predicate::str::contains("actions"))
+        .stdout(predicate::str::contains("integrations"))
         .stdout(predicate::str::contains("workspace"))
         .stdout(predicate::str::contains("trace"))
+        .stdout(predicate::str::contains("model"))
         .stdout(predicate::str::contains("wake-signals"));
     Ok(())
 }
@@ -103,6 +105,21 @@ fn admin_trace_cleanup_help_lists_json_argument() -> Result<()> {
         .arg("admin")
         .arg("trace")
         .arg("cleanup-model-payloads")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_model_preflight_help_lists_json_argument() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("model")
+        .arg("preflight-structured-output")
         .arg("--help");
     command
         .assert()
@@ -195,6 +212,60 @@ fn admin_workspace_runs_help_lists_filter_arguments() -> Result<()> {
         .assert()
         .success()
         .stdout(predicate::str::contains("--script-id"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_integrations_calendar_list_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("integrations")
+        .arg("calendar")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_integrations_email_list_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("integrations")
+        .arg("email")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("--json"));
+    Ok(())
+}
+
+#[test]
+fn admin_integrations_task_sync_list_help_lists_filter_arguments() -> Result<()> {
+    let mut command = Command::cargo_bin("runtime")?;
+    command
+        .arg("admin")
+        .arg("integrations")
+        .arg("task-sync")
+        .arg("list")
+        .arg("--help");
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--status"))
         .stdout(predicate::str::contains("--limit"))
         .stdout(predicate::str::contains("--json"));
     Ok(())
@@ -405,6 +476,21 @@ async fn phase_six_admin_json_commands_run_against_a_real_database() -> Result<(
     assert_admin_json_command(
         &database_url,
         &["admin", "identity", "edit", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "integrations", "calendar", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "integrations", "email", "list", "--json"],
+        "[]",
+    )?;
+    assert_admin_json_command(
+        &database_url,
+        &["admin", "integrations", "task-sync", "list", "--json"],
         "[]",
     )?;
 

@@ -200,6 +200,8 @@ pub struct EpisodeSummary {
 pub struct WorkerFailure {
     pub code: WorkerErrorCode,
     pub message: String,
+    #[serde(default)]
+    pub metadata: Option<WorkerFailureMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +222,29 @@ impl WorkerErrorCode {
             Self::InternalFailure => "internal_failure",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFailureMetadata {
+    pub failure_kind: WorkerFailureKind,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub side_effect_status: Option<WorkerFailureSideEffectStatus>,
+    #[serde(default)]
+    pub retry_recommended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureKind {
+    MalformedActionProposal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureSideEffectStatus {
+    NoneExecuted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +459,17 @@ pub struct ForegroundGovernedActionLoopState {
     pub max_actions_per_turn: u32,
     pub remaining_actions_before_cap: u32,
     pub cap_exceeded_behavior: GovernedActionCapExceededBehavior,
+    #[serde(default)]
+    pub repair_guidance: Option<ForegroundGovernedActionRepairGuidance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundGovernedActionRepairGuidance {
+    pub attempt_index: u32,
+    pub max_attempts: u32,
+    pub failure_kind: WorkerFailureKind,
+    #[serde(default)]
+    pub failure_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1393,6 +1429,13 @@ pub enum GovernedActionKind {
     CreateWorkspaceScript,
     AppendWorkspaceScriptVersion,
     ListWorkspaceScriptRuns,
+    InspectIngressAttachments,
+    ProcessIngressAttachment,
+    ListCalendarEvents,
+    UpsertCalendarEvent,
+    ListEmailMessages,
+    SendEmailMessage,
+    SyncTaskList,
     UpsertScheduledForegroundTask,
     RequestBackgroundJob,
     RunDiagnostic,
@@ -1508,6 +1551,92 @@ pub struct ListWorkspaceScriptRunsAction {
     pub status: Option<WorkspaceScriptRunStatus>,
     #[serde(default = "default_governed_action_list_limit")]
     pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressAttachmentProcessingStatus {
+    Pending,
+    Processed,
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressAttachmentSummary {
+    pub ingress_attachment_id: Uuid,
+    pub ingress_id: Uuid,
+    pub attachment_id: String,
+    pub media_type: Option<String>,
+    pub file_name: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub processing_status: IngressAttachmentProcessingStatus,
+    pub last_processed_at: Option<DateTime<Utc>>,
+    pub last_failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectIngressAttachmentsAction {
+    pub ingress_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIngressAttachmentAction {
+    pub ingress_id: Uuid,
+    pub attachment_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListCalendarEventsAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    #[serde(default = "default_governed_action_list_limit")]
+    pub max_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpsertCalendarEventAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub title: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub location: Option<String>,
+    pub details: Option<String>,
+    pub external_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListEmailMessagesAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub mailbox: Option<String>,
+    pub query: Option<String>,
+    #[serde(default = "default_governed_action_list_limit")]
+    pub max_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendEmailMessageAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub reply_to_external_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTaskListAction {
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub task_list_title: String,
+    pub items: Vec<String>,
+    pub external_list_id: Option<String>,
+    pub workspace_artifact_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1665,6 +1794,13 @@ pub enum GovernedActionPayload {
     CreateWorkspaceScript(CreateWorkspaceScriptAction),
     AppendWorkspaceScriptVersion(AppendWorkspaceScriptVersionAction),
     ListWorkspaceScriptRuns(ListWorkspaceScriptRunsAction),
+    InspectIngressAttachments(InspectIngressAttachmentsAction),
+    ProcessIngressAttachment(ProcessIngressAttachmentAction),
+    ListCalendarEvents(ListCalendarEventsAction),
+    UpsertCalendarEvent(UpsertCalendarEventAction),
+    ListEmailMessages(ListEmailMessagesAction),
+    SendEmailMessage(SendEmailMessageAction),
+    SyncTaskList(SyncTaskListAction),
     UpsertScheduledForegroundTask(UpsertScheduledForegroundTaskAction),
     RequestBackgroundJob(RequestBackgroundJobAction),
     RunDiagnostic(RunDiagnosticAction),
@@ -1820,6 +1956,8 @@ pub enum LoopKind {
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderKind {
     ZAi,
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1877,6 +2015,29 @@ pub struct ModelInputMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PromptCompositionMetrics {
+    pub system_prompt_chars: u32,
+    pub developer_message_chars: u32,
+    pub user_message_chars: u32,
+    pub assistant_message_chars: u32,
+    pub total_message_chars: u32,
+    pub total_chars: u32,
+    pub estimated_input_tokens: u32,
+    pub message_count: u32,
+    pub trimmed_message_count: u32,
+    pub trimmed_char_count: u32,
+    pub trim_events: Vec<String>,
+    #[serde(default)]
+    pub context_scenario: Option<String>,
+    #[serde(default)]
+    pub schema_disclosure: Option<String>,
+    #[serde(default)]
+    pub retrieval_eligible: Option<bool>,
+    #[serde(default)]
+    pub inclusion_decisions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCallRequest {
     pub request_id: Uuid,
@@ -1887,6 +2048,7 @@ pub struct ModelCallRequest {
     pub task_class: String,
     pub budget: ModelBudget,
     pub input: ModelInput,
+    pub prompt_metrics: Option<PromptCompositionMetrics>,
     pub output_mode: ModelOutputMode,
     pub schema_name: Option<String>,
     pub schema_json: Option<Value>,
@@ -2017,6 +2179,16 @@ mod tests {
                 preferred_model: Some("z-ai-foreground".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn model_provider_kind_serializes_stable_openrouter_label() {
+        let json = serde_json::to_string(&ModelProviderKind::OpenRouter)
+            .expect("provider should serialize");
+        assert_eq!(json, r#""openrouter""#);
+        let decoded: ModelProviderKind =
+            serde_json::from_str(r#""open_router""#).expect("legacy alias should deserialize");
+        assert_eq!(decoded, ModelProviderKind::OpenRouter);
     }
 
     #[test]
@@ -2206,6 +2378,108 @@ mod tests {
     }
 
     #[test]
+    fn governed_action_calendar_list_payload_defaults_bounded_max_results() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("list_calendar_events");
+        value["payload"] = serde_json::json!({
+            "kind": "list_calendar_events",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "start_at": "2026-05-20T09:00:00Z",
+                "end_at": "2026-05-20T18:00:00Z"
+            }
+        });
+
+        let decoded: GovernedActionProposal =
+            serde_json::from_value(value).expect("missing calendar max_results should default");
+        let GovernedActionPayload::ListCalendarEvents(payload) = decoded.payload else {
+            panic!("expected list calendar events payload");
+        };
+        assert_eq!(payload.max_results, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn governed_action_calendar_payload_rejects_missing_required_fields() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("upsert_calendar_event");
+        value["payload"] = serde_json::json!({
+            "kind": "upsert_calendar_event",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "starts_at": "2026-05-20T09:00:00Z",
+                "ends_at": "2026-05-20T10:00:00Z"
+            }
+        });
+
+        let error = serde_json::from_value::<GovernedActionProposal>(value)
+            .expect_err("missing title should fail calendar upsert payload parse");
+        assert!(error.to_string().contains("title"));
+    }
+
+    #[test]
+    fn governed_action_email_list_payload_defaults_bounded_max_results() {
+        let mut value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        value["action_kind"] = serde_json::json!("list_email_messages");
+        value["payload"] = serde_json::json!({
+            "kind": "list_email_messages",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "mailbox": "inbox",
+                "query": "subject:milestone"
+            }
+        });
+
+        let decoded: GovernedActionProposal =
+            serde_json::from_value(value).expect("missing email max_results should default");
+        let GovernedActionPayload::ListEmailMessages(payload) = decoded.payload else {
+            panic!("expected list email messages payload");
+        };
+        assert_eq!(payload.max_results, DEFAULT_GOVERNED_ACTION_LIST_LIMIT);
+    }
+
+    #[test]
+    fn governed_action_email_and_task_sync_payloads_reject_missing_required_fields() {
+        let mut email_value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        email_value["action_kind"] = serde_json::json!("send_email_message");
+        email_value["payload"] = serde_json::json!({
+            "kind": "send_email_message",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "to": ["one@example.com"],
+                "cc": [],
+                "body_text": "hello"
+            }
+        });
+        let email_error = serde_json::from_value::<GovernedActionProposal>(email_value)
+            .expect_err("missing subject should fail email send payload parse");
+        assert!(email_error.to_string().contains("subject"));
+
+        let mut task_value =
+            serde_json::to_value(sample_governed_action_proposal()).expect("proposal to value");
+        task_value["action_kind"] = serde_json::json!("sync_task_list");
+        task_value["payload"] = serde_json::json!({
+            "kind": "sync_task_list",
+            "value": {
+                "internal_principal_ref": "primary-user",
+                "internal_conversation_ref": "telegram-primary",
+                "external_list_id": null,
+                "workspace_artifact_id": null
+            }
+        });
+        let task_error = serde_json::from_value::<GovernedActionProposal>(task_value)
+            .expect_err("missing task_list_title should fail task sync payload parse");
+        assert!(task_error.to_string().contains("task_list_title"));
+    }
+
+    #[test]
     fn diagnostic_query_limits_default_to_bounded_read_limit() {
         let decoded: RunDiagnosticAction = serde_json::from_value(serde_json::json!({
             "query": {
@@ -2347,6 +2621,7 @@ mod tests {
                 max_actions_per_turn: 10,
                 remaining_actions_before_cap: 10,
                 cap_exceeded_behavior: GovernedActionCapExceededBehavior::Escalate,
+                repair_guidance: None,
             }),
             recovery_context: ForegroundRecoveryContext {
                 mode: ForegroundExecutionMode::BacklogRecovery,
@@ -2566,6 +2841,23 @@ mod tests {
                     },
                 ],
             },
+            prompt_metrics: Some(PromptCompositionMetrics {
+                system_prompt_chars: 21,
+                developer_message_chars: 13,
+                user_message_chars: 5,
+                assistant_message_chars: 0,
+                total_message_chars: 18,
+                total_chars: 39,
+                estimated_input_tokens: 10,
+                message_count: 2,
+                trimmed_message_count: 0,
+                trimmed_char_count: 0,
+                trim_events: Vec::new(),
+                context_scenario: Some("routine_greeting".to_string()),
+                schema_disclosure: Some("short_reminder".to_string()),
+                retrieval_eligible: Some(false),
+                inclusion_decisions: vec!["schema:short_reminder".to_string()],
+            }),
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,

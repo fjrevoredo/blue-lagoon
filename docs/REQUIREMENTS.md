@@ -101,6 +101,15 @@ This specification does not select:
 - The conscious loop MUST NOT directly instantiate or control unconscious workers.
 - The conscious loop MUST NOT bypass harness policy or permission checks.
 
+### 6.3 Output constraints
+- Conscious workers MUST return structured outputs only.
+- Foreground structured output MUST include a required user-facing reply field.
+- Governed-action proposals and identity-control directives, when present, MUST
+  be carried as optional structured fields in the same foreground output object.
+- A conscious worker response MUST include at most one governed-action proposal;
+  additional action rounds, if needed, MUST occur through harness-mediated
+  continuation turns.
+
 ## 7. Unconscious loop requirements
 
 ### 7.1 Responsibilities
@@ -197,6 +206,16 @@ The unconscious loop MUST be allowed to produce:
 - The system SHOULD include warning thresholds before hard termination.
 - The system SHOULD surface repeated budget exhaustion as an operational signal.
 - Foreground execution MAY include multiple harness-mediated governed actions inside one foreground turn, but every additional action MUST remain bounded by explicit budgets, a configured per-turn action cap, and normal approval or policy gates.
+
+### 10.4 Model-call reasoning policy
+- The harness MUST support explicit reasoning-policy selection for model-call routes where the configured provider supports provider-controlled reasoning modes.
+- The minimum supported reasoning-policy outcomes MUST include:
+  - reasoning disabled
+  - reasoning enabled with an explicit policy-controlled level when the active route supports it
+  - provider-default behavior when the operator intentionally chooses it
+- Reasoning policy MUST be resolved by the harness before the model call is issued.
+- Provider-specific reasoning request encoding MUST remain a harness concern rather than a worker concern.
+- If the active route cannot safely satisfy the selected reasoning policy, the harness MUST fail closed or apply a documented safe compatibility rule owned by the harness.
 
 ## 11. Self-model and identity
 
@@ -341,6 +360,12 @@ Each meaningful episodic record SHOULD capture:
 ### 16.2 Safety posture
 - The implementation MUST assume that model output can be incorrect, manipulated, or adversarial.
 - The implementation design SHOULD prefer least privilege, bounded execution, approval paths for sensitive actions, and isolated execution for risky tools.
+
+### 16.3 Archived workspace immutability
+- Workspace artifacts and workspace scripts in an archived state MUST be treated as immutable records.
+- The harness MUST NOT allow direct mutation or execution of archived workspace artifacts or archived workspace scripts through normal governed-action paths.
+- Returning archived workspace artifacts or scripts to active use MUST require an explicit restore or unarchive path that is harness-mediated, policy-evaluated, and auditable.
+- Restore or unarchive flows MUST record actor identity, reason, and timestamp before any subsequent active-state mutation proceeds.
 
 ## 17. Logging, traceability, and observability
 

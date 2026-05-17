@@ -13,7 +13,7 @@ The explorer is CLI-first. It now supports:
 
 - diagnosis-first text and JSON output for one trace
 - detailed timeline output with a prepended diagnosis summary
-- focused failing-node inspection for the most relevant payload
+- focused failing-node and failing-model-call inspection for relevant payloads
 - static Mermaid graph rendering for architecture inspection
 
 Mermaid is no longer the recommended first-line troubleshooting path. Operators
@@ -28,11 +28,11 @@ they need causal-graph inspection.
 
 | File | Relevant symbol |
 |---|---|
-| `crates/harness/src/management.rs` | `TraceReport` (line 398), `TraceFailureClass` (line 482), `TraceDiagnosisSummary` (line 542), `TraceExplanationReport` (line 584), `load_trace_report()` (line 2165), `diagnose_trace_report()` (line 2201), `classify_failure_text()` (line 3719), `derive_next_steps()` (line 3913), `trace_failure_class_label()` (line 4049) |
-| `crates/harness/src/model_calls.rs` | `ModelCallRecord` (line 16), `insert_pending_model_call_record()` (line 41), `clear_expired_model_call_payloads()` (line 258), `background_job_run_for_execution()` (line 312) |
+| `crates/harness/src/management.rs` | `TraceReport` (line 452), `TraceFailureClass` (line 536), `TraceDiagnosisSummary` (line 598), `TraceExplanationReport` (line 641), `load_trace_report()` (line 2342), `diagnose_trace_report()` (line 2376), `classify_failure_text()` (line 3935), `derive_next_steps()` (line 4129), `trace_failure_class_label()` (line 4265) |
+| `crates/harness/src/model_calls.rs` | `ModelCallRecord` (line 16), `insert_pending_model_call_record()` (line 41), `clear_expired_model_call_payloads()` (line 261), `background_job_run_for_execution()` (line 315) |
 | `crates/harness/src/causal_links.rs` | `NewCausalLink` (line 8), `insert()` (line 31), `list_for_trace()` (line 69) |
-| `crates/harness/src/worker.rs` | `launch_conscious_worker_with_timeout()` (line 136), `launch_unconscious_worker_with_timeout()` (line 344), `collect_worker_protocol_failure_context()` (line 620), `stderr_excerpt()` (line 645) |
-| `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 85), `TraceExplainCommand` (line 119), `TraceShowCommand` (line 129), `render_trace_explanation_text()` (line 1431), `render_trace_report_text()` (line 1518), `render_trace_mermaid()` (line 1680), `format_trace_failure_class()` (line 1739) |
+| `crates/harness/src/worker.rs` | `launch_conscious_worker_with_timeout()` (line 141), `launch_unconscious_worker_with_timeout()` (line 352), `explicit_worker_args()` (line 620), `is_worker_multiplexer_command()` (line 632), `collect_worker_protocol_failure_context()` (line 682), `stderr_excerpt()` (line 707) |
+| `crates/runtime/src/admin.rs` | `TraceSubcommand` (line 87), `TraceExplainCommand` (line 124), `TraceShowCommand` (line 134), `render_trace_explanation_text()` (line 1581), `render_trace_report_text()` (line 1668), `render_trace_mermaid()` (line 1830), `format_trace_failure_class()` (line 1889) |
 | `migrations/0011__model_call_records.sql` | durable model-call records |
 | `migrations/0012__causal_links.sql` | durable causal graph edges |
 
@@ -95,6 +95,16 @@ excerpt when available. `trace explain` classifies those errors as
 `worker_protocol_failure` and tells the operator to inspect the worker
 binary/configuration before retrying.
 
+Worker command resolution supports both packaged and explicitly configured
+worker binaries. With the default empty `worker.command`, the harness looks for a
+sibling `workers` or `workers.exe` binary next to the runtime and appends the
+per-worker subcommand at launch. If `worker.command` or
+`BLUE_LAGOON_WORKER_COMMAND` explicitly points at the `workers` multiplexer
+binary and `worker.args`/`BLUE_LAGOON_WORKER_ARGS` are empty, the harness still
+appends the required `smoke-worker`, `conscious-worker`, or `unconscious-worker`
+subcommand. Explicit one-purpose wrapper commands keep their configured args
+unchanged.
+
 Retention-managed fields are:
 
 - `request_payload_json`
@@ -133,6 +143,7 @@ The runtime admin CLI exposes:
 - `cargo run -p runtime -- admin trace explain --trace-id <uuid>`
 - `cargo run -p runtime -- admin trace explain --execution-id <uuid>`
 - `cargo run -p runtime -- admin trace explain --trace-id <uuid> --focus failing-node`
+- `cargo run -p runtime -- admin trace explain --trace-id <uuid> --focus failing-model-call`
 - `cargo run -p runtime -- admin trace explain --trace-id <uuid> --json`
 - `cargo run -p runtime -- admin trace show --trace-id <uuid>`
 - `cargo run -p runtime -- admin trace show --execution-id <uuid>`
@@ -142,11 +153,18 @@ The runtime admin CLI exposes:
 - `cargo run -p runtime -- admin trace cleanup-model-payloads`
 
 `trace explain` is the primary troubleshooting entrypoint. It renders a
-failure-first diagnosis summary and can optionally attach a focused failing-node
-inspection. `trace show` renders the same diagnosis summary first, then the full
-timeline, edges, scheduling projection, and trace notes. `trace show --json`
+failure-first diagnosis summary and can optionally attach focused node
+inspection (`failing-node` or `failing-model-call`). `trace show` renders the
+same diagnosis summary first, then the full timeline, edges, scheduling
+projection, and trace notes. `trace show --json`
 continues to emit the normalized `TraceReport`. `trace explain --json` emits a
 `TraceExplanationReport` with `diagnosis` and optional `focus`.
+
+When a trace includes retained foreground or background model-call payloads,
+`trace show --json` also exposes `ModelCallRequest.prompt_metrics`. For
+foreground calls this includes post-trim character totals for the system prompt,
+developer messages, user messages, assistant-history messages, estimated input
+tokens, and any trim events recorded during final prompt assembly.
 
 Focused inspection is conservative:
 
@@ -154,7 +172,7 @@ Focused inspection is conservative:
   availability classification
 - if retained bulky model-call payloads were cleared by retention, the report
   marks that explicitly and keeps only retained metadata
-- if no failing node exists, focused failing-node inspection reports
+- if the requested target does not exist, focused inspection reports
   `unavailable` rather than guessing
 
 `trace render --format mermaid` renders the normalized node and edge model as a
@@ -171,7 +189,7 @@ metadata required for trace correlation and conservative diagnosis.
 
 | Config key | Default | Valid range | Read by |
 |---|---:|---|---|
-| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `config.rs:130`, `worker.rs:200`, `worker.rs:380` |
+| `observability.model_call_payload_retention_days` | `30` | integer greater than zero | `crates/harness/src/config.rs:130`, `crates/harness/src/worker.rs:200`, `crates/harness/src/worker.rs:380` |
 
 To add a new traceable relationship:
 
@@ -213,4 +231,4 @@ To extend diagnosis:
 - `crates/runtime/src/admin.rs` contains the operator command parser and trace
   text/Mermaid renderers.
 
-Verified: 2026-05-07.
+Verified: 2026-05-17.

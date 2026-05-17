@@ -1,27 +1,34 @@
 use std::fmt::Write as _;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use contracts::{
+    LoopKind, ModelBudget, ModelCallPurpose, ModelCallRequest, ModelInput, ModelInputMessage,
+    ModelMessageRole, ModelOutputMode, ModelProviderHint, ModelProviderKind, ToolPolicy,
+};
 use harness::{
     config::RuntimeConfig,
     management::{
         self, ApprovalRequestSummary, ApprovalResolutionSummary, BackgroundEnqueueOutcome,
-        BackgroundJobSummary, BackgroundRunNextOutcome, EnqueueBackgroundJobRequest,
-        GovernedActionSummary, IdentityDiagnosticSummary, IdentityEditProposalReport,
-        IdentityEditProposalRequest, IdentityEditProposalSummary, IdentityEditResolutionReport,
-        IdentityEditResolutionRequest, IdentityHistorySummary, IdentityResetReport,
-        IdentityResetRequest, IdentityShowReport, IdentityStatusReport,
-        OperationalDiagnosticSummary, OperationalHealthSummary,
+        BackgroundJobSummary, BackgroundRunNextOutcome, CalendarIntegrationRunSummary,
+        EmailIntegrationRunSummary, EnqueueBackgroundJobRequest, GovernedActionSummary,
+        IdentityDiagnosticSummary, IdentityEditProposalReport, IdentityEditProposalRequest,
+        IdentityEditProposalSummary, IdentityEditResolutionReport, IdentityEditResolutionRequest,
+        IdentityHistorySummary, IdentityResetReport, IdentityResetRequest, IdentityShowReport,
+        IdentityStatusReport, OperationalDiagnosticSummary, OperationalHealthSummary,
         PendingForegroundConversationSummary, RecoveryCheckpointSummary, RecoverySupervisionReport,
         ResolveApprovalRequest, RuntimeStatusReport, ScheduledForegroundTaskSummary,
         ScheduledForegroundTaskUpsertSummary, SchemaStatusReport, SchemaUpgradeAssessmentReport,
-        SuperviseWorkerLeasesRequest, TraceDiagnosisSummary, TraceExplanationReport,
-        TraceFocusPayloadAvailability, TraceFocusReport, TraceFocusSelector, TraceLookupRequest,
-        TraceReport, TraceSummary, UpsertScheduledForegroundTaskRequest, WakeSignalSummary,
-        WorkerLeaseInspectionSummary, WorkspaceScriptRunSummary,
+        SuperviseWorkerLeasesRequest, TaskSyncRunSummary, TraceDiagnosisSummary,
+        TraceExplanationReport, TraceFocusPayloadAvailability, TraceFocusReport,
+        TraceFocusSelector, TraceLookupRequest, TraceReport, TraceSummary,
+        UpsertScheduledForegroundTaskRequest, WakeSignalSummary, WorkerLeaseInspectionSummary,
+        WorkspaceScriptRunSummary,
     },
+    model_gateway,
 };
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 pub struct AdminCommand {
@@ -41,8 +48,10 @@ pub enum AdminSubcommand {
     Identity(IdentityCommand),
     Approvals(ApprovalsCommand),
     Actions(ActionsCommand),
+    Integrations(IntegrationsCommand),
     Workspace(WorkspaceCommand),
     Trace(TraceCommand),
+    Model(ModelCommand),
     #[command(name = "wake-signals")]
     WakeSignals(WakeSignalsCommand),
 }
@@ -105,12 +114,15 @@ pub struct TraceLookupCommandArgs {
 pub enum TraceFocusArg {
     #[value(name = "failing-node")]
     FailingNode,
+    #[value(name = "failing-model-call")]
+    FailingModelCall,
 }
 
 impl From<TraceFocusArg> for TraceFocusSelector {
     fn from(value: TraceFocusArg) -> Self {
         match value {
             TraceFocusArg::FailingNode => Self::FailingNode,
+            TraceFocusArg::FailingModelCall => Self::FailingModelCall,
         }
     }
 }
@@ -156,6 +168,24 @@ pub enum TraceRenderFormatArg {
 
 #[derive(Debug, Args)]
 pub struct TraceCleanupModelPayloadsCommand {
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ModelCommand {
+    #[command(subcommand)]
+    pub command: ModelSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelSubcommand {
+    #[command(name = "preflight-structured-output")]
+    PreflightStructuredOutput(ModelPreflightStructuredOutputCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ModelPreflightStructuredOutputCommand {
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
@@ -513,6 +543,83 @@ pub enum ActionsSubcommand {
 
 #[derive(Debug, Args)]
 pub struct ActionsListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct IntegrationsCommand {
+    #[command(subcommand)]
+    pub command: IntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IntegrationsSubcommand {
+    Calendar(CalendarIntegrationsCommand),
+    Email(EmailIntegrationsCommand),
+    #[command(name = "task-sync")]
+    TaskSync(TaskSyncIntegrationsCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct CalendarIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: CalendarIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CalendarIntegrationsSubcommand {
+    List(CalendarIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct CalendarIntegrationListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct EmailIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: EmailIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EmailIntegrationsSubcommand {
+    List(EmailIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct EmailIntegrationListCommand {
+    #[arg(long, value_enum)]
+    pub status: Option<GovernedActionStatusArg>,
+    #[arg(long, default_value_t = management::default_list_limit())]
+    pub limit: u32,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct TaskSyncIntegrationsCommand {
+    #[command(subcommand)]
+    pub command: TaskSyncIntegrationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskSyncIntegrationsSubcommand {
+    List(TaskSyncIntegrationListCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskSyncIntegrationListCommand {
     #[arg(long, value_enum)]
     pub status: Option<GovernedActionStatusArg>,
     #[arg(long, default_value_t = management::default_list_limit())]
@@ -964,6 +1071,41 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 print_governed_actions(actions, command.json)?;
             }
         },
+        AdminSubcommand::Integrations(command) => match command.command {
+            IntegrationsSubcommand::Calendar(command) => match command.command {
+                CalendarIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_calendar_integration_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_calendar_integration_runs(runs, command.json)?;
+                }
+            },
+            IntegrationsSubcommand::Email(command) => match command.command {
+                EmailIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_email_integration_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_email_integration_runs(runs, command.json)?;
+                }
+            },
+            IntegrationsSubcommand::TaskSync(command) => match command.command {
+                TaskSyncIntegrationsSubcommand::List(command) => {
+                    let runs = management::list_task_sync_runs(
+                        config,
+                        command.status.map(Into::into),
+                        command.limit,
+                    )
+                    .await?;
+                    print_task_sync_runs(runs, command.json)?;
+                }
+            },
+        },
         AdminSubcommand::Workspace(command) => match command.command {
             WorkspaceSubcommand::Artifacts(command) => match command.command {
                 WorkspaceArtifactsSubcommand::List(command) => {
@@ -1037,6 +1179,11 @@ pub async fn run_admin_command(config: &RuntimeConfig, command: AdminCommand) ->
                 } else {
                     println!("Cleared {cleared_count} expired model-call payload record(s).");
                 }
+            }
+        },
+        AdminSubcommand::Model(command) => match command.command {
+            ModelSubcommand::PreflightStructuredOutput(command) => {
+                run_model_structured_output_preflight(config, command.json).await?;
             }
         },
         AdminSubcommand::WakeSignals(command) => match command.command {
@@ -1118,6 +1265,15 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
     if let Some(timeout_ms) = report.model_gateway.timeout_ms {
         println!("  timeout_ms: {timeout_ms}");
     }
+    if let Some(compatible) = report.model_gateway.conscious_structured_output_compatible {
+        println!(
+            "  conscious structured output route compatible: {}",
+            yes_no(compatible)
+        );
+    }
+    if let Some(issue) = &report.model_gateway.conscious_structured_output_issue {
+        println!("  conscious structured output issue: {issue}");
+    }
 
     println!("Self model");
     println!("  configured: {}", yes_no(report.self_model.configured));
@@ -1157,6 +1313,176 @@ fn print_status(report: RuntimeStatusReport, json: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ModelStructuredOutputPreflightReport {
+    status: String,
+    provider: String,
+    model: String,
+    request_id: String,
+    detail: String,
+    response_preview: Option<String>,
+}
+
+async fn run_model_structured_output_preflight(config: &RuntimeConfig, json: bool) -> Result<()> {
+    let gateway = config.require_model_gateway_config()?;
+    let request_id = Uuid::now_v7();
+    let trace_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+
+    let request = ModelCallRequest {
+        request_id,
+        trace_id,
+        execution_id,
+        loop_kind: LoopKind::Conscious,
+        purpose: ModelCallPurpose::ForegroundResponse,
+        task_class: "admin_structured_output_preflight".to_string(),
+        budget: ModelBudget {
+            max_input_tokens: 512,
+            max_output_tokens: 128,
+            timeout_ms: gateway.foreground.timeout_ms.min(20_000),
+        },
+        input: ModelInput {
+            system_prompt: "You are running a structured-output preflight. Return only valid JSON."
+                .to_string(),
+            messages: vec![
+                ModelInputMessage {
+                    role: ModelMessageRole::Developer,
+                    content:
+                        "Return one JSON object with required `assistant_text` and optional `governed_actions`."
+                            .to_string(),
+                },
+                ModelInputMessage {
+                    role: ModelMessageRole::User,
+                    content: "Return a valid preflight response.".to_string(),
+                },
+            ],
+        },
+        prompt_metrics: None,
+        output_mode: ModelOutputMode::JsonObject,
+        schema_name: Some("admin_conscious_output_preflight".to_string()),
+        schema_json: Some(serde_json::json!({
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["assistant_text"],
+            "properties": {
+                "assistant_text": { "type": "string", "minLength": 1 },
+                "governed_actions": { "type": "array" },
+                "identity_kickstart": { "type": "object" }
+            }
+        })),
+        tool_policy: ToolPolicy::NoTools,
+        provider_hint: Some(ModelProviderHint {
+            preferred_provider: Some(gateway.foreground.provider),
+            preferred_model: Some(gateway.foreground.model.clone()),
+        }),
+    };
+
+    let transport = model_gateway::ReqwestModelProviderTransport::new();
+    let provider = model_provider_identifier(gateway.foreground.provider).to_string();
+    let model = gateway.foreground.model.clone();
+
+    let report =
+        match model_gateway::execute_foreground_model_call(&gateway, &request, &transport).await {
+            Ok(response) => {
+                let validation =
+                    validate_structured_output_preflight_response(response.output.json.as_ref());
+                match validation {
+                    Ok(detail) => ModelStructuredOutputPreflightReport {
+                        status: "success".to_string(),
+                        provider,
+                        model,
+                        request_id: request_id.to_string(),
+                        detail,
+                        response_preview: Some(bounded_preview(&response.output.text, 600)),
+                    },
+                    Err(error) => ModelStructuredOutputPreflightReport {
+                        status: "failed".to_string(),
+                        provider,
+                        model,
+                        request_id: request_id.to_string(),
+                        detail: error.to_string(),
+                        response_preview: Some(bounded_preview(&response.output.text, 600)),
+                    },
+                }
+            }
+            Err(error) => ModelStructuredOutputPreflightReport {
+                status: "failed".to_string(),
+                provider,
+                model,
+                request_id: request_id.to_string(),
+                detail: error.to_string(),
+                response_preview: None,
+            },
+        };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Structured output preflight");
+        println!("  status: {}", report.status);
+        println!("  provider: {}", report.provider);
+        println!("  model: {}", report.model);
+        println!("  request_id: {}", report.request_id);
+        println!("  detail: {}", report.detail);
+        if let Some(preview) = &report.response_preview {
+            println!("  response preview: {preview}");
+        }
+    }
+
+    if report.status != "success" {
+        bail!("structured-output preflight failed");
+    }
+
+    Ok(())
+}
+
+fn validate_structured_output_preflight_response(
+    json: Option<&serde_json::Value>,
+) -> Result<String> {
+    let Some(output_json) = json else {
+        bail!("provider response did not include output.json for json_object mode");
+    };
+    let Some(obj) = output_json.as_object() else {
+        bail!("provider output.json was not an object");
+    };
+
+    let assistant_text = obj
+        .get("assistant_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if assistant_text.trim().is_empty() {
+        bail!("provider output.json.assistant_text must be a non-empty string");
+    }
+
+    if let Some(governed_actions) = obj.get("governed_actions") {
+        let Some(actions) = governed_actions.as_array() else {
+            bail!("provider output.json.governed_actions must be an array when present");
+        };
+        if actions.len() > 1 {
+            bail!("provider output.json.governed_actions may include at most one proposal");
+        }
+    }
+
+    Ok("response JSON matched conscious structured-output baseline".to_string())
+}
+
+fn bounded_preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.trim().replace('\n', "\\n");
+    if preview.chars().count() <= max_chars {
+        return preview;
+    }
+    preview = preview.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn model_provider_identifier(provider: ModelProviderKind) -> &'static str {
+    match provider {
+        ModelProviderKind::ZAi => "z_ai",
+        ModelProviderKind::OpenRouter => "openrouter",
+    }
 }
 
 fn print_health_summary(summary: OperationalHealthSummary, json: bool) -> Result<()> {
@@ -1352,6 +1678,39 @@ fn print_governed_actions(actions: Vec<GovernedActionSummary>, json: bool) -> Re
     }
 
     println!("{}", render_governed_actions_text(&actions));
+    Ok(())
+}
+
+fn print_calendar_integration_runs(
+    runs: Vec<CalendarIntegrationRunSummary>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_calendar_integration_runs_text(&runs));
+    Ok(())
+}
+
+fn print_email_integration_runs(runs: Vec<EmailIntegrationRunSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_email_integration_runs_text(&runs));
+    Ok(())
+}
+
+fn print_task_sync_runs(runs: Vec<TaskSyncRunSummary>, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!("{}", render_task_sync_runs_text(&runs));
     Ok(())
 }
 
@@ -1806,6 +2165,7 @@ fn format_trace_likely_cause_kind(kind: harness::management::TraceLikelyCauseKin
 fn format_trace_focus_selector(selector: TraceFocusSelector) -> String {
     match selector {
         TraceFocusSelector::FailingNode => "failing_node",
+        TraceFocusSelector::FailingModelCall => "failing_model_call",
     }
     .to_string()
 }
@@ -2029,6 +2389,117 @@ fn render_governed_actions_text(actions: &[GovernedActionSummary]) -> String {
             let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
         }
         if let Some(output_ref) = action.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_calendar_integration_runs_text(runs: &[CalendarIntegrationRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No calendar integration runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_email_integration_runs_text(runs: &[EmailIntegrationRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No email integration runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
+            let _ = writeln!(output, "  output_ref: {output_ref}");
+        }
+    }
+    output.trim_end().to_string()
+}
+
+fn render_task_sync_runs_text(runs: &[TaskSyncRunSummary]) -> String {
+    if runs.is_empty() {
+        return "No task sync runs.".to_string();
+    }
+
+    let mut output = String::new();
+    for (index, run) in runs.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "{} | status={} | risk={} | kind={} | principal={} | conversation={} | started={} | completed={}",
+            run.governed_action_execution_id,
+            run.status,
+            run.risk_tier,
+            run.action_kind,
+            run.internal_principal_ref,
+            run.internal_conversation_ref,
+            run.started_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            run.completed_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let _ = writeln!(output, "  request: {}", run.request_summary);
+        if let Some(blocked_reason) = run.blocked_reason.as_deref() {
+            let _ = writeln!(output, "  blocked_reason: {blocked_reason}");
+        }
+        if let Some(output_ref) = run.output_ref.as_deref() {
             let _ = writeln!(output, "  output_ref: {output_ref}");
         }
     }
@@ -3029,6 +3500,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_trace_explain_command_with_failing_model_call_focus() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "trace",
+            "explain",
+            "--trace-id",
+            "00000000-0000-0000-0000-000000000042",
+            "--focus",
+            "failing-model-call",
+            "--json",
+        ])
+        .expect("trace explain command should parse");
+
+        match command.command {
+            AdminSubcommand::Trace(TraceCommand {
+                command: TraceSubcommand::Explain(command),
+            }) => {
+                assert_eq!(
+                    command.lookup.trace_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000042")
+                );
+                assert_eq!(command.focus, Some(TraceFocusArg::FailingModelCall));
+                assert!(command.json);
+            }
+            _ => panic!("expected trace explain command"),
+        }
+    }
+
+    #[test]
     fn render_trace_explanation_text_includes_verdict_and_focus() {
         let rendered = render_trace_explanation_text(&sample_trace_explanation_report());
         assert!(rendered.contains("verdict=failed"));
@@ -3281,6 +3781,66 @@ mod tests {
             "completed_at": "2026-04-22T10:06:00Z"
         }))
         .expect("sample governed action should deserialize")
+    }
+
+    fn sample_calendar_integration_run_summary() -> CalendarIntegrationRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000111",
+            "trace_id": "00000000-0000-0000-0000-000000000112",
+            "execution_id": "00000000-0000-0000-0000-000000000113",
+            "approval_request_id": null,
+            "action_kind": "list_calendar_events",
+            "risk_tier": "tier_1",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "window=2026-05-20 09:00:00 UTC..2026-05-20 18:00:00 UTC max_results=10",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000113",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample calendar integration run should deserialize")
+    }
+
+    fn sample_email_integration_run_summary() -> EmailIntegrationRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000121",
+            "trace_id": "00000000-0000-0000-0000-000000000122",
+            "execution_id": "00000000-0000-0000-0000-000000000123",
+            "approval_request_id": null,
+            "action_kind": "list_email_messages",
+            "risk_tier": "tier_1",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "mailbox=inbox query=subject:milestone max_results=10",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000123",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample email integration run should deserialize")
+    }
+
+    fn sample_task_sync_run_summary() -> TaskSyncRunSummary {
+        serde_json::from_value(json!({
+            "governed_action_execution_id": "00000000-0000-0000-0000-000000000131",
+            "trace_id": "00000000-0000-0000-0000-000000000132",
+            "execution_id": "00000000-0000-0000-0000-000000000133",
+            "approval_request_id": null,
+            "action_kind": "sync_task_list",
+            "risk_tier": "tier_2",
+            "status": "executed",
+            "internal_principal_ref": "primary-user",
+            "internal_conversation_ref": "telegram-primary",
+            "request_summary": "title=Milestone Tasks items=2 external_list_id=new workspace_artifact_id=none",
+            "blocked_reason": null,
+            "output_ref": "execution_record:00000000-0000-0000-0000-000000000133",
+            "started_at": "2026-05-20T08:59:58Z",
+            "completed_at": "2026-05-20T08:59:59Z"
+        }))
+        .expect("sample task sync run should deserialize")
     }
 
     fn sample_workspace_run_summary() -> WorkspaceScriptRunSummary {
@@ -3558,6 +4118,121 @@ mod tests {
     }
 
     #[test]
+    fn phase_five_admin_parser_accepts_model_structured_output_preflight_command() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "model",
+            "preflight-structured-output",
+            "--json",
+        ])
+        .expect("model structured-output preflight command should parse");
+
+        match command.command {
+            AdminSubcommand::Model(ModelCommand {
+                command: ModelSubcommand::PreflightStructuredOutput(command),
+            }) => {
+                assert!(command.json);
+            }
+            other => panic!("expected model preflight command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_calendar_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "calendar",
+            "list",
+            "--status",
+            "failed",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("calendar integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::Calendar(CalendarIntegrationsCommand {
+                        command: CalendarIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 5);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Failed)
+                ));
+                assert!(command.json);
+            }
+            other => panic!("expected calendar integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_email_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "email",
+            "list",
+            "--status",
+            "failed",
+            "--limit",
+            "3",
+        ])
+        .expect("email integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::Email(EmailIntegrationsCommand {
+                        command: EmailIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 3);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Failed)
+                ));
+            }
+            other => panic!("expected email integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_five_admin_parser_accepts_task_sync_integration_filters() {
+        let command = AdminCommand::try_parse_from([
+            "runtime",
+            "integrations",
+            "task-sync",
+            "list",
+            "--status",
+            "executed",
+            "--limit",
+            "4",
+        ])
+        .expect("task sync integration list command should parse");
+
+        match command.command {
+            AdminSubcommand::Integrations(IntegrationsCommand {
+                command:
+                    IntegrationsSubcommand::TaskSync(TaskSyncIntegrationsCommand {
+                        command: TaskSyncIntegrationsSubcommand::List(command),
+                    }),
+            }) => {
+                assert_eq!(command.limit, 4);
+                assert!(matches!(
+                    command.status,
+                    Some(GovernedActionStatusArg::Executed)
+                ));
+            }
+            other => panic!("expected task sync integration list command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn phase_six_admin_parser_accepts_recovery_checkpoint_filters() {
         let command = AdminCommand::try_parse_from([
             "runtime",
@@ -3782,6 +4457,29 @@ mod tests {
         assert!(rendered.contains("status=blocked"));
         assert!(rendered.contains("blocked_reason: scope invalid"));
         assert!(rendered.contains("output_ref: execution_record:"));
+    }
+
+    #[test]
+    fn render_calendar_integration_runs_text_includes_request_and_scope() {
+        let rendered =
+            render_calendar_integration_runs_text(&[sample_calendar_integration_run_summary()]);
+        assert!(rendered.contains("status=executed"));
+        assert!(rendered.contains("kind=list_calendar_events"));
+        assert!(rendered.contains("principal=primary-user"));
+        assert!(rendered.contains("conversation=telegram-primary"));
+        assert!(rendered.contains("request: window=2026-05-20"));
+    }
+
+    #[test]
+    fn render_email_and_task_sync_runs_text_include_request_and_scope() {
+        let email_rendered =
+            render_email_integration_runs_text(&[sample_email_integration_run_summary()]);
+        assert!(email_rendered.contains("kind=list_email_messages"));
+        assert!(email_rendered.contains("request: mailbox=inbox"));
+
+        let task_rendered = render_task_sync_runs_text(&[sample_task_sync_run_summary()]);
+        assert!(task_rendered.contains("kind=sync_task_list"));
+        assert!(task_rendered.contains("request: title=Milestone Tasks"));
     }
 
     #[test]

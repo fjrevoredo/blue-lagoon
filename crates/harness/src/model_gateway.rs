@@ -18,6 +18,7 @@ use crate::config::{ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConf
 pub struct ProviderHttpRequest {
     pub url: String,
     pub api_key: String,
+    pub headers: Vec<(String, String)>,
     pub timeout_ms: u64,
     pub body: Value,
 }
@@ -35,9 +36,26 @@ pub enum ModelGatewayError {
     #[error("model gateway transport failed: {0}")]
     Transport(String),
     #[error("provider returned status {status}: {message}")]
-    ProviderRejected { status: u16, message: String },
-    #[error("provider response shape was invalid: {0}")]
-    InvalidResponse(String),
+    ProviderRejected {
+        status: u16,
+        message: String,
+        response_body: Option<Value>,
+    },
+    #[error("provider response shape was invalid: {detail}")]
+    InvalidResponse {
+        detail: String,
+        response_body: Option<Value>,
+    },
+}
+
+impl ModelGatewayError {
+    pub fn response_body(&self) -> Option<&Value> {
+        match self {
+            Self::ProviderRejected { response_body, .. }
+            | Self::InvalidResponse { response_body, .. } => response_body.as_ref(),
+            Self::Validation(_) | Self::Transport(_) => None,
+        }
+    }
 }
 
 pub trait ModelProviderTransport {
@@ -65,22 +83,23 @@ impl ModelProviderTransport for ReqwestModelProviderTransport {
         &self,
         request: ProviderHttpRequest,
     ) -> std::result::Result<ProviderHttpResponse, ModelGatewayError> {
-        let response = self
+        let mut builder = self
             .client
             .post(&request.url)
             .timeout(Duration::from_millis(request.timeout_ms))
             .bearer_auth(&request.api_key)
-            .json(&request.body)
-            .send()
-            .await
-            .map_err(|error| {
-                ModelGatewayError::Transport(format_reqwest_transport_error(
-                    "send request",
-                    &request.url,
-                    request.timeout_ms,
-                    &error,
-                ))
-            })?;
+            .json(&request.body);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder.send().await.map_err(|error| {
+            ModelGatewayError::Transport(format_reqwest_transport_error(
+                "send request",
+                &request.url,
+                request.timeout_ms,
+                &error,
+            ))
+        })?;
 
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.map_err(|error| {
@@ -179,7 +198,7 @@ pub async fn execute_foreground_model_call<T: ModelProviderTransport>(
     transport: &T,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_foreground_request(request)?;
-    execute_model_call_unchecked(gateway, request, transport).await
+    execute_model_call_unchecked(gateway, request, transport, ModelRoute::Foreground).await
 }
 
 pub async fn execute_background_model_call<T: ModelProviderTransport>(
@@ -188,19 +207,30 @@ pub async fn execute_background_model_call<T: ModelProviderTransport>(
     transport: &T,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_background_request(request)?;
-    execute_model_call_unchecked(gateway, request, transport).await
+    execute_model_call_unchecked(gateway, request, transport, ModelRoute::Unconscious).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRoute {
+    Foreground,
+    Unconscious,
 }
 
 async fn execute_model_call_unchecked<T: ModelProviderTransport>(
     gateway: &ResolvedModelGatewayConfig,
     request: &ModelCallRequest,
     transport: &T,
+    route: ModelRoute,
 ) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
     validate_common_request(request)?;
-    let route = resolve_foreground_route(gateway, request)?;
+    let route = match route {
+        ModelRoute::Foreground => resolve_foreground_route(gateway, request)?,
+        ModelRoute::Unconscious => resolve_unconscious_route(gateway, request)?,
+    };
 
     match route.provider {
         ModelProviderKind::ZAi => execute_z_ai_call(request, route, transport).await,
+        ModelProviderKind::OpenRouter => execute_openrouter_call(request, route, transport).await,
     }
 }
 
@@ -285,13 +315,22 @@ fn resolve_foreground_route<'a>(
     gateway: &'a ResolvedModelGatewayConfig,
     request: &ModelCallRequest,
 ) -> std::result::Result<&'a ResolvedForegroundModelRouteConfig, ModelGatewayError> {
-    validate_provider_hint(&request.provider_hint, &gateway.foreground)?;
+    validate_provider_hint(&request.provider_hint, &gateway.foreground, "foreground")?;
     Ok(&gateway.foreground)
+}
+
+fn resolve_unconscious_route<'a>(
+    gateway: &'a ResolvedModelGatewayConfig,
+    request: &ModelCallRequest,
+) -> std::result::Result<&'a ResolvedForegroundModelRouteConfig, ModelGatewayError> {
+    validate_provider_hint(&request.provider_hint, &gateway.unconscious, "unconscious")?;
+    Ok(&gateway.unconscious)
 }
 
 fn validate_provider_hint(
     hint: &Option<ModelProviderHint>,
     route: &ResolvedForegroundModelRouteConfig,
+    route_name: &str,
 ) -> std::result::Result<(), ModelGatewayError> {
     let Some(hint) = hint else {
         return Ok(());
@@ -301,8 +340,8 @@ fn validate_provider_hint(
         && provider != route.provider
     {
         return Err(ModelGatewayError::Validation(format!(
-            "provider hint {:?} did not match configured foreground provider {:?}",
-            provider, route.provider
+            "provider hint {:?} did not match configured {route_name} provider {:?}",
+            provider, route.provider,
         )));
     }
 
@@ -310,8 +349,8 @@ fn validate_provider_hint(
         && model != &route.model
     {
         return Err(ModelGatewayError::Validation(format!(
-            "provider hint model '{model}' did not match configured foreground model '{}'",
-            route.model
+            "provider hint model '{model}' did not match configured {route_name} model '{}'",
+            route.model,
         )));
     }
 
@@ -329,8 +368,9 @@ async fn execute_z_ai_call<T: ModelProviderTransport>(
             route.api_base_url.trim_end_matches('/')
         ),
         api_key: route.api_key.clone(),
+        headers: Vec::new(),
         timeout_ms: request.budget.timeout_ms.min(route.timeout_ms),
-        body: z_ai_request_body(request, route),
+        body: openai_compatible_request_body(request, route),
     };
 
     let response = transport.send_json(http_request).await?;
@@ -338,13 +378,46 @@ async fn execute_z_ai_call<T: ModelProviderTransport>(
         return Err(ModelGatewayError::ProviderRejected {
             status: response.status,
             message: provider_error_message(&response.body),
+            response_body: Some(response.body),
         });
     }
 
-    parse_z_ai_response(request, route, response.body)
+    parse_openai_compatible_response(request, route, response.body)
 }
 
-fn z_ai_request_body(
+async fn execute_openrouter_call<T: ModelProviderTransport>(
+    request: &ModelCallRequest,
+    route: &ResolvedForegroundModelRouteConfig,
+    transport: &T,
+) -> std::result::Result<ModelCallResponse, ModelGatewayError> {
+    let http_request = ProviderHttpRequest {
+        url: format!(
+            "{}/chat/completions",
+            route.api_base_url.trim_end_matches('/')
+        ),
+        api_key: route.api_key.clone(),
+        headers: route
+            .provider_headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect(),
+        timeout_ms: request.budget.timeout_ms.min(route.timeout_ms),
+        body: openai_compatible_request_body(request, route),
+    };
+
+    let response = transport.send_json(http_request).await?;
+    if !(200..300).contains(&response.status) {
+        return Err(ModelGatewayError::ProviderRejected {
+            status: response.status,
+            message: provider_error_message(&response.body),
+            response_body: Some(response.body),
+        });
+    }
+
+    parse_openai_compatible_response(request, route, response.body)
+}
+
+fn openai_compatible_request_body(
     request: &ModelCallRequest,
     route: &ResolvedForegroundModelRouteConfig,
 ) -> Value {
@@ -366,6 +439,18 @@ fn z_ai_request_body(
         "max_tokens": request.budget.max_output_tokens,
         "temperature": 0.2,
     });
+    if let Some(reasoning) = &route.provider_reasoning {
+        let mut reasoning_body = serde_json::Map::new();
+        if let Some(effort) = &reasoning.effort {
+            reasoning_body.insert("effort".to_string(), Value::String(effort.clone()));
+        }
+        if let Some(exclude) = reasoning.exclude {
+            reasoning_body.insert("exclude".to_string(), Value::Bool(exclude));
+        }
+        if !reasoning_body.is_empty() {
+            body["reasoning"] = Value::Object(reasoning_body);
+        }
+    }
     if request.output_mode == ModelOutputMode::JsonObject {
         body["response_format"] = json!({
             "type": "json_object"
@@ -374,7 +459,7 @@ fn z_ai_request_body(
     body
 }
 
-fn parse_z_ai_response(
+fn parse_openai_compatible_response(
     request: &ModelCallRequest,
     route: &ResolvedForegroundModelRouteConfig,
     body: Value,
@@ -383,16 +468,26 @@ fn parse_z_ai_response(
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
-        .ok_or_else(|| {
-            ModelGatewayError::InvalidResponse(
-                "missing choices[0] in provider response".to_string(),
-            )
+        .ok_or_else(|| ModelGatewayError::InvalidResponse {
+            detail: "missing choices[0] in provider response".to_string(),
+            response_body: Some(body.clone()),
         })?;
 
-    let text = extract_message_text(choice).ok_or_else(|| {
-        ModelGatewayError::InvalidResponse(
-            "missing choices[0].message.content in provider response".to_string(),
-        )
+    let text = extract_choice_text(choice).ok_or_else(|| {
+        let detail = choice
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(|message| format!("choice error: {message}"))
+            .or_else(|| invalid_choice_detail(choice))
+            .unwrap_or_else(|| {
+                "missing choices[0].message.content or choices[0].text in provider response"
+                    .to_string()
+            });
+        ModelGatewayError::InvalidResponse {
+            detail,
+            response_body: Some(body.clone()),
+        }
     })?;
 
     let finish_reason = choice
@@ -413,9 +508,12 @@ fn parse_z_ai_response(
         ModelOutputMode::PlainText => None,
         ModelOutputMode::JsonObject => {
             Some(serde_json::from_str::<Value>(&text).map_err(|error| {
-                ModelGatewayError::InvalidResponse(format!(
-                    "provider returned non-JSON content for json_object mode: {error}"
-                ))
+                ModelGatewayError::InvalidResponse {
+                    detail: format!(
+                        "provider returned non-JSON content for json_object mode: {error}"
+                    ),
+                    response_body: Some(body.clone()),
+                }
             })?)
         }
     };
@@ -439,7 +537,13 @@ fn parse_z_ai_response(
     })
 }
 
-fn extract_message_text(choice: &Value) -> Option<String> {
+fn extract_choice_text(choice: &Value) -> Option<String> {
+    if let Some(text) = choice.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
+    }
+
     let content = choice.get("message")?.get("content")?;
     match content {
         Value::String(text) => Some(text.clone()),
@@ -457,6 +561,29 @@ fn extract_message_text(choice: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn invalid_choice_detail(choice: &Value) -> Option<String> {
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let content_is_null = choice
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .is_some_and(Value::is_null);
+    let reasoning_present = choice
+        .get("message")
+        .and_then(|message| message.get("reasoning"))
+        .is_some_and(|value| !value.is_null());
+    if content_is_null {
+        let mut parts = vec!["choices[0].message.content was null".to_string()];
+        if let Some(reason) = finish_reason {
+            parts.push(format!("finish_reason={reason}"));
+        }
+        if reasoning_present {
+            parts.push("reasoning tokens were present".to_string());
+        }
+        return Some(parts.join("; "));
+    }
+    None
 }
 
 fn provider_error_message(body: &Value) -> String {
@@ -520,6 +647,170 @@ mod tests {
             seen[0].body.get("model").and_then(Value::as_str),
             Some("z-ai-foreground")
         );
+        assert!(seen[0].headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn executes_foreground_call_through_openrouter_route() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: vec![
+                    crate::config::ProviderHttpHeaderConfig {
+                        name: "HTTP-Referer".to_string(),
+                        value: "https://blue-lagoon.local".to_string(),
+                    },
+                    crate::config::ProviderHttpHeaderConfig {
+                        name: "X-OpenRouter-Title".to_string(),
+                        value: "Blue Lagoon".to_string(),
+                    },
+                ],
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("none".to_string()),
+                    exclude: None,
+                }),
+                timeout_ms: 20_000,
+            },
+            unconscious: sample_unconscious_route(),
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "hello from openrouter" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 7
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway call should succeed");
+
+        assert_eq!(response.provider, ModelProviderKind::OpenRouter);
+        assert_eq!(response.model, "openai/gpt-5.2");
+        assert_eq!(response.output.text, "hello from openrouter");
+        assert_eq!(response.usage.input_tokens, 20);
+
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(seen[0].api_key, "openrouter-secret");
+        assert_eq!(
+            seen[0].headers,
+            vec![
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://blue-lagoon.local".to_string()
+                ),
+                ("X-OpenRouter-Title".to_string(), "Blue Lagoon".to_string()),
+            ]
+        );
+        assert_eq!(
+            seen[0].body.get("model").and_then(Value::as_str),
+            Some("openai/gpt-5.2")
+        );
+        assert_eq!(
+            seen[0]
+                .body
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str),
+            Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_openrouter_non_chat_choice_text_fallback() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("none".to_string()),
+                    exclude: None,
+                }),
+                timeout_ms: 20_000,
+            },
+            unconscious: sample_unconscious_route(),
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "text": "fallback non-chat response",
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 4
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway should accept documented non-chat fallback shape");
+
+        assert_eq!(response.output.text, "fallback non-chat response");
+        assert_eq!(response.usage.input_tokens, 9);
+        assert_eq!(response.usage.output_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn omits_openrouter_reasoning_payload_for_provider_default_mode() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "openai/gpt-5.2".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::ProviderDefault,
+                provider_reasoning: None,
+                timeout_ms: 20_000,
+            },
+            unconscious: sample_unconscious_route(),
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "message": { "content": "provider default response" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3
+                }
+            }),
+        }));
+
+        let response = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect("gateway should accept provider-default requests");
+        assert_eq!(response.output.text, "provider default response");
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].body.get("reasoning").is_none());
     }
 
     #[tokio::test]
@@ -555,6 +846,59 @@ mod tests {
             .expect_err("provider error should surface");
         assert!(error.to_string().contains("429"));
         assert!(error.to_string().contains("rate limit"));
+        assert_eq!(
+            error.response_body(),
+            Some(&json!({
+                "error": { "message": "rate limit" }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_null_content_with_reasoning_detail() {
+        let gateway = ResolvedModelGatewayConfig {
+            foreground: ResolvedForegroundModelRouteConfig {
+                provider: ModelProviderKind::OpenRouter,
+                model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+                api_base_url: "https://openrouter.ai/api/v1".to_string(),
+                api_key: "openrouter-secret".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Minimal,
+                provider_reasoning: Some(crate::config::ProviderReasoningConfig {
+                    effort: Some("minimal".to_string()),
+                    exclude: None,
+                }),
+                timeout_ms: 20_000,
+            },
+            unconscious: sample_unconscious_route(),
+        };
+        let request = sample_request();
+        let transport = FakeModelProviderTransport::new();
+        transport.push_response(Ok(ProviderHttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning": "thinking"
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 32
+                }
+            }),
+        }));
+
+        let error = execute_foreground_model_call(&gateway, &request, &transport)
+            .await
+            .expect_err("null content response should fail with diagnostic detail");
+        assert!(error
+            .to_string()
+            .contains("choices[0].message.content was null; finish_reason=length; reasoning tokens were present"));
+        assert!(error.response_body().is_some());
     }
 
     #[tokio::test]
@@ -571,7 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executes_background_call_through_same_route() {
+    async fn executes_background_call_through_unconscious_route() {
         let gateway = sample_gateway();
         let mut request = sample_request();
         request.loop_kind = LoopKind::Unconscious;
@@ -598,7 +942,12 @@ mod tests {
             .expect("background gateway call should succeed");
 
         assert_eq!(response.output.text, "background summary");
-        assert_eq!(transport.seen_requests().len(), 1);
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].body.get("model").and_then(Value::as_str),
+            Some("z-ai-unconscious")
+        );
     }
 
     #[tokio::test]
@@ -623,8 +972,25 @@ mod tests {
                 model: "z-ai-foreground".to_string(),
                 api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                 api_key: "secret".to_string(),
+                provider_headers: Vec::new(),
+                reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                provider_reasoning: None,
                 timeout_ms: 20_000,
             },
+            unconscious: sample_unconscious_route(),
+        }
+    }
+
+    fn sample_unconscious_route() -> ResolvedForegroundModelRouteConfig {
+        ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "unconscious-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 20_000,
         }
     }
 
@@ -657,6 +1023,7 @@ mod tests {
             output_mode: ModelOutputMode::PlainText,
             schema_name: None,
             schema_json: None,
+            prompt_metrics: None,
             tool_policy: ToolPolicy::NoTools,
             provider_hint: None,
         }

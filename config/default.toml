@@ -37,6 +37,27 @@ allow_foreground_conversion = true
 max_pending_signals = 8
 cooldown_seconds = 900
 
+[integrations.calendar]
+enabled = false
+provider = ""
+credential_env = ""
+# Optional provider endpoint override for adapter-specific routing.
+api_base_url = ""
+
+[integrations.email]
+enabled = false
+provider = ""
+credential_env = ""
+# Optional provider endpoint override for adapter-specific routing.
+api_base_url = ""
+
+[integrations.task_sync]
+enabled = false
+provider = ""
+credential_env = ""
+# Optional provider endpoint override for adapter-specific routing.
+api_base_url = ""
+
 [continuity.retrieval]
 max_recent_episode_candidates = 3
 max_memory_artifact_candidates = 5
@@ -67,6 +88,8 @@ approval_required_min_risk_tier = "tier_2"
 default_subprocess_timeout_ms = 30000
 max_subprocess_timeout_ms = 120000
 max_actions_per_foreground_turn = 10
+malformed_action_resteer_max_attempts = 2
+malformed_action_resteer_timeout_ms = 10000
 cap_exceeded_behavior = "escalate"
 max_filesystem_roots_per_action = 4
 default_network_access = "disabled"
@@ -81,6 +104,8 @@ timeout_ms = 10000
 # The harness now requires either:
 # - a packaged sibling `workers` binary next to the runtime binary, or
 # - an explicit worker command supplied here or through BLUE_LAGOON_WORKER_COMMAND.
+# If the explicit command points at the `workers` multiplexer binary and args are
+# empty, the harness appends the required per-worker subcommand automatically.
 # BLUE_LAGOON_WORKER_ARGS, when used, must be a JSON array of strings.
 # worker.timeout_ms remains the generic worker timeout. Live Telegram foreground
 # derives its conscious worker timeout from harness.default_wall_clock_budget_ms
@@ -99,11 +124,29 @@ poll_limit = 10
 [model_gateway.foreground]
 provider = "z_ai"
 model = "z-ai-foreground"
+reasoning_mode = "off"
 api_key_env = "BLUE_LAGOON_FOREGROUND_API_KEY"
+timeout_ms = 60000
+
+[model_gateway.unconscious]
+provider = "z_ai"
+model = "z-ai-unconscious"
+reasoning_mode = "off"
+api_key_env = "BLUE_LAGOON_UNCONSCIOUS_API_KEY"
 timeout_ms = 60000
 
 [model_gateway.z_ai]
 api_surface = "coding"
+
+[model_gateway.openrouter]
+# OpenRouter is available by setting model_gateway.foreground.provider to
+# "openrouter" in local config or BLUE_LAGOON_FOREGROUND_ROUTE to
+# "openrouter/<provider-model-id>". The default endpoint follows the
+# OpenRouter OpenAI-compatible chat completions API.
+# Conscious structured-output mode requires a pinned model id in
+# "<provider>/<model>" form (for example "openai/gpt-5.2"). Auto routes such as
+# "openrouter/auto" are rejected for foreground conscious calls.
+api_base_url = "https://openrouter.ai/api/v1"
 
 [self_model]
 seed_path = "config/self_model_seed.toml"

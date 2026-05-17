@@ -34,6 +34,13 @@ use sqlx::Row;
 use std::env;
 use uuid::Uuid;
 
+fn conscious_output_content(assistant_text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": assistant_text,
+    })
+    .to_string()
+}
+
 // --- UC-1: Basic Conversation ---
 
 #[tokio::test]
@@ -55,7 +62,7 @@ async fn uc1_basic_conversation_delivers_reply_with_self_model_in_prompt() -> Re
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "basic reply" },
+                    "message": { "content": conscious_output_content("basic reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
@@ -123,7 +130,7 @@ async fn uc2_second_message_receives_prior_episode_in_context() -> Result<()> {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "first reply" },
+                    "message": { "content": conscious_output_content("first reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
@@ -133,7 +140,7 @@ async fn uc2_second_message_receives_prior_episode_in_context() -> Result<()> {
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "second reply" },
+                    "message": { "content": conscious_output_content("second reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 4 }
@@ -207,7 +214,7 @@ async fn uc3_preference_from_session_1_appears_in_session_2_context() -> Result<
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "noted your preference" },
+                    "message": { "content": conscious_output_content("noted your preference") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 20, "completion_tokens": 6 }
@@ -217,7 +224,7 @@ async fn uc3_preference_from_session_1_appears_in_session_2_context() -> Result<
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "yes, keeping it concise" },
+                    "message": { "content": conscious_output_content("yes, keeping it concise") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 18, "completion_tokens": 5 }
@@ -476,7 +483,7 @@ async fn uc5_scheduled_task_fires_and_delivers_proactive_message() -> Result<()>
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "proactive scheduled reply" },
+                    "message": { "content": conscious_output_content("proactive scheduled reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 14, "completion_tokens": 5 }
@@ -644,7 +651,7 @@ async fn uc6_background_wake_signal_stages_then_delivers_notification() -> Resul
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "background notification delivered" },
+                    "message": { "content": conscious_output_content("background notification delivered") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 14, "completion_tokens": 5 }
@@ -707,7 +714,7 @@ async fn uc7_backlog_of_messages_batched_into_single_coherent_reply() -> Result<
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "batched backlog reply" },
+                    "message": { "content": conscious_output_content("batched backlog reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 23, "completion_tokens": 6 }
@@ -858,7 +865,7 @@ async fn uc8_worker_crash_creates_checkpoint_and_task_is_clean_after_recovery() 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "recovered task reply" },
+                    "message": { "content": conscious_output_content("recovered task reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": { "prompt_tokens": 14, "completion_tokens": 5 }
@@ -1262,6 +1269,13 @@ fn resolved_telegram_config() -> ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
         poll_limit: 10,
     }
 }
@@ -1273,6 +1287,19 @@ fn resolved_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 30_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 30_000,
         },
     }
@@ -1284,6 +1311,15 @@ fn unresolved_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             provider: ModelProviderKind::ZAi,
             model: "z-ai-background".to_string(),
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
+            api_key_env: api_key_env.to_string(),
+            timeout_ms: 20_000,
+        },
+        unconscious: ForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+            reasoning_mode: Some(harness::config::ForegroundReasoningMode::Off),
             api_key_env: api_key_env.to_string(),
             timeout_ms: 20_000,
         },
@@ -1291,6 +1327,7 @@ fn unresolved_model_gateway_config(api_key_env: &str) -> ModelGatewayConfig {
             api_surface: None,
             api_base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
         }),
+        openrouter: None,
     }
 }
 
@@ -1304,6 +1341,9 @@ fn unresolved_telegram_config() -> TelegramConfig {
             allowed_chat_id: 42,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            delegates: Vec::new(),
+            approval_resolution_policy:
+                harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
         }),
     }
 }
@@ -1325,8 +1365,9 @@ fn provider_response(message: &str) -> ProviderHttpResponse {
 fn approval_required_action_model_output() -> String {
     let workspace_root = support::workspace_root().display().to_string();
     let docs_dir = support::workspace_root().join("docs").display().to_string();
-    let action_block = serde_json::json!({
-        "actions": [{
+    serde_json::json!({
+        "assistant_text": "I need to update documentation.",
+        "governed_actions": [{
             "proposal_id": Uuid::now_v7(),
             "title": "Document update requiring approval",
             "rationale": "Needs to write to docs directory",
@@ -1360,8 +1401,8 @@ fn approval_required_action_model_output() -> String {
                 },
             },
         }],
-    });
-    format!("I need to update documentation.\n```blue-lagoon-governed-actions\n{action_block}\n```")
+    })
+    .to_string()
 }
 
 async fn seed_planned_background_job_with_kind(

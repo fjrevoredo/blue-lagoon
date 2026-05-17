@@ -257,6 +257,56 @@ async fn conversation_binding_merge_keeps_internal_row_identity() -> Result<()> 
 
 #[tokio::test]
 #[serial]
+async fn delegate_ingress_binding_is_accepted_for_allowlisted_principal() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let update = telegram::load_fixture_updates(&telegram_fixture(
+            "private_text_delegate_message.json",
+        ))?
+        .into_iter()
+        .next()
+        .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config_with_delegate(),
+            &update,
+            Some("fixtures/private_text_delegate_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        assert_eq!(ingress.internal_principal_ref, "delegate-user");
+
+        let outcome = foreground::intake_telegram_foreground_trigger(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config_with_delegate(),
+            ingress,
+        )
+        .await?;
+        match outcome {
+            foreground::ForegroundTriggerIntakeOutcome::Accepted(trigger) => {
+                assert_eq!(trigger.ingress.internal_principal_ref, "delegate-user");
+            }
+            other => panic!("delegate ingress should be accepted, got {other:?}"),
+        }
+
+        let stored_principal: String = sqlx::query_scalar(
+            r#"
+            SELECT internal_principal_ref
+            FROM conversation_bindings
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(stored_principal, "delegate-user");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn foreground_persistence_reads_recent_episode_history() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let execution_id = Uuid::now_v7();
@@ -638,7 +688,7 @@ async fn approval_callback_orchestration_resolves_request_and_replies() -> Resul
         );
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Run scoped callback action"
+            "Approval approved: Run scoped callback action\nState: approved\nNext: running the approved action now."
         );
         assert_eq!(delivery.sent_messages()[0].reply_to_message_id, Some(46));
 
@@ -725,7 +775,142 @@ async fn approval_command_orchestration_resolves_request_and_replies() -> Result
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Run scoped command action"
+            "Approval approved: Run scoped command action\nState: approved\nNext: running the approved action now."
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn approval_callback_replay_is_idempotent_and_reports_stale_resolution() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-idempotent-callback".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Run scoped callback action".to_string(),
+                consequence_summary: "Used to verify idempotent callback replay.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let update = telegram::load_fixture_updates(&telegram_fixture("approval_callback.json"))?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/approval_callback.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("callback fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress.clone(),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+        let mut replay_ingress = ingress;
+        replay_ingress.ingress_id = Uuid::now_v7();
+        replay_ingress.external_event_id = format!("{}:replay", replay_ingress.external_event_id);
+        let replay_outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            replay_ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let replay = match replay_outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::ApprovalResolved(
+                replay,
+            ) => replay,
+            other => panic!("expected approval-resolution replay outcome, got {other:?}"),
+        };
+        assert_eq!(replay.decision, contracts::ApprovalResolutionDecision::Approved);
+        assert_eq!(delivery.sent_messages().len(), 2);
+        assert_eq!(
+            delivery.sent_messages()[1].text,
+            "Approval already approved: Run scoped callback action\nState: approved\nNext: no additional action is needed."
+        );
+
+        let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "approval_resolution_stale_token"
+        }));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn unknown_approval_token_records_diagnostic() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let update = telegram::load_fixture_updates(&telegram_fixture("approval_callback.json"))?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/approval_callback.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => {
+                panic!("callback fixture should normalize into accepted ingress, got {other:?}")
+            }
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("unknown approval token should fail closed");
+        assert!(error.to_string().contains("unknown approval token"));
+
+        let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.reason_code == "approval_resolution_unknown_token"
+            })
         );
         Ok(())
     })
@@ -1628,7 +1813,7 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
         status: 200,
         body: serde_json::json!({
             "choices": [{
-                "message": { "content": "hello from fake provider" },
+                "message": { "content": conscious_output_content("hello from fake provider") },
                 "finish_reason": "stop"
             }],
             "usage": {
@@ -1645,7 +1830,10 @@ async fn model_gateway_executes_foreground_request_with_fake_provider() -> Resul
     assert_eq!(response.request_id, request.request_id);
     assert_eq!(response.provider, contracts::ModelProviderKind::ZAi);
     assert_eq!(response.model, "z-ai-foreground");
-    assert_eq!(response.output.text, "hello from fake provider");
+    assert_eq!(
+        response.output.text,
+        conscious_output_content("hello from fake provider")
+    );
 
     let seen = transport.seen_requests();
     assert_eq!(seen.len(), 1);
@@ -1818,7 +2006,7 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1867,6 +2055,7 @@ async fn conscious_worker_path_runs_one_harness_mediated_model_cycle() -> Result
 }
 
 #[tokio::test]
+#[serial]
 async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> Result<()> {
     support::with_clean_database(|_ctx| async move {
         let mut config = _ctx.config.clone();
@@ -1880,7 +2069,7 @@ async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1901,7 +2090,10 @@ async fn conscious_worker_protocol_failure_includes_phase_exit_and_stderr() -> R
             .expect_err("early worker exit should fail the protocol boundary");
         let message = error.to_string();
         assert!(message.contains("conscious worker protocol failure"));
-        assert!(message.contains("worker_protocol_phase=write_model_response"));
+        assert!(
+            message.contains("worker_protocol_phase=write_model_response")
+                || message.contains("worker_protocol_phase=read_final_response")
+        );
         assert!(message.contains("worker_exit_status="));
         assert!(message.contains("worker_stderr_excerpt="));
         assert!(message.contains("intentionally exiting before final response"));
@@ -1922,7 +2114,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
         });
         let worker_binary = support::workers_binary()?;
         config.worker.command = worker_binary.to_string_lossy().into_owned();
-        config.worker.args = vec!["conscious-worker".to_string()];
+        config.worker.args = Vec::new();
 
         let update =
             telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
@@ -1947,7 +2139,7 @@ async fn foreground_orchestration_runs_from_ingress_to_delivery() -> Result<()> 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fake provider" },
+                    "message": { "content": conscious_output_content("assistant reply from fake provider") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2119,7 +2311,7 @@ async fn foreground_orchestration_infers_custom_identity_start_without_worker_bl
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "" },
+                    "message": { "content": conscious_output_content("Starting the custom identity interview. What name should this assistant identity use?") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2252,7 +2444,7 @@ async fn planned_foreground_orchestration_processes_backlog_batch_with_single_re
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply for delayed backlog" },
+                    "message": { "content": conscious_output_content("assistant reply for delayed backlog") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2266,6 +2458,7 @@ async fn planned_foreground_orchestration_processes_backlog_batch_with_single_re
         let outcome = foreground_orchestration::orchestrate_telegram_foreground_plan(
             &ctx.pool,
             &config,
+            None,
             &gateway,
             foreground_orchestration::TelegramForegroundPlanExecution {
                 execution: foreground_orchestration::ForegroundExecutionIds {
@@ -2499,6 +2692,241 @@ async fn foreground_orchestration_marks_execution_failed_when_context_assembly_f
 
 #[tokio::test]
 #[serial]
+async fn foreground_orchestration_resteers_malformed_action_and_completes() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "assistant_text": "I will inspect this now.",
+                            "governed_actions": [{ "version": "1" }]
+                        }).to_string()
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 17
+                }
+            }),
+        }));
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": conscious_output_content("Recovered response after repair.")
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 29,
+                    "completion_tokens": 6
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let outcome = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        let completed = match outcome {
+            foreground_orchestration::TelegramForegroundOrchestrationOutcome::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed orchestration, got {other:?}"),
+        };
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Recovered response after repair."
+        );
+
+        let seen = transport.seen_requests();
+        assert_eq!(seen.len(), 2);
+        let second_request_messages = seen[1]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages");
+        assert!(
+            second_request_messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+                .any(|content| {
+                    content.contains("Harness requested a malformed-action repair retry")
+                        && content.contains("invalid conscious structured output")
+                })
+        );
+
+        let audit_events = audit::list_for_execution(&ctx.pool, completed.execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| { event.event_kind == "foreground_malformed_action_resteer_attempt" })
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_completed")
+        );
+        assert!(
+            !audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_failed")
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn foreground_orchestration_records_diagnostic_when_resteer_attempts_exhausted() -> Result<()>
+{
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let update =
+            telegram::load_fixture_updates(&telegram_fixture("private_text_message.json"))?
+                .into_iter()
+                .next()
+                .expect("fixture should contain one update");
+        let ingress = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some("fixtures/private_text_message.json".to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        for _ in 0..2 {
+            transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": serde_json::json!({
+                                "assistant_text": "Retrying.",
+                                "governed_actions": [{ "version": "1" }]
+                            }).to_string()
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 27,
+                        "completion_tokens": 12
+                    }
+                }),
+            }));
+        }
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let error = foreground_orchestration::orchestrate_telegram_foreground_ingress(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            ingress,
+            &transport,
+            &mut delivery,
+        )
+        .await
+        .expect_err("repeated malformed proposals should fail after retry budget");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid conscious structured output")
+        );
+
+        let execution_row = sqlx::query(
+            r#"
+            SELECT execution_id
+            FROM execution_records
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let execution_id: Uuid = execution_row.get("execution_id");
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| { event.event_kind == "foreground_malformed_action_resteer_attempt" })
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_execution_failed")
+        );
+
+        let diagnostics = harness::recovery::list_operational_diagnostics(&ctx.pool, 20).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "foreground_malformed_action_resteer_exhausted"
+        }));
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn foreground_orchestration_closes_planned_ingress_batch_on_terminal_failure() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -2557,6 +2985,7 @@ async fn foreground_orchestration_closes_planned_ingress_batch_on_terminal_failu
         let error = foreground_orchestration::orchestrate_telegram_foreground_plan(
             &ctx.pool,
             &config,
+            None,
             &sample_model_gateway_config(),
             foreground_orchestration::TelegramForegroundPlanExecution {
                 execution: foreground_orchestration::ForegroundExecutionIds {
@@ -2607,7 +3036,7 @@ async fn runtime_fixture_entrypoint_processes_telegram_fixture_once() -> Result<
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from fixture runtime path" },
+                    "message": { "content": conscious_output_content("assistant reply from fixture runtime path") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2774,7 +3203,7 @@ async fn runtime_fixture_resumes_stale_processing_backlog_without_new_accepted_u
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after resumed backlog" },
+                    "message": { "content": conscious_output_content("assistant reply after resumed backlog") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -2901,7 +3330,7 @@ async fn scheduled_foreground_runtime_executes_due_task_and_updates_state() -> R
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "scheduled proactive reply" },
+                    "message": { "content": conscious_output_content("scheduled proactive reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -3021,7 +3450,7 @@ async fn scheduled_foreground_runtime_executes_one_shot_task_and_disables_after_
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "one-shot proactive reply" },
+                    "message": { "content": conscious_output_content("one-shot proactive reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -3406,6 +3835,9 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 allowed_chat_id: 42,
                 internal_principal_ref: "primary-user".to_string(),
                 internal_conversation_ref: "telegram-primary".to_string(),
+                delegates: Vec::new(),
+                approval_resolution_policy:
+                    harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
             }),
         });
         config.model_gateway = Some(ModelGatewayConfig {
@@ -3413,6 +3845,15 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 provider: contracts::ModelProviderKind::ZAi,
                 model: "glm-test".to_string(),
                 api_base_url: None,
+                reasoning_mode: None,
+                api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
+                timeout_ms: 30_000,
+            },
+            unconscious: ForegroundModelRouteConfig {
+                provider: contracts::ModelProviderKind::ZAi,
+                model: "glm-unconscious".to_string(),
+                api_base_url: None,
+                reasoning_mode: None,
                 api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
                 timeout_ms: 30_000,
             },
@@ -3420,6 +3861,7 @@ async fn runtime_poll_once_audits_live_telegram_fetch_failures() -> Result<()> {
                 api_surface: Some(harness::config::ZAiApiSurface::Coding),
                 api_base_url: None,
             }),
+            openrouter: None,
         });
 
         let error = runtime::run_telegram_once(
@@ -3488,6 +3930,39 @@ fn sample_telegram_config() -> ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
+        poll_limit: 10,
+    }
+}
+
+fn sample_telegram_config_with_delegate() -> ResolvedTelegramConfig {
+    ResolvedTelegramConfig {
+        api_base_url: "https://api.telegram.org".to_string(),
+        bot_token: "secret".to_string(),
+        allowed_user_id: 42,
+        allowed_chat_id: 42,
+        internal_principal_ref: "primary-user".to_string(),
+        internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![
+            harness::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: harness::config::TelegramPrincipalRole::Owner,
+            },
+            harness::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 43,
+                internal_principal_ref: "delegate-user".to_string(),
+                role: harness::config::TelegramPrincipalRole::Delegate,
+            },
+        ],
         poll_limit: 10,
     }
 }
@@ -3507,6 +3982,19 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 20_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 20_000,
         },
     }
@@ -3541,6 +4029,7 @@ fn sample_model_call_request() -> ModelCallRequest {
         output_mode: ModelOutputMode::PlainText,
         schema_name: None,
         schema_json: None,
+        prompt_metrics: None,
         tool_policy: ToolPolicy::NoTools,
         provider_hint: None,
     }
@@ -3815,6 +4304,13 @@ fn sample_capability_scope() -> CapabilityScope {
             max_stderr_bytes: 32_768,
         },
     }
+}
+
+fn conscious_output_content(assistant_text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": assistant_text,
+    })
+    .to_string()
 }
 
 async fn insert_pending_ingress(

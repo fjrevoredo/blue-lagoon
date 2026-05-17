@@ -112,7 +112,12 @@ pub async fn launch_smoke_worker(
     let response: WorkerResponse =
         serde_json::from_slice(&stdout).context("failed to decode worker response")?;
     if let WorkerResult::Error(error) = &response.result {
-        bail!("worker returned an error response: {}", error.message);
+        let metadata_suffix = worker_error_metadata_suffix(error);
+        bail!(
+            "worker returned an error response: {}{}",
+            error.message,
+            metadata_suffix
+        );
     }
     Ok(response)
 }
@@ -239,6 +244,7 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
                         &pool,
                         model_call_id,
                         &error.to_string(),
+                        error.response_body(),
                         Utc::now(),
                     )
                     .await
@@ -313,10 +319,12 @@ pub async fn launch_conscious_worker_with_timeout<T: ModelProviderTransport>(
         bail!("conscious worker subprocess failed: {stderr}");
     }
     if let WorkerResult::Error(error) = &response.result {
+        let metadata_suffix = worker_error_metadata_suffix(error);
         bail!(
-            "conscious worker returned an error response: worker_error_code={} message={}",
+            "conscious worker returned an error response: worker_error_code={} message={}{}",
             error.code.as_str(),
-            error.message
+            error.message,
+            metadata_suffix
         );
     }
     if !matches!(response.result, WorkerResult::Conscious(_)) {
@@ -447,6 +455,7 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
                         &pool,
                         model_call_id,
                         &error.to_string(),
+                        error.response_body(),
                         Utc::now(),
                     )
                     .await
@@ -521,10 +530,12 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
         bail!("unconscious worker subprocess failed: {stderr}");
     }
     if let WorkerResult::Error(error) = &response.result {
+        let metadata_suffix = worker_error_metadata_suffix(error);
         bail!(
-            "unconscious worker returned an error response: worker_error_code={} message={}",
+            "unconscious worker returned an error response: worker_error_code={} message={}{}",
             error.code.as_str(),
-            error.message
+            error.message,
+            metadata_suffix
         );
     }
     if !matches!(response.result, WorkerResult::Unconscious(_)) {
@@ -535,11 +546,21 @@ pub async fn launch_unconscious_worker_with_timeout<T: ModelProviderTransport>(
 
 pub fn inspect_resolution(config: &RuntimeConfig) -> WorkerResolutionSummary {
     if !config.worker.command.trim().is_empty() {
+        let command_uses_per_worker_subcommands =
+            config.worker.args.is_empty() && is_worker_multiplexer_command(&config.worker.command);
         return WorkerResolutionSummary {
             resolution_kind: WorkerResolutionKind::ExplicitCommand,
             command: Some(config.worker.command.clone()),
-            args: config.worker.args.clone(),
-            notes: "worker subprocesses use the configured command directly".to_string(),
+            args: if command_uses_per_worker_subcommands {
+                vec!["<per-worker-subcommand>".to_string()]
+            } else {
+                config.worker.args.clone()
+            },
+            notes: if command_uses_per_worker_subcommands {
+                "configured worker command points at the workers multiplexer; the harness appends the per-worker subcommand at launch".to_string()
+            } else {
+                "worker subprocesses use the configured command directly".to_string()
+            },
         };
     }
 
@@ -576,7 +597,11 @@ fn resolve_command(config: &RuntimeConfig, default_subcommand: &str) -> Result<C
     if !config.worker.command.trim().is_empty() {
         return Ok(CommandSpec {
             command: OsString::from(&config.worker.command),
-            args: config.worker.args.iter().map(OsString::from).collect(),
+            args: explicit_worker_args(
+                &config.worker.command,
+                &config.worker.args,
+                default_subcommand,
+            ),
         });
     }
 
@@ -590,6 +615,33 @@ fn resolve_command(config: &RuntimeConfig, default_subcommand: &str) -> Result<C
     bail!(
         "worker command is not configured and no sibling workers binary was found; set worker.command or BLUE_LAGOON_WORKER_COMMAND explicitly"
     )
+}
+
+fn explicit_worker_args(
+    command: &str,
+    configured_args: &[String],
+    default_subcommand: &str,
+) -> Vec<OsString> {
+    if configured_args.is_empty() && is_worker_multiplexer_command(command) {
+        return vec![OsString::from(default_subcommand)];
+    }
+
+    configured_args.iter().map(OsString::from).collect()
+}
+
+fn is_worker_multiplexer_command(command: &str) -> bool {
+    // Normalize path separators so Windows-style command paths are recognized
+    // even when tests run on non-Windows CI hosts.
+    let normalized_command = command.replace('\\', "/");
+    let Some(file_name) = PathBuf::from(normalized_command)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+    else {
+        return false;
+    };
+
+    file_name == "workers" || file_name == "workers-bin"
 }
 
 fn sibling_worker_binary() -> Option<PathBuf> {
@@ -614,6 +666,16 @@ async fn read_child_stream(
             .with_context(|| format!("failed to join worker {stream_name} reader task"))?
             .with_context(|| format!("failed to read worker {stream_name}")),
         None => Ok(Vec::new()),
+    }
+}
+
+fn worker_error_metadata_suffix(error: &contracts::WorkerFailure) -> String {
+    match &error.metadata {
+        Some(metadata) => match serde_json::to_string(metadata) {
+            Ok(serialized) => format!(" worker_error_metadata={serialized}"),
+            Err(_) => String::new(),
+        },
+        None => String::new(),
     }
 }
 
@@ -672,4 +734,38 @@ async fn write_json_line<T: serde::Serialize>(
         .await
         .context("failed to flush worker stdin")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_worker_multiplexer_command_appends_default_subcommand_when_args_are_empty() {
+        let args = explicit_worker_args(
+            r"D:\Repos\blue-lagoon\target\debug\workers.exe",
+            &[],
+            "conscious-worker",
+        );
+
+        assert_eq!(args, vec![OsString::from("conscious-worker")]);
+    }
+
+    #[test]
+    fn explicit_non_multiplexer_command_keeps_empty_args() {
+        let args = explicit_worker_args("custom-conscious-worker.exe", &[], "conscious-worker");
+
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn explicit_worker_multiplexer_command_preserves_configured_args() {
+        let configured_args = vec!["conscious-worker".to_string(), "--flag".to_string()];
+        let args = explicit_worker_args("workers.exe", &configured_args, "unconscious-worker");
+
+        assert_eq!(
+            args,
+            vec![OsString::from("conscious-worker"), OsString::from("--flag")]
+        );
+    }
 }

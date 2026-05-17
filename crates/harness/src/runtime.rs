@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     audit::{self, NewAuditEvent},
-    background, background_execution,
+    background, background_execution, background_planning,
     config::RuntimeConfig,
     db,
     execution::{self, NewExecutionRecord},
@@ -213,6 +213,14 @@ pub async fn run_background_once_with<T: ModelProviderTransport>(
             Ok(HarnessOutcome::BackgroundNoDueJob)
         }
     }
+}
+
+pub async fn run_background_scheduler_once_with_transport<T: ModelProviderTransport>(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    transport: &T,
+) -> Result<u32> {
+    run_background_scheduler_iteration(pool, config, transport).await
 }
 
 pub async fn run_telegram_once(
@@ -522,12 +530,26 @@ async fn run_background_scheduler_iteration<T: ModelProviderTransport>(
     config: &RuntimeConfig,
     transport: &T,
 ) -> Result<u32> {
+    let scheduler_started_at = Utc::now();
+    let planning_summary =
+        background_planning::run_scheduler_planning_pass(pool, config, scheduler_started_at)
+            .await?;
+    if planning_summary.request_count > 0 {
+        info!(
+            scheduler_planning_requests = planning_summary.request_count,
+            scheduler_planning_planned = planning_summary.planned_count,
+            scheduler_planning_suppressed = planning_summary.suppressed_duplicate_count,
+            scheduler_planning_rejected = planning_summary.rejected_count,
+            "background scheduler completed planning pass"
+        );
+    }
+
     let due_limit = config
         .background
         .scheduler
         .max_due_jobs_per_iteration
         .max(1);
-    if background::list_due_jobs(pool, Utc::now(), due_limit)
+    if background::list_due_jobs(pool, scheduler_started_at, due_limit)
         .await?
         .is_empty()
     {
@@ -807,6 +829,7 @@ where
     match foreground_orchestration::orchestrate_telegram_foreground_plan(
         pool,
         config,
+        None,
         model_gateway_config,
         foreground_orchestration::TelegramForegroundPlanExecution {
             execution: ids,
@@ -1229,6 +1252,7 @@ where
         match foreground_orchestration::orchestrate_telegram_foreground_plan(
             context.pool,
             context.config,
+            Some(context.telegram_config),
             context.model_gateway_config,
             foreground_orchestration::TelegramForegroundPlanExecution {
                 execution: foreground_orchestration::ForegroundExecutionIds {

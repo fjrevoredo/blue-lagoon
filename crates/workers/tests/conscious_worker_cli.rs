@@ -48,8 +48,10 @@ fn conscious_worker_cli_emits_model_request_and_final_response() {
         model: "z-ai-foreground".to_string(),
         received_at: chrono::Utc::now(),
         output: ModelOutput {
-            text: "hello from model".to_string(),
-            json: None,
+            text: r#"{"assistant_text":"hello from model"}"#.to_string(),
+            json: Some(serde_json::json!({
+                "assistant_text": "hello from model"
+            })),
             finish_reason: "stop".to_string(),
         },
         usage: ModelUsage {

@@ -9,6 +9,7 @@ use sqlx::{Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{
+    attachments,
     audit::{self, NewAuditEvent},
     background,
     causal_links::{self, NewCausalLink},
@@ -274,18 +275,19 @@ async fn reconcile_conversation_binding_in_tx(
     binding: &NewConversationBinding,
 ) -> Result<ConversationBindingWriteResult> {
     let external = find_locked_conversation_binding_by_external_tuple(tx, binding).await?;
-    let internal =
-        find_locked_conversation_binding_by_internal_ref(tx, &binding.internal_conversation_ref)
-            .await?;
+    let internal = find_locked_conversation_binding_by_internal_principal(
+        tx,
+        binding.channel_kind,
+        &binding.internal_conversation_ref,
+        &binding.internal_principal_ref,
+    )
+    .await?;
 
     let result = match (external, internal) {
-        (None, None) => {
-            // The first accepted ingress for a conversation creates the canonical binding row.
-            ConversationBindingWriteResult {
-                record: insert_conversation_binding(tx, binding).await?,
-                action: ConversationBindingAction::Created,
-            }
-        }
+        (None, None) => ConversationBindingWriteResult {
+            record: insert_conversation_binding(tx, binding).await?,
+            action: ConversationBindingAction::Created,
+        },
         (Some(external), Some(internal))
             if external.conversation_binding_id == internal.conversation_binding_id =>
         {
@@ -306,9 +308,6 @@ async fn reconcile_conversation_binding_in_tx(
             action: ConversationBindingAction::Updated,
         },
         (Some(external), Some(internal)) => {
-            // Preserve the canonical internal conversation identity, rewrite any historical
-            // ingress rows that still reference the superseded external binding row, then
-            // remove the duplicate binding row.
             reassign_ingress_event_bindings(
                 tx,
                 external.conversation_binding_id,
@@ -489,9 +488,11 @@ async fn find_locked_conversation_binding_by_external_tuple(
     Ok(row.map(decode_conversation_binding_row))
 }
 
-async fn find_locked_conversation_binding_by_internal_ref(
+async fn find_locked_conversation_binding_by_internal_principal(
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    channel_kind: ChannelKind,
     internal_conversation_ref: &str,
+    internal_principal_ref: &str,
 ) -> Result<Option<ConversationBindingRecord>> {
     let row = sqlx::query(
         r#"
@@ -503,14 +504,20 @@ async fn find_locked_conversation_binding_by_internal_ref(
             internal_principal_ref,
             internal_conversation_ref
         FROM conversation_bindings
-        WHERE internal_conversation_ref = $1
+        WHERE channel_kind = $1
+          AND internal_conversation_ref = $2
+          AND internal_principal_ref = $3
         FOR UPDATE
         "#,
     )
+    .bind(channel_kind_as_str(channel_kind))
     .bind(internal_conversation_ref)
+    .bind(internal_principal_ref)
     .fetch_optional(&mut **tx)
     .await
-    .context("failed to look up conversation binding by internal conversation ref")?;
+    .context(
+        "failed to look up conversation binding by internal conversation and principal refs",
+    )?;
 
     Ok(row.map(decode_conversation_binding_row))
 }
@@ -1584,6 +1591,20 @@ pub async fn intake_telegram_foreground_trigger(
         return Err(error);
     }
     mark_ingress_event_processing(&mut *tx, ingress.ingress_id, execution_id).await?;
+    attachments::register_ingress_attachments(
+        &mut tx,
+        &attachments::RegisterIngressAttachmentsRequest {
+            ingress_id: ingress.ingress_id,
+            trace_id: trace.trace_id,
+            execution_id: Some(execution_id),
+            internal_principal_ref: &ingress.internal_principal_ref,
+            internal_conversation_ref: &ingress.internal_conversation_ref,
+            channel_kind: channel_kind_as_str(ingress.channel_kind),
+            raw_payload_ref: ingress.raw_payload_ref.as_deref(),
+            attachments: &ingress.attachments,
+        },
+    )
+    .await?;
 
     audit::insert(
         &mut *tx,
@@ -1716,6 +1737,20 @@ pub async fn stage_telegram_foreground_ingress(
             execution_id: None,
             status: "accepted".to_string(),
             rejection_reason: None,
+        },
+    )
+    .await?;
+    attachments::register_ingress_attachments(
+        &mut tx,
+        &attachments::RegisterIngressAttachmentsRequest {
+            ingress_id: ingress.ingress_id,
+            trace_id: trace.trace_id,
+            execution_id: None,
+            internal_principal_ref: &ingress.internal_principal_ref,
+            internal_conversation_ref: &ingress.internal_conversation_ref,
+            channel_kind: channel_kind_as_str(ingress.channel_kind),
+            raw_payload_ref: ingress.raw_payload_ref.as_deref(),
+            attachments: &ingress.attachments,
         },
     )
     .await?;
@@ -2049,13 +2084,30 @@ fn matching_conversation_binding(
     config: &ResolvedTelegramConfig,
     ingress: &NormalizedIngress,
 ) -> Option<NewConversationBinding> {
-    matching_conversation_binding_from_parts(
-        config.allowed_user_id,
-        config.allowed_chat_id,
-        &config.internal_principal_ref,
-        &config.internal_conversation_ref,
-        ingress,
-    )
+    if ingress.channel_kind != ChannelKind::Telegram {
+        return None;
+    }
+    if ingress.external_conversation_id != config.allowed_chat_id.to_string() {
+        return None;
+    }
+    if ingress.internal_conversation_ref != config.internal_conversation_ref {
+        return None;
+    }
+
+    let user_id = ingress.external_user_id.parse::<i64>().ok()?;
+    let principal_binding = config.principal_binding_for_user_id(user_id)?;
+    if ingress.internal_principal_ref != principal_binding.internal_principal_ref {
+        return None;
+    }
+
+    Some(NewConversationBinding {
+        conversation_binding_id: Uuid::now_v7(),
+        channel_kind: ChannelKind::Telegram,
+        external_user_id: ingress.external_user_id.clone(),
+        external_conversation_id: ingress.external_conversation_id.clone(),
+        internal_principal_ref: ingress.internal_principal_ref.clone(),
+        internal_conversation_ref: ingress.internal_conversation_ref.clone(),
+    })
 }
 
 fn matching_conversation_binding_for_binding_config(

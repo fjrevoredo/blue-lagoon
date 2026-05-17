@@ -12,12 +12,14 @@ use crate::{
     audit::{self, NewAuditEvent},
     background::{self, BackgroundJobStatus},
     config::RuntimeConfig,
-    continuity, foreground, policy,
+    continuity, foreground, policy, recovery,
 };
 
 const DEFAULT_EPISODE_SCOPE_LIMIT: i64 = 4;
 const DEFAULT_MEMORY_SCOPE_LIMIT: i64 = 8;
 const DEFAULT_RETRIEVAL_SCOPE_LIMIT: i64 = 6;
+const SELF_MODEL_REFLECTION_SCHEDULE_MULTIPLIER: u64 = 12;
+const PLANNER_DIAGNOSTIC_MIN_COOLDOWN_SECONDS: i64 = 900;
 
 #[derive(Debug, Clone)]
 pub struct BackgroundPlanningRequest {
@@ -47,6 +49,48 @@ pub struct PlannedBackgroundJob {
     pub deduplication_key: String,
     pub scope: UnconsciousScope,
     pub budget: BackgroundExecutionBudget,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerPlanningPassSummary {
+    pub request_count: usize,
+    pub planned_count: usize,
+    pub suppressed_duplicate_count: usize,
+    pub rejected_count: usize,
+}
+
+pub async fn run_scheduler_planning_pass(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    scheduled_at: DateTime<Utc>,
+) -> Result<SchedulerPlanningPassSummary> {
+    let requests = build_scheduler_planning_requests(pool, config, scheduled_at).await?;
+    let summary = run_scheduler_planning_pass_with_requests(pool, config, requests).await?;
+    record_scheduler_planning_telemetry(pool, config, scheduled_at, &summary).await?;
+    Ok(summary)
+}
+
+pub async fn run_scheduler_planning_pass_with_requests(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    requests: Vec<BackgroundPlanningRequest>,
+) -> Result<SchedulerPlanningPassSummary> {
+    let mut summary = SchedulerPlanningPassSummary {
+        request_count: requests.len(),
+        ..SchedulerPlanningPassSummary::default()
+    };
+
+    for request in requests {
+        match plan_background_job(pool, config, request).await? {
+            BackgroundPlanningDecision::Planned(_) => summary.planned_count += 1,
+            BackgroundPlanningDecision::SuppressedDuplicate { .. } => {
+                summary.suppressed_duplicate_count += 1;
+            }
+            BackgroundPlanningDecision::Rejected { .. } => summary.rejected_count += 1,
+        }
+    }
+
+    Ok(summary)
 }
 
 pub async fn plan_background_job(
@@ -248,6 +292,266 @@ fn build_deduplication_key(
         trigger_kind = trigger_kind_as_str(trigger.trigger_kind),
         discriminator = normalize_dedup_component(&discriminator),
     )
+}
+
+async fn build_scheduler_planning_requests(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    scheduled_at: DateTime<Utc>,
+) -> Result<Vec<BackgroundPlanningRequest>> {
+    let mut requests = build_volume_threshold_requests(pool, config, scheduled_at).await?;
+    if is_periodic_schedule_due(
+        pool,
+        UnconsciousJobKind::SelfModelReflection,
+        scheduled_at,
+        config
+            .background
+            .scheduler
+            .poll_interval_seconds
+            .max(1)
+            .saturating_mul(SELF_MODEL_REFLECTION_SCHEDULE_MULTIPLIER),
+    )
+    .await?
+    {
+        requests.push(BackgroundPlanningRequest {
+            trace_id: Uuid::now_v7(),
+            job_kind: UnconsciousJobKind::SelfModelReflection,
+            trigger: BackgroundTrigger {
+                trigger_id: Uuid::now_v7(),
+                trigger_kind: BackgroundTriggerKind::TimeSchedule,
+                requested_at: scheduled_at,
+                reason_summary: "periodic self-model reflection schedule is due".to_string(),
+                payload_ref: Some(format!(
+                    "schedule://self_model_reflection/every_{}s",
+                    config
+                        .background
+                        .scheduler
+                        .poll_interval_seconds
+                        .max(1)
+                        .saturating_mul(SELF_MODEL_REFLECTION_SCHEDULE_MULTIPLIER)
+                )),
+            },
+            internal_conversation_ref: None,
+            available_at: scheduled_at,
+        });
+    }
+
+    Ok(requests)
+}
+
+async fn build_volume_threshold_requests(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    scheduled_at: DateTime<Utc>,
+) -> Result<Vec<BackgroundPlanningRequest>> {
+    let mut requests = Vec::new();
+
+    let episode_backlog_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM episodes")
+        .fetch_one(pool)
+        .await
+        .context("failed to count episodes for background threshold planning")?;
+    let episode_threshold = i64::from(config.background.thresholds.episode_backlog_threshold);
+    if episode_backlog_count >= episode_threshold {
+        requests.push(BackgroundPlanningRequest {
+            trace_id: Uuid::now_v7(),
+            job_kind: UnconsciousJobKind::MemoryConsolidation,
+            trigger: BackgroundTrigger {
+                trigger_id: Uuid::now_v7(),
+                trigger_kind: BackgroundTriggerKind::VolumeThreshold,
+                requested_at: scheduled_at,
+                reason_summary: format!(
+                    "episode backlog reached threshold ({episode_backlog_count} >= {episode_threshold})"
+                ),
+                payload_ref: Some(format!(
+                    "threshold://episodes/count={episode_backlog_count}/threshold={episode_threshold}"
+                )),
+            },
+            internal_conversation_ref: None,
+            available_at: scheduled_at,
+        });
+    }
+
+    let candidate_memory_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM memory_artifacts WHERE status = 'active'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count active memory artifacts for background threshold planning")?;
+    let candidate_memory_threshold =
+        i64::from(config.background.thresholds.candidate_memory_threshold);
+    if candidate_memory_count >= candidate_memory_threshold {
+        requests.push(BackgroundPlanningRequest {
+            trace_id: Uuid::now_v7(),
+            job_kind: UnconsciousJobKind::RetrievalMaintenance,
+            trigger: BackgroundTrigger {
+                trigger_id: Uuid::now_v7(),
+                trigger_kind: BackgroundTriggerKind::VolumeThreshold,
+                requested_at: scheduled_at,
+                reason_summary: format!(
+                    "active memory artifacts reached threshold ({candidate_memory_count} >= {candidate_memory_threshold})"
+                ),
+                payload_ref: Some(format!(
+                    "threshold://memory_artifacts/count={candidate_memory_count}/threshold={candidate_memory_threshold}"
+                )),
+            },
+            internal_conversation_ref: None,
+            available_at: scheduled_at,
+        });
+    }
+
+    Ok(requests)
+}
+
+async fn is_periodic_schedule_due(
+    pool: &PgPool,
+    job_kind: UnconsciousJobKind,
+    scheduled_at: DateTime<Utc>,
+    interval_seconds: u64,
+) -> Result<bool> {
+    let latest_activity_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        r#"
+        SELECT MAX(COALESCE(last_completed_at, last_started_at, available_at))
+        FROM background_jobs
+        WHERE job_kind = $1
+          AND trigger_kind = $2
+        "#,
+    )
+    .bind(job_kind_as_str(job_kind))
+    .bind(trigger_kind_as_str(BackgroundTriggerKind::TimeSchedule))
+    .fetch_one(pool)
+    .await
+    .context("failed to inspect latest periodic schedule timestamp")?;
+
+    let interval_seconds =
+        i64::try_from(interval_seconds).context("periodic schedule interval exceeded i64 range")?;
+    Ok(match latest_activity_at {
+        Some(latest) => latest + chrono::Duration::seconds(interval_seconds) <= scheduled_at,
+        None => true,
+    })
+}
+
+async fn record_scheduler_planning_telemetry(
+    pool: &PgPool,
+    config: &RuntimeConfig,
+    scheduled_at: DateTime<Utc>,
+    summary: &SchedulerPlanningPassSummary,
+) -> Result<()> {
+    let trace_id = Uuid::now_v7();
+    audit::insert(
+        pool,
+        &NewAuditEvent {
+            loop_kind: "unconscious".to_string(),
+            subsystem: "background_planning".to_string(),
+            event_kind: "background_scheduler_planning_pass_completed".to_string(),
+            severity: "info".to_string(),
+            trace_id,
+            execution_id: None,
+            worker_pid: None,
+            payload: json!({
+                "scheduled_at": scheduled_at,
+                "request_count": summary.request_count,
+                "planned_count": summary.planned_count,
+                "suppressed_duplicate_count": summary.suppressed_duplicate_count,
+                "rejected_count": summary.rejected_count,
+            }),
+        },
+    )
+    .await?;
+
+    let cooldown_seconds = i64::try_from(config.background.scheduler.poll_interval_seconds)
+        .context("background scheduler poll interval exceeded i64 range")?
+        .max(PLANNER_DIAGNOSTIC_MIN_COOLDOWN_SECONDS);
+
+    if summary.suppressed_duplicate_count > 0 {
+        insert_scheduler_planning_diagnostic_with_cooldown(
+            pool,
+            scheduled_at,
+            cooldown_seconds,
+            "background_scheduler_planning_duplicates_suppressed",
+            recovery::OperationalDiagnosticSeverity::Info,
+            format!(
+                "background scheduler suppressed {} duplicate planning request(s)",
+                summary.suppressed_duplicate_count
+            ),
+            json!({
+                "scheduled_at": scheduled_at,
+                "request_count": summary.request_count,
+                "suppressed_duplicate_count": summary.suppressed_duplicate_count,
+                "planned_count": summary.planned_count,
+            }),
+        )
+        .await?;
+    }
+
+    if summary.rejected_count > 0 {
+        insert_scheduler_planning_diagnostic_with_cooldown(
+            pool,
+            scheduled_at,
+            cooldown_seconds,
+            "background_scheduler_planning_requests_rejected",
+            recovery::OperationalDiagnosticSeverity::Warn,
+            format!(
+                "background scheduler rejected {} planning request(s)",
+                summary.rejected_count
+            ),
+            json!({
+                "scheduled_at": scheduled_at,
+                "request_count": summary.request_count,
+                "rejected_count": summary.rejected_count,
+                "planned_count": summary.planned_count,
+            }),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_scheduler_planning_diagnostic_with_cooldown(
+    pool: &PgPool,
+    scheduled_at: DateTime<Utc>,
+    cooldown_seconds: i64,
+    reason_code: &str,
+    severity: recovery::OperationalDiagnosticSeverity,
+    summary: String,
+    diagnostic_payload: serde_json::Value,
+) -> Result<()> {
+    let window_start = scheduled_at - chrono::Duration::seconds(cooldown_seconds);
+    let already_recorded = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM operational_diagnostics
+            WHERE reason_code = $1
+              AND created_at >= $2
+        )
+        "#,
+    )
+    .bind(reason_code)
+    .bind(window_start)
+    .fetch_one(pool)
+    .await
+    .with_context(|| format!("failed to check recent planner diagnostic for {reason_code}"))?;
+    if already_recorded {
+        return Ok(());
+    }
+
+    recovery::insert_operational_diagnostic(
+        pool,
+        &recovery::NewOperationalDiagnostic {
+            operational_diagnostic_id: Uuid::now_v7(),
+            trace_id: None,
+            execution_id: None,
+            subsystem: "background_planning".to_string(),
+            severity,
+            reason_code: reason_code.to_string(),
+            summary,
+            diagnostic_payload,
+        },
+    )
+    .await
+    .with_context(|| format!("failed to insert planner diagnostic for {reason_code}"))?;
+    Ok(())
 }
 
 async fn assemble_scope(
@@ -530,5 +834,23 @@ mod tests {
             key,
             "background:contradiction_and_drift_scan:maintenance_trigger:maintenance-contradiction-scan-nightly"
         );
+    }
+
+    #[test]
+    fn validate_job_trigger_compatibility_rejects_drift_signal_for_contradiction_scan() {
+        let trigger = BackgroundTrigger {
+            trigger_id: Uuid::now_v7(),
+            trigger_kind: BackgroundTriggerKind::DriftOrAnomalySignal,
+            requested_at: Utc::now(),
+            reason_summary: "drift".to_string(),
+            payload_ref: Some("diagnostic://event".to_string()),
+        };
+
+        let error = validate_job_trigger_compatibility(
+            UnconsciousJobKind::ContradictionAndDriftScan,
+            &trigger,
+        )
+        .expect_err("drift signal should be rejected for contradiction scan");
+        assert!(error.contains("not supported"));
     }
 }

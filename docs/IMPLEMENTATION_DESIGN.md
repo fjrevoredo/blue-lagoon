@@ -92,6 +92,10 @@ A conscious episode should follow this high-level flow:
 5. The conscious loop emits user-facing outputs, episodic records, candidate memories, and optional background job requests.
 6. The loop halts when the goal is satisfied or its budgets are exhausted.
 
+Conscious foreground model outputs should remain structured-only. The user-facing
+reply should be a required field in the same output object that carries optional
+governed-action and identity-control directives.
+
 Allowed conscious triggers remain:
 
 - User input.
@@ -174,6 +178,31 @@ This remains a hard design posture:
 - Foreground and background work are explicitly bounded and forcibly terminable.
 - Recovery coordination is harness-owned.
 - No worker self-recovery exists as an authority path.
+
+Model-provider reasoning policy follows the same posture. The harness owns
+reasoning-policy resolution for model calls before any provider request is
+constructed. Workers remain provider-agnostic: they request a bounded model
+call, but they do not choose provider-specific reasoning payload shapes. When a
+provider supports explicit reasoning levels or disablement, the harness maps the
+resolved policy into that provider's request format. When a route cannot safely
+satisfy the selected reasoning policy, the harness fails closed or applies a
+documented compatibility rule owned by the harness rather than letting workers
+silently degrade behavior.
+
+The implementation vocabulary for foreground reasoning policy is:
+
+- `off`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+- `provider_default`
+
+`off` means the harness should actively disable provider-controlled reasoning
+where the active route supports that control. `provider_default` means the
+harness intentionally omits any provider-specific reasoning-strength override
+and accepts the provider's native default behavior for the chosen route.
 
 Transaction boundaries remain harness-owned. The harness may expose reusable service-layer write paths, but low-level repositories or workers must not become de facto owners of business-critical transaction logic.
 
@@ -505,6 +534,13 @@ Logical model tiers are also part of the current direction:
 - Tier C: low-cost utility extraction and bounded transforms.
 
 Structured outputs should be the default whenever practical, especially for unconscious work. Unconscious jobs should stay constrained to structured results such as proposals, diagnostics, alerts, retrieval updates, self-model deltas, and optional wake signals.
+
+For conscious foreground routing, structured output support is mandatory rather
+than best-effort. Route selection should fail closed if the configured provider
+or model cannot reliably satisfy `json_object` output mode for foreground calls.
+OpenRouter auto routing should be treated as incompatible for this foreground
+structured-output contract; pinned provider/model identifiers should be used
+instead.
 
 Tool execution stays outside the gateway. The gateway may return structured tool-call candidates or equivalent proposals, but actual tool execution, validation, approval, and routing remain inside the harness execution and policy layers.
 
@@ -1294,12 +1330,14 @@ Approval requests remain canonical harness objects first and Telegram renderings
 The v1 approval flow should be:
 
 1. The harness creates an approval request with TTL, action fingerprint, risk tier, and concise consequence summary.
-2. Telegram renders the request primarily with inline approval controls.
-3. Typed approval or rejection may exist as a controlled fallback using the same approval token model.
+2. Telegram renders the request primarily with inline approval controls when callback payload size allows.
+3. Typed approval or rejection exists as a controlled fallback (`/approve <token>` and `/reject <token>`) using the same approval token model.
 4. The response becomes an approval-resolution event.
 5. The harness validates actor identity, TTL, one-shot use, and unchanged action fingerprint.
 6. The harness re-checks policy before executing on approval.
 7. Rejection or expiry returns control through the normal approval-resolution path for replanning, cancellation, or abandonment.
+
+Inline callback and fallback command resolution are transport aliases, not separate approval systems. Both paths must resolve through the same harness-owned approval transition logic and preserve idempotent one-shot semantics.
 
 #### Notifications and local chat scope
 
@@ -1313,6 +1351,13 @@ The v1 approval flow should be:
 - Attachments are accepted in v1 as normalized references with basic metadata.
 - Deeper attachment processing remains harness-mediated and policy-controlled.
 - Attachment handling should not force Telegram-specific semantics upward into core business logic.
+
+#### Workspace archive lifecycle
+
+- Governed workspace artifacts and workspace scripts use explicit lifecycle state.
+- Archived workspace artifacts and scripts are immutable through normal mutation and execution paths.
+- Returning an archived artifact or script to active use requires an explicit, harness-mediated restore or unarchive transition.
+- Restore or unarchive transitions remain policy-evaluated and auditable before any subsequent mutation or execution is allowed.
 
 #### Minimal operator surface
 

@@ -3,17 +3,18 @@ mod support;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use contracts::{
-    ApprovalRequestStatus, CanonicalProposal, CanonicalProposalKind, CanonicalProposalPayload,
-    CanonicalTargetKind, CapabilityScope, ChannelKind, EnvironmentCapabilityScope,
-    ExecutionCapabilityBudget, FilesystemCapabilityScope, GovernedActionFingerprint,
-    GovernedActionKind, GovernedActionPayload, GovernedActionProposal, GovernedActionRiskTier,
-    IdentityDeltaProposal, IdentityInterviewAnswer, IdentityKickstartAction,
-    IdentityLifecycleState, ModelProviderKind, NetworkAccessPosture, ProposalConflictPosture,
-    ProposalProvenance, ProposalProvenanceKind, SubprocessAction,
+    ApprovalRequestStatus, ApprovalResolutionDecision, CanonicalProposal, CanonicalProposalKind,
+    CanonicalProposalPayload, CanonicalTargetKind, CapabilityScope, ChannelKind,
+    EnvironmentCapabilityScope, ExecutionCapabilityBudget, FilesystemCapabilityScope,
+    GovernedActionFingerprint, GovernedActionKind, GovernedActionPayload, GovernedActionProposal,
+    GovernedActionRiskTier, IdentityDeltaProposal, IdentityInterviewAnswer,
+    IdentityKickstartAction, IdentityLifecycleState, IngressAttachmentProcessingStatus,
+    ModelProviderKind, NetworkAccessPosture, ProcessIngressAttachmentAction,
+    ProposalConflictPosture, ProposalProvenance, ProposalProvenanceKind, SubprocessAction,
 };
 use harness::{
     approval::{self, NewApprovalRequestRecord},
-    audit,
+    attachments, audit,
     config::{
         ResolvedForegroundModelRouteConfig, ResolvedModelGatewayConfig, ResolvedTelegramConfig,
         SelfModelConfig,
@@ -24,6 +25,13 @@ use harness::{
 use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
+
+fn conscious_output_content(assistant_text: &str) -> String {
+    serde_json::json!({
+        "assistant_text": assistant_text,
+    })
+    .to_string()
+}
 
 #[tokio::test]
 #[serial]
@@ -44,7 +52,7 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from foreground integration" },
+                    "message": { "content": conscious_output_content("assistant reply from foreground integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -134,6 +142,134 @@ async fn telegram_fixture_runtime_run_persists_response_and_trace_linked_audit()
 
 #[tokio::test]
 #[serial]
+async fn telegram_fixture_runtime_resteers_malformed_governed_action_and_completes_same_turn()
+-> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+        config
+            .governed_actions
+            .malformed_action_resteer_max_attempts = 1;
+        config.governed_actions.malformed_action_resteer_timeout_ms = 5_000;
+
+        let malformed_payload = serde_json::json!({
+            "payload": {
+                "kind": "list_workspace_artifacts",
+                "value": {
+                    "artifact_kind": serde_json::Value::Null,
+                    "status": "active",
+                    "query": serde_json::Value::Null,
+                    "limit": 10
+                }
+            }
+        })
+        .to_string();
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": malformed_payload },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 18,
+                    "completion_tokens": 10
+                }
+            }),
+        }));
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": conscious_output_content("assistant reply after malformed-action repair") },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 22,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("private_text_message.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "assistant reply after malformed-action repair"
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 2);
+        let retry_request_messages = seen_requests[1]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(retry_request_messages.iter().any(|content| {
+            content.contains("Harness requested a malformed-action repair retry")
+        }));
+
+        let execution_row = sqlx::query(
+            r#"
+            SELECT execution_id
+            FROM execution_records
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        let execution_id: Uuid = execution_row.get("execution_id");
+
+        let audit_events = audit::list_for_execution(&ctx.pool, execution_id).await?;
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_kind == "foreground_malformed_action_resteer_attempt")
+        );
+
+        let exhausted_resteer_diagnostic_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM operational_diagnostics
+            WHERE reason_code = 'foreground_malformed_action_resteer_exhausted'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(exhausted_resteer_diagnostic_count, 0);
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn telegram_fixture_runtime_run_applies_predefined_identity_selection() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -152,10 +288,11 @@ async fn telegram_fixture_runtime_run_applies_predefined_identity_selection() ->
             "answer": serde_json::Value::Null,
             "cancel_reason": serde_json::Value::Null,
         });
-        let model_text = format!(
-            "Continuity Operator selected.\n```blue-lagoon-identity-kickstart\n{}\n```",
-            identity_block
-        );
+        let model_text = serde_json::json!({
+            "assistant_text": "Continuity Operator selected.",
+            "identity_kickstart": identity_block,
+        })
+        .to_string();
         let transport = model_gateway::FakeModelProviderTransport::new();
         transport.push_response(Ok(model_gateway::ProviderHttpResponse {
             status: 200,
@@ -264,10 +401,10 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
             body: serde_json::json!({
                 "choices": [{
                     "message": {
-                        "content": format!(
-                            "Let's build a custom identity.\n```blue-lagoon-identity-kickstart\n{}\n```",
-                            start_block
-                        )
+                        "content": serde_json::json!({
+                            "assistant_text": "Let's build a custom identity.",
+                            "identity_kickstart": start_block,
+                        }).to_string()
                     },
                     "finish_reason": "stop"
                 }],
@@ -290,7 +427,10 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
         )
         .await?;
         assert_eq!(summary.completed_count, 1);
-        assert_eq!(delivery.sent_messages()[0].text, "Let's build a custom identity.");
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Let's build a custom identity."
+        );
 
         let lifecycle = identity::get_current_lifecycle(&ctx.pool)
             .await?
@@ -364,7 +504,8 @@ async fn telegram_fixture_runtime_run_completes_custom_identity_interview() -> R
         assert_eq!(completed_interview.status, "completed");
         assert_eq!(completed_interview.current_step, "completed");
 
-        let compact_identity = identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
+        let compact_identity =
+            identity::reconstruct_compact_identity_snapshot(&ctx.pool, 32).await?;
         assert_eq!(compact_identity.identity_summary, "Lagoon Forge");
         assert!(
             compact_identity
@@ -426,13 +567,22 @@ async fn telegram_callback_fixture_runtime_run_resolves_pending_approval() -> Re
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Runtime callback approval"
+            "Approval approved: Runtime callback approval\nState: approved\nNext: running the approved action now."
         );
 
         let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
             .await?
             .expect("approval request should still be queryable");
         assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Approved)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
         Ok(())
     })
     .await
@@ -485,13 +635,158 @@ async fn telegram_command_fixture_runtime_run_resolves_pending_approval() -> Res
         assert_eq!(delivery.sent_messages().len(), 1);
         assert_eq!(
             delivery.sent_messages()[0].text,
-            "Approved: Runtime command approval"
+            "Approval approved: Runtime command approval\nState: approved\nNext: running the approved action now."
         );
 
         let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
             .await?
             .expect("approval request should still be queryable");
         assert_eq!(resolved.status, ApprovalRequestStatus::Approved);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Approved)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_callback_fixture_runtime_run_rejects_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-callback-reject".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime callback rejection".to_string(),
+                consequence_summary: "Used to verify runtime callback reject routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_callback_reject.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approval rejected: Runtime callback rejection\nState: rejected\nNext: no action was executed."
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Rejected);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Rejected)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn telegram_command_fixture_runtime_run_rejects_pending_approval() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        approval::create_approval_request(
+            &ctx.config,
+            &ctx.pool,
+            &NewApprovalRequestRecord {
+                approval_request_id: Uuid::now_v7(),
+                trace_id: Uuid::now_v7(),
+                execution_id: None,
+                action_proposal_id: Uuid::now_v7(),
+                action_fingerprint: GovernedActionFingerprint {
+                    value: "sha256:foreground-integration-command-reject".to_string(),
+                },
+                action_kind: GovernedActionKind::RunSubprocess,
+                risk_tier: GovernedActionRiskTier::Tier2,
+                title: "Runtime command rejection".to_string(),
+                consequence_summary: "Used to verify runtime command reject routing.".to_string(),
+                capability_scope: sample_capability_scope(),
+                requested_by: "telegram:primary-user".to_string(),
+                token: "42".to_string(),
+                requested_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            },
+        )
+        .await?;
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &ctx.config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("approval_command_reject.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.fetched_updates, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "Approval rejected: Runtime command rejection\nState: rejected\nNext: no action was executed."
+        );
+
+        let resolved = approval::get_approval_request_by_token(&ctx.pool, "42")
+            .await?
+            .expect("approval request should still be queryable");
+        assert_eq!(resolved.status, ApprovalRequestStatus::Rejected);
+        assert_eq!(
+            resolved.resolution_kind,
+            Some(ApprovalResolutionDecision::Rejected)
+        );
+        assert_eq!(
+            resolved.resolved_by.as_deref(),
+            Some("telegram:primary-user")
+        );
+        assert!(resolved.resolved_at.is_some());
         Ok(())
     })
     .await
@@ -516,7 +811,7 @@ async fn telegram_fixture_runtime_batch_activates_backlog_recovery() -> Result<(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply from backlog runtime integration" },
+                    "message": { "content": conscious_output_content("assistant reply from backlog runtime integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -633,7 +928,7 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after preference capture" },
+                    "message": { "content": conscious_output_content("assistant reply after preference capture") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -646,7 +941,7 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply after retrieval" },
+                    "message": { "content": conscious_output_content("assistant reply after retrieval") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -713,6 +1008,248 @@ async fn telegram_fixture_runtime_retrieves_prior_canonical_memory_on_later_run(
 
 #[tokio::test]
 #[serial]
+async fn staged_document_attachment_is_processed_and_visible_in_model_context() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.self_model = Some(SelfModelConfig {
+            seed_path: support::workspace_root()
+                .join("config")
+                .join("self_model_seed.toml"),
+        });
+        let worker_binary = support::workers_binary()?;
+        config.worker.command = worker_binary.to_string_lossy().into_owned();
+        config.worker.args = vec!["conscious-worker".to_string()];
+
+        let fixture_path =
+            telegram_fixture("private_command_with_document_attachment_payload.json");
+        let update = telegram::load_fixture_updates(&fixture_path)?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let normalized = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some(fixture_path.display().to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let staged = match foreground::stage_telegram_foreground_ingress(
+            &ctx.pool,
+            &sample_telegram_config(),
+            normalized,
+        )
+        .await?
+        {
+            foreground::StagedForegroundIngressOutcome::Accepted(staged) => staged,
+            other => panic!("fixture should stage foreground ingress, got {other:?}"),
+        };
+
+        let attachments_before =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_before.len(), 1);
+        assert_eq!(
+            attachments_before[0].processing_status,
+            IngressAttachmentProcessingStatus::Pending
+        );
+        assert_eq!(attachments_before[0].attachment_id, "doc-payload-1");
+
+        let processing = plan_and_execute_process_ingress_attachment_governed_action(
+            &config,
+            &ctx.pool,
+            staged.ingress_id,
+            "doc-payload-1",
+        )
+        .await?;
+        assert!(processing.outcome.summary.contains("processed attachment"));
+
+        let attachments_after =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_after.len(), 1);
+        assert_eq!(
+            attachments_after[0].processing_status,
+            IngressAttachmentProcessingStatus::Processed
+        );
+        assert!(attachments_after[0].last_failure_reason.is_none());
+        assert!(attachments_after[0].latest_extracted_artifact_id.is_some());
+
+        let latest_attempt_status: String = sqlx::query_scalar(
+            r#"
+            SELECT status
+            FROM ingress_attachment_processing_attempts
+            WHERE ingress_attachment_id = $1
+            ORDER BY started_at DESC, ingress_attachment_processing_attempt_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(latest_attempt_status, "succeeded");
+
+        let extracted_artifact_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_attachment_extracted_artifacts
+            WHERE ingress_attachment_id = $1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(extracted_artifact_count, 1);
+
+        let transport = model_gateway::FakeModelProviderTransport::new();
+        transport.push_response(Ok(model_gateway::ProviderHttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "choices": [{
+                    "message": { "content": conscious_output_content("assistant reply with attachment context") },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 22,
+                    "completion_tokens": 8
+                }
+            }),
+        }));
+        let mut delivery = telegram::FakeTelegramDelivery::default();
+        let summary = runtime::run_telegram_fixture_with(
+            &ctx.pool,
+            &config,
+            &sample_telegram_config(),
+            &sample_model_gateway_config(),
+            &telegram_fixture("unsupported_update.json"),
+            &transport,
+            &mut delivery,
+        )
+        .await?;
+
+        assert_eq!(summary.ignored_count, 1);
+        assert_eq!(summary.completed_count, 1);
+        assert_eq!(delivery.sent_messages().len(), 1);
+        assert_eq!(
+            delivery.sent_messages()[0].text,
+            "assistant reply with attachment context"
+        );
+
+        let seen_requests = transport.seen_requests();
+        assert_eq!(seen_requests.len(), 1);
+        let message_contents = seen_requests[0]
+            .body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("provider request should include messages")
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        let retrieved_context_message = message_contents
+            .iter()
+            .find(|content| content.contains("Retrieved canonical context:"))
+            .expect("retrieved context developer message should be present");
+        let retrieved_context_message_lower = retrieved_context_message.to_ascii_lowercase();
+        assert!(retrieved_context_message_lower.contains("attachment_excerpt"));
+        assert!(retrieved_context_message_lower.contains("project-notes.txt"));
+        assert!(retrieved_context_message_lower.contains("attachment fixture excerpt start"));
+        assert!(!retrieved_context_message_lower.contains("truncation_sentinel_end"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn governed_attachment_processing_marks_unsupported_documents() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let fixture_path = telegram_fixture("private_command_with_unsupported_document.json");
+        let update = telegram::load_fixture_updates(&fixture_path)?
+            .into_iter()
+            .next()
+            .expect("fixture should contain one update");
+        let normalized = match ingress::normalize_telegram_update(
+            &sample_telegram_config(),
+            &update,
+            Some(fixture_path.display().to_string()),
+        )? {
+            ingress::TelegramNormalizationOutcome::Accepted(ingress) => *ingress,
+            other => panic!("fixture should normalize into accepted ingress, got {other:?}"),
+        };
+        let staged = match foreground::stage_telegram_foreground_ingress(
+            &ctx.pool,
+            &sample_telegram_config(),
+            normalized,
+        )
+        .await?
+        {
+            foreground::StagedForegroundIngressOutcome::Accepted(staged) => staged,
+            other => panic!("fixture should stage foreground ingress, got {other:?}"),
+        };
+
+        let attachments_before =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_before.len(), 1);
+        assert_eq!(
+            attachments_before[0].processing_status,
+            IngressAttachmentProcessingStatus::Pending
+        );
+        assert_eq!(attachments_before[0].attachment_id, "doc-unsupported-1");
+
+        let processing = plan_and_execute_process_ingress_attachment_governed_action(
+            &ctx.config,
+            &ctx.pool,
+            staged.ingress_id,
+            "doc-unsupported-1",
+        )
+        .await?;
+        assert!(processing.outcome.summary.contains("unsupported"));
+
+        let attachments_after =
+            attachments::list_ingress_attachments(&ctx.pool, staged.ingress_id).await?;
+        assert_eq!(attachments_after.len(), 1);
+        assert_eq!(
+            attachments_after[0].processing_status,
+            IngressAttachmentProcessingStatus::Unsupported
+        );
+        assert!(
+            attachments_after[0]
+                .last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not supported"))
+        );
+        assert!(attachments_after[0].latest_extracted_artifact_id.is_none());
+
+        let latest_attempt_status: String = sqlx::query_scalar(
+            r#"
+            SELECT status
+            FROM ingress_attachment_processing_attempts
+            WHERE ingress_attachment_id = $1
+            ORDER BY started_at DESC, ingress_attachment_processing_attempt_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(latest_attempt_status, "unsupported");
+
+        let extracted_artifact_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM ingress_attachment_extracted_artifacts
+            WHERE ingress_attachment_id = $1
+            "#,
+        )
+        .bind(attachments_after[0].ingress_attachment_id)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(extracted_artifact_count, 0);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let mut config = ctx.config.clone();
@@ -730,7 +1267,7 @@ async fn telegram_fixture_runtime_duplicate_ingress_is_idempotent_and_audited() 
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "assistant reply for duplicate integration" },
+                    "message": { "content": conscious_output_content("assistant reply for duplicate integration") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -916,7 +1453,7 @@ async fn runtime_fixture_blocks_stale_processing_replay_when_prior_governed_acti
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "unexpected resumed reply" },
+                    "message": { "content": conscious_output_content("unexpected resumed reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1050,7 +1587,7 @@ async fn scheduled_foreground_runtime_run_executes_due_task_through_worker_binar
             status: 200,
             body: serde_json::json!({
                 "choices": [{
-                    "message": { "content": "scheduled integration reply" },
+                    "message": { "content": conscious_output_content("scheduled integration reply") },
                     "finish_reason": "stop"
                 }],
                 "usage": {
@@ -1217,6 +1754,13 @@ fn sample_telegram_config() -> ResolvedTelegramConfig {
         allowed_chat_id: 42,
         internal_principal_ref: "primary-user".to_string(),
         internal_conversation_ref: "telegram-primary".to_string(),
+        approval_resolution_policy:
+            harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+        principal_bindings: vec![harness::config::ResolvedTelegramPrincipalBinding {
+            allowed_user_id: 42,
+            internal_principal_ref: "primary-user".to_string(),
+            role: harness::config::TelegramPrincipalRole::Owner,
+        }],
         poll_limit: 10,
     }
 }
@@ -1285,6 +1829,58 @@ async fn plan_nonrepeatable_recovery_governed_action(
     }
 }
 
+async fn plan_and_execute_process_ingress_attachment_governed_action(
+    config: &harness::config::RuntimeConfig,
+    pool: &sqlx::PgPool,
+    ingress_id: Uuid,
+    attachment_id: &str,
+) -> Result<governed_actions::GovernedActionExecutionResult> {
+    let planned = match governed_actions::plan_governed_action(
+        config,
+        pool,
+        &governed_actions::GovernedActionPlanningRequest {
+            governed_action_execution_id: Uuid::now_v7(),
+            trace_id: Uuid::now_v7(),
+            execution_id: None,
+            proposal: GovernedActionProposal {
+                proposal_id: Uuid::now_v7(),
+                title: "Process ingress attachment".to_string(),
+                rationale: Some("Process staged attachment for integration coverage.".to_string()),
+                action_kind: GovernedActionKind::ProcessIngressAttachment,
+                requested_risk_tier: None,
+                capability_scope: CapabilityScope {
+                    filesystem: FilesystemCapabilityScope {
+                        read_roots: Vec::new(),
+                        write_roots: Vec::new(),
+                    },
+                    network: NetworkAccessPosture::Disabled,
+                    environment: EnvironmentCapabilityScope {
+                        allow_variables: Vec::new(),
+                    },
+                    execution: ExecutionCapabilityBudget {
+                        timeout_ms: 30_000,
+                        max_stdout_bytes: 65_536,
+                        max_stderr_bytes: 32_768,
+                    },
+                },
+                payload: GovernedActionPayload::ProcessIngressAttachment(
+                    ProcessIngressAttachmentAction {
+                        ingress_id,
+                        attachment_id: attachment_id.to_string(),
+                    },
+                ),
+            },
+        },
+    )
+    .await?
+    {
+        governed_actions::GovernedActionPlanningOutcome::Planned(planned) => planned,
+        other => panic!("expected planned governed action, got {other:?}"),
+    };
+    assert!(!planned.requires_approval);
+    governed_actions::execute_governed_action(config, pool, &planned.record).await
+}
+
 fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
     ResolvedModelGatewayConfig {
         foreground: ResolvedForegroundModelRouteConfig {
@@ -1292,6 +1888,19 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-foreground".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 30_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "provider-secret".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 30_000,
         },
     }

@@ -266,6 +266,8 @@ pub struct ModelGatewayStatusReport {
     pub api_key_env: Option<String>,
     pub api_key_present: bool,
     pub timeout_ms: Option<u64>,
+    pub conscious_structured_output_compatible: Option<bool>,
+    pub conscious_structured_output_issue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +366,60 @@ pub struct GovernedActionSummary {
     pub status: String,
     pub workspace_script_id: Option<Uuid>,
     pub workspace_script_version_id: Option<Uuid>,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarIntegrationRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailIntegrationRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
+    pub blocked_reason: Option<String>,
+    pub output_ref: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSyncRunSummary {
+    pub governed_action_execution_id: Uuid,
+    pub trace_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub approval_request_id: Option<Uuid>,
+    pub action_kind: String,
+    pub risk_tier: String,
+    pub status: String,
+    pub internal_principal_ref: String,
+    pub internal_conversation_ref: String,
+    pub request_summary: String,
     pub blocked_reason: Option<String>,
     pub output_ref: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
@@ -561,6 +617,7 @@ pub struct TraceDiagnosisSummary {
 #[serde(rename_all = "snake_case")]
 pub enum TraceFocusSelector {
     FailingNode,
+    FailingModelCall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2164,6 +2221,126 @@ pub async fn list_governed_actions(
         .collect()
 }
 
+pub async fn list_calendar_integration_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<CalendarIntegrationRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('list_calendar_events', 'upsert_calendar_event')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list calendar integration runs for management")?;
+
+    rows.into_iter()
+        .map(calendar_integration_run_summary_from_row)
+        .collect()
+}
+
+pub async fn list_email_integration_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<EmailIntegrationRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('list_email_messages', 'send_email_message')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list email integration runs for management")?;
+
+    rows.into_iter()
+        .map(email_integration_run_summary_from_row)
+        .collect()
+}
+
+pub async fn list_task_sync_runs(
+    config: &RuntimeConfig,
+    status: Option<contracts::GovernedActionStatus>,
+    limit: u32,
+) -> Result<Vec<TaskSyncRunSummary>> {
+    let pool = db::connect(config).await?;
+    let status_filter = status.map(governed_action_status_as_str);
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            governed_action_execution_id,
+            trace_id,
+            execution_id,
+            approval_request_id,
+            action_kind,
+            risk_tier,
+            status,
+            payload_json,
+            blocked_reason,
+            output_ref,
+            started_at,
+            completed_at
+        FROM governed_action_executions
+        WHERE action_kind IN ('sync_task_list')
+          AND ($1::TEXT IS NULL OR status = $1::TEXT)
+        ORDER BY created_at DESC, governed_action_execution_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(status_filter)
+    .bind(i64::from(limit))
+    .fetch_all(&pool)
+    .await
+    .context("failed to list task sync integration runs for management")?;
+
+    rows.into_iter()
+        .map(task_sync_run_summary_from_row)
+        .collect()
+}
+
 pub async fn load_trace_report(
     config: &RuntimeConfig,
     request: TraceLookupRequest,
@@ -2290,6 +2467,9 @@ pub fn inspect_trace_report_focus(
                 .find(|candidate| candidate.node_id == node.node_id)
                 .cloned()
         }),
+        TraceFocusSelector::FailingModelCall => {
+            find_relevant_failing_model_call_node(report, diagnosis)
+        }
     };
     let (payload_availability, payload_availability_reason, mut notes) =
         classify_focus_payload_availability(resolved_node.as_ref());
@@ -2304,6 +2484,47 @@ pub fn inspect_trace_report_focus(
         payload_availability_reason,
         notes,
     }
+}
+
+fn find_relevant_failing_model_call_node(
+    report: &TraceReport,
+    diagnosis: &TraceDiagnosisSummary,
+) -> Option<TraceNode> {
+    if let Some(failing_node) = diagnosis.first_failing_node.as_ref() {
+        if failing_node.node_kind == "model_call" {
+            return report
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == failing_node.node_id)
+                .cloned();
+        }
+        if let Some(node) = report
+            .nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.node_kind == "model_call"
+                    && candidate.occurred_at <= failing_node.occurred_at
+            })
+            .max_by(|left, right| {
+                left.occurred_at
+                    .cmp(&right.occurred_at)
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            })
+        {
+            return Some(node.clone());
+        }
+    }
+
+    report
+        .nodes
+        .iter()
+        .filter(|candidate| candidate.node_kind == "model_call")
+        .max_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        })
+        .cloned()
 }
 
 pub async fn list_recent_traces(config: &RuntimeConfig, limit: u32) -> Result<Vec<TraceSummary>> {
@@ -4371,15 +4592,25 @@ fn inspect_telegram_status(config: &RuntimeConfig) -> TelegramStatusReport {
 
 fn inspect_model_gateway_status(config: &RuntimeConfig) -> ModelGatewayStatusReport {
     match &config.model_gateway {
-        Some(model_gateway) => ModelGatewayStatusReport {
-            configured: true,
-            provider: Some(model_gateway.foreground.provider.identifier().to_string()),
-            model: Some(model_gateway.foreground.model.clone()),
-            api_base_url: model_gateway.foreground.api_base_url.clone(),
-            api_key_env: Some(model_gateway.foreground.api_key_env.clone()),
-            api_key_present: env_var_present(&model_gateway.foreground.api_key_env),
-            timeout_ms: Some(model_gateway.foreground.timeout_ms),
-        },
+        Some(model_gateway) => {
+            let structured_output_compatibility =
+                model_gateway.validate_foreground_structured_output_route();
+            ModelGatewayStatusReport {
+                configured: true,
+                provider: Some(model_gateway.foreground.provider.identifier().to_string()),
+                model: Some(model_gateway.foreground.model.clone()),
+                api_base_url: model_gateway.foreground.api_base_url.clone(),
+                api_key_env: Some(model_gateway.foreground.api_key_env.clone()),
+                api_key_present: env_var_present(&model_gateway.foreground.api_key_env),
+                timeout_ms: Some(model_gateway.foreground.timeout_ms),
+                conscious_structured_output_compatible: Some(
+                    structured_output_compatibility.is_ok(),
+                ),
+                conscious_structured_output_issue: structured_output_compatibility
+                    .err()
+                    .map(|error| error.to_string()),
+            }
+        }
         None => ModelGatewayStatusReport {
             configured: false,
             provider: None,
@@ -4388,6 +4619,8 @@ fn inspect_model_gateway_status(config: &RuntimeConfig) -> ModelGatewayStatusRep
             api_key_env: None,
             api_key_present: false,
             timeout_ms: None,
+            conscious_structured_output_compatible: None,
+            conscious_structured_output_issue: None,
         },
     }
 }
@@ -5219,6 +5452,176 @@ fn governed_action_summary(
     }
 }
 
+fn calendar_integration_run_summary_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<CalendarIntegrationRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode calendar integration payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::ListCalendarEvents(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "window={}..{} max_results={}",
+                action.start_at, action.end_at, action.max_results
+            ),
+        ),
+        contracts::GovernedActionPayload::UpsertCalendarEvent(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "title={} starts_at={} ends_at={} external_event_id={} location={}",
+                action.title,
+                action.starts_at,
+                action.ends_at,
+                action.external_event_id.as_deref().unwrap_or("new"),
+                action.location.as_deref().unwrap_or("none")
+            ),
+        ),
+        _ => bail!(
+            "calendar integration query returned non-calendar payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(CalendarIntegrationRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
+fn email_integration_run_summary_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<EmailIntegrationRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode email integration payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::ListEmailMessages(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "mailbox={} query={} max_results={}",
+                action.mailbox.as_deref().unwrap_or("inbox"),
+                action.query.as_deref().unwrap_or("none"),
+                action.max_results
+            ),
+        ),
+        contracts::GovernedActionPayload::SendEmailMessage(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "to={} cc={} subject={} reply_to={}",
+                action.to.len(),
+                action.cc.len(),
+                action.subject,
+                action
+                    .reply_to_external_message_id
+                    .as_deref()
+                    .unwrap_or("none")
+            ),
+        ),
+        _ => bail!(
+            "email integration query returned non-email payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(EmailIntegrationRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
+fn task_sync_run_summary_from_row(row: sqlx::postgres::PgRow) -> Result<TaskSyncRunSummary> {
+    let action_kind: String = row.get("action_kind");
+    let payload_json: JsonValue = row.get("payload_json");
+    let payload: contracts::GovernedActionPayload = serde_json::from_value(payload_json)
+        .with_context(|| {
+            format!(
+                "failed to decode task sync payload for action kind '{}'",
+                action_kind
+            )
+        })?;
+
+    let (internal_principal_ref, internal_conversation_ref, request_summary) = match payload {
+        contracts::GovernedActionPayload::SyncTaskList(action) => (
+            action.internal_principal_ref,
+            action.internal_conversation_ref,
+            format!(
+                "title={} items={} external_list_id={} workspace_artifact_id={}",
+                action.task_list_title,
+                action.items.len(),
+                action.external_list_id.as_deref().unwrap_or("new"),
+                action
+                    .workspace_artifact_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ),
+        _ => bail!(
+            "task sync query returned non-task-sync payload for action kind '{}'",
+            action_kind
+        ),
+    };
+
+    Ok(TaskSyncRunSummary {
+        governed_action_execution_id: row.get("governed_action_execution_id"),
+        trace_id: row.get("trace_id"),
+        execution_id: row.get("execution_id"),
+        approval_request_id: row.get("approval_request_id"),
+        action_kind,
+        risk_tier: row.get("risk_tier"),
+        status: row.get("status"),
+        internal_principal_ref,
+        internal_conversation_ref,
+        request_summary,
+        blocked_reason: row.get("blocked_reason"),
+        output_ref: row.get("output_ref"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+    })
+}
+
 fn workspace_script_run_summary(
     record: &workspace::WorkspaceScriptRunRecord,
 ) -> WorkspaceScriptRunSummary {
@@ -5283,6 +5686,13 @@ fn governed_action_kind_label(kind: contracts::GovernedActionKind) -> String {
             "append_workspace_script_version"
         }
         contracts::GovernedActionKind::ListWorkspaceScriptRuns => "list_workspace_script_runs",
+        contracts::GovernedActionKind::InspectIngressAttachments => "inspect_ingress_attachments",
+        contracts::GovernedActionKind::ProcessIngressAttachment => "process_ingress_attachment",
+        contracts::GovernedActionKind::ListCalendarEvents => "list_calendar_events",
+        contracts::GovernedActionKind::UpsertCalendarEvent => "upsert_calendar_event",
+        contracts::GovernedActionKind::ListEmailMessages => "list_email_messages",
+        contracts::GovernedActionKind::SendEmailMessage => "send_email_message",
+        contracts::GovernedActionKind::SyncTaskList => "sync_task_list",
         contracts::GovernedActionKind::UpsertScheduledForegroundTask => {
             "upsert_scheduled_foreground_task"
         }
@@ -5304,6 +5714,10 @@ fn governed_action_risk_tier_label(risk_tier: contracts::GovernedActionRiskTier)
 }
 
 fn governed_action_status_label(status: contracts::GovernedActionStatus) -> String {
+    governed_action_status_as_str(status).to_string()
+}
+
+fn governed_action_status_as_str(status: contracts::GovernedActionStatus) -> &'static str {
     match status {
         contracts::GovernedActionStatus::Proposed => "proposed",
         contracts::GovernedActionStatus::AwaitingApproval => "awaiting_approval",
@@ -5315,7 +5729,6 @@ fn governed_action_status_label(status: contracts::GovernedActionStatus) -> Stri
         contracts::GovernedActionStatus::Executed => "executed",
         contracts::GovernedActionStatus::Failed => "failed",
     }
-    .to_string()
 }
 
 fn workspace_script_run_status_label(status: contracts::WorkspaceScriptRunStatus) -> String {
@@ -5495,6 +5908,7 @@ impl ModelProviderKindExt for contracts::ModelProviderKind {
     fn identifier(self) -> &'static str {
         match self {
             contracts::ModelProviderKind::ZAi => "z_ai",
+            contracts::ModelProviderKind::OpenRouter => "openrouter",
         }
     }
 }
@@ -5587,6 +6001,8 @@ mod tests {
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
                 max_actions_per_foreground_turn: 10,
+                malformed_action_resteer_max_attempts: 2,
+                malformed_action_resteer_timeout_ms: 10_000,
                 cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: contracts::NetworkAccessPosture::Disabled,
@@ -5610,6 +6026,9 @@ mod tests {
                     allowed_chat_id: 2,
                     internal_principal_ref: "primary-user".to_string(),
                     internal_conversation_ref: "telegram-primary".to_string(),
+                    delegates: Vec::new(),
+                    approval_resolution_policy:
+                        crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
                 }),
             }),
             model_gateway: Some(ModelGatewayConfig {
@@ -5617,11 +6036,22 @@ mod tests {
                     provider: contracts::ModelProviderKind::ZAi,
                     model: "foreground".to_string(),
                     api_base_url: None,
+                    reasoning_mode: None,
+                    api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
+                    timeout_ms: 60_000,
+                },
+                unconscious: crate::config::ForegroundModelRouteConfig {
+                    provider: contracts::ModelProviderKind::ZAi,
+                    model: "unconscious".to_string(),
+                    api_base_url: None,
+                    reasoning_mode: None,
                     api_key_env: "BLUE_LAGOON_FOREGROUND_API_KEY".to_string(),
                     timeout_ms: 60_000,
                 },
                 z_ai: None,
+                openrouter: None,
             }),
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: Some(SelfModelConfig {
                 seed_path: PathBuf::from("config/self_model_seed.toml"),
             }),
@@ -5655,6 +6085,119 @@ mod tests {
     #[test]
     fn default_cli_actor_ref_falls_back_when_requested_by_is_malformed() {
         assert_eq!(default_cli_actor_ref("primary-user"), "cli:operator");
+    }
+
+    fn sample_trace_report(nodes: Vec<TraceNode>) -> TraceReport {
+        TraceReport {
+            trace_id: Uuid::now_v7(),
+            root_execution_id: Some(Uuid::now_v7()),
+            generated_at: Utc::now(),
+            node_count: nodes.len(),
+            edge_count: 0,
+            nodes,
+            edges: Vec::new(),
+            scheduling: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn sample_trace_node(
+        node_id: &str,
+        node_kind: &str,
+        occurred_at: DateTime<Utc>,
+        status: Option<&str>,
+        payload: JsonValue,
+    ) -> TraceNode {
+        TraceNode {
+            node_id: node_id.to_string(),
+            node_kind: node_kind.to_string(),
+            source_id: Uuid::now_v7(),
+            occurred_at,
+            status: status.map(ToOwned::to_owned),
+            title: node_id.to_string(),
+            summary: node_kind.to_string(),
+            payload,
+            related_ids: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn failing_model_call_focus_resolves_latest_model_call_before_failure() {
+        let model_call_at = Utc::now();
+        let report = sample_trace_report(vec![
+            sample_trace_node(
+                "model_call:foreground",
+                "model_call",
+                model_call_at,
+                Some("succeeded"),
+                json!({
+                    "request_payload_json": {
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }
+                }),
+            ),
+            sample_trace_node(
+                "audit_event:failed",
+                "audit_event",
+                model_call_at + Duration::seconds(1),
+                Some("error"),
+                json!({
+                    "payload": {
+                        "failure_kind": "malformed_action_proposal"
+                    }
+                }),
+            ),
+        ]);
+
+        let diagnosis = diagnose_trace_report(&report);
+        assert_eq!(
+            diagnosis
+                .first_failing_node
+                .as_ref()
+                .map(|node| node.node_id.as_str()),
+            Some("audit_event:failed")
+        );
+
+        let focus =
+            inspect_trace_report_focus(&report, &diagnosis, TraceFocusSelector::FailingModelCall);
+        let resolved = focus
+            .resolved_node
+            .as_ref()
+            .expect("failing-model-call focus should resolve a model call");
+        assert_eq!(resolved.node_id, "model_call:foreground");
+    }
+
+    #[test]
+    fn failing_model_call_focus_prefers_failing_model_call_node() {
+        let model_call_at = Utc::now();
+        let report = sample_trace_report(vec![sample_trace_node(
+            "model_call:failed",
+            "model_call",
+            model_call_at,
+            Some("failed"),
+            json!({
+                "response_payload_json": {
+                    "error": "provider timeout"
+                }
+            }),
+        )]);
+
+        let diagnosis = diagnose_trace_report(&report);
+        assert_eq!(
+            diagnosis
+                .first_failing_node
+                .as_ref()
+                .map(|node| node.node_id.as_str()),
+            Some("model_call:failed")
+        );
+
+        let focus =
+            inspect_trace_report_focus(&report, &diagnosis, TraceFocusSelector::FailingModelCall);
+        let resolved = focus
+            .resolved_node
+            .as_ref()
+            .expect("failing-model-call focus should resolve the failing model call");
+        assert_eq!(resolved.node_id, "model_call:failed");
     }
 
     #[test]

@@ -181,6 +181,8 @@ cargo run -p runtime -- telegram --poll-once
 
 ## Next Reading
 
+- Architecture diagrams: [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md)
+- Diagram strategy: [`docs/diagram-strategy.md`](docs/diagram-strategy.md)
 - Operator guide: [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md)
 - Requirements: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)
 - Loop architecture: [`docs/LOOP_ARCHITECTURE.md`](docs/LOOP_ARCHITECTURE.md)

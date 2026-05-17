@@ -453,6 +453,129 @@ async fn background_planning_suppresses_duplicate_active_jobs() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn scheduler_planning_pass_applies_deterministic_requests() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let now = Utc::now();
+        let requests = vec![
+            BackgroundPlanningRequest {
+                trace_id: Uuid::now_v7(),
+                job_kind: UnconsciousJobKind::MemoryConsolidation,
+                trigger: BackgroundTrigger {
+                    trigger_id: Uuid::now_v7(),
+                    trigger_kind: BackgroundTriggerKind::TimeSchedule,
+                    requested_at: now,
+                    reason_summary: "nightly consolidation".to_string(),
+                    payload_ref: None,
+                },
+                internal_conversation_ref: None,
+                available_at: now,
+            },
+            BackgroundPlanningRequest {
+                trace_id: Uuid::now_v7(),
+                job_kind: UnconsciousJobKind::MemoryConsolidation,
+                trigger: BackgroundTrigger {
+                    trigger_id: Uuid::now_v7(),
+                    trigger_kind: BackgroundTriggerKind::TimeSchedule,
+                    requested_at: now,
+                    reason_summary: "same nightly consolidation".to_string(),
+                    payload_ref: None,
+                },
+                internal_conversation_ref: None,
+                available_at: now,
+            },
+            BackgroundPlanningRequest {
+                trace_id: Uuid::now_v7(),
+                job_kind: UnconsciousJobKind::ContradictionAndDriftScan,
+                trigger: BackgroundTrigger {
+                    trigger_id: Uuid::now_v7(),
+                    trigger_kind: BackgroundTriggerKind::DriftOrAnomalySignal,
+                    requested_at: now,
+                    reason_summary: "drift diagnostic".to_string(),
+                    payload_ref: Some("diagnostic://event".to_string()),
+                },
+                internal_conversation_ref: None,
+                available_at: now,
+            },
+        ];
+
+        let summary = background_planning::run_scheduler_planning_pass_with_requests(
+            &ctx.pool,
+            &ctx.config,
+            requests,
+        )
+        .await?;
+
+        assert_eq!(summary.request_count, 3);
+        assert_eq!(summary.planned_count, 1);
+        assert_eq!(summary.suppressed_duplicate_count, 1);
+        assert_eq!(summary.rejected_count, 1);
+        assert_eq!(count_background_jobs(&ctx.pool).await?, 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn scheduler_planning_pass_produces_threshold_and_time_schedule_requests() -> Result<()> {
+    support::with_migrated_database(|ctx| async move {
+        let mut config = ctx.config.clone();
+        config.background.thresholds.episode_backlog_threshold = 1;
+        config.background.thresholds.candidate_memory_threshold = 1;
+        config.background.scheduler.poll_interval_seconds = 1;
+
+        let now = Utc::now();
+        let trace_id = Uuid::now_v7();
+        let episode_id =
+            seed_episode_for_conversation(&ctx.pool, trace_id, "telegram-primary").await?;
+        seed_memory_artifact(&ctx.pool, trace_id, episode_id).await?;
+
+        let first_summary =
+            background_planning::run_scheduler_planning_pass(&ctx.pool, &config, now).await?;
+        assert_eq!(first_summary.request_count, 3);
+        assert_eq!(first_summary.planned_count, 3);
+        assert_eq!(first_summary.suppressed_duplicate_count, 0);
+        assert_eq!(first_summary.rejected_count, 0);
+        assert_eq!(count_background_jobs(&ctx.pool).await?, 3);
+
+        let second_summary = background_planning::run_scheduler_planning_pass(
+            &ctx.pool,
+            &config,
+            now + Duration::seconds(2),
+        )
+        .await?;
+        assert_eq!(second_summary.request_count, 2);
+        assert_eq!(second_summary.planned_count, 0);
+        assert_eq!(second_summary.suppressed_duplicate_count, 2);
+        assert_eq!(second_summary.rejected_count, 0);
+        assert_eq!(count_background_jobs(&ctx.pool).await?, 3);
+
+        let planner_audit_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM audit_events
+            WHERE subsystem = 'background_planning'
+              AND event_kind = 'background_scheduler_planning_pass_completed'
+            "#,
+        )
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert!(
+            planner_audit_count >= 2,
+            "expected planner pass audit events for repeated scheduler iterations"
+        );
+
+        let diagnostics = recovery::list_operational_diagnostics(&ctx.pool, 10).await?;
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "background_scheduler_planning_duplicates_suppressed"
+        }));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
 async fn background_planning_rejects_recognized_but_unsupported_trigger_kinds() -> Result<()> {
     support::with_migrated_database(|ctx| async move {
         let trace_id = Uuid::now_v7();
@@ -998,6 +1121,9 @@ async fn background_execution_converts_accepted_wake_signal_into_staged_foregrou
                 allowed_chat_id: 24,
                 internal_principal_ref: "primary-user".to_string(),
                 internal_conversation_ref: "telegram-primary".to_string(),
+                delegates: Vec::new(),
+                approval_resolution_policy:
+                    harness::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
             }),
         });
 
@@ -1704,6 +1830,19 @@ fn sample_model_gateway_config() -> ResolvedModelGatewayConfig {
             model: "z-ai-background".to_string(),
             api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
             api_key: "test-key".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
+            timeout_ms: 20_000,
+        },
+        unconscious: ResolvedForegroundModelRouteConfig {
+            provider: contracts::ModelProviderKind::ZAi,
+            model: "z-ai-unconscious".to_string(),
+            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "test-key".to_string(),
+            provider_headers: Vec::new(),
+            reasoning_mode: harness::config::ForegroundReasoningMode::Off,
+            provider_reasoning: None,
             timeout_ms: 20_000,
         },
     }

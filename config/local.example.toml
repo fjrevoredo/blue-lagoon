@@ -3,8 +3,71 @@ allowed_user_id = 123456789
 allowed_chat_id = 123456789
 internal_principal_ref = "primary-user"
 internal_conversation_ref = "telegram-primary"
+approval_resolution_policy = "delegate_allowed"
+
+# Optional delegate bindings for bounded collaboration.
+#
+# [[telegram.foreground_binding.delegates]]
+# allowed_user_id = 987654321
+# internal_principal_ref = "delegate-user"
 
 # Optional local override. The committed default keeps full model-call prompt
 # and response payloads for 30 days before cleanup clears bulky text fields.
 [observability]
 model_call_payload_retention_days = 30
+
+# Optional calendar integration local override.
+# Keep disabled unless operator credentials and downstream policy are ready.
+#
+# [integrations.calendar]
+# enabled = true
+# provider = "google_calendar"
+# credential_env = "BLUE_LAGOON_CALENDAR_CREDENTIAL"
+# api_base_url = "https://www.googleapis.com/calendar/v3"
+
+# Optional email integration local override.
+#
+# [integrations.email]
+# enabled = true
+# provider = "gmail"
+# credential_env = "BLUE_LAGOON_EMAIL_CREDENTIAL"
+# api_base_url = "https://gmail.googleapis.com/gmail/v1"
+
+# Optional task-sync integration local override.
+#
+# [integrations.task_sync]
+# enabled = true
+# provider = "todoist"
+# credential_env = "BLUE_LAGOON_TASK_SYNC_CREDENTIAL"
+# api_base_url = "https://api.todoist.com/rest/v2"
+
+# Optional foreground model provider override for OpenRouter testing.
+# Use an OpenRouter model id after the provider prefix, preserving any slash in
+# the model id, for example "openrouter/openai/gpt-5.2".
+# Foreground conscious structured-output mode does not allow auto routing
+# ("openrouter/auto"): use a pinned model id.
+#
+# [model_gateway.foreground]
+# provider = "openrouter"
+# model = "openai/gpt-5.2"
+# reasoning_mode = "off"
+# api_key_env = "OPENROUTER_API_KEY"
+# timeout_ms = 60000
+#
+# [model_gateway.unconscious]
+# provider = "openrouter"
+# model = "openai/gpt-5.2"
+# reasoning_mode = "off"
+# api_key_env = "OPENROUTER_API_KEY"
+# timeout_ms = 60000
+#
+# [model_gateway.openrouter]
+# api_base_url = "https://openrouter.ai/api/v1"
+# http_referer = "https://example.invalid"
+# app_title = "Blue Lagoon"
+# exclude_reasoning = true
+#
+# Compatibility note:
+# `model_gateway.openrouter.reasoning_effort` remains accepted as a provider-
+# specific compatibility alias, but `model_gateway.foreground.reasoning_mode`
+# is the primary contract.

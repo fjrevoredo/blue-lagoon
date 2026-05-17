@@ -46,7 +46,10 @@ Operational assets live at the repository root:
 
 Use `docs/sources/` for research inputs and external references. Historical
 handover documents live in `docs/archive/` and should be treated as archived
-context rather than current canonical guidance.
+context rather than current canonical guidance. `docs/archive/` is read-only
+history: do not edit existing archive files during normal implementation work.
+If behavior changes, update canonical docs instead; only perform archive edits
+when explicit archival maintenance is requested.
 
 Planning labels belong in planning documents only. Code, tests, migrations,
 config, workflow steps, and canonical behavior docs must use domain or
@@ -281,3 +284,8 @@ is retained for historical traceability. Promote conclusions into
 `docs/REQUIREMENTS.md`, `docs/LOOP_ARCHITECTURE.md`,
 `docs/IMPLEMENTATION_DESIGN.md`, or other canonical docs only after they are
 cleaned up, reconciled, and stated as repository-approved guidance.
+
+Treat `docs/archive/` as immutable historical record. Do not update archived
+documents as part of normal feature work, refactors, or behavior corrections.
+When a correction is required, apply it to canonical docs (or add a new
+archival note/file) instead of rewriting prior archived records.

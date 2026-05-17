@@ -132,7 +132,7 @@ CLI surface before Phase 5 broadens the governed action surface.
 - Phase 4.5 status: `COMPLETE`
 - Phase 5 status: `COMPLETE`
 - Phase 6 status: `COMPLETE`
-- Phase 7 status: `DONE`
+- Phase 7 status: `COMPLETE`
 - Implementation evidence for Phase 1 lives in
   `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
 - Detailed planning for Phase 1.1 lives in
@@ -591,41 +591,21 @@ core single-user v1 runtime enough to justify the added complexity now.
 This document should be used as the agreement point for implementation order and
 milestone definition.
 
-With Phases 1, 1.1, and 2 complete, the next planning step is the detailed
-implementation plan for Phase 3. That document should break the next phase
-into:
+Phases 1 through 7 are complete, so this document now serves as historical
+sequencing context for the v1 foundation and hardening arc.
 
-- concrete subsystems
-- major schema work
-- contract definitions
-- milestone-sized deliverables
-- test requirements
-- dependency ordering
-- proposal-validation and merge boundaries
-- canonical self-model and retrieval-read paths
-- backlog-aware foreground recovery behavior
+Execution evidence remains in the detailed phase documents:
 
-That Phase 3 document should stay subordinate to this one. It should add
-execution detail, not re-open the high-level architectural sequence without an
-explicit decision.
+- `docs/PHASE_1_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_1_1_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_2_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_3_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_5_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_6_DETAILED_IMPLEMENTATION_PLAN.md`
+- `docs/PHASE_7_DETAILED_IMPLEMENTATION_PLAN.md`
 
-With Phase 3 complete, detailed planning for Phase 4 now lives in
-`docs/PHASE_4_DETAILED_IMPLEMENTATION_PLAN.md`, focused on the unconscious
-loop, bounded background maintenance, and wake-signal production and
-evaluation.
+Post-v1 expansion planning and execution evidence now lives in:
 
-With Phase 4 complete, the bridging Phase 4.5 implementation added the narrow
-management CLI surface needed before broader runtime complexity expands again.
-
-Detailed planning for Phase 5 now lives in
-`docs/PHASE_5_DETAILED_IMPLEMENTATION_PLAN.md`, where the next execution work
-should focus on workspace state, governed execution, approval handling,
-capability scoping, and the required management CLI extensions.
-
-Detailed planning and execution evidence for Phase 6 now lives in
-`docs/PHASE_6_DETAILED_IMPLEMENTATION_PLAN.md`.
-
-Detailed planning for Phase 7 now lives in
-`docs/PHASE_7_DETAILED_IMPLEMENTATION_PLAN.md`, focused on closing remaining
-post-Phase-6 drift against the canonical requirements and on publishing
-user-facing documentation only after that drift is resolved.
+- `docs/REAL_WORLD_ASSISTANT_GAP_CLOSURE_DESIGN.md`
+- `docs/real-world-assistant-gap-closure-implementation-plan.md`

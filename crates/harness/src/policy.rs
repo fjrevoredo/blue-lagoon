@@ -106,12 +106,17 @@ pub fn evaluate_telegram_foreground_trigger(
     config: &ResolvedTelegramConfig,
     ingress: &NormalizedIngress,
 ) -> PolicyDecision {
-    if ingress.external_user_id != config.allowed_user_id.to_string() {
+    let principal_binding = match ingress.external_user_id.parse::<i64>() {
+        Ok(user_id) => config.principal_binding_for_user_id(user_id),
+        Err(_) => None,
+    };
+    let Some(principal_binding) = principal_binding else {
         return PolicyDecision::Denied {
-            reason: "Telegram ingress actor does not match the configured single-user boundary"
-                .to_string(),
+            reason:
+                "Telegram ingress actor is not allowlisted for the configured principal bindings"
+                    .to_string(),
         };
-    }
+    };
 
     if ingress.external_conversation_id != config.allowed_chat_id.to_string() {
         return PolicyDecision::Denied {
@@ -121,7 +126,7 @@ pub fn evaluate_telegram_foreground_trigger(
         };
     }
 
-    if ingress.internal_principal_ref != config.internal_principal_ref {
+    if ingress.internal_principal_ref != principal_binding.internal_principal_ref {
         return PolicyDecision::Denied {
             reason: "Telegram ingress principal binding does not match configured policy"
                 .to_string(),
@@ -183,12 +188,19 @@ pub fn classify_governed_action_risk(proposal: &GovernedActionProposal) -> Gover
         | GovernedActionKind::ListWorkspaceScripts
         | GovernedActionKind::InspectWorkspaceScript
         | GovernedActionKind::ListWorkspaceScriptRuns
+        | GovernedActionKind::InspectIngressAttachments
         | GovernedActionKind::RunDiagnostic => GovernedActionRiskTier::Tier0,
         GovernedActionKind::CreateWorkspaceArtifact
         | GovernedActionKind::UpdateWorkspaceArtifact
+        | GovernedActionKind::ProcessIngressAttachment
+        | GovernedActionKind::ListCalendarEvents
+        | GovernedActionKind::ListEmailMessages
         | GovernedActionKind::RequestBackgroundJob => GovernedActionRiskTier::Tier1,
         GovernedActionKind::CreateWorkspaceScript
         | GovernedActionKind::AppendWorkspaceScriptVersion
+        | GovernedActionKind::UpsertCalendarEvent
+        | GovernedActionKind::SendEmailMessage
+        | GovernedActionKind::SyncTaskList
         | GovernedActionKind::UpsertScheduledForegroundTask => GovernedActionRiskTier::Tier2,
         GovernedActionKind::WebFetch => GovernedActionRiskTier::Tier2,
         GovernedActionKind::RunSubprocess | GovernedActionKind::RunWorkspaceScript => {
@@ -227,7 +239,15 @@ pub fn evaluate_governed_action_identity_boundaries(
 
         if boundary_blocks_network(&normalized)
             && (proposal.capability_scope.network != NetworkAccessPosture::Disabled
-                || proposal.action_kind == GovernedActionKind::WebFetch)
+                || matches!(
+                    proposal.action_kind,
+                    GovernedActionKind::WebFetch
+                        | GovernedActionKind::ListCalendarEvents
+                        | GovernedActionKind::UpsertCalendarEvent
+                        | GovernedActionKind::ListEmailMessages
+                        | GovernedActionKind::SendEmailMessage
+                        | GovernedActionKind::SyncTaskList
+                ))
         {
             return PolicyDecision::Denied {
                 reason: format!(
@@ -497,6 +517,8 @@ mod tests {
                 default_subprocess_timeout_ms: 30_000,
                 max_subprocess_timeout_ms: 120_000,
                 max_actions_per_foreground_turn: 10,
+                malformed_action_resteer_max_attempts: 2,
+                malformed_action_resteer_timeout_ms: 10_000,
                 cap_exceeded_behavior: contracts::GovernedActionCapExceededBehavior::Escalate,
                 max_filesystem_roots_per_action: 4,
                 default_network_access: NetworkAccessPosture::Disabled,
@@ -513,6 +535,7 @@ mod tests {
             },
             telegram: None,
             model_gateway: None,
+            integrations: crate::config::WorkflowIntegrationsConfig::default(),
             self_model: None,
         }
     }
@@ -624,6 +647,19 @@ mod tests {
                     model: "glm".to_string(),
                     api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
                     api_key: "secret".to_string(),
+                    provider_headers: Vec::new(),
+                    reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                    provider_reasoning: None,
+                    timeout_ms: 45_000,
+                },
+                unconscious: crate::config::ResolvedForegroundModelRouteConfig {
+                    provider: contracts::ModelProviderKind::ZAi,
+                    model: "glm-unconscious".to_string(),
+                    api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+                    api_key: "secret".to_string(),
+                    provider_headers: Vec::new(),
+                    reasoning_mode: crate::config::ForegroundReasoningMode::Off,
+                    provider_reasoning: None,
                     timeout_ms: 45_000,
                 },
             },
@@ -700,7 +736,7 @@ mod tests {
         match evaluate_telegram_foreground_trigger(&telegram_config(), &ingress) {
             PolicyDecision::Allowed => panic!("unauthorized actor should be rejected"),
             PolicyDecision::Denied { reason } => {
-                assert!(reason.contains("single-user boundary"));
+                assert!(reason.contains("not allowlisted"));
             }
         }
     }
@@ -713,6 +749,13 @@ mod tests {
             allowed_chat_id: 24,
             internal_principal_ref: "primary-user".to_string(),
             internal_conversation_ref: "telegram-primary".to_string(),
+            approval_resolution_policy:
+                crate::config::TelegramApprovalResolutionPolicy::DelegateAllowed,
+            principal_bindings: vec![crate::config::ResolvedTelegramPrincipalBinding {
+                allowed_user_id: 42,
+                internal_principal_ref: "primary-user".to_string(),
+                role: crate::config::TelegramPrincipalRole::Owner,
+            }],
             poll_limit: 10,
         }
     }
